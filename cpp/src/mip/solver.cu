@@ -74,6 +74,7 @@ struct branch_and_bound_solution_helper_t {
   void solution_callback(std::vector<f_t>& solution, f_t objective)
   {
     dm->population.add_external_solution(solution, objective, solution_origin_t::BRANCH_AND_BOUND);
+    dm->rins.new_best_incumbent_callback(solution);
   }
 
   void set_simplex_solution(std::vector<f_t>& solution,
@@ -229,7 +230,8 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
     branch_and_bound_status_future = std::async(std::launch::async,
                                                 &dual_simplex::branch_and_bound_t<i_t, f_t>::solve,
                                                 branch_and_bound.get(),
-                                                std::ref(branch_and_bound_solution));
+                                                std::ref(branch_and_bound_solution),
+                                                "aaaaaaa");
   }
 
   // Start the primal heuristics

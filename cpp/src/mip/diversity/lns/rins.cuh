@@ -22,9 +22,12 @@
 #include <mip/solver.cuh>
 #include <utilities/timer.hpp>
 
+#include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace cuopt::linear_programming::detail {
@@ -33,15 +36,41 @@ namespace cuopt::linear_programming::detail {
 template <typename i_t, typename f_t>
 class diversity_manager_t;
 
-template <typename i_t, typename f_t>
 struct rins_settings_t {
-  i_t node_freq          = 10;
-  f_t min_frac           = 0.3;
-  f_t max_frac           = 0.8;
-  f_t default_frac       = 0.5;
-  f_t min_time_limit     = 1.;
-  f_t max_time_limit     = 20.;
-  f_t default_time_limit = 4.;
+  int node_freq                     = 10;
+  int nodes_after_later_improvement = 20;
+  double min_fixrate                = 0.3;
+  double max_fixrate                = 0.8;
+  double default_fixrate            = 0.5;
+  double min_time_limit             = 1.;
+  double max_time_limit             = 35.;
+  double default_time_limit         = 6.;
+  bool objective_cut                = true;
+};
+
+template <typename i_t, typename f_t>
+class rins_t;
+
+template <typename i_t, typename f_t>
+struct rins_thread_t {
+  rins_thread_t();
+  ~rins_thread_t();
+
+  void cpu_worker_thread();
+  void start_cpu_solver();
+  void stop_cpu_solver();
+  bool wait_for_cpu_solver();  // return feasibility
+  void kill_cpu_solver();
+
+  std::thread cpu_worker;
+  std::mutex cpu_mutex;
+  std::condition_variable cpu_cv;
+  std::atomic<bool> should_stop{false};
+  std::atomic<bool> cpu_thread_should_start{false};
+  std::atomic<bool> cpu_thread_done{false};
+  std::atomic<bool> cpu_thread_terminate{false};
+
+  rins_t<i_t, f_t>* rins_ptr{nullptr};
 };
 
 template <typename i_t, typename f_t>
@@ -49,19 +78,31 @@ class rins_t {
  public:
   rins_t(mip_solver_context_t<i_t, f_t>& context,
          diversity_manager_t<i_t, f_t>& dm,
-         rins_settings_t<i_t, f_t> settings = rins_settings_t<i_t, f_t>());
+         rins_settings_t settings = rins_settings_t());
 
   void node_callback(const std::vector<f_t>& solution, f_t objective);
+  void new_best_incumbent_callback(const std::vector<f_t>& solution);
+
+  void run_rins();
 
   mip_solver_context_t<i_t, f_t>& context;
   problem_t<i_t, f_t>* problem_ptr;
   diversity_manager_t<i_t, f_t>& dm;
-  rins_settings_t<i_t, f_t> settings;
+  rins_settings_t settings;
 
-  f_t frac{0.5};
+  std::vector<f_t> lp_optimal_solution;
 
+  f_t fixrate{0.5};
   i_t total_calls{0};
   i_t total_success{0};
+  f_t time_limit{4.};
+
+  std::atomic<i_t> node_count{0};
+  std::atomic<i_t> node_count_at_last_rins{0};
+  std::atomic<i_t> node_count_at_last_improvement{0};
+  std::mutex rins_mutex;
+
+  std::unique_ptr<rins_thread_t<i_t, f_t>> rins_thread;
 };
 
 }  // namespace cuopt::linear_programming::detail

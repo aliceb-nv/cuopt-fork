@@ -638,7 +638,9 @@ node_status_t branch_and_bound_t<i_t, f_t>::solve_node(search_tree_t<i_t, f_t>& 
     pc_.update_pseudo_costs(node_ptr, leaf_objective);
 
     if (settings_.node_processed_callback != nullptr) {
-      settings_.node_processed_callback(leaf_solution.x, leaf_objective);
+      std::vector<f_t> original_x;
+      uncrush_primal_solution(original_problem_, original_lp_, leaf_solution.x, original_x);
+      settings_.node_processed_callback(original_x, leaf_objective);
     }
 
     if (leaf_num_fractional == 0) {
@@ -1022,13 +1024,16 @@ void branch_and_bound_t<i_t, f_t>::diving_thread(lp_problem_t<i_t, f_t>& leaf_pr
 }
 
 template <typename i_t, typename f_t>
-mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solution)
+mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solution,
+                                                 std::string log_prefix)
 {
   logger_t log;
-  log.log                 = false;
-  status_                 = mip_exploration_status_t::UNSET;
-  stats_.nodes_unexplored = 0;
-  stats_.nodes_explored   = 0;
+  log.log                  = false;
+  log.log_prefix           = log_prefix;
+  settings_.log.log_prefix = log_prefix;
+  status_                  = mip_exploration_status_t::UNSET;
+  stats_.nodes_unexplored  = 0;
+  stats_.nodes_explored    = 0;
 
   if (guess_.size() != 0) {
     std::vector<f_t> crushed_guess;
