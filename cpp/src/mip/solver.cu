@@ -83,6 +83,11 @@ struct branch_and_bound_solution_helper_t {
     dm->set_simplex_solution(solution, dual_solution, objective);
   }
 
+  void node_processed_callback(std::vector<f_t>& solution, f_t objective)
+  {
+    dm->rins.node_callback(solution, objective);
+  }
+
   void preempt_heuristic_solver() { dm->population.preempt_heuristic_solver(); }
   diversity_manager_t<i_t, f_t>* dm;
   dual_simplex::simplex_solver_settings_t<i_t, f_t>& settings_;
@@ -200,6 +205,12 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
                 std::placeholders::_1,
                 std::placeholders::_2,
                 std::placeholders::_3);
+
+    branch_and_bound_settings.node_processed_callback =
+      std::bind(&branch_and_bound_solution_helper_t<i_t, f_t>::node_processed_callback,
+                &solution_helper,
+                std::placeholders::_1,
+                std::placeholders::_2);
 
     // Create the branch and bound object
     branch_and_bound = std::make_unique<dual_simplex::branch_and_bound_t<i_t, f_t>>(

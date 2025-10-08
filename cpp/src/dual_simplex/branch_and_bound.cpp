@@ -637,6 +637,10 @@ node_status_t branch_and_bound_t<i_t, f_t>::solve_node(search_tree_t<i_t, f_t>& 
     search_tree.graphviz_node(log, node_ptr, "lower bound", leaf_objective);
     pc_.update_pseudo_costs(node_ptr, leaf_objective);
 
+    if (settings_.node_processed_callback != nullptr) {
+      settings_.node_processed_callback(leaf_solution.x, leaf_objective);
+    }
+
     if (leaf_num_fractional == 0) {
       // Found a integer feasible solution
       add_feasible_solution(leaf_objective, leaf_solution.x, node_ptr->depth, thread_type);

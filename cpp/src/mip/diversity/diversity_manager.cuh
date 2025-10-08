@@ -31,6 +31,7 @@
 #include <cuopt/linear_programming/mip/solver_settings.hpp>
 #include <cuopt/linear_programming/mip/solver_stats.hpp>
 
+#include <mip/diversity/lns/rins.cuh>
 #include <mip/local_search/local_search.cuh>
 #include <mip/solution/solution.cuh>
 #include <mip/solver.cuh>
@@ -94,6 +95,7 @@ class diversity_manager_t {
   rmm::device_uvector<f_t> lp_dual_optimal_solution;
   std::atomic<bool> simplex_solution_exists{false};
   local_search_t<i_t, f_t> ls;
+  rins_t<i_t, f_t> rins;
   cuopt::timer_t timer;
   bound_prop_recombiner_t<i_t, f_t> bound_prop_recombiner;
   fp_recombiner_t<i_t, f_t> fp_recombiner;
