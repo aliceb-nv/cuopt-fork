@@ -37,9 +37,9 @@ template <typename i_t, typename f_t>
 class diversity_manager_t;
 
 struct rins_settings_t {
-  int node_freq                     = 10;
-  int nodes_after_later_improvement = 20;
-  double min_fixrate                = 0.3;
+  int node_freq                     = 100;
+  int nodes_after_later_improvement = 200;
+  double min_fixrate                = 0.1;
   double max_fixrate                = 0.8;
   double default_fixrate            = 0.5;
   double min_time_limit             = 1.;
