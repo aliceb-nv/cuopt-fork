@@ -314,9 +314,9 @@ void rins_t<i_t, f_t>::run_rins()
     best_sol.handle_ptr->sync_stream();
     // unfix the assignment on given result no matter if it is feasible
     best_sol.unfix_variables(fixed_assignment, variable_map);
-    // cuopt_assert(solution.test_number_all_integer(), "All must be integers after offspring");
     best_sol.compute_feasibility();
     if (rins_solution_found && best_sol.get_feasible()) {
+      cuopt_assert(best_sol.test_number_all_integer(), "All must be integers after offspring");
       CUOPT_LOG_DEBUG("RINS Solution: feasible: %d, objective: %g",
                       best_sol.get_feasible(),
                       best_sol.get_user_objective());
