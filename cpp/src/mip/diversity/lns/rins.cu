@@ -117,15 +117,16 @@ void rins_t<i_t, f_t>::node_callback(const std::vector<f_t>& solution, f_t objec
   std::lock_guard<std::mutex> lock(rins_mutex);
 
   node_count++;
-  //   printf(
-  //     "-------- node processed w/ solution %d and objective %e\n", (int)solution.size(),
-  //     objective);
+  // CUOPT_LOG_INFO("RINS callback node count %d, node count at last improvement %d, node count at
+  // last rins %d", node_count.load(), node_count_at_last_improvement.load(),
+  // node_count_at_last_rins.load());
+  //    printf(
+  //      "-------- node processed w/ solution %d and objective %e\n", (int)solution.size(),
+  //      objective);
 
   if (node_count - node_count_at_last_improvement < settings.nodes_after_later_improvement) return;
 
   if (node_count - node_count_at_last_rins > settings.node_freq) {
-    node_count_at_last_rins = node_count.load();
-
     // printf("-------- rins triggered at node %d\n", node_count.load());
     if (!rins_thread->cpu_thread_should_start &&
         (dm.population.current_size() > 0 || dm.population.external_solution_queue.size() > 0 ||
@@ -205,9 +206,13 @@ void rins_t<i_t, f_t>::run_rins()
                                 }),
                  "All variables to fix must be integer variables");
 
-    if (n_to_fix == 0) return;
+    if (n_to_fix == 0) {
+      CUOPT_LOG_DEBUG("RINS no variables to fix");
+      return;
+    }
 
     total_calls++;
+    node_count_at_last_rins = node_count.load();
     CUOPT_LOG_DEBUG("Running RINS on solution with objective %g, fixing %d/%d",
                     best_sol.get_user_objective(),
                     vars_to_fix.size(),
