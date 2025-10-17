@@ -1054,12 +1054,85 @@ bool fj_t<i_t, f_t>::cpu_solve(fj_cpu_climber_t<i_t, f_t>& fj_cpu, f_t in_time_l
   return fj_cpu.feasible_found;
 }
 
+template <typename i_t, typename f_t>
+cpu_fj_thread_t<i_t, f_t>::cpu_fj_thread_t()
+{
+  cpu_worker = std::thread(&cpu_fj_thread_t<i_t, f_t>::cpu_worker_thread, this);
+}
+
+template <typename i_t, typename f_t>
+cpu_fj_thread_t<i_t, f_t>::~cpu_fj_thread_t()
+{
+  if (!cpu_thread_terminate) { kill_cpu_solver(); }
+}
+
+template <typename i_t, typename f_t>
+void cpu_fj_thread_t<i_t, f_t>::cpu_worker_thread()
+{
+  while (!cpu_thread_terminate) {
+    // Wait for start signal
+    {
+      std::unique_lock<std::mutex> lock(cpu_mutex);
+      cpu_cv.wait(lock, [this] { return cpu_thread_should_start || cpu_thread_terminate; });
+    }
+
+    if (cpu_thread_terminate) break;
+
+    // Run CPU solver
+    {
+      raft::common::nvtx::range fun_scope("Running CPU FJ");
+      cpu_fj_solution_found = fj_ptr->cpu_solve(*fj_cpu);
+    }
+
+    cpu_thread_should_start = false;
+    cpu_thread_done         = true;
+  }
+}
+
+template <typename i_t, typename f_t>
+void cpu_fj_thread_t<i_t, f_t>::kill_cpu_solver()
+{
+  cpu_thread_terminate = true;
+  if (fj_cpu) fj_cpu->halted = true;
+  cpu_cv.notify_one();
+  cpu_worker.join();
+}
+
+template <typename i_t, typename f_t>
+void cpu_fj_thread_t<i_t, f_t>::start_cpu_solver()
+{
+  cuopt_assert(fj_cpu != nullptr, "fj_cpu must not be null");
+  // Reset flags
+  cpu_thread_done         = false;
+  cpu_thread_should_start = true;
+  fj_cpu->halted          = false;
+  cpu_cv.notify_one();
+}
+
+template <typename i_t, typename f_t>
+void cpu_fj_thread_t<i_t, f_t>::stop_cpu_solver()
+{
+  fj_cpu->halted = true;
+}
+
+template <typename i_t, typename f_t>
+bool cpu_fj_thread_t<i_t, f_t>::wait_for_cpu_solver()
+{
+  while (!cpu_thread_done && !cpu_thread_terminate) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  return cpu_fj_solution_found;
+}
+
 #if MIP_INSTANTIATE_FLOAT
 template class fj_t<int, float>;
+template class cpu_fj_thread_t<int, float>;
 #endif
 
 #if MIP_INSTANTIATE_DOUBLE
 template class fj_t<int, double>;
+template class cpu_fj_thread_t<int, double>;
 #endif
 
 }  // namespace cuopt::linear_programming::detail

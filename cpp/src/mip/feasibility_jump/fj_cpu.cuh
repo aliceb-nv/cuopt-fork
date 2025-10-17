@@ -17,7 +17,11 @@
 
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <functional>
+#include <mutex>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -119,6 +123,29 @@ struct fj_cpu_climber_t {
   std::string log_prefix{""};
 
   std::atomic<bool> halted{false};
+};
+
+template <typename i_t, typename f_t>
+struct cpu_fj_thread_t {
+  cpu_fj_thread_t();
+  ~cpu_fj_thread_t();
+
+  void cpu_worker_thread();
+  void start_cpu_solver();
+  void stop_cpu_solver();
+  bool wait_for_cpu_solver();  // return feasibility
+  void kill_cpu_solver();
+
+  std::thread cpu_worker;
+  std::mutex cpu_mutex;
+  std::condition_variable cpu_cv;
+  std::atomic<bool> should_stop{false};
+  std::atomic<bool> cpu_thread_should_start{false};
+  std::atomic<bool> cpu_thread_done{false};
+  std::atomic<bool> cpu_thread_terminate{false};
+  bool cpu_fj_solution_found{false};
+  std::unique_ptr<fj_cpu_climber_t<i_t, f_t>> fj_cpu;
+  fj_t<i_t, f_t>* fj_ptr{nullptr};
 };
 
 }  // namespace cuopt::linear_programming::detail
