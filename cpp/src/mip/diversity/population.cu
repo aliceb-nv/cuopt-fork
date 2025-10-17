@@ -648,6 +648,7 @@ template <typename i_t, typename f_t>
 std::vector<solution_t<i_t, f_t>> population_t<i_t, f_t>::population_to_vector()
 {
   std::lock_guard<std::recursive_mutex> lock(solution_mutex);
+  if (solutions.empty()) return {};
   std::vector<solution_t<i_t, f_t>> sol_vec;
   bool population_feasible = is_feasible();
   for (size_t i = !population_feasible; i < indices.size(); i++) {
