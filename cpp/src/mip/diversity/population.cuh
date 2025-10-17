@@ -204,7 +204,8 @@ class population_t {
   std::vector<external_solution_t> external_solution_queue_cpufj;
   std::mt19937 rng;
   i_t update_iter = 0;
-  std::recursive_mutex solution_mutex;
+  std::recursive_mutex write_mutex;
+  std::mutex solution_mutex;
   std::atomic<bool> early_exit_primal_generation = false;
   std::atomic<bool> preempt_heuristic_solver_    = false;
   f_t best_feasible_objective                    = std::numeric_limits<f_t>::max();

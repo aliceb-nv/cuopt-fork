@@ -68,7 +68,7 @@ i_t get_max_var_threshold(i_t n_vars)
 template <typename i_t, typename f_t>
 void population_t<i_t, f_t>::allocate_solutions()
 {
-  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
+  std::lock_guard<std::recursive_mutex> lock(write_mutex);
   for (size_t i = 0; i < max_solutions; ++i) {
     bool occupied = false;
     solutions.emplace_back(occupied, solution_t<i_t, f_t>(*problem_ptr));
@@ -78,7 +78,7 @@ void population_t<i_t, f_t>::allocate_solutions()
 template <typename i_t, typename f_t>
 void population_t<i_t, f_t>::initialize_population()
 {
-  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
+  std::lock_guard<std::recursive_mutex> lock(write_mutex);
 
   var_threshold = get_max_var_threshold(problem_ptr->n_integer_vars);
   solutions.reserve(max_solutions);
@@ -97,8 +97,6 @@ template <typename i_t, typename f_t>
 std::pair<solution_t<i_t, f_t>, solution_t<i_t, f_t>> population_t<i_t, f_t>::get_two_random(
   bool tournament)
 {
-  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
-
   raft::common::nvtx::range fun_scope("get_two_random");
   cuopt_assert(indices.size() > 2, "There should be enough solutions");
   size_t add = (size_t)(!solutions[0].first);
@@ -133,7 +131,6 @@ std::pair<solution_t<i_t, f_t>, solution_t<i_t, f_t>> population_t<i_t, f_t>::ge
 template <typename i_t, typename f_t>
 void population_t<i_t, f_t>::add_solutions_from_vec(std::vector<solution_t<i_t, f_t>>&& solutions)
 {
-  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
   raft::common::nvtx::range fun_scope("add_solution_from_vec");
   for (auto&& sol : solutions) {
     add_solution(std::move(sol));
@@ -143,7 +140,7 @@ void population_t<i_t, f_t>::add_solutions_from_vec(std::vector<solution_t<i_t, 
 template <typename i_t, typename f_t>
 size_t population_t<i_t, f_t>::get_external_solution_size()
 {
-  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
+  std::lock_guard<std::mutex> lock(solution_mutex);
   return external_solution_queue.size();
 }
 
@@ -152,7 +149,7 @@ void population_t<i_t, f_t>::add_external_solution(const std::vector<f_t>& solut
                                                    f_t objective,
                                                    solution_origin_t origin)
 {
-  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
+  std::lock_guard<std::mutex> lock(solution_mutex);
 
   if (origin == solution_origin_t::CPUFJ) {
     external_solution_queue_cpufj.emplace_back(solution, objective, origin);
@@ -197,7 +194,7 @@ void population_t<i_t, f_t>::preempt_heuristic_solver()
 template <typename i_t, typename f_t>
 std::vector<solution_t<i_t, f_t>> population_t<i_t, f_t>::get_external_solutions()
 {
-  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
+  std::lock_guard<std::mutex> lock(solution_mutex);
   std::vector<solution_t<i_t, f_t>> return_vector;
   i_t counter                     = 0;
   f_t new_best_feasible_objective = best_feasible_objective;
@@ -248,7 +245,6 @@ std::vector<solution_t<i_t, f_t>> population_t<i_t, f_t>::get_external_solutions
 template <typename i_t, typename f_t>
 bool population_t<i_t, f_t>::is_better_than_best_feasible(solution_t<i_t, f_t>& sol)
 {
-  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
   bool obj_better = sol.get_objective() < best_feasible_objective;
   return obj_better && sol.get_feasible();
 }
@@ -256,7 +252,6 @@ bool population_t<i_t, f_t>::is_better_than_best_feasible(solution_t<i_t, f_t>& 
 template <typename i_t, typename f_t>
 void population_t<i_t, f_t>::run_solution_callbacks(solution_t<i_t, f_t>& sol)
 {
-  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
   bool better_solution_found = is_better_than_best_feasible(sol);
   auto user_callbacks        = context.settings.get_mip_callbacks();
   if (better_solution_found) {
@@ -351,7 +346,6 @@ void population_t<i_t, f_t>::run_solution_callbacks(solution_t<i_t, f_t>& sol)
 template <typename i_t, typename f_t>
 void population_t<i_t, f_t>::adjust_weights_according_to_best_feasible()
 {
-  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
   // check if the best in population still the best feasible
   if (!best().get_feasible()) {
     CUOPT_LOG_DEBUG("Best solution is infeasible, adjusting weights");
@@ -384,7 +378,7 @@ void population_t<i_t, f_t>::adjust_weights_according_to_best_feasible()
 template <typename i_t, typename f_t>
 i_t population_t<i_t, f_t>::add_solution(solution_t<i_t, f_t>&& sol)
 {
-  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
+  std::lock_guard<std::recursive_mutex> lock(write_mutex);
   raft::common::nvtx::range fun_scope("add_solution");
   population_hash_map.insert(sol);
   double sol_cost = sol.get_quality(weights);
@@ -461,7 +455,6 @@ i_t population_t<i_t, f_t>::add_solution(solution_t<i_t, f_t>&& sol)
 template <typename i_t, typename f_t>
 void population_t<i_t, f_t>::normalize_weights()
 {
-  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
   CUOPT_LOG_DEBUG("Normalizing weights");
 
   rmm::device_scalar<f_t> l2_norm(problem_ptr->handle_ptr->get_stream());
@@ -505,7 +498,6 @@ void population_t<i_t, f_t>::normalize_weights()
 template <typename i_t, typename f_t>
 void population_t<i_t, f_t>::compute_new_weights()
 {
-  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
   auto& best_sol = best();
   auto settings  = context.settings;
 
@@ -554,7 +546,7 @@ void population_t<i_t, f_t>::compute_new_weights()
 template <typename i_t, typename f_t>
 void population_t<i_t, f_t>::update_qualities()
 {
-  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
+  std::lock_guard<std::recursive_mutex> lock(write_mutex);
   if (indices.size() == 1) return;
   using pr = std::pair<size_t, double>;
   for (size_t i = !is_feasible(); i < indices.size(); i++)
@@ -570,7 +562,6 @@ void population_t<i_t, f_t>::update_qualities()
 template <typename i_t, typename f_t>
 void population_t<i_t, f_t>::update_weights()
 {
-  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
   raft::common::nvtx::range fun_scope("adjust_weight_changes");
   CUOPT_LOG_DEBUG("Changing the weights");
   compute_new_weights();
@@ -591,7 +582,6 @@ bool population_t<i_t, f_t>::check_sols_similar(solution_t<i_t, f_t>& sol1,
 template <typename i_t, typename f_t>
 size_t population_t<i_t, f_t>::best_similar_index(solution_t<i_t, f_t>& sol)
 {
-  raft::common::nvtx::range fun_scope("best_similar_index");
   if (indices.size() == 1) return max_solutions;
   for (size_t i = 1; i < indices.size(); i++) {
     if (check_sols_similar(sol, solutions[indices[i].first].second)) { return i; }
@@ -604,7 +594,6 @@ size_t population_t<i_t, f_t>::best_similar_index(solution_t<i_t, f_t>& sol)
 template <typename i_t, typename f_t>
 i_t population_t<i_t, f_t>::insert_index(std::pair<i_t, f_t> to_insert)
 {
-  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
   raft::common::nvtx::range fun_scope("insert_index");
   // Assert free index is available
   indices.emplace_back(0, 0.0);
@@ -622,7 +611,6 @@ template <typename i_t, typename f_t>
 bool population_t<i_t, f_t>::check_if_feasible_similar_exists(size_t start_index,
                                                               solution_t<i_t, f_t>& sol)
 {
-  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
   raft::common::nvtx::range fun_scope("check_if_feasible_similar_exists");
   for (size_t i = start_index; i < indices.size(); i++) {
     if (check_sols_similar(sol, solutions[indices[i].first].second)) {
@@ -635,7 +623,6 @@ bool population_t<i_t, f_t>::check_if_feasible_similar_exists(size_t start_index
 template <typename i_t, typename f_t>
 void population_t<i_t, f_t>::eradicate_similar(size_t start_index, solution_t<i_t, f_t>& sol)
 {
-  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
   raft::common::nvtx::range fun_scope("eradicate_similar");
   for (size_t i = start_index; i < indices.size(); i++) {
     if (check_sols_similar(sol, solutions[indices[i].first].second)) {
@@ -657,7 +644,7 @@ void population_t<i_t, f_t>::eradicate_similar(size_t start_index, solution_t<i_
 template <typename i_t, typename f_t>
 std::vector<solution_t<i_t, f_t>> population_t<i_t, f_t>::population_to_vector()
 {
-  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
+  std::lock_guard<std::recursive_mutex> lock(write_mutex);
   if (solutions.empty()) return {};
   std::vector<solution_t<i_t, f_t>> sol_vec;
   bool population_feasible = is_feasible();
@@ -670,7 +657,6 @@ std::vector<solution_t<i_t, f_t>> population_t<i_t, f_t>::population_to_vector()
 template <typename i_t, typename f_t>
 void population_t<i_t, f_t>::halve_the_population()
 {
-  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
   raft::common::nvtx::range fun_scope("halve_the_population");
   // try 3/4 here
   if (current_size() <= (max_solutions * halving_skip_ratio)) { return; }
@@ -680,6 +666,8 @@ void population_t<i_t, f_t>::halve_the_population()
   i_t counter                   = 0;
   constexpr i_t max_adjustments = 4;
   size_t max_var_threshold      = get_max_var_threshold(problem_ptr->n_integer_vars);
+
+  std::lock_guard<std::recursive_mutex> lock(write_mutex);
   while (current_size() > max_solutions / 2) {
     clear_except_best_feasible();
     var_threshold = std::max(var_threshold * 0.97, 0.5 * problem_ptr->n_integer_vars);
@@ -705,7 +693,6 @@ void population_t<i_t, f_t>::halve_the_population()
 template <typename i_t, typename f_t>
 size_t population_t<i_t, f_t>::find_free_solution_index()
 {
-  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
   raft::common::nvtx::range fun_scope("find_free_solution_index");
   // ASSERT such index exists
   for (size_t i = 1; i < solutions.size(); i++)
