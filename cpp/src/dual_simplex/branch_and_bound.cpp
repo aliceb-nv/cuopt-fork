@@ -851,6 +851,10 @@ void branch_and_bound_t<i_t, f_t>::explore_subtree(i_t task_id,
       status_ = mip_exploration_status_t::TIME_LIMIT;
       return;
     }
+    if (stats_.nodes_explored >= settings_.node_limit) {
+      status_ = mip_exploration_status_t::TIME_LIMIT;
+      return;
+    }
 
     // Set the correct bounds for the leaf problem
     leaf_problem.lower = original_lp_.lower;

@@ -42,8 +42,8 @@ struct rins_settings_t {
   double min_fixrate                = 0.1;
   double max_fixrate                = 0.8;
   double default_fixrate            = 0.5;
-  double min_time_limit             = 1.;
-  double max_time_limit             = 35.;
+  double min_time_limit             = 10.;
+  double max_time_limit             = 20.;
   double default_time_limit         = 6.;
   bool objective_cut                = true;
 };
@@ -95,7 +95,7 @@ class rins_t {
   f_t fixrate{0.5};
   i_t total_calls{0};
   i_t total_success{0};
-  f_t time_limit{4.};
+  f_t time_limit{10.};
 
   std::atomic<i_t> node_count{0};
   std::atomic<i_t> node_count_at_last_rins{0};

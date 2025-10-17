@@ -117,7 +117,6 @@ void rins_t<i_t, f_t>::node_callback(const std::vector<f_t>& solution, f_t objec
   std::lock_guard<std::mutex> lock(rins_mutex);
 
   node_count++;
-  total_calls++;
   //   printf(
   //     "-------- node processed w/ solution %d and objective %e\n", (int)solution.size(),
   //     objective);
@@ -168,18 +167,16 @@ void rins_t<i_t, f_t>::run_rins()
 
     rmm::device_uvector<i_t> vars_to_fix(problem_ptr->n_integer_vars,
                                          problem_ptr->handle_ptr->get_stream());
-    auto end =
-      thrust::copy_if(problem_ptr->handle_ptr->get_thrust_policy(),
-                      thrust::make_counting_iterator(i_t(0)),
-                      thrust::make_counting_iterator(problem_ptr->n_integer_vars),
-                      vars_to_fix.begin(),
-                      [lpopt     = lp_opt_device.data(),
-                       incumbent = best_sol.assignment.data(),
-                       pb        = problem_ptr->view()] __device__(i_t int_idx) {
-                        i_t var_idx = pb.integer_indices[int_idx];
-                        cuopt_assert(var_idx < pb.n_variables, "Variable index out of bounds");
-                        return pb.integer_equal(lpopt[var_idx], incumbent[var_idx]);
-                      });
+    auto end = thrust::copy_if(problem_ptr->handle_ptr->get_thrust_policy(),
+                               thrust::make_counting_iterator(i_t(0)),
+                               thrust::make_counting_iterator(problem_ptr->n_variables),
+                               vars_to_fix.begin(),
+                               [lpopt     = lp_opt_device.data(),
+                                incumbent = best_sol.assignment.data(),
+                                pb        = problem_ptr->view()] __device__(i_t var_idx) {
+                                 if (!pb.is_integer_var(var_idx)) return false;
+                                 return pb.integer_equal(lpopt[var_idx], incumbent[var_idx]);
+                               });
     vars_to_fix.resize(end - vars_to_fix.begin(), problem_ptr->handle_ptr->get_stream());
     f_t fractional_ratio = (f_t)(vars_to_fix.size()) / (f_t)problem_ptr->n_integer_vars;
 
@@ -200,8 +197,17 @@ void rins_t<i_t, f_t>::run_rins()
     thrust::sort(
       problem_ptr->handle_ptr->get_thrust_policy(), vars_to_fix.begin(), vars_to_fix.end());
 
+    cuopt_assert(thrust::all_of(problem_ptr->handle_ptr->get_thrust_policy(),
+                                vars_to_fix.begin(),
+                                vars_to_fix.end(),
+                                [pb = problem_ptr->view()] __device__(i_t var_idx) {
+                                  return pb.is_integer_var(var_idx);
+                                }),
+                 "All variables to fix must be integer variables");
+
     if (n_to_fix == 0) return;
 
+    total_calls++;
     CUOPT_LOG_DEBUG("Running RINS on solution with objective %g, fixing %d/%d",
                     best_sol.get_user_objective(),
                     vars_to_fix.size(),
@@ -209,7 +215,7 @@ void rins_t<i_t, f_t>::run_rins()
     CUOPT_LOG_DEBUG("RINS fixrate %g time limit %g", fixrate, time_limit);
     CUOPT_LOG_DEBUG("RINS fractional ratio %g%%", fractional_ratio * 100);
 
-    f_t prev_obj = best_sol.get_objective();
+    f_t prev_obj = best_sol.get_user_objective();
 
     auto [fixed_problem, fixed_assignment, variable_map] = best_sol.fix_variables(vars_to_fix);
     CUOPT_LOG_DEBUG(
@@ -219,7 +225,8 @@ void rins_t<i_t, f_t>::run_rins()
     solution_t<i_t, f_t> best_sol_fixed_space(fixed_problem);
     best_sol_fixed_space.copy_new_assignment(host_copy(fixed_assignment));
     best_sol_fixed_space.compute_feasibility();
-    CUOPT_LOG_DEBUG("RINS best sol fixed space objective %g", best_sol_fixed_space.get_objective());
+    CUOPT_LOG_DEBUG("RINS best sol fixed space objective %g",
+                    best_sol_fixed_space.get_user_objective());
 
     if (settings.objective_cut) {
       f_t objective_cut =
@@ -256,6 +263,7 @@ void rins_t<i_t, f_t>::run_rins()
     branch_and_bound_solution.resize(branch_and_bound_problem.num_cols);
     // Fill in the settings for branch and bound
     branch_and_bound_settings.time_limit           = time_limit;
+    branch_and_bound_settings.node_limit           = 5000;
     branch_and_bound_settings.print_presolve_stats = false;
     branch_and_bound_settings.absolute_mip_gap_tol = context.settings.tolerances.absolute_mip_gap;
     branch_and_bound_settings.relative_mip_gap_tol = context.settings.tolerances.relative_mip_gap;
@@ -267,7 +275,7 @@ void rins_t<i_t, f_t>::run_rins()
                                                          f_t objective) {};
     dual_simplex::branch_and_bound_t<i_t, f_t> branch_and_bound(branch_and_bound_problem,
                                                                 branch_and_bound_settings);
-    // branch_and_bound.set_initial_guess(cuopt::host_copy(fixed_assignment));
+    branch_and_bound.set_initial_guess(cuopt::host_copy(fixed_assignment));
     branch_and_bound_status  = branch_and_bound.solve(branch_and_bound_solution, "[RINS] ");
     bool rins_solution_found = false;
     if (!std::isnan(branch_and_bound_solution.objective)) {
@@ -303,8 +311,10 @@ void rins_t<i_t, f_t>::run_rins()
       time_limit = std::min(time_limit + 2, settings.max_time_limit);
     } else if (branch_and_bound_status == dual_simplex::mip_status_t::INFEASIBLE) {
       CUOPT_LOG_DEBUG("RINS submip infeasible");
+      fixrate    = std::min(fixrate + 0.05, settings.max_fixrate);
+      time_limit = std::min(time_limit + 2, settings.max_time_limit);
       // do goldilocks update, decreasing fixrate
-      fixrate = std::max(fixrate - 0.05, settings.min_fixrate);
+      // fixrate = std::max(fixrate - 0.05, settings.min_fixrate);
     } else {
       CUOPT_LOG_DEBUG("RINS solution not found");
       // do goldilocks update
@@ -320,9 +330,11 @@ void rins_t<i_t, f_t>::run_rins()
       CUOPT_LOG_DEBUG("RINS Solution: feasible: %d, objective: %g",
                       best_sol.get_feasible(),
                       best_sol.get_user_objective());
-      if (best_sol.get_objective() < prev_obj) {
-        CUOPT_LOG_DEBUG(
-          "RINS solution improved objective from %g to %g", prev_obj, best_sol.get_objective());
+      if (best_sol.get_user_objective() < prev_obj) {
+        CUOPT_LOG_DEBUG("RINS solution improved objective from %g to %g",
+                        prev_obj,
+                        best_sol.get_user_objective());
+        total_success++;
       }
       cuopt_assert(best_sol.assignment.size() == sol_size_before_rins, "Assignment size mismatch");
       // TODO: figure out WHY???
@@ -332,6 +344,7 @@ void rins_t<i_t, f_t>::run_rins()
           best_sol.get_host_assignment(), best_sol.get_objective(), solution_origin_t::RINS);
     }
   }
+  CUOPT_LOG_DEBUG("RINS calls/successes %d/%d", total_calls, total_success);
 }
 
 #if MIP_INSTANTIATE_FLOAT
