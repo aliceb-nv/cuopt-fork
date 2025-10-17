@@ -64,10 +64,10 @@ class population_t {
   // functions without logic:
   // --------------------
   /*! \brief { Current number of solutions in the pool }*/
-  size_t current_size() { return indices.size() - 1; }
+  size_t current_size() { return indices.empty() ? 0 : indices.size() - 1; }
 
   /*! \brief { Is feasible soution in the pool? } */
-  bool is_feasible() { return solutions[0].first; }
+  bool is_feasible() { return indices.empty() ? false : solutions[0].first; }
 
   /*! \brief { Best feasible quality }*/
   f_t feasible_quality() { return indices[0].second; }

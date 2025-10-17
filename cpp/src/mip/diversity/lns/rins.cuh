@@ -97,6 +97,8 @@ class rins_t {
   i_t total_success{0};
   f_t time_limit{10.};
 
+  bool enabled{false};
+
   std::atomic<i_t> node_count{0};
   std::atomic<i_t> node_count_at_last_rins{0};
   std::atomic<i_t> node_count_at_last_improvement{0};

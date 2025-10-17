@@ -449,6 +449,8 @@ solution_t<i_t, f_t> diversity_manager_t<i_t, f_t>::run_solver()
     return sol;
   }
 
+  rins.enabled = true;
+
   auto sol = generate_solution(timer.remaining_time(), false);
   population.add_solution(std::move(solution_t<i_t, f_t>(sol)));
   if (timer.check_time_limit()) {

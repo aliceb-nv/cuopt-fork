@@ -68,6 +68,7 @@ i_t get_max_var_threshold(i_t n_vars)
 template <typename i_t, typename f_t>
 void population_t<i_t, f_t>::allocate_solutions()
 {
+  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
   for (size_t i = 0; i < max_solutions; ++i) {
     bool occupied = false;
     solutions.emplace_back(occupied, solution_t<i_t, f_t>(*problem_ptr));
@@ -77,6 +78,8 @@ void population_t<i_t, f_t>::allocate_solutions()
 template <typename i_t, typename f_t>
 void population_t<i_t, f_t>::initialize_population()
 {
+  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
+
   var_threshold = get_max_var_threshold(problem_ptr->n_integer_vars);
   solutions.reserve(max_solutions);
   indices.reserve(max_solutions);
@@ -130,6 +133,7 @@ std::pair<solution_t<i_t, f_t>, solution_t<i_t, f_t>> population_t<i_t, f_t>::ge
 template <typename i_t, typename f_t>
 void population_t<i_t, f_t>::add_solutions_from_vec(std::vector<solution_t<i_t, f_t>>&& solutions)
 {
+  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
   raft::common::nvtx::range fun_scope("add_solution_from_vec");
   for (auto&& sol : solutions) {
     add_solution(std::move(sol));
@@ -347,6 +351,7 @@ void population_t<i_t, f_t>::run_solution_callbacks(solution_t<i_t, f_t>& sol)
 template <typename i_t, typename f_t>
 void population_t<i_t, f_t>::adjust_weights_according_to_best_feasible()
 {
+  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
   // check if the best in population still the best feasible
   if (!best().get_feasible()) {
     CUOPT_LOG_DEBUG("Best solution is infeasible, adjusting weights");
@@ -456,6 +461,7 @@ i_t population_t<i_t, f_t>::add_solution(solution_t<i_t, f_t>&& sol)
 template <typename i_t, typename f_t>
 void population_t<i_t, f_t>::normalize_weights()
 {
+  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
   CUOPT_LOG_DEBUG("Normalizing weights");
 
   rmm::device_scalar<f_t> l2_norm(problem_ptr->handle_ptr->get_stream());
@@ -499,6 +505,7 @@ void population_t<i_t, f_t>::normalize_weights()
 template <typename i_t, typename f_t>
 void population_t<i_t, f_t>::compute_new_weights()
 {
+  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
   auto& best_sol = best();
   auto settings  = context.settings;
 
@@ -563,6 +570,7 @@ void population_t<i_t, f_t>::update_qualities()
 template <typename i_t, typename f_t>
 void population_t<i_t, f_t>::update_weights()
 {
+  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
   raft::common::nvtx::range fun_scope("adjust_weight_changes");
   CUOPT_LOG_DEBUG("Changing the weights");
   compute_new_weights();
@@ -596,6 +604,7 @@ size_t population_t<i_t, f_t>::best_similar_index(solution_t<i_t, f_t>& sol)
 template <typename i_t, typename f_t>
 i_t population_t<i_t, f_t>::insert_index(std::pair<i_t, f_t> to_insert)
 {
+  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
   raft::common::nvtx::range fun_scope("insert_index");
   // Assert free index is available
   indices.emplace_back(0, 0.0);
@@ -613,6 +622,7 @@ template <typename i_t, typename f_t>
 bool population_t<i_t, f_t>::check_if_feasible_similar_exists(size_t start_index,
                                                               solution_t<i_t, f_t>& sol)
 {
+  std::lock_guard<std::recursive_mutex> lock(solution_mutex);
   raft::common::nvtx::range fun_scope("check_if_feasible_similar_exists");
   for (size_t i = start_index; i < indices.size(); i++) {
     if (check_sols_similar(sol, solutions[indices[i].first].second)) {
