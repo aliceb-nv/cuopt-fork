@@ -174,7 +174,7 @@ static inline std::pair<fj_staged_score_t, f_t> compute_score(fj_cpu_climber_t<i
   }
 
   f_t base_obj = 0;
-  if (obj_diff < 0)  // improving move wrt objective
+  if (obj_diff < 0)  // improving move wrt objective 1
     base_obj = fj_cpu.h_objective_weight;
   else if (obj_diff > 0)
     base_obj = -fj_cpu.h_objective_weight;
