@@ -390,7 +390,7 @@ void rins_t<i_t, f_t>::run_rins()
         total_success++;
       }
       cuopt_assert(best_sol.assignment.size() == sol_size_before_rins, "Assignment size mismatch");
-      // TODO: figure out WHY???
+      // TODO: figure out WHY??? 1
       if ((int)best_sol.assignment.size() == sol_size_before_rins &&
           (int)best_sol.assignment.size() == problem_ptr->n_variables &&
           best_sol.get_objective() < dm.population.best_feasible_objective)
