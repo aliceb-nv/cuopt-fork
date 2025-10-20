@@ -191,11 +191,46 @@ void rins_t<i_t, f_t>::run_rins()
     vars_to_fix.resize(end - vars_to_fix.begin(), problem_ptr->handle_ptr->get_stream());
     f_t fractional_ratio = (f_t)(vars_to_fix.size()) / (f_t)problem_ptr->n_integer_vars;
 
+    // establish fixing priorities by looking at the number of equal integer assignments
+    // on other diverse solutions
+    rmm::device_uvector<i_t> similarity_scores(vars_to_fix.size(),
+                                               problem_ptr->handle_ptr->get_stream());
+    thrust::uninitialized_fill(problem_ptr->handle_ptr->get_thrust_policy(),
+                               similarity_scores.begin(),
+                               similarity_scores.end(),
+                               0);
+    for (i_t sol_idx = 1; sol_idx < (i_t)pop.size(); sol_idx++) {
+      auto& other_sol = pop[sol_idx];
+      thrust::for_each(
+        problem_ptr->handle_ptr->get_thrust_policy(),
+        vars_to_fix.begin(),
+        vars_to_fix.end(),
+        [similarity_scores = similarity_scores.data(),
+         sol               = best_sol.assignment.data(),
+         other_sol         = other_sol.assignment.data(),
+         pb                = problem_ptr->view()] __device__(i_t var_idx) {
+          if (pb.is_integer_var(var_idx) && pb.integer_equal(sol[var_idx], other_sol[var_idx])) {
+            similarity_scores[var_idx]++;
+          }
+        });
+    }
+
     thrust::default_random_engine g(seed + node_count);
 
     // shuffle fixing order
     thrust::shuffle(
       problem_ptr->handle_ptr->get_thrust_policy(), vars_to_fix.begin(), vars_to_fix.end(), g);
+
+    // sort variables to fix by similarity score, keep the shuffle on equivalent vars w/ stable sort
+    thrust::stable_sort(
+      problem_ptr->handle_ptr->get_thrust_policy(),
+      vars_to_fix.begin(),
+      vars_to_fix.end(),
+      [seed = this->seed, similarity_scores = similarity_scores.data()] __device__(i_t var_idx_1,
+                                                                                   i_t var_idx_2) {
+        raft::random::PCGenerator rng(seed, var_idx_1, var_idx_2);
+        return similarity_scores[var_idx_1] > similarity_scores[var_idx_2];
+      });
 
     // fix n first according to fractional ratio
     f_t rins_ratio = fixrate;
@@ -274,16 +309,17 @@ void rins_t<i_t, f_t>::run_rins()
     branch_and_bound_solution.resize(branch_and_bound_problem.num_cols);
     // Fill in the settings for branch and bound
     branch_and_bound_settings.time_limit = time_limit;
-    branch_and_bound_settings.node_limit = 5000 + node_count / 100;  // try harder as time goes on
+    // branch_and_bound_settings.node_limit = 5000 + node_count / 100;  // try harder as time goes
+    // on
     branch_and_bound_settings.print_presolve_stats = false;
     branch_and_bound_settings.absolute_mip_gap_tol = context.settings.tolerances.absolute_mip_gap;
     // branch_and_bound_settings.relative_mip_gap_tol =
     // context.settings.tolerances.relative_mip_gap;
     branch_and_bound_settings.relative_mip_gap_tol = 0.03;  // 3%
-    branch_and_bound_settings.integer_tol = context.settings.tolerances.integrality_tolerance;
-    // branch_and_bound_settings.num_threads     = 2;
-    branch_and_bound_settings.num_bfs_threads    = 6;
-    branch_and_bound_settings.num_diving_threads = 6;
+    branch_and_bound_settings.integer_tol     = context.settings.tolerances.integrality_tolerance;
+    branch_and_bound_settings.num_threads     = 2;
+    branch_and_bound_settings.num_bfs_threads = 1;
+    branch_and_bound_settings.num_diving_threads = 1;
     branch_and_bound_settings.solution_callback  = [this](std::vector<f_t>& solution,
                                                          f_t objective) {};
     dual_simplex::branch_and_bound_t<i_t, f_t> branch_and_bound(branch_and_bound_problem,
