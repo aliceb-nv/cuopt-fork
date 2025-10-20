@@ -40,8 +40,8 @@ struct rins_settings_t {
   int node_freq                     = 100;
   int nodes_after_later_improvement = 200;
   double min_fixrate                = 0.3;
-  double max_fixrate                = 0.95;
-  double default_fixrate            = 0.75;
+  double max_fixrate                = 0.8;
+  double default_fixrate            = 0.6;
   double min_time_limit             = 10.;
   double max_time_limit             = 20.;
   double default_time_limit         = 6.;
@@ -92,7 +92,7 @@ class rins_t {
 
   std::vector<f_t> lp_optimal_solution;
 
-  f_t fixrate{0.5};
+  f_t fixrate{0.6};
   i_t total_calls{0};
   i_t total_success{0};
   f_t time_limit{10.};
