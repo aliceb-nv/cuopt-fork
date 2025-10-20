@@ -68,7 +68,6 @@ i_t get_max_var_threshold(i_t n_vars)
 template <typename i_t, typename f_t>
 void population_t<i_t, f_t>::allocate_solutions()
 {
-  std::lock_guard<std::recursive_mutex> lock(write_mutex);
   for (size_t i = 0; i < max_solutions; ++i) {
     bool occupied = false;
     solutions.emplace_back(occupied, solution_t<i_t, f_t>(*problem_ptr));
@@ -78,8 +77,6 @@ void population_t<i_t, f_t>::allocate_solutions()
 template <typename i_t, typename f_t>
 void population_t<i_t, f_t>::initialize_population()
 {
-  std::lock_guard<std::recursive_mutex> lock(write_mutex);
-
   var_threshold = get_max_var_threshold(problem_ptr->n_integer_vars);
   solutions.reserve(max_solutions);
   indices.reserve(max_solutions);
@@ -582,6 +579,7 @@ bool population_t<i_t, f_t>::check_sols_similar(solution_t<i_t, f_t>& sol1,
 template <typename i_t, typename f_t>
 size_t population_t<i_t, f_t>::best_similar_index(solution_t<i_t, f_t>& sol)
 {
+  raft::common::nvtx::range fun_scope("best_similar_index");
   if (indices.size() == 1) return max_solutions;
   for (size_t i = 1; i < indices.size(); i++) {
     if (check_sols_similar(sol, solutions[indices[i].first].second)) { return i; }

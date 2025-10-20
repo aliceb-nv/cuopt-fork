@@ -435,9 +435,6 @@ solution_t<i_t, f_t> diversity_manager_t<i_t, f_t>::run_solver()
 
   if (check_b_b_preemption()) { return population.best_feasible(); }
 
-  auto new_sol_vector = population.get_external_solutions();
-  population.add_solutions_from_vec(std::move(new_sol_vector));
-
   if (context.settings.benchmark_info_ptr != nullptr) {
     context.settings.benchmark_info_ptr->objective_of_initial_population =
       population.best_feasible().get_user_objective();
@@ -458,7 +455,6 @@ solution_t<i_t, f_t> diversity_manager_t<i_t, f_t>::run_solver()
     population.add_solutions_from_vec(std::move(new_sol_vector));
     return population.best_feasible();
   }
-
   run_fp_alone(sol);
   population.update_weights();
 

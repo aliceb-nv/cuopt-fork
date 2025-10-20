@@ -117,7 +117,7 @@ void rins_t<i_t, f_t>::node_callback(const std::vector<f_t>& solution, f_t objec
 {
   if (!enabled) return;
 
-  std::lock_guard<std::mutex> lock(rins_mutex);
+  // std::lock_guard<std::mutex> lock(rins_mutex);
 
   node_count++;
   // CUOPT_LOG_INFO("RINS callback node count %d, node count at last improvement %d, node count at
@@ -131,7 +131,8 @@ void rins_t<i_t, f_t>::node_callback(const std::vector<f_t>& solution, f_t objec
 
   if (node_count - node_count_at_last_rins > settings.node_freq) {
     // printf("-------- rins triggered at node %d\n", node_count.load());
-    if (!rins_thread->cpu_thread_should_start && dm.population.current_size() > 0) {
+    if (!rins_thread->cpu_thread_should_start && dm.population.current_size() > 0 &&
+        dm.population.is_feasible()) {
       lp_optimal_solution = solution;
       rins_thread->start_cpu_solver();
     } else {
@@ -163,6 +164,7 @@ void rins_t<i_t, f_t>::run_rins()
         best_sol.compute_feasibility();
       }
     }
+    // TODO: gpu operations should probably be done on a separate stream here
     if (!best_sol.get_feasible()) { return; }
     i_t sol_size_before_rins = best_sol.assignment.size();
     auto lp_opt_device =

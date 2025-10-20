@@ -483,7 +483,9 @@ mip_status_t branch_and_bound_t<i_t, f_t>::set_final_solution(mip_solution_t<i_t
     }
   }
 
-  uncrush_primal_solution(original_problem_, original_lp_, incumbent_.x, solution.x);
+  if (upper_bound != inf) {
+    uncrush_primal_solution(original_problem_, original_lp_, incumbent_.x, solution.x);
+  }
   solution.objective          = incumbent_.objective;
   solution.lower_bound        = lower_bound;
   solution.nodes_explored     = stats_.nodes_explored;
