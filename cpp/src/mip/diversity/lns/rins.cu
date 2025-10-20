@@ -282,8 +282,8 @@ void rins_t<i_t, f_t>::run_rins()
     branch_and_bound_settings.relative_mip_gap_tol = 0.03;  // 3%
     branch_and_bound_settings.integer_tol = context.settings.tolerances.integrality_tolerance;
     // branch_and_bound_settings.num_threads     = 2;
-    branch_and_bound_settings.num_bfs_threads    = 2;
-    branch_and_bound_settings.num_diving_threads = 2;
+    branch_and_bound_settings.num_bfs_threads    = 6;
+    branch_and_bound_settings.num_diving_threads = 6;
     branch_and_bound_settings.solution_callback  = [this](std::vector<f_t>& solution,
                                                          f_t objective) {};
     dual_simplex::branch_and_bound_t<i_t, f_t> branch_and_bound(branch_and_bound_problem,
