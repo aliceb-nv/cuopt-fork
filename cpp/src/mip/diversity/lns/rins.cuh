@@ -80,7 +80,7 @@ class rins_t {
          diversity_manager_t<i_t, f_t>& dm,
          rins_settings_t settings = rins_settings_t());
 
-  void node_callback(const std::vector<f_t>& solution, f_t objective);
+  void node_callback(i_t node_id, const std::vector<f_t>& solution, f_t objective);
   void new_best_incumbent_callback(const std::vector<f_t>& solution);
 
   void run_rins();
@@ -96,6 +96,7 @@ class rins_t {
   i_t total_calls{0};
   i_t total_success{0};
   f_t time_limit{10.};
+  i_t seed;
 
   bool enabled{false};
 

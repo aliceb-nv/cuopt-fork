@@ -33,6 +33,7 @@ rins_t<i_t, f_t>::rins_t(mip_solver_context_t<i_t, f_t>& context_,
   fixrate               = settings.default_fixrate;
   rins_thread           = std::make_unique<rins_thread_t<i_t, f_t>>();
   rins_thread->rins_ptr = this;
+  seed                  = cuopt::seed_generator::get_seed();
 }
 
 template <typename i_t, typename f_t>
@@ -113,13 +114,13 @@ void rins_t<i_t, f_t>::new_best_incumbent_callback(const std::vector<f_t>& solut
 
 // node_callback may be called from different threads(i think?). need lock protection
 template <typename i_t, typename f_t>
-void rins_t<i_t, f_t>::node_callback(const std::vector<f_t>& solution, f_t objective)
+void rins_t<i_t, f_t>::node_callback(i_t node_id, const std::vector<f_t>& solution, f_t objective)
 {
+  node_count++;
+
   if (!enabled) return;
 
-  // std::lock_guard<std::mutex> lock(rins_mutex);
-
-  node_count++;
+  std::lock_guard<std::mutex> lock(rins_mutex);
   // CUOPT_LOG_INFO("RINS callback node count %d, node count at last improvement %d, node count at
   // last rins %d", node_count.load(), node_count_at_last_improvement.load(),
   // node_count_at_last_rins.load());
@@ -149,6 +150,8 @@ void rins_t<i_t, f_t>::run_rins()
   if (total_calls == 0) cudaSetDevice(context.handle_ptr->get_device());
 
   if (!dm.population.is_feasible()) return;
+
+  cuopt_assert(lp_optimal_solution.size() == problem_ptr->n_variables, "Assignment size mismatch");
 
   auto pop = dm.population.population_to_vector();
   if (pop.size() > 0) {
@@ -188,15 +191,11 @@ void rins_t<i_t, f_t>::run_rins()
     vars_to_fix.resize(end - vars_to_fix.begin(), problem_ptr->handle_ptr->get_stream());
     f_t fractional_ratio = (f_t)(vars_to_fix.size()) / (f_t)problem_ptr->n_integer_vars;
 
-    // sort by fixing priority
-    thrust::sort(problem_ptr->handle_ptr->get_thrust_policy(),
-                 vars_to_fix.begin(),
-                 vars_to_fix.end(),
-                 [assignment = best_sol.assignment.data(), pb = problem_ptr->view()] __device__(
-                   i_t var_1, i_t var_2) {
-                   return get_fractionality_of_val(assignment[var_1]) <
-                          get_fractionality_of_val(assignment[var_2]);
-                 });
+    thrust::default_random_engine g(seed + node_count);
+
+    // shuffle fixing order
+    thrust::shuffle(
+      problem_ptr->handle_ptr->get_thrust_policy(), vars_to_fix.begin(), vars_to_fix.end(), g);
 
     // fix n first according to fractional ratio
     f_t rins_ratio = fixrate;
@@ -247,17 +246,6 @@ void rins_t<i_t, f_t>::run_rins()
       fixed_problem.add_cutting_plane_at_objective(objective_cut);
     }
 
-    // limit remaining fractional to their integer bounds
-    // thrust::for_each(
-    //   problem_ptr->handle_ptr->get_thrust_policy(),
-    //   thrust::make_counting_iterator(i_t(0)),
-    //   thrust::make_counting_iterator(fixed_problem.n_variables),
-    //   [assignment = fixed_assignment.data(), pb = fixed_problem.view()] __device__(i_t var_idx) {
-    //     if (pb.is_integer_var(var_idx) && !pb.is_integer(assignment[var_idx])) {
-    //       get_lower(pb.variable_bounds[var_idx]) = std::floor(assignment[var_idx]);
-    //       get_upper(pb.variable_bounds[var_idx]) = std::ceil(assignment[var_idx]);
-    //     }
-    //   });
     fixed_problem.presolve_data.reset_additional_vars(fixed_problem, best_sol.handle_ptr);
     fixed_problem.presolve_data.initialize_var_mapping(fixed_problem, best_sol.handle_ptr);
     trivial_presolve(fixed_problem);
@@ -285,8 +273,8 @@ void rins_t<i_t, f_t>::run_rins()
     fixed_problem.get_host_user_problem(branch_and_bound_problem);
     branch_and_bound_solution.resize(branch_and_bound_problem.num_cols);
     // Fill in the settings for branch and bound
-    branch_and_bound_settings.time_limit           = time_limit;
-    branch_and_bound_settings.node_limit           = 5000;
+    branch_and_bound_settings.time_limit = time_limit;
+    branch_and_bound_settings.node_limit = 5000 + node_count / 100;  // try harder as time goes on
     branch_and_bound_settings.print_presolve_stats = false;
     branch_and_bound_settings.absolute_mip_gap_tol = context.settings.tolerances.absolute_mip_gap;
     // branch_and_bound_settings.relative_mip_gap_tol =
@@ -392,10 +380,10 @@ void rins_t<i_t, f_t>::run_rins()
         total_success++;
       }
       cuopt_assert(best_sol.assignment.size() == sol_size_before_rins, "Assignment size mismatch");
+      cuopt_assert(best_sol.assignment.size() == problem_ptr->n_variables,
+                   "Assignment size mismatch");
       // TODO: figure out WHY??? 1
-      if ((int)best_sol.assignment.size() == sol_size_before_rins &&
-          (int)best_sol.assignment.size() == problem_ptr->n_variables &&
-          best_sol.get_objective() < dm.population.best_feasible_objective)
+      if (best_sol.get_objective() < dm.population.best_feasible_objective)
         dm.population.add_external_solution(
           best_sol.get_host_assignment(), best_sol.get_objective(), solution_origin_t::RINS);
     }

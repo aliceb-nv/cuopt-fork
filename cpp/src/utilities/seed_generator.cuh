@@ -21,6 +21,7 @@
 
 namespace cuopt {
 
+// TODO: should be thread local?
 class seed_generator {
   static int64_t seed_;
 
