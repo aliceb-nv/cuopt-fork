@@ -45,7 +45,7 @@ struct rins_settings_t {
   double min_time_limit             = 10.;
   double max_time_limit             = 20.;
   double default_time_limit         = 6.;
-  bool objective_cut                = true;
+  bool objective_cut                = false;
 };
 
 template <typename i_t, typename f_t>
