@@ -199,7 +199,7 @@ void rins_t<i_t, f_t>::run_rins()
 
     // fix n first according to fractional ratio
     f_t rins_ratio = fixrate;
-    i_t n_to_fix   = std::max((int)(vars_to_fix.size() * rins_ratio), 0);
+    i_t n_to_fix = std::max((int)(vars_to_fix.size() * std::min(rins_ratio, fractional_ratio)), 0);
     vars_to_fix.resize(n_to_fix, problem_ptr->handle_ptr->get_stream());
     thrust::sort(
       problem_ptr->handle_ptr->get_thrust_policy(), vars_to_fix.begin(), vars_to_fix.end());
@@ -325,8 +325,6 @@ void rins_t<i_t, f_t>::run_rins()
       time_limit = std::min(time_limit + 2, settings.max_time_limit);
     } else if (branch_and_bound_status == dual_simplex::mip_status_t::INFEASIBLE) {
       CUOPT_LOG_DEBUG("RINS submip infeasible");
-      fixrate    = std::min(fixrate + 0.05, settings.max_fixrate);
-      time_limit = std::min(time_limit + 2, settings.max_time_limit);
       // do goldilocks update, decreasing fixrate
       fixrate = std::max(fixrate - 0.05, settings.min_fixrate);
     } else {

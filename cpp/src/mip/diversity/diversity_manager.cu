@@ -465,6 +465,8 @@ solution_t<i_t, f_t> diversity_manager_t<i_t, f_t>::run_solver()
   }
   main_loop();
 
+  auto new_sol_vector = population.get_external_solutions();
+  population.add_solutions_from_vec(std::move(new_sol_vector));
   return population.best_feasible();
 };
 
