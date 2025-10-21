@@ -191,47 +191,15 @@ void rins_t<i_t, f_t>::run_rins()
     vars_to_fix.resize(end - vars_to_fix.begin(), problem_ptr->handle_ptr->get_stream());
     f_t fractional_ratio = (f_t)(vars_to_fix.size()) / (f_t)problem_ptr->n_integer_vars;
 
-    thrust::default_random_engine g(seed + node_count);
-
-    // shuffle fixing order
-    thrust::shuffle(
-      problem_ptr->handle_ptr->get_thrust_policy(), vars_to_fix.begin(), vars_to_fix.end(), g);
-
-    // // establish fixing priorities by looking at the number of equal integer assignments
-    // // on other diverse solutions
-    // rmm::device_uvector<i_t> similarity_scores(vars_to_fix.size(),
-    //                                            problem_ptr->handle_ptr->get_stream());
-    // thrust::uninitialized_fill(problem_ptr->handle_ptr->get_thrust_policy(),
-    //                            similarity_scores.begin(),
-    //                            similarity_scores.end(),
-    //                            0);
-    // for (i_t sol_idx = 1; sol_idx < (i_t)pop.size(); sol_idx++) {
-    //   auto& other_sol = pop[sol_idx];
-    //   thrust::for_each(
-    //     problem_ptr->handle_ptr->get_thrust_policy(),
-    //     vars_to_fix.begin(),
-    //     vars_to_fix.end(),
-    //     [similarity_scores = similarity_scores.data(),
-    //      sol               = best_sol.assignment.data(),
-    //      other_sol         = other_sol.assignment.data(),
-    //      pb                = problem_ptr->view()] __device__(i_t var_idx) {
-    //       if (pb.is_integer_var(var_idx) && pb.integer_equal(sol[var_idx], other_sol[var_idx])) {
-    //         similarity_scores[var_idx]++;
-    //       }
-    //     });
-    // }
-
-    // // sort variables to fix by similarity score, keep the shuffle on equivalent vars w/ stable
-    // sort thrust::stable_sort(
-    //   problem_ptr->handle_ptr->get_thrust_policy(),
-    //   vars_to_fix.begin(),
-    //   vars_to_fix.end(),
-    //   [seed = this->seed, similarity_scores = similarity_scores.data()] __device__(i_t var_idx_1,
-    //                                                                                i_t var_idx_2)
-    //                                                                                {
-    //     raft::random::PCGenerator rng(seed, var_idx_1, var_idx_2);
-    //     return similarity_scores[var_idx_1] > similarity_scores[var_idx_2];
-    //   });
+    // sort by fixing priority
+    thrust::sort(problem_ptr->handle_ptr->get_thrust_policy(),
+                 vars_to_fix.begin(),
+                 vars_to_fix.end(),
+                 [assignment = best_sol.assignment.data(), pb = problem_ptr->view()] __device__(
+                   i_t var_1, i_t var_2) {
+                   return get_fractionality_of_val(assignment[var_1]) <
+                          get_fractionality_of_val(assignment[var_2]);
+                 });
 
     // fix n first according to fractional ratio
     f_t rins_ratio = fixrate;
