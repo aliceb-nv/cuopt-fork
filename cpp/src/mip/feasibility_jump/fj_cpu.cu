@@ -1070,30 +1070,35 @@ template <typename i_t, typename f_t>
 void cpu_fj_thread_t<i_t, f_t>::cpu_worker_thread()
 {
   while (!cpu_thread_terminate) {
-    // Wait for start signal
     {
       std::unique_lock<std::mutex> lock(cpu_mutex);
       cpu_cv.wait(lock, [this] { return cpu_thread_should_start || cpu_thread_terminate; });
+
+      if (cpu_thread_terminate) break;
+
+      cpu_thread_done         = false;
+      cpu_thread_should_start = false;
     }
 
-    if (cpu_thread_terminate) break;
+    // Run CPU solver (outside lock)
+    bool solution_found = fj_ptr->cpu_solve(*fj_cpu, time_limit);
 
-    // Run CPU solver
     {
-      raft::common::nvtx::range fun_scope("Running CPU FJ");
-      cpu_fj_solution_found = fj_ptr->cpu_solve(*fj_cpu);
+      std::lock_guard<std::mutex> lock(cpu_mutex);
+      cpu_fj_solution_found = solution_found;
+      cpu_thread_done       = true;
     }
-
-    cpu_thread_should_start = false;
-    cpu_thread_done         = true;
   }
 }
 
 template <typename i_t, typename f_t>
 void cpu_fj_thread_t<i_t, f_t>::kill_cpu_solver()
 {
-  cpu_thread_terminate = true;
-  if (fj_cpu) fj_cpu->halted = true;
+  {
+    std::lock_guard<std::mutex> lock(cpu_mutex);
+    cpu_thread_terminate = true;
+    if (fj_cpu) fj_cpu->halted = true;
+  }
   cpu_cv.notify_one();
   cpu_worker.join();
 }
@@ -1102,10 +1107,12 @@ template <typename i_t, typename f_t>
 void cpu_fj_thread_t<i_t, f_t>::start_cpu_solver()
 {
   cuopt_assert(fj_cpu != nullptr, "fj_cpu must not be null");
-  // Reset flags
-  cpu_thread_done         = false;
-  cpu_thread_should_start = true;
-  fj_cpu->halted          = false;
+  {
+    std::lock_guard<std::mutex> lock(cpu_mutex);
+    cpu_thread_done         = false;
+    cpu_thread_should_start = true;
+    fj_cpu->halted          = false;
+  }
   cpu_cv.notify_one();
 }
 

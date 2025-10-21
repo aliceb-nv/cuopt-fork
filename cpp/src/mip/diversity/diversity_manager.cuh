@@ -95,7 +95,6 @@ class diversity_manager_t {
   rmm::device_uvector<f_t> lp_dual_optimal_solution;
   std::atomic<bool> simplex_solution_exists{false};
   local_search_t<i_t, f_t> ls;
-  rins_t<i_t, f_t> rins;
   cuopt::timer_t timer;
   bound_prop_recombiner_t<i_t, f_t> bound_prop_recombiner;
   fp_recombiner_t<i_t, f_t> fp_recombiner;
@@ -113,6 +112,8 @@ class diversity_manager_t {
   std::mutex relaxed_solution_mutex;
   // atomic for signalling pdlp to stop
   volatile int global_concurrent_halt{0};
+
+  rins_t<i_t, f_t> rins;
 
   bool run_only_ls_recombiner{false};
   bool run_only_bp_recombiner{false};

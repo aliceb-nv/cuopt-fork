@@ -223,6 +223,7 @@ void rins_t<i_t, f_t>::run_rins()
 
     total_calls++;
     node_count_at_last_rins = node_count.load();
+    time_limit              = std::min(time_limit, dm.timer.remaining_time());
     CUOPT_LOG_DEBUG("Running RINS on solution with objective %g, fixing %d/%d",
                     best_sol.get_user_objective(),
                     vars_to_fix.size(),
@@ -265,7 +266,10 @@ void rins_t<i_t, f_t>::run_rins()
     cpu_fj_thread_t<i_t, f_t> cpu_fj_thread;
     cpu_fj_thread.fj_cpu = fj.create_cpu_climber(
       fj_solution, default_weights, default_weights, 0., fj_settings_t{}, true);
-    cpu_fj_thread.fj_ptr = &fj;
+    cpu_fj_thread.fj_ptr             = &fj;
+    cpu_fj_thread.fj_cpu->log_prefix = "[RINS] ";
+    // cpu_fj_thread.fj_cpu->log_interval = 100;
+    cpu_fj_thread.time_limit = time_limit;
     cpu_fj_thread.start_cpu_solver();
 
     // run sub-mip
