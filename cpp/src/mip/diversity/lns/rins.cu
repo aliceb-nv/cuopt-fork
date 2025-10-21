@@ -114,13 +114,13 @@ void rins_t<i_t, f_t>::new_best_incumbent_callback(const std::vector<f_t>& solut
 
 // node_callback may be called from different threads(i think?). need lock protection
 template <typename i_t, typename f_t>
-void rins_t<i_t, f_t>::node_callback(i_t node_id, const std::vector<f_t>& solution, f_t objective)
+void rins_t<i_t, f_t>::node_callback(const std::vector<f_t>& solution, f_t objective)
 {
-  node_count++;
-
   if (!enabled) return;
 
-  std::lock_guard<std::mutex> lock(rins_mutex);
+  // std::lock_guard<std::mutex> lock(rins_mutex);
+
+  node_count++;
   // CUOPT_LOG_INFO("RINS callback node count %d, node count at last improvement %d, node count at
   // last rins %d", node_count.load(), node_count_at_last_improvement.load(),
   // node_count_at_last_rins.load());
@@ -385,10 +385,10 @@ void rins_t<i_t, f_t>::run_rins()
         total_success++;
       }
       cuopt_assert(best_sol.assignment.size() == sol_size_before_rins, "Assignment size mismatch");
-      cuopt_assert(best_sol.assignment.size() == problem_ptr->n_variables,
-                   "Assignment size mismatch");
       // TODO: figure out WHY??? 1
-      if (best_sol.get_objective() < dm.population.best_feasible_objective)
+      if ((int)best_sol.assignment.size() == sol_size_before_rins &&
+          (int)best_sol.assignment.size() == problem_ptr->n_variables &&
+          best_sol.get_objective() < dm.population.best_feasible_objective)
         dm.population.add_external_solution(
           best_sol.get_host_assignment(), best_sol.get_objective(), solution_origin_t::RINS);
     }
