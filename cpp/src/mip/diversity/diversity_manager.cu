@@ -471,7 +471,7 @@ solution_t<i_t, f_t> diversity_manager_t<i_t, f_t>::run_solver()
 template <typename i_t, typename f_t>
 void diversity_manager_t<i_t, f_t>::diversity_step()
 {
-  // TODO when the solver is faster, increase this number 2
+  // TODO when the solver is faster, increase this number 3
   const i_t max_iterations_without_improvement =
     diversity_config.max_iterations_without_improvement;
   bool improved = true;
