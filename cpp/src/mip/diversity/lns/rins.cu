@@ -330,6 +330,8 @@ void rins_t<i_t, f_t>::run_rins()
       time_limit = std::min(time_limit + 2, settings.max_time_limit);
     } else if (branch_and_bound_status == dual_simplex::mip_status_t::INFEASIBLE) {
       CUOPT_LOG_DEBUG("RINS submip infeasible");
+      fixrate    = std::min(fixrate + 0.05, settings.max_fixrate);
+      time_limit = std::min(time_limit + 2, settings.max_time_limit);
       // do goldilocks update, decreasing fixrate
       fixrate = std::max(fixrate - 0.05, settings.min_fixrate);
     } else {
