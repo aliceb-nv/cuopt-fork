@@ -854,7 +854,7 @@ void branch_and_bound_t<i_t, f_t>::explore_subtree(i_t task_id,
       return;
     }
     if (stats_.nodes_explored >= settings_.node_limit) {
-      status_ = mip_exploration_status_t::TIME_LIMIT;
+      status_ = mip_exploration_status_t::NODE_LIMIT;
       return;
     }
 
@@ -1034,12 +1034,11 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
                                                  std::string log_prefix)
 {
   logger_t log;
-  log.log                  = false;
-  log.log_prefix           = log_prefix;
-  settings_.log.log_prefix = log_prefix;
-  status_                  = mip_exploration_status_t::UNSET;
-  stats_.nodes_unexplored  = 0;
-  stats_.nodes_explored    = 0;
+  log.log        = false;
+  log.log_prefix = settings_.log.log_prefix = log_prefix;
+  status_                                   = mip_exploration_status_t::UNSET;
+  stats_.nodes_unexplored                   = 0;
+  stats_.nodes_explored                     = 0;
 
   if (guess_.size() != 0) {
     std::vector<f_t> crushed_guess;

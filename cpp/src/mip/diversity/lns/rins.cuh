@@ -60,7 +60,7 @@ struct rins_thread_t {
   void cpu_worker_thread();
   void start_cpu_solver();
   void stop_cpu_solver();
-  bool wait_for_cpu_solver();  // return feasibility
+  bool wait_for_cpu_solver();
   void kill_cpu_solver();
 
   std::thread cpu_worker;
@@ -83,6 +83,7 @@ class rins_t {
 
   void node_callback(const std::vector<f_t>& solution, f_t objective);
   void new_best_incumbent_callback(const std::vector<f_t>& solution);
+  void enable();
 
   void run_rins();
 

@@ -418,7 +418,7 @@ solution_t<i_t, f_t> diversity_manager_t<i_t, f_t>::run_solver()
     run_fj_alone(sol);
     return sol;
   }
-  rins.enabled = true;
+  rins.enable();
 
   generate_solution(timer.remaining_time(), false);
   if (timer.check_time_limit()) {
