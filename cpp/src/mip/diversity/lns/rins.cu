@@ -108,7 +108,6 @@ void rins_t<i_t, f_t>::new_best_incumbent_callback(const std::vector<f_t>& solut
   node_count_at_last_improvement = node_count.load();
 }
 
-// node_callback may be called from different threads(i think?). need lock protection
 template <typename i_t, typename f_t>
 void rins_t<i_t, f_t>::node_callback(const std::vector<f_t>& solution, f_t objective)
 {

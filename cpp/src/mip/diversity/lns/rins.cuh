@@ -100,7 +100,7 @@ class rins_t {
   f_t time_limit{10.};
   i_t seed;
 
-  bool enabled{false};
+  std::atomic<bool> enabled{false};
 
   std::atomic<i_t> node_count{0};
   std::atomic<i_t> node_count_at_last_rins{0};

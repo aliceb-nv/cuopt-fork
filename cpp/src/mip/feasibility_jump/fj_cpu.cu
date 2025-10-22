@@ -1080,7 +1080,6 @@ void cpu_fj_thread_t<i_t, f_t>::cpu_worker_thread()
       cpu_thread_should_start = false;
     }
 
-    // Run CPU solver (outside lock) 3
     bool solution_found = fj_ptr->cpu_solve(*fj_cpu, time_limit);
 
     {
