@@ -225,7 +225,7 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
 
     // Fork a thread for branch and bound
     // std::async and std::future allow us to get the return value of bb::solve()
-    // without having to manually manage the thread 2
+    // without having to manually manage the thread 3
     // std::future.get() performs a join() operation to wait until the return status is available
     branch_and_bound_status_future = std::async(std::launch::async,
                                                 &dual_simplex::branch_and_bound_t<i_t, f_t>::solve,
