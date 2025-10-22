@@ -20,6 +20,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <thread>
 #include <unordered_set>

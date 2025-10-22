@@ -31,6 +31,7 @@ rins_t<i_t, f_t>::rins_t(mip_solver_context_t<i_t, f_t>& context_,
   : context(context_), problem_ptr(context.problem_ptr), dm(dm_), settings(settings_)
 {
   fixrate               = settings.default_fixrate;
+  time_limit            = settings.default_time_limit;
   rins_thread           = std::make_unique<rins_thread_t<i_t, f_t>>();
   rins_thread->rins_ptr = this;
   seed                  = cuopt::seed_generator::get_seed();
@@ -56,34 +57,44 @@ void rins_thread_t<i_t, f_t>::cpu_worker_thread()
     {
       std::unique_lock<std::mutex> lock(cpu_mutex);
       cpu_cv.wait(lock, [this] { return cpu_thread_should_start || cpu_thread_terminate; });
+
+      if (cpu_thread_terminate) break;
+
+      cpu_thread_should_start = false;
     }
 
-    if (cpu_thread_terminate) break;
-
-    // Run CPU solver
+    // Run RINS
     {
       raft::common::nvtx::range fun_scope("Running RINS");
       rins_ptr->run_rins();
     }
 
-    cpu_thread_should_start = false;
-    cpu_thread_done         = true;
+    {
+      std::lock_guard<std::mutex> lock(cpu_mutex);
+      cpu_thread_done = true;
+    }
   }
 }
 
 template <typename i_t, typename f_t>
 void rins_thread_t<i_t, f_t>::kill_cpu_solver()
 {
-  cpu_thread_terminate = true;
+  {
+    std::lock_guard<std::mutex> lock(cpu_mutex);
+    cpu_thread_terminate = true;
+  }
   cpu_cv.notify_one();
   cpu_worker.join();
 }
 
 template <typename i_t, typename f_t>
 void rins_thread_t<i_t, f_t>::start_cpu_solver()
-{  // Reset flags
-  cpu_thread_done         = false;
-  cpu_thread_should_start = true;
+{
+  {
+    std::lock_guard<std::mutex> lock(cpu_mutex);
+    cpu_thread_done         = false;
+    cpu_thread_should_start = true;
+  }
   cpu_cv.notify_one();
 }
 
@@ -119,7 +130,7 @@ void rins_t<i_t, f_t>::node_callback(const std::vector<f_t>& solution, f_t objec
 
   if (node_count - node_count_at_last_rins > settings.node_freq) {
     std::lock_guard<std::mutex> lock(rins_mutex);
-    if (!rins_thread->cpu_thread_should_start && dm.population.current_size() > 0 &&
+    if (!rins_thread->cpu_thread_done && dm.population.current_size() > 0 &&
         dm.population.is_feasible()) {
       lp_optimal_solution = solution;
       rins_thread->start_cpu_solver();
@@ -230,7 +241,7 @@ void rins_t<i_t, f_t>::run_rins()
 
     // should probably just do an spmv to get the objective instead. ugly mess of copies
     solution_t<i_t, f_t> best_sol_fixed_space(fixed_problem);
-    best_sol_fixed_space.copy_new_assignment(host_copy(fixed_assignment));
+    best_sol_fixed_space.copy_new_assignment(cuopt::host_copy(fixed_assignment));
     best_sol_fixed_space.compute_feasibility();
     CUOPT_LOG_DEBUG("RINS best sol fixed space objective %g",
                     best_sol_fixed_space.get_user_objective());
@@ -349,9 +360,7 @@ void rins_t<i_t, f_t>::run_rins()
         best_sol.handle_ptr->sync_stream();
         std::swap(fixed_assignment, post_processed_solution);
 
-        CUOPT_LOG_DEBUG("RINS FJ solution improved objective from %g to %g",
-                        best_sol.get_user_objective(),
-                        fj_solution.get_user_objective());
+        CUOPT_LOG_DEBUG("RINS FJ solution improved objective");
         rins_solution_found = true;
       }
     }

@@ -448,6 +448,10 @@ mip_status_t branch_and_bound_t<i_t, f_t>::set_final_solution(mip_solution_t<i_t
     settings_.log.printf("Time limit reached. Stopping the solver...\n");
     mip_status = mip_status_t::TIME_LIMIT;
   }
+  if (status_ == mip_exploration_status_t::NODE_LIMIT) {
+    settings_.log.printf("Node limit reached. Stopping the solver...\n");
+    mip_status = mip_status_t::NODE_LIMIT;
+  }
 
   f_t upper_bound = get_upper_bound();
   f_t gap         = upper_bound - lower_bound;

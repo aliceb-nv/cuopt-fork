@@ -84,7 +84,7 @@ struct branch_and_bound_solution_helper_t {
     dm->set_simplex_solution(solution, dual_solution, objective);
   }
 
-  void node_processed_callback(std::vector<f_t>& solution, f_t objective)
+  void node_processed_callback(const std::vector<f_t>& solution, f_t objective)
   {
     dm->rins.node_callback(solution, objective);
   }
