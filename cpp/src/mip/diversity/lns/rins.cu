@@ -286,10 +286,10 @@ void rins_t<i_t, f_t>::run_rins()
     branch_and_bound_settings.print_presolve_stats = false;
     branch_and_bound_settings.absolute_mip_gap_tol = context.settings.tolerances.absolute_mip_gap;
     branch_and_bound_settings.relative_mip_gap_tol = 0.03;  // 3%
-    branch_and_bound_settings.integer_tol     = context.settings.tolerances.integrality_tolerance;
-    branch_and_bound_settings.num_threads     = 2;
-    branch_and_bound_settings.num_bfs_threads = 1;
-    branch_and_bound_settings.num_diving_threads = 1;
+    branch_and_bound_settings.integer_tol = context.settings.tolerances.integrality_tolerance;
+    // branch_and_bound_settings.num_threads     = 2;
+    branch_and_bound_settings.num_bfs_threads    = 8;
+    branch_and_bound_settings.num_diving_threads = 8;
     dual_simplex::branch_and_bound_t<i_t, f_t> branch_and_bound(branch_and_bound_problem,
                                                                 branch_and_bound_settings);
     branch_and_bound.set_initial_guess(cuopt::host_copy(fixed_assignment));
