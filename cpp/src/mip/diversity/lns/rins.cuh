@@ -68,7 +68,7 @@ struct rins_thread_t {
   std::condition_variable cpu_cv;
   std::atomic<bool> should_stop{false};
   std::atomic<bool> cpu_thread_should_start{false};
-  std::atomic<bool> cpu_thread_done{false};
+  std::atomic<bool> cpu_thread_done{true};
   std::atomic<bool> cpu_thread_terminate{false};
 
   rins_t<i_t, f_t>* rins_ptr{nullptr};

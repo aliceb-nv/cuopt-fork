@@ -130,7 +130,7 @@ void rins_t<i_t, f_t>::node_callback(const std::vector<f_t>& solution, f_t objec
 
   if (node_count - node_count_at_last_rins > settings.node_freq) {
     std::lock_guard<std::mutex> lock(rins_mutex);
-    if (!rins_thread->cpu_thread_done && dm.population.current_size() > 0 &&
+    if (rins_thread->cpu_thread_done && dm.population.current_size() > 0 &&
         dm.population.is_feasible()) {
       lp_optimal_solution = solution;
       rins_thread->start_cpu_solver();
