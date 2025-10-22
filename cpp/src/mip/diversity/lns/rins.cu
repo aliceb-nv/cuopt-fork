@@ -282,8 +282,7 @@ void rins_t<i_t, f_t>::run_rins()
     branch_and_bound_solution.resize(branch_and_bound_problem.num_cols);
     // Fill in the settings for branch and bound
     branch_and_bound_settings.time_limit = time_limit;
-    // branch_and_bound_settings.node_limit = 5000 + node_count / 100;  // try harder as time goes
-    // on
+    branch_and_bound_settings.node_limit = 5000 + node_count / 100;  // try harder as time goes on
     branch_and_bound_settings.print_presolve_stats = false;
     branch_and_bound_settings.absolute_mip_gap_tol = context.settings.tolerances.absolute_mip_gap;
     branch_and_bound_settings.relative_mip_gap_tol = 0.03;  // 3%
