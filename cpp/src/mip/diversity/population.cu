@@ -164,17 +164,14 @@ void population_t<i_t, f_t>::add_external_solution(const std::vector<f_t>& solut
   }
 
   // Prevent CPUFJ scratch solutions from flooding the queue
-  if (external_solution_queue_cpufj.size() >= 10) {
+  if (external_solution_queue_cpufj.size() > 10) {
     auto worst_obj_it =
       std::max_element(external_solution_queue_cpufj.begin(),
                        external_solution_queue_cpufj.end(),
                        [](const external_solution_t& a, const external_solution_t& b) {
                          return a.objective < b.objective;
                        });
-    if (objective > worst_obj_it->objective) return;
-    auto worst_obj_idx = std::distance(external_solution_queue_cpufj.begin(), worst_obj_it);
-
-    external_solution_queue_cpufj.erase(external_solution_queue_cpufj.begin() + worst_obj_idx);
+    external_solution_queue_cpufj.erase(worst_obj_it);
   }
 
   CUOPT_LOG_DEBUG("%s added a solution to population, solution queue size %lu with objective %g",
