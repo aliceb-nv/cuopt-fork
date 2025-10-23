@@ -129,6 +129,8 @@ void rins_t<i_t, f_t>::node_callback(const std::vector<f_t>& solution, f_t objec
   if (node_count - node_count_at_last_improvement < settings.nodes_after_later_improvement) return;
 
   if (node_count - node_count_at_last_rins > settings.node_freq) {
+    // opportunistic early test w/ atomic to avoid having to take the lock
+    if (!rins_thread->cpu_thread_done) return;
     std::lock_guard<std::mutex> lock(rins_mutex);
     if (rins_thread->cpu_thread_done && dm.population.current_size() > 0 &&
         dm.population.is_feasible()) {
