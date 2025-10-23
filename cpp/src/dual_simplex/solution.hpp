@@ -61,7 +61,11 @@ class lp_solution_t {
 template <typename i_t, typename f_t>
 class mip_solution_t {
  public:
-  mip_solution_t(i_t n) : x(n), objective(std::numeric_limits<f_t>::quiet_NaN()), lower_bound(-inf)
+  mip_solution_t(i_t n)
+    : x(n),
+      objective(std::numeric_limits<f_t>::quiet_NaN()),
+      lower_bound(-inf),
+      has_incumbent(false)
   {
   }
 
@@ -69,8 +73,9 @@ class mip_solution_t {
 
   void set_incumbent_solution(f_t primal_objective, const std::vector<f_t>& primal_solution)
   {
-    x         = primal_solution;
-    objective = primal_objective;
+    x             = primal_solution;
+    objective     = primal_objective;
+    has_incumbent = true;
   }
 
   // Primal solution vector
@@ -79,6 +84,7 @@ class mip_solution_t {
   f_t lower_bound;
   i_t nodes_explored;
   i_t simplex_iterations;
+  bool has_incumbent;
 };
 
 }  // namespace cuopt::linear_programming::dual_simplex

@@ -279,6 +279,7 @@ void branch_and_bound_t<i_t, f_t>::set_new_solution(const std::vector<f_t>& solu
       original_lp_, settings_, var_types_, crushed_solution, primal_err, bound_err, num_fractional);
     if (is_feasible) {
       upper_bound_ = obj;
+      incumbent_.set_incumbent_solution(obj, crushed_solution);
     } else {
       attempt_repair         = true;
       constexpr bool verbose = false;
@@ -453,15 +454,20 @@ mip_status_t branch_and_bound_t<i_t, f_t>::set_final_solution(mip_solution_t<i_t
     mip_status = mip_status_t::NODE_LIMIT;
   }
 
-  f_t upper_bound = get_upper_bound();
-  f_t gap         = upper_bound - lower_bound;
-  f_t obj         = compute_user_objective(original_lp_, upper_bound);
-  f_t user_lower  = compute_user_objective(original_lp_, lower_bound);
-  f_t gap_rel     = user_relative_gap(original_lp_, upper_bound, lower_bound);
+  f_t upper_bound      = get_upper_bound();
+  f_t gap              = upper_bound - lower_bound;
+  f_t obj              = compute_user_objective(original_lp_, upper_bound);
+  f_t user_bound       = compute_user_objective(original_lp_, lower_bound);
+  f_t gap_rel          = user_relative_gap(original_lp_, upper_bound, lower_bound);
+  bool is_maximization = original_lp_.obj_scale < 0.0;
 
   settings_.log.printf(
     "Explored %d nodes in %.2fs.\n", stats_.nodes_explored, toc(stats_.start_time));
-  settings_.log.printf("Absolute Gap %e Objective %.16e Lower Bound %.16e\n", gap, obj, user_lower);
+  settings_.log.printf("Absolute Gap %e Objective %.16e %s Bound %.16e\n",
+                       gap,
+                       obj,
+                       is_maximization ? "Upper" : "Lower",
+                       user_bound);
 
   if (gap <= settings_.absolute_mip_gap_tol || gap_rel <= settings_.relative_mip_gap_tol) {
     mip_status = mip_status_t::OPTIMAL;
@@ -488,6 +494,7 @@ mip_status_t branch_and_bound_t<i_t, f_t>::set_final_solution(mip_solution_t<i_t
   }
 
   if (upper_bound != inf) {
+    assert(incumbent_.has_incumbent);
     uncrush_primal_solution(original_problem_, original_lp_, incumbent_.x, solution.x);
   }
   solution.objective          = incumbent_.objective;
