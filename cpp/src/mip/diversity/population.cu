@@ -648,7 +648,7 @@ void population_t<i_t, f_t>::eradicate_similar(size_t start_index, solution_t<i_
   size_t count = start_index;
   for (size_t i = start_index; i < indices.size(); i++)
     if (indices[i].first != std::numeric_limits<size_t>::max())
-      indices[count++] = indices[i];  // here count is incremented 1
+      indices[count++] = indices[i];  // here count is incremented 2
 
   indices.erase(indices.begin() + count, indices.end());
   cuopt_assert(test_invariant(), "Population invariant doesn't hold");
