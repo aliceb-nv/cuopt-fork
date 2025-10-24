@@ -92,6 +92,11 @@ class rins_t {
   diversity_manager_t<i_t, f_t>& dm;
   rins_settings_t settings;
 
+  // need a separate handle for RINS to operate on a separate stream and prevent graph capture
+  // issues
+  std::unique_ptr<problem_t<i_t, f_t>> problem_copy;
+  raft::handle_t rins_handle;
+
   std::vector<f_t> lp_optimal_solution;
 
   f_t fixrate{0.5};

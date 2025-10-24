@@ -62,7 +62,7 @@ class problem_t {
   problem_t() = delete;
   // copy constructor
   problem_t(const problem_t<i_t, f_t>& problem);
-  problem_t(const problem_t<i_t, f_t>& problem, bool no_deep_copy);
+  problem_t(const problem_t<i_t, f_t>& problem, bool deep_copy);
   problem_t(problem_t<i_t, f_t>&& problem) = default;
   problem_t& operator=(problem_t&&)        = default;
   void op_problem_cstr_body(const optimization_problem_t<i_t, f_t>& problem_);
