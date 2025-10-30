@@ -75,7 +75,7 @@ void rins_t<i_t, f_t>::enable()
   rins_thread->rins_ptr    = this;
   seed                     = cuopt::seed_generator::get_seed();
   problem_copy             = std::make_unique<problem_t<i_t, f_t>>(*problem_ptr);
-  problem_copy->handle_ptr = &rins_handle;  // 1
+  problem_copy->handle_ptr = &rins_handle;
   enabled                  = true;
 }
 
