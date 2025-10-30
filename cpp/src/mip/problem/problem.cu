@@ -204,7 +204,7 @@ problem_t<i_t, f_t>::problem_t(const problem_t<i_t, f_t>& problem_)
 }
 
 template <typename i_t, typename f_t>
-problem_t<i_t, f_t>::problem_t(const problem_t<i_t, f_t>& problem_, bool deep_copy)
+problem_t<i_t, f_t>::problem_t(const problem_t<i_t, f_t>& problem_, bool no_deep_copy)
   : original_problem_ptr(problem_.original_problem_ptr),
     tolerances(problem_.tolerances),
     handle_ptr(problem_.handle_ptr),
@@ -219,66 +219,70 @@ problem_t<i_t, f_t>::problem_t(const problem_t<i_t, f_t>& problem_, bool deep_co
     empty(problem_.empty),
     is_binary_pb(problem_.is_binary_pb),
     // Copy constructor used by PDLP and MIP
-    // PDLP uses the version with deep_copy = false which deep copy some fields but doesn't
+    // PDLP uses the version with no_deep_copy = false which deep copy some fields but doesn't
     // allocate others that are not needed in PDLP
     presolve_data(
-      (!deep_copy)
+      (!no_deep_copy)
         ? std::move(presolve_data_t{*problem_.original_problem_ptr, handle_ptr->get_stream()})
         : std::move(presolve_data_t{problem_.presolve_data, handle_ptr->get_stream()})),
     original_ids(problem_.original_ids),
     reverse_original_ids(problem_.reverse_original_ids),
     reverse_coefficients(
-      (!deep_copy)
+      (!no_deep_copy)
         ? rmm::device_uvector<f_t>(problem_.reverse_coefficients, handle_ptr->get_stream())
-        : rmm::device_uvector<f_t>(problem_.reverse_coefficients, handle_ptr->get_stream())),
+        : rmm::device_uvector<f_t>(problem_.reverse_coefficients.size(), handle_ptr->get_stream())),
     reverse_constraints(
-      (!deep_copy)
+      (!no_deep_copy)
         ? rmm::device_uvector<i_t>(problem_.reverse_constraints, handle_ptr->get_stream())
-        : rmm::device_uvector<i_t>(problem_.reverse_constraints, handle_ptr->get_stream())),
+        : rmm::device_uvector<i_t>(problem_.reverse_constraints.size(), handle_ptr->get_stream())),
     reverse_offsets(
-      (!deep_copy) ? rmm::device_uvector<i_t>(problem_.reverse_offsets, handle_ptr->get_stream())
-                   : rmm::device_uvector<i_t>(problem_.reverse_offsets, handle_ptr->get_stream())),
-    coefficients((!deep_copy)
-                   ? rmm::device_uvector<f_t>(problem_.coefficients, handle_ptr->get_stream())
-                   : rmm::device_uvector<f_t>(problem_.coefficients, handle_ptr->get_stream())),
-    variables((!deep_copy)
+      (!no_deep_copy)
+        ? rmm::device_uvector<i_t>(problem_.reverse_offsets, handle_ptr->get_stream())
+        : rmm::device_uvector<i_t>(problem_.reverse_offsets.size(), handle_ptr->get_stream())),
+    coefficients(
+      (!no_deep_copy)
+        ? rmm::device_uvector<f_t>(problem_.coefficients, handle_ptr->get_stream())
+        : rmm::device_uvector<f_t>(problem_.coefficients.size(), handle_ptr->get_stream())),
+    variables((!no_deep_copy)
                 ? rmm::device_uvector<i_t>(problem_.variables, handle_ptr->get_stream())
-                : rmm::device_uvector<i_t>(problem_.variables, handle_ptr->get_stream())),
-    offsets((!deep_copy) ? rmm::device_uvector<i_t>(problem_.offsets, handle_ptr->get_stream())
-                         : rmm::device_uvector<i_t>(problem_.offsets, handle_ptr->get_stream())),
+                : rmm::device_uvector<i_t>(problem_.variables.size(), handle_ptr->get_stream())),
+    offsets((!no_deep_copy)
+              ? rmm::device_uvector<i_t>(problem_.offsets, handle_ptr->get_stream())
+              : rmm::device_uvector<i_t>(problem_.offsets.size(), handle_ptr->get_stream())),
     objective_coefficients(
-      (!deep_copy)
+      (!no_deep_copy)
         ? rmm::device_uvector<f_t>(problem_.objective_coefficients, handle_ptr->get_stream())
-        : rmm::device_uvector<f_t>(problem_.objective_coefficients, handle_ptr->get_stream())),
+        : rmm::device_uvector<f_t>(problem_.objective_coefficients.size(),
+                                   handle_ptr->get_stream())),
     variable_bounds(
-      (!deep_copy) ? rmm::device_uvector<f_t2>(problem_.variable_bounds, handle_ptr->get_stream())
-                   : rmm::device_uvector<f_t2>(problem_.variable_bounds, handle_ptr->get_stream())),
+      (!no_deep_copy)
+        ? rmm::device_uvector<f_t2>(problem_.variable_bounds, handle_ptr->get_stream())
+        : rmm::device_uvector<f_t2>(problem_.variable_bounds.size(), handle_ptr->get_stream())),
     constraint_lower_bounds(
-      (!deep_copy)
+      (!no_deep_copy)
         ? rmm::device_uvector<f_t>(problem_.constraint_lower_bounds, handle_ptr->get_stream())
-        : rmm::device_uvector<f_t>(problem_.constraint_lower_bounds, handle_ptr->get_stream())),
+        : rmm::device_uvector<f_t>(problem_.constraint_lower_bounds.size(),
+                                   handle_ptr->get_stream())),
     constraint_upper_bounds(
-      (!deep_copy)
+      (!no_deep_copy)
         ? rmm::device_uvector<f_t>(problem_.constraint_upper_bounds, handle_ptr->get_stream())
-        : rmm::device_uvector<f_t>(problem_.constraint_upper_bounds, handle_ptr->get_stream())),
+        : rmm::device_uvector<f_t>(problem_.constraint_upper_bounds.size(),
+                                   handle_ptr->get_stream())),
     combined_bounds(
-      (!deep_copy) ? rmm::device_uvector<f_t>(problem_.combined_bounds, handle_ptr->get_stream())
-                   : rmm::device_uvector<f_t>(problem_.combined_bounds, handle_ptr->get_stream())),
+      (!no_deep_copy)
+        ? rmm::device_uvector<f_t>(problem_.combined_bounds, handle_ptr->get_stream())
+        : rmm::device_uvector<f_t>(problem_.combined_bounds.size(), handle_ptr->get_stream())),
     variable_types(
-      (!deep_copy) ? rmm::device_uvector<var_t>(problem_.variable_types, handle_ptr->get_stream())
-                   : rmm::device_uvector<var_t>(problem_.variable_types, handle_ptr->get_stream())),
-    integer_indices(
-      (!deep_copy) ? rmm::device_uvector<i_t>(0, handle_ptr->get_stream())
-                   : rmm::device_uvector<i_t>(problem_.integer_indices, handle_ptr->get_stream())),
-    binary_indices((!deep_copy)
-                     ? rmm::device_uvector<i_t>(0, handle_ptr->get_stream())
-                     : rmm::device_uvector<i_t>(problem_.binary_indices, handle_ptr->get_stream())),
-    nonbinary_indices((!deep_copy) ? rmm::device_uvector<i_t>(0, handle_ptr->get_stream())
-                                   : rmm::device_uvector<i_t>(problem_.nonbinary_indices,
-                                                              handle_ptr->get_stream())),
-    is_binary_variable((!deep_copy) ? rmm::device_uvector<i_t>(0, handle_ptr->get_stream())
-                                    : rmm::device_uvector<i_t>(problem_.is_binary_variable,
-                                                               handle_ptr->get_stream())),
+      (!no_deep_copy)
+        ? rmm::device_uvector<var_t>(problem_.variable_types, handle_ptr->get_stream())
+        : rmm::device_uvector<var_t>(problem_.variable_types.size(), handle_ptr->get_stream())),
+    integer_indices((!no_deep_copy) ? 0 : problem_.integer_indices.size(),
+                    handle_ptr->get_stream()),
+    binary_indices((!no_deep_copy) ? 0 : problem_.binary_indices.size(), handle_ptr->get_stream()),
+    nonbinary_indices((!no_deep_copy) ? 0 : problem_.nonbinary_indices.size(),
+                      handle_ptr->get_stream()),
+    is_binary_variable((!no_deep_copy) ? 0 : problem_.is_binary_variable.size(),
+                       handle_ptr->get_stream()),
     related_variables(problem_.related_variables, handle_ptr->get_stream()),
     related_variables_offsets(problem_.related_variables_offsets, handle_ptr->get_stream()),
     var_names(problem_.var_names),
@@ -1186,7 +1190,7 @@ problem_t<i_t, f_t> problem_t<i_t, f_t>::get_problem_after_fixing_vars(
   raft::common::nvtx::range fun_scope("get_problem_after_fixing_vars");
   auto start_time = std::chrono::high_resolution_clock::now();
   cuopt_assert(n_variables == assignment.size(), "Assignment size issue");
-  problem_t<i_t, f_t> problem(*this, true);
+  problem_t<i_t, f_t> problem(*this);
   CUOPT_LOG_DEBUG("Fixing %d variables", variables_to_fix.size());
   // we will gather from this and scatter back to the original problem
   variable_map.resize(assignment.size() - variables_to_fix.size(), handle_ptr->get_stream());
