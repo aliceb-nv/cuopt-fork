@@ -1055,80 +1055,29 @@ bool fj_t<i_t, f_t>::cpu_solve(fj_cpu_climber_t<i_t, f_t>& fj_cpu, f_t in_time_l
 }
 
 template <typename i_t, typename f_t>
-cpu_fj_thread_t<i_t, f_t>::cpu_fj_thread_t()
+void cpu_fj_thread_t<i_t, f_t>::run_worker()
 {
-  cpu_worker = std::thread(&cpu_fj_thread_t<i_t, f_t>::cpu_worker_thread, this);
+  bool solution_found   = fj_ptr->cpu_solve(*fj_cpu, time_limit);
+  cpu_fj_solution_found = solution_found;
 }
 
 template <typename i_t, typename f_t>
-cpu_fj_thread_t<i_t, f_t>::~cpu_fj_thread_t()
+void cpu_fj_thread_t<i_t, f_t>::on_terminate()
 {
-  if (!cpu_thread_terminate) { kill_cpu_solver(); }
+  if (fj_cpu) fj_cpu->halted = true;
 }
 
 template <typename i_t, typename f_t>
-void cpu_fj_thread_t<i_t, f_t>::cpu_worker_thread()
-{
-  while (!cpu_thread_terminate) {
-    {
-      std::unique_lock<std::mutex> lock(cpu_mutex);
-      cpu_cv.wait(lock, [this] { return cpu_thread_should_start || cpu_thread_terminate; });
-
-      if (cpu_thread_terminate) break;
-
-      cpu_thread_done         = false;
-      cpu_thread_should_start = false;
-    }
-
-    bool solution_found = fj_ptr->cpu_solve(*fj_cpu, time_limit);
-
-    {
-      std::lock_guard<std::mutex> lock(cpu_mutex);
-      cpu_fj_solution_found = solution_found;
-      cpu_thread_done       = true;
-    }
-  }
-}
-
-template <typename i_t, typename f_t>
-void cpu_fj_thread_t<i_t, f_t>::kill_cpu_solver()
-{
-  {
-    std::lock_guard<std::mutex> lock(cpu_mutex);
-    cpu_thread_terminate = true;
-    if (fj_cpu) fj_cpu->halted = true;
-  }
-  cpu_cv.notify_one();
-  cpu_worker.join();
-}
-
-template <typename i_t, typename f_t>
-void cpu_fj_thread_t<i_t, f_t>::start_cpu_solver()
+void cpu_fj_thread_t<i_t, f_t>::on_start()
 {
   cuopt_assert(fj_cpu != nullptr, "fj_cpu must not be null");
-  {
-    std::lock_guard<std::mutex> lock(cpu_mutex);
-    cpu_thread_done         = false;
-    cpu_thread_should_start = true;
-    fj_cpu->halted          = false;
-  }
-  cpu_cv.notify_one();
+  fj_cpu->halted = false;
 }
 
 template <typename i_t, typename f_t>
 void cpu_fj_thread_t<i_t, f_t>::stop_cpu_solver()
 {
   fj_cpu->halted = true;
-}
-
-template <typename i_t, typename f_t>
-bool cpu_fj_thread_t<i_t, f_t>::wait_for_cpu_solver()
-{
-  while (!cpu_thread_done && !cpu_thread_terminate) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-
-  return cpu_fj_solution_found;
 }
 
 #if MIP_INSTANTIATE_FLOAT

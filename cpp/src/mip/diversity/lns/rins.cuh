@@ -20,6 +20,7 @@
 #include <mip/diversity/population.cuh>
 #include <mip/solution/solution.cuh>
 #include <mip/solver.cuh>
+#include <mip/utilities/cpu_worker_thread.cuh>
 #include <utilities/timer.hpp>
 
 #include <atomic>
@@ -43,9 +44,10 @@ struct rins_settings_t {
   double max_fixrate                = 0.8;
   double default_fixrate            = 0.5;
   double min_fractional_ratio       = 0.3;
-  double min_time_limit             = 10.;
+  double min_time_limit             = 3.;
   double max_time_limit             = 20.;
-  double default_time_limit         = 6.;
+  double default_time_limit         = 3.;
+  double target_mip_gap             = 0.03;
   bool objective_cut                = true;
 };
 
@@ -53,23 +55,11 @@ template <typename i_t, typename f_t>
 class rins_t;
 
 template <typename i_t, typename f_t>
-struct rins_thread_t {
-  rins_thread_t();
-  ~rins_thread_t();
-
-  void cpu_worker_thread();
-  void start_cpu_solver();
-  void stop_cpu_solver();
-  bool wait_for_cpu_solver();
-  void kill_cpu_solver();
-
-  std::thread cpu_worker;
-  std::mutex cpu_mutex;
-  std::condition_variable cpu_cv;
-  std::atomic<bool> should_stop{false};
-  std::atomic<bool> cpu_thread_should_start{false};
-  std::atomic<bool> cpu_thread_done{true};
-  std::atomic<bool> cpu_thread_terminate{false};
+struct rins_thread_t : public cpu_worker_thread_base_t<rins_thread_t<i_t, f_t>> {
+  void run_worker();
+  void on_terminate() {}
+  void on_start() {}
+  bool get_result() { return true; }
 
   rins_t<i_t, f_t>* rins_ptr{nullptr};
 };
@@ -106,6 +96,7 @@ class rins_t {
   i_t seed;
 
   std::atomic<bool> enabled{false};
+  std::atomic<f_t> lower_bound{0.};
 
   std::atomic<i_t> node_count{0};
   std::atomic<i_t> node_count_at_last_rins{0};

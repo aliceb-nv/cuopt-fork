@@ -27,6 +27,7 @@
 #include <vector>
 
 #include <mip/feasibility_jump/feasibility_jump.cuh>
+#include <mip/utilities/cpu_worker_thread.cuh>
 
 namespace cuopt::linear_programming::detail {
 
@@ -127,23 +128,14 @@ struct fj_cpu_climber_t {
 };
 
 template <typename i_t, typename f_t>
-struct cpu_fj_thread_t {
-  cpu_fj_thread_t();
-  ~cpu_fj_thread_t();
+struct cpu_fj_thread_t : public cpu_worker_thread_base_t<cpu_fj_thread_t<i_t, f_t>> {
+  void run_worker();
+  void on_terminate();
+  void on_start();
+  bool get_result() { return cpu_fj_solution_found; }
 
-  void cpu_worker_thread();
-  void start_cpu_solver();
   void stop_cpu_solver();
-  bool wait_for_cpu_solver();  // return feasibility
-  void kill_cpu_solver();
 
-  std::thread cpu_worker;
-  std::mutex cpu_mutex;
-  std::condition_variable cpu_cv;
-  std::atomic<bool> should_stop{false};
-  std::atomic<bool> cpu_thread_should_start{false};
-  std::atomic<bool> cpu_thread_done{false};
-  std::atomic<bool> cpu_thread_terminate{false};
   std::atomic<bool> cpu_fj_solution_found{false};
   f_t time_limit{+std::numeric_limits<f_t>::infinity()};
   std::unique_ptr<fj_cpu_climber_t<i_t, f_t>> fj_cpu;

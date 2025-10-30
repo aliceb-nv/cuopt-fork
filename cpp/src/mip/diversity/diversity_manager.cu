@@ -734,7 +734,7 @@ void diversity_manager_t<i_t, f_t>::set_simplex_solution(const std::vector<f_t>&
 {
   CUOPT_LOG_DEBUG("Setting simplex solution with objective %f", objective);
   using sol_t = solution_t<i_t, f_t>;
-  cudaSetDevice(context.handle_ptr->get_device());
+  RAFT_CUDA_TRY(cudaSetDevice(context.handle_ptr->get_device()));
   context.handle_ptr->sync_stream();
   cuopt_func_call(sol_t new_sol(*problem_ptr));
   cuopt_assert(new_sol.assignment.size() == solution.size(), "Assignment size mismatch");
