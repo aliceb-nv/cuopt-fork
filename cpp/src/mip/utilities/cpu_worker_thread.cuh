@@ -89,24 +89,29 @@ void cpu_worker_thread_base_t<Derived>::cpu_worker_thread()
 template <typename Derived>
 void cpu_worker_thread_base_t<Derived>::request_termination()
 {
+  bool should_terminate = false;
   {
     std::lock_guard<std::mutex> lock(cpu_mutex);
-    if (cpu_thread_terminate) return;
+    if (cpu_thread_terminate) return;  // Already terminated
     cpu_thread_terminate = true;
+    should_terminate     = true;
     static_cast<Derived*>(this)->on_terminate();
+  }  // Release lock before notify
+
+  if (should_terminate) {
+    cpu_cv.notify_one();
+    join_worker();
   }
-  cpu_cv.notify_one();
-  join_worker();
 }
 
 template <typename Derived>
 void cpu_worker_thread_base_t<Derived>::join_worker()
 {
-  if (!cpu_thread_terminate) {
+  {
     std::lock_guard<std::mutex> lock(cpu_mutex);
-    cpu_thread_terminate = true;
-    cpu_cv.notify_one();
+    if (!cpu_thread_terminate) { cpu_thread_terminate = true; }
   }
+  cpu_cv.notify_one();
 
   if (cpu_worker.joinable()) { cpu_worker.join(); }
 }
