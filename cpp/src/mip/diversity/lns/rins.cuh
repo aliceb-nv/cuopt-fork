@@ -56,6 +56,8 @@ class rins_t;
 
 template <typename i_t, typename f_t>
 struct rins_thread_t : public cpu_worker_thread_base_t<rins_thread_t<i_t, f_t>> {
+  ~rins_thread_t();
+
   void run_worker();
   void on_terminate() {}
   void on_start() {}

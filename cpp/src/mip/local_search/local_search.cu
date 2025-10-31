@@ -146,9 +146,9 @@ template <typename i_t, typename f_t>
 void local_search_t<i_t, f_t>::stop_cpufj_scratch_threads()
 {
   for (auto& cpu_fj : scratch_cpu_fj) {
-    cpu_fj.kill_cpu_worker();
+    cpu_fj.request_termination();
   }
-  scratch_cpu_fj_on_lp_opt.kill_cpu_worker();
+  scratch_cpu_fj_on_lp_opt.request_termination();
 }
 
 template <typename i_t, typename f_t>

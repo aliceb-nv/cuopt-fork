@@ -1055,6 +1055,12 @@ bool fj_t<i_t, f_t>::cpu_solve(fj_cpu_climber_t<i_t, f_t>& fj_cpu, f_t in_time_l
 }
 
 template <typename i_t, typename f_t>
+cpu_fj_thread_t<i_t, f_t>::~cpu_fj_thread_t()
+{
+  this->request_termination();
+}
+
+template <typename i_t, typename f_t>
 void cpu_fj_thread_t<i_t, f_t>::run_worker()
 {
   bool solution_found   = fj_ptr->cpu_solve(*fj_cpu, time_limit);

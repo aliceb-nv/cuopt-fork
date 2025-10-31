@@ -32,8 +32,13 @@ class cpu_worker_thread_base_t {
 
   void start_cpu_solver();
   bool wait_for_cpu_solver();
-  void kill_cpu_worker();
 
+  // Derived classes MUST call this in their destructor before the base destructor runs.
+  // This ensures on_terminate() is called while the derived object is still fully alive.
+  void request_termination();
+
+  // Internal method for thread management - safe to call during destruction
+  void join_worker();
   void cpu_worker_thread();
 
   std::thread cpu_worker;
@@ -54,7 +59,8 @@ cpu_worker_thread_base_t<Derived>::cpu_worker_thread_base_t()
 template <typename Derived>
 cpu_worker_thread_base_t<Derived>::~cpu_worker_thread_base_t()
 {
-  if (!cpu_thread_terminate) { kill_cpu_worker(); }
+  // Note: We don't call on_terminate() here since the derived object is already destroyed.
+  join_worker();
 }
 
 template <typename Derived>
@@ -81,15 +87,28 @@ void cpu_worker_thread_base_t<Derived>::cpu_worker_thread()
 }
 
 template <typename Derived>
-void cpu_worker_thread_base_t<Derived>::kill_cpu_worker()
+void cpu_worker_thread_base_t<Derived>::request_termination()
 {
   {
     std::lock_guard<std::mutex> lock(cpu_mutex);
+    if (cpu_thread_terminate) return;
     cpu_thread_terminate = true;
     static_cast<Derived*>(this)->on_terminate();
   }
   cpu_cv.notify_one();
-  cpu_worker.join();
+  join_worker();
+}
+
+template <typename Derived>
+void cpu_worker_thread_base_t<Derived>::join_worker()
+{
+  if (!cpu_thread_terminate) {
+    std::lock_guard<std::mutex> lock(cpu_mutex);
+    cpu_thread_terminate = true;
+    cpu_cv.notify_one();
+  }
+
+  if (cpu_worker.joinable()) { cpu_worker.join(); }
 }
 
 template <typename Derived>

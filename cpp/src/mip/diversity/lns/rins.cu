@@ -35,6 +35,12 @@ rins_t<i_t, f_t>::rins_t(mip_solver_context_t<i_t, f_t>& context_,
 }
 
 template <typename i_t, typename f_t>
+rins_thread_t<i_t, f_t>::~rins_thread_t()
+{
+  this->request_termination();
+}
+
+template <typename i_t, typename f_t>
 void rins_thread_t<i_t, f_t>::run_worker()
 {
   raft::common::nvtx::range fun_scope("Running RINS");
@@ -136,7 +142,7 @@ void rins_t<i_t, f_t>::run_rins()
 
   // abort if the fractional ratio is too low
   if (fractional_ratio < settings.min_fractional_ratio) {
-    CUOPT_LOG_DEBUG("RINS fractional ratio too low, aborting");
+    CUOPT_LOG_TRACE("RINS fractional ratio too low, aborting");
     return;
   }
 
@@ -285,7 +291,7 @@ void rins_t<i_t, f_t>::run_rins()
                     cpu_fj_thread.fj_cpu->h_best_objective);
     rins_solution_queue.push_back(cpu_fj_thread.fj_cpu->h_best_assignment);
   }
-  cpu_fj_thread.kill_cpu_worker();
+  // Thread will be automatically terminated and joined by destructor
 
   bool improvement_found = false;
   for (auto& fixed_sol : rins_solution_queue) {
