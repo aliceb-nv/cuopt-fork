@@ -92,11 +92,11 @@ void cpu_worker_thread_base_t<Derived>::request_termination()
   bool should_terminate = false;
   {
     std::lock_guard<std::mutex> lock(cpu_mutex);
-    if (cpu_thread_terminate) return;  // Already terminated
+    if (cpu_thread_terminate) return;
     cpu_thread_terminate = true;
     should_terminate     = true;
     static_cast<Derived*>(this)->on_terminate();
-  }  // Release lock before notify
+  }
 
   if (should_terminate) {
     cpu_cv.notify_one();
