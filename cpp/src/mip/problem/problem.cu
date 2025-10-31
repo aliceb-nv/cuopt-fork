@@ -1190,7 +1190,7 @@ problem_t<i_t, f_t> problem_t<i_t, f_t>::get_problem_after_fixing_vars(
   raft::common::nvtx::range fun_scope("get_problem_after_fixing_vars");
   auto start_time = std::chrono::high_resolution_clock::now();
   cuopt_assert(n_variables == assignment.size(), "Assignment size issue");
-  problem_t<i_t, f_t> problem(*this);
+  problem_t<i_t, f_t> problem(*this, true);
   CUOPT_LOG_DEBUG("Fixing %d variables", variables_to_fix.size());
   // we will gather from this and scatter back to the original problem
   variable_map.resize(assignment.size() - variables_to_fix.size(), handle_ptr->get_stream());
