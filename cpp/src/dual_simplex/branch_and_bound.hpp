@@ -142,7 +142,7 @@ class branch_and_bound_t {
   i_t get_heap_size();
 
   // The main entry routine. Returns the solver status and populates solution with the incumbent.
-  mip_status_t solve(mip_solution_t<i_t, f_t>& solution, std::string log_prefix = "");
+  mip_status_t solve(mip_solution_t<i_t, f_t>& solution);
 
  private:
   const user_problem_t<i_t, f_t>& original_problem_;

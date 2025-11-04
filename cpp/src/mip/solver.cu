@@ -231,8 +231,7 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
     branch_and_bound_status_future = std::async(std::launch::async,
                                                 &dual_simplex::branch_and_bound_t<i_t, f_t>::solve,
                                                 branch_and_bound.get(),
-                                                std::ref(branch_and_bound_solution),
-                                                "");
+                                                std::ref(branch_and_bound_solution));
   }
 
   // Start the primal heuristics

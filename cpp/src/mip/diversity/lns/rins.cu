@@ -247,6 +247,7 @@ void rins_t<i_t, f_t>::run_rins()
   branch_and_bound_settings.num_threads        = 2;
   branch_and_bound_settings.num_bfs_threads    = 1;
   branch_and_bound_settings.num_diving_threads = 1;
+  branch_and_bound_settings.log.log_prefix     = "[RINS] ";
   branch_and_bound_settings.solution_callback  = [this, &rins_solution_queue](
                                                   std::vector<f_t>& solution, f_t objective) {
     rins_solution_queue.push_back(solution);
@@ -254,7 +255,7 @@ void rins_t<i_t, f_t>::run_rins()
   dual_simplex::branch_and_bound_t<i_t, f_t> branch_and_bound(branch_and_bound_problem,
                                                               branch_and_bound_settings);
   branch_and_bound.set_initial_guess(cuopt::host_copy(fixed_assignment, rins_handle.get_stream()));
-  branch_and_bound_status = branch_and_bound.solve(branch_and_bound_solution, "[RINS] ");
+  branch_and_bound_status = branch_and_bound.solve(branch_and_bound_solution);
 
   if (!std::isnan(branch_and_bound_solution.objective)) {
     CUOPT_LOG_DEBUG("RINS submip solution found. Objective %.16e. Status %d",

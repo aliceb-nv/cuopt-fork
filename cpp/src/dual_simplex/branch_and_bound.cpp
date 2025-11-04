@@ -1041,15 +1041,14 @@ void branch_and_bound_t<i_t, f_t>::diving_thread(lp_problem_t<i_t, f_t>& leaf_pr
 }
 
 template <typename i_t, typename f_t>
-mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solution,
-                                                 std::string log_prefix)
+mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solution)
 {
   logger_t log;
-  log.log        = false;
-  log.log_prefix = settings_.log.log_prefix = log_prefix;
-  status_                                   = mip_exploration_status_t::UNSET;
-  stats_.nodes_unexplored                   = 0;
-  stats_.nodes_explored                     = 0;
+  log.log                 = false;
+  log.log_prefix          = settings_.log.log_prefix;
+  status_                 = mip_exploration_status_t::UNSET;
+  stats_.nodes_unexplored = 0;
+  stats_.nodes_explored   = 0;
 
   if (guess_.size() != 0) {
     std::vector<f_t> crushed_guess;
