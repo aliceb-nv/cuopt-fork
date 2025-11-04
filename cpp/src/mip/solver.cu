@@ -164,7 +164,6 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
   std::unique_ptr<dual_simplex::branch_and_bound_t<i_t, f_t>> branch_and_bound;
   branch_and_bound_solution_helper_t solution_helper(&dm, branch_and_bound_settings);
   dual_simplex::mip_solution_t<i_t, f_t> branch_and_bound_solution(1);
-  context.branch_and_bound_ptr = branch_and_bound.get();
 
   if (!context.settings.heuristics_only) {
     // Convert the presolved problem to dual_simplex::user_problem_t
@@ -217,6 +216,7 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
     // Create the branch and bound object
     branch_and_bound = std::make_unique<dual_simplex::branch_and_bound_t<i_t, f_t>>(
       branch_and_bound_problem, branch_and_bound_settings);
+    context.branch_and_bound_ptr = branch_and_bound.get();
 
     // Set the primal heuristics -> branch and bound callback
     context.problem_ptr->branch_and_bound_callback =
