@@ -23,7 +23,7 @@
 
 #pragma once
 
-// forward declare
+// Forward declare
 namespace cuopt::linear_programming::dual_simplex {
 template <typename i_t, typename f_t>
 class branch_and_bound_t;
