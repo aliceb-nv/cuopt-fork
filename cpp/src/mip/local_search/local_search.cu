@@ -680,7 +680,7 @@ bool local_search_t<i_t, f_t>::run_fp(solution_t<i_t, f_t>& solution,
     population_ptr->add_external_solutions_to_population();
     CUOPT_LOG_DEBUG("Population size at iteration %d: %d", i, population_ptr->current_size());
     if (population_ptr->preempt_heuristic_solver_.load()) {
-      CUOPT_LOG_DEBUG("Preempting heuristic solver!");  // 1
+      CUOPT_LOG_DEBUG("Preempting heuristic solver!");
       break;
     }
     if (is_feasible) {
