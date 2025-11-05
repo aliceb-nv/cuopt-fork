@@ -90,9 +90,6 @@ void rins_t<i_t, f_t>::run_rins()
 {
   if (total_calls == 0) RAFT_CUDA_TRY(cudaSetDevice(context.handle_ptr->get_device()));
 
-  auto external_solution_size = dm.population.get_external_solution_size();
-  if (external_solution_size > 0) dm.population.add_external_solutions_to_population();
-
   if (!dm.population.is_feasible()) return;
 
   cuopt_assert(lp_optimal_solution.size() == problem_ptr->n_variables, "Assignment size mismatch");

@@ -255,6 +255,7 @@ bool diversity_manager_t<i_t, f_t>::check_b_b_preemption()
     population.add_external_solutions_to_population();
     return true;
   }
+  population.add_external_solutions_to_population();
   return false;
 }
 

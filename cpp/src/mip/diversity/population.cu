@@ -183,11 +183,15 @@ void population_t<i_t, f_t>::add_external_solution(const std::vector<f_t>& solut
                     problem_ptr->get_user_obj_from_solver_obj(objective));
   }
   if (external_solution_queue.size() >= 5) { early_exit_primal_generation = true; }
+  solutions_in_external_queue_ = true;
 }
 
 template <typename i_t, typename f_t>
 void population_t<i_t, f_t>::add_external_solutions_to_population()
 {
+  // early exit to avoid taking the population lock
+  if (!solutions_in_external_queue_.load()) { return; }
+
   auto new_sol_vector = get_external_solutions();
   add_solutions_from_vec(std::move(new_sol_vector));
 }
@@ -208,6 +212,7 @@ std::vector<solution_t<i_t, f_t>> population_t<i_t, f_t>::get_external_solutions
   std::vector<solution_t<i_t, f_t>> return_vector;
   i_t counter                     = 0;
   f_t new_best_feasible_objective = best_feasible_objective;
+  f_t longest_wait_time           = 0;
   for (auto& queue : {external_solution_queue, external_solution_queue_cpufj}) {
     for (auto& h_entry : queue) {
       // ignore CPUFJ solutions if they're not better than the best feasible.
@@ -220,6 +225,7 @@ std::vector<solution_t<i_t, f_t>> population_t<i_t, f_t>::get_external_solutions
         new_best_feasible_objective = h_entry.objective;
       }
 
+      longest_wait_time = max(longest_wait_time, h_entry.timer.elapsed_time());
       solution_t<i_t, f_t> sol(*problem_ptr);
       sol.copy_new_assignment(h_entry.solution);
       sol.compute_feasibility();
@@ -249,6 +255,10 @@ std::vector<solution_t<i_t, f_t>> population_t<i_t, f_t>::get_external_solutions
     external_solution_queue.clear();
   }
   external_solution_queue_cpufj.clear();
+  solutions_in_external_queue_ = false;
+  if (return_vector.size() > 0) {
+    CUOPT_LOG_DEBUG("Longest wait time in external queue: %f seconds", longest_wait_time);
+  }
   return return_vector;
 }
 

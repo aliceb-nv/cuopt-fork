@@ -194,12 +194,16 @@ class population_t {
   struct external_solution_t {
     external_solution_t() = default;
     external_solution_t(const std::vector<f_t>& solution, f_t objective, solution_origin_t origin)
-      : solution(solution), objective(objective), origin(origin)
+      : solution(solution),
+        objective(objective),
+        origin(origin),
+        timer(std::numeric_limits<double>::infinity())
     {
     }
     std::vector<f_t> solution;
     f_t objective;
     solution_origin_t origin;
+    timer_t timer;  // debug timer to track how long a solution has lingered in the queue
   };
 
   std::vector<external_solution_t> external_solution_queue;
@@ -210,6 +214,7 @@ class population_t {
   std::mutex solution_mutex;
   std::atomic<bool> early_exit_primal_generation = false;
   std::atomic<bool> preempt_heuristic_solver_    = false;
+  std::atomic<bool> solutions_in_external_queue_ = false;
   f_t best_feasible_objective                    = std::numeric_limits<f_t>::max();
   assignment_hash_map_t<i_t, f_t> population_hash_map;
   cuopt::timer_t timer;
