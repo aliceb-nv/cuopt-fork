@@ -320,10 +320,10 @@ solution_t<i_t, f_t> diversity_manager_t<i_t, f_t>::run_solver()
     ls.constraint_prop.bounds_update.calculate_infeasible_redundant_constraints(*problem_ptr),
     "The problem must not be ii");
   population.initialize_population();
+  population.allocate_solutions();
   if (check_b_b_preemption()) { return population.best_feasible(); }
   add_user_given_solutions(initial_sol_vector);
   // Run CPUFJ early to find quick initial solutions
-  population.allocate_solutions();
   ls_cpufj_raii_guard_t ls_cpufj_raii_guard(ls);  // RAII to stop cpufj threads on solve stop
   ls.start_cpufj_scratch_threads(population);
 
