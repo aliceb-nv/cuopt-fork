@@ -55,6 +55,7 @@ cache:
       - ${{ stdlib("c") }}
       - cuda-version =${{ cuda_version }}
       - cmake ${{ cmake_version }}
+      - make
       - ninja
       - tbb-devel
       - zlib
