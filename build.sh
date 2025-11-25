@@ -376,15 +376,12 @@ if buildAll || hasArg libcuopt; then
           "${CACHE_ARGS[@]}" \
           "${EXTRA_CMAKE_ARGS[@]}" \
           "${REPODIR}"/cpp
+    JFLAG="${PARALLEL_LEVEL:+-j${PARALLEL_LEVEL}}"
     if hasArg -n; then
         # Manual make invocation to start its jobserver
-        make -j${PARALLEL_LEVEL} -C "${REPODIR}" LIBCUOPT_BUILD_DIR="${LIBCUOPT_BUILD_DIR}" VERBOSE_FLAG="${VERBOSE_FLAG}" PARALLEL_LEVEL="${PARALLEL_LEVEL}" ninja-build
+        make ${JFLAG} -C "${REPODIR}" LIBCUOPT_BUILD_DIR="${LIBCUOPT_BUILD_DIR}" VERBOSE_FLAG="${VERBOSE_FLAG}" PARALLEL_LEVEL="${PARALLEL_LEVEL}" ninja-build
     else
-        if [[ -n "${PARALLEL_LEVEL}" ]]; then
-            cmake --build "${LIBCUOPT_BUILD_DIR}" --target ${INSTALL_TARGET} ${VERBOSE_FLAG} -j"${PARALLEL_LEVEL}"
-        else
-            cmake --build "${LIBCUOPT_BUILD_DIR}" --target ${INSTALL_TARGET} ${VERBOSE_FLAG}
-        fi
+        cmake --build "${LIBCUOPT_BUILD_DIR}" --target ${INSTALL_TARGET} ${VERBOSE_FLAG} ${JFLAG}
     fi
 fi
 
