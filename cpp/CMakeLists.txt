@@ -124,6 +124,11 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9 AND CMAKE_CUDA_COMPILE
 endif()
 list(APPEND CUOPT_CUDA_FLAGS -fopenmp)
 
+# Add jobserver flags for parallel compilation if PARALLEL_LEVEL is set
+if(PARALLEL_LEVEL AND NOT "${PARALLEL_LEVEL}" STREQUAL "")
+  message(STATUS "Enabling nvcc jobserver support for parallel builds")
+  list(APPEND CUOPT_CUDA_FLAGS --threads=0 --split-compile=0 --jobserver)
+endif()
 
 if(NOT DISABLE_OPENMP)
   find_package(OpenMP)
