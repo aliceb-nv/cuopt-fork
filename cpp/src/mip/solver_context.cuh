@@ -21,9 +21,6 @@ class branch_and_bound_t;
 
 namespace cuopt::linear_programming::detail {
 
-template <typename i_t, typename f_t>
-class population_t;
-
 // Aggregate structure containing the global context of the solving process for convenience:
 // The current problem, user settings, raft handle and statistics objects
 template <typename i_t, typename f_t>
