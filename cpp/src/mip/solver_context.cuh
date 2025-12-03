@@ -21,6 +21,9 @@ class branch_and_bound_t;
 
 namespace cuopt::linear_programming::detail {
 
+template <typename i_t, typename f_t>
+class population_t;
+
 // Aggregate structure containing the global context of the solving process for convenience:
 // The current problem, user settings, raft handle and statistics objects
 template <typename i_t, typename f_t>
@@ -39,6 +42,7 @@ struct mip_solver_context_t {
   raft::handle_t const* const handle_ptr;
   problem_t<i_t, f_t>* problem_ptr;
   dual_simplex::branch_and_bound_t<i_t, f_t>* branch_and_bound_ptr{nullptr};
+  std::atomic<bool> preempt_heuristic_solver_ = false;
   const mip_solver_settings_t<i_t, f_t> settings;
   pdlp_initial_scaling_strategy_t<i_t, f_t>& scaling;
   solver_stats_t<i_t, f_t> stats;
