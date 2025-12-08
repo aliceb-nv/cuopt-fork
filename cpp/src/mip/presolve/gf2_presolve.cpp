@@ -180,7 +180,7 @@ papilo::PresolveStatus GF2Presolve<f_t>::execute(const papilo::Problem<f_t>& pro
     continue;
   }
 
-  // If no GF2 constraints found, return unchanged
+  // 1If no GF2 constraints found, return unchanged
   if (gf2_constraints.empty()) { return papilo::PresolveStatus::kUnchanged; }
 
   // Skip if that would cause computational explosion (O(n^3) with simple gaussian elimination)
