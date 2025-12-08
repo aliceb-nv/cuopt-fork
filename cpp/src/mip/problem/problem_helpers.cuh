@@ -184,9 +184,13 @@ __global__ void kernel_check_transpose_validity(raft::device_span<const f_t> coe
     __syncthreads();
     // Would want to assert there but no easy way to gtest it, so moved it to the host
     if (!shared_found) {
-      DEVICE_LOG_DEBUG(
-        "For cstr %d, var %d, value %f was not found in the transpose", constraint_id, col, value);
-      *failed = true;
+      if (threadIdx.x == 0) {
+        DEVICE_LOG_DEBUG("For cstr %d, var %d, value %f was not found in the transpose",
+                         constraint_id,
+                         col,
+                         value);
+        *failed = true;
+      }
       return;
     }
     __syncthreads();

@@ -311,6 +311,9 @@ void problem_t<i_t, f_t>::compute_transpose_of_problem()
     return;
   }
 
+  check_csr_representation(
+    coefficients, offsets, variables, handle_ptr, n_variables, n_constraints);
+
   raft::sparse::linalg::csr_transpose(*handle_ptr,
                                       offsets.data(),
                                       variables.data(),
@@ -322,6 +325,13 @@ void problem_t<i_t, f_t>::compute_transpose_of_problem()
                                       n_variables,
                                       nnz,
                                       handle_ptr->get_stream());
+
+  check_csr_representation(reverse_coefficients,
+                           reverse_offsets,
+                           reverse_constraints,
+                           handle_ptr,
+                           n_constraints,
+                           n_variables);
 
   cuopt_assert(check_transpose_validity(this->coefficients,
                                         this->offsets,
