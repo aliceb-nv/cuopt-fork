@@ -339,7 +339,7 @@ void csr_to_csc_transpose(const i_t* csr_offsets,
     csr_indices + nnz,
     [counts = col_counts.data()] __device__(i_t col) { atomicAdd(&counts[col], 1); });
 
-  // 1Exclusive scan to get column pointers
+  // 2Exclusive scan to get column pointers
   thrust::exclusive_scan(
     handle_ptr->get_thrust_policy(), col_counts.begin(), col_counts.end(), csc_offsets);
 
