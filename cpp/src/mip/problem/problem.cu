@@ -340,7 +340,7 @@ void problem_t<i_t, f_t>::compute_transpose_of_problem()
                                         this->reverse_offsets,
                                         this->reverse_constraints,
                                         handle_ptr),
-               "cuSparse returned an invalid transpose");
+               "1cuSparse returned an invalid transpose");
 }
 
 template <typename i_t, typename f_t>
