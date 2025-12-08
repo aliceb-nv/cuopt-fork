@@ -219,9 +219,7 @@ static bool check_transpose_validity(const rmm::device_uvector<f_t>& coefficient
       failed.data());
   RAFT_CUDA_TRY(cudaStreamSynchronize(handle_ptr->get_stream()));
   RAFT_CUDA_TRY(cudaPeekAtLastError());
-  cuopt_assert(!failed.value(handle_ptr->get_stream()),
-               "Difference between the matrix and its transpose");
-  return true;
+  return !failed.value(handle_ptr->get_stream());
 }
 
 template <typename i_t, typename f_t>

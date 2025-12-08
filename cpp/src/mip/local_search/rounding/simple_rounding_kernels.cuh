@@ -49,8 +49,12 @@ __global__ void simple_rounding_kernel(typename solution_t<i_t, f_t>::view_t sol
     }
   }
 
-  bool can_round_up   = up_locks == 0;
-  bool can_round_down = down_locks == 0;
+  auto var_bnd = solution.problem.variable_bounds[var_id];
+  f_t lb       = get_lower(var_bnd);
+  f_t ub       = get_upper(var_bnd);
+
+  bool can_round_up   = up_locks == 0 && ceil(curr_val) <= floor(ub);
+  bool can_round_down = down_locks == 0 && floor(curr_val) >= ceil(lb);
 
   if (can_round_up && can_round_down) {
     if (solution.problem.objective_coefficients[var_id] > 0) {

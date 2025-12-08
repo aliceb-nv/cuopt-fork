@@ -322,6 +322,15 @@ void problem_t<i_t, f_t>::compute_transpose_of_problem()
                                       n_variables,
                                       nnz,
                                       handle_ptr->get_stream());
+
+  cuopt_assert(check_transpose_validity(this->coefficients,
+                                        this->offsets,
+                                        this->variables,
+                                        this->reverse_coefficients,
+                                        this->reverse_offsets,
+                                        this->reverse_constraints,
+                                        handle_ptr),
+               "cuSparse returned an invalid transpose");
 }
 
 template <typename i_t, typename f_t>
@@ -380,7 +389,7 @@ void problem_t<i_t, f_t>::check_problem_representation(bool check_transposed,
                                           this->reverse_offsets,
                                           this->reverse_constraints,
                                           handle_ptr),
-                 "Tranpose invalide");
+                 "Invalid transpose");
   }
 
   // Check variable bounds are set and with the correct size
