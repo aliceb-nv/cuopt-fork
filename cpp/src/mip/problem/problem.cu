@@ -339,7 +339,7 @@ void csr_to_csc_transpose(const i_t* csr_offsets,
     csr_indices + nnz,
     [counts = col_counts.data()] __device__(i_t col) { atomicAdd(&counts[col], 1); });
 
-  // 5Exclusive scan to get column pointers
+  // Exclusive scan to get column pointers
   thrust::exclusive_scan(
     handle_ptr->get_thrust_policy(), col_counts.begin(), col_counts.end(), csc_offsets);
 
@@ -357,6 +357,7 @@ void csr_to_csc_transpose(const i_t* csr_offsets,
 
   csr_to_csc_scatter_kernel<i_t, f_t><<<n_rows, 256, 0, stream>>>(
     n_rows, csr_offsets, csr_indices, csr_values, next_pos.data(), csc_indices, csc_values);
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
 
   // Sort row indices
   rmm::device_uvector<i_t> row_ind_sorted(nnz, stream);
