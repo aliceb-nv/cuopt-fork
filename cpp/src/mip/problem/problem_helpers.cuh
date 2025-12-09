@@ -222,7 +222,6 @@ static bool check_transpose_validity(const rmm::device_uvector<f_t>& coefficient
       raft::device_span<const i_t>(reverse_offsets.data(), reverse_offsets.size()),
       raft::device_span<const i_t>(reverse_variables.data(), reverse_variables.size()),
       failed.data());
-  RAFT_CUDA_TRY(cudaStreamSynchronize(handle_ptr->get_stream()));
   RAFT_CUDA_TRY(cudaPeekAtLastError());
   return !failed.value(handle_ptr->get_stream());
 }
