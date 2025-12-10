@@ -283,7 +283,7 @@ void population_t<i_t, f_t>::run_solution_callbacks(solution_t<i_t, f_t>& sol)
           context.scaling.unscale_solutions(temp_sol.assignment, dummy);
           // Need to get unscaled problem as well
           problem_t<i_t, f_t> n_problem(*sol.problem_ptr->original_problem_ptr);
-          auto scaled_sol(sol);
+          auto scaled_sol(temp_sol);
           scaled_sol.problem_ptr = &n_problem;
           scaled_sol.resize_to_original_problem();
           scaled_sol.compute_feasibility();
