@@ -376,7 +376,7 @@ solution_t<i_t, f_t> diversity_manager_t<i_t, f_t>::run_solver()
                    lp_dual_optimal_solution.size(),
                    problem_ptr->handle_ptr->get_stream());
       } else {
-        // copy the lp state
+        // 1copy the lp state
         raft::copy(lp_state.prev_primal.data(),
                    lp_optimal_solution.data(),
                    lp_optimal_solution.size(),
