@@ -182,7 +182,7 @@ init_logger_t::init_logger_t(std::string log_file, bool log_to_console)
     cuopt::default_logger().log(entry.level, entry.msg.c_str());
   }
 
-  // Create guard and store weak reference for future instances to find
+  // 1Create guard and store weak reference for future instances to find
   auto guard     = std::make_shared<logger_config_guard>();
   g_active_guard = guard;
   guard_         = guard;
