@@ -15,7 +15,7 @@ REPODIR=$(cd "$(dirname "$0")"; pwd)
 LIBCUOPT_BUILD_DIR=${LIBCUOPT_BUILD_DIR:=${REPODIR}/cpp/build}
 LIBMPS_PARSER_BUILD_DIR=${LIBMPS_PARSER_BUILD_DIR:=${REPODIR}/cpp/libmps_parser/build}
 
-VALIDARGS="clean libcuopt libmps_parser cuopt_mps_parser cuopt cuopt_server cuopt_sh_client docs deb -a -b -g -fsanitize -v -j -l= --verbose-pdlp --build-lp-only  --no-fetch-rapids --skip-c-python-adapters --skip-tests-build --skip-routing-build --skip-fatbin-write --host-lineinfo [--cmake-args=\\\"<args>\\\"] [--cache-tool=<tool>] -n --allgpuarch --ci-only-arch --show_depr_warn -h --help"
+VALIDARGS="clean libcuopt libmps_parser cuopt_mps_parser cuopt cuopt_server cuopt_sh_client docs deb -a -b -g -fsanitize -v -l= --verbose-pdlp --build-lp-only  --no-fetch-rapids --skip-c-python-adapters --skip-tests-build --skip-routing-build --skip-fatbin-write --host-lineinfo [--cmake-args=\\\"<args>\\\"] [--cache-tool=<tool>] -n --allgpuarch --ci-only-arch --show_depr_warn -h --help"
 HELP="$0 [<target> ...] [<flag> ...]
  where <target> is:
    clean            - remove all existing build artifacts and configuration (start over)
@@ -34,7 +34,6 @@ HELP="$0 [<target> ...] [<flag> ...]
    -b               - Build with benchmark settings
    -fsanitize       - Build with sanitizer
    -n               - no install step
-   -j               - parallel build jobs (unlimited if no value, or -j<N> for N threads)
    --no-fetch-rapids  - don't fetch rapids dependencies
    -l=              - log level. Options are: TRACE | DEBUG | INFO | WARN | ERROR | CRITICAL | OFF. Default=INFO
    --verbose-pdlp   - verbose mode for pdlp solver
@@ -86,7 +85,7 @@ CACHE_ARGS=()
 PYTHON_ARGS_FOR_INSTALL=("-m" "pip" "install" "--no-build-isolation" "--no-deps")
 LOGGING_ACTIVE_LEVEL="INFO"
 FETCH_RAPIDS=ON
-PARALLEL_LEVEL=""
+PARALLEL_LEVEL=${PARALLEL_LEVEL:=$(nproc)}
 
 # Set defaults for vars that may not have been defined externally
 #  FIXME: if PREFIX is not set, check CONDA_PREFIX, but there is no fallback
@@ -174,26 +173,6 @@ function cmakeArgs {
     read -ra EXTRA_CMAKE_ARGS <<< "$EXTRA_CMAKE_ARGS"
 }
 
-function parallelArgs {
-    # Check for -j option
-    if [[ -n $(echo "$ARGS" | { grep -E "\-j" || true; } ) ]]; then
-        # Extract -j with optional number (e.g., -j, -j8, -j16)
-        PARALLEL_ARG=$(echo "$ARGS" | { grep -Eo "\-j[0-9]*" || true; } | head -1)
-        if [[ -n ${PARALLEL_ARG} ]]; then
-            # Remove the -j argument from list of args so that it passes validArgs function
-            ARGS=${ARGS//$PARALLEL_ARG/}
-            # Extract the number if present
-            PARALLEL_NUM=$(echo "$PARALLEL_ARG" | sed 's/-j//')
-            if [[ -z ${PARALLEL_NUM} ]]; then
-                # If no number specified, use nproc
-                PARALLEL_LEVEL=$(nproc)
-            else
-                PARALLEL_LEVEL=${PARALLEL_NUM}
-            fi
-        fi
-    fi
-}
-
 
 if hasArg -h || hasArg --help; then
     echo "${HELP}"
@@ -205,7 +184,6 @@ if (( NUMARGS != 0 )); then
     cacheTool
     cmakeArgs
     loggingArgs
-    parallelArgs
     for a in ${ARGS}; do
         if ! (echo " ${VALIDARGS} " | grep -q " ${a} "); then
             echo "Invalid option: ${a}"
