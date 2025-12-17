@@ -373,6 +373,7 @@ if buildAll || hasArg libcuopt; then
           -DWRITE_FATBIN=${WRITE_FATBIN} \
           -DHOST_LINEINFO=${HOST_LINEINFO} \
           -DPARALLEL_LEVEL="${PARALLEL_LEVEL}" \
+          -DINSTALL_TARGET="${INSTALL_TARGET}" \
           "${CACHE_ARGS[@]}" \
           "${EXTRA_CMAKE_ARGS[@]}" \
           "${REPODIR}"/cpp
