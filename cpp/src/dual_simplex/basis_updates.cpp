@@ -2059,16 +2059,21 @@ int basis_update_mpf_t<i_t, f_t>::refactor_basis(
 
   if (L0_.m != A.m) { resize(A.m); }
   std::vector<i_t> q;
-  if (factorize_basis(A,
-                      settings,
-                      basic_list,
-                      L0_,
-                      U0_,
-                      row_permutation_,
-                      inverse_row_permutation_,
-                      q,
-                      deficient,
-                      slacks_needed) == -1) {
+  i_t factorize_result = factorize_basis(A,
+                                         settings,
+                                         basic_list,
+                                         L0_,
+                                         U0_,
+                                         row_permutation_,
+                                         inverse_row_permutation_,
+                                         q,
+                                         deficient,
+                                         slacks_needed);
+  if (factorize_result == -2) {
+    // Concurrent halt requested, return early
+    return -2;
+  }
+  if (factorize_result == -1) {
     settings.log.debug("Initial factorization failed\n");
     basis_repair(A, settings, deficient, slacks_needed, basic_list, nonbasic_list, vstatus);
 
@@ -2089,16 +2094,18 @@ int basis_update_mpf_t<i_t, f_t>::refactor_basis(
     }
 #endif
 
-    if (factorize_basis(A,
-                        settings,
-                        basic_list,
-                        L0_,
-                        U0_,
-                        row_permutation_,
-                        inverse_row_permutation_,
-                        q,
-                        deficient,
-                        slacks_needed) == -1) {
+    factorize_result = factorize_basis(A,
+                                       settings,
+                                       basic_list,
+                                       L0_,
+                                       U0_,
+                                       row_permutation_,
+                                       inverse_row_permutation_,
+                                       q,
+                                       deficient,
+                                       slacks_needed);
+    if (factorize_result == -2) { return -2; }
+    if (factorize_result == -1) {
 #ifdef CHECK_L_FACTOR
       if (L0_.check_matrix() == -1) { settings.log.printf("Bad L after basis repair\n"); }
 #endif

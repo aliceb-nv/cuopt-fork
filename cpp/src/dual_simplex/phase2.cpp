@@ -2242,9 +2242,9 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
     assert(superbasic_list.size() == 0);
     assert(nonbasic_list.size() == n - m);
 
-    if (ft.refactor_basis(lp.A, settings, basic_list, nonbasic_list, vstatus) > 0) {
-      return dual::status_t::NUMERICAL;
-    }
+    i_t refactor_result = ft.refactor_basis(lp.A, settings, basic_list, nonbasic_list, vstatus);
+    if (refactor_result == -2) { return dual::status_t::CONCURRENT_LIMIT; }
+    if (refactor_result > 0) { return dual::status_t::NUMERICAL; }
 
     if (toc(start_time) > settings.time_limit) { return dual::status_t::TIME_LIMIT; }
   }
@@ -2884,7 +2884,9 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
 #endif
     if (should_refactor) {
       bool should_recompute_x = false;
-      if (ft.refactor_basis(lp.A, settings, basic_list, nonbasic_list, vstatus) > 0) {
+      i_t refactor_result = ft.refactor_basis(lp.A, settings, basic_list, nonbasic_list, vstatus);
+      if (refactor_result == -2) { return dual::status_t::CONCURRENT_LIMIT; }
+      if (refactor_result > 0) {
         should_recompute_x = true;
         settings.log.printf("Failed to factorize basis. Iteration %d\n", iter);
         if (toc(start_time) > settings.time_limit) { return dual::status_t::TIME_LIMIT; }
@@ -2902,6 +2904,7 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
           count++;
           if (count > 10) { return dual::status_t::NUMERICAL; }
         }
+        if (deficient_size == -2) { return dual::status_t::CONCURRENT_LIMIT; }
 
         settings.log.printf("Successfully repaired basis. Iteration %d\n", iter);
       }

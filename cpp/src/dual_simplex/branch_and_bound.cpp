@@ -1364,6 +1364,11 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
     return mip_status_t::UNBOUNDED;
   }
 
+  if (root_status == lp_status_t::CONCURRENT_LIMIT &&
+      settings_.check_termination(exploration_stats_.start_time)) {
+    solver_status_ = mip_exploration_status_t::TIME_LIMIT;
+    return set_final_solution(solution, root_objective_);
+  }
   if (root_status == lp_status_t::TIME_LIMIT) {
     solver_status_ = mip_exploration_status_t::TIME_LIMIT;
     return set_final_solution(solution, -inf);
