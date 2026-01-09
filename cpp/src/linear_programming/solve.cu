@@ -846,7 +846,7 @@ optimization_problem_solution_t<i_t, f_t> solve_lp(
     // This needs to be called before pdlp is initialized
     init_handler(op_problem.get_handle_ptr());
 
-#ifndef NDEBUG
+#if 1
     CUOPT_LOG_DEBUG("Enabling host FPEs");
     fpe_enable fpe_guard(FE_DIVBYZERO | FE_INVALID);
 #endif
