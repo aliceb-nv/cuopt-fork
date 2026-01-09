@@ -88,7 +88,7 @@ endif(BUILD_SANITIZER)
 
 # To use ThreadSanitizer:
 # 1. Build with clang and the -tsan flag
-# 2. Run the binary with env var set: OMP_TOOL_LIBRARIES=/usr/lib/llvm-17/lib/libarcher.so ARCHER_OPTIONS='verbose=1' TSAN_OPTIONS='suppresions=cpp/tsan_suppressions.txt:ignore_noninstrumented_modules=1:halt_on_error=1'
+# 2. Run the binary with env var set: OMP_TOOL_LIBRARIES=/usr/lib/llvm-17/lib/libarcher.so ARCHER_OPTIONS='verbose=1' TSAN_OPTIONS='suppresions=cpp/utilities/tsan_suppressions.txt:ignore_noninstrumented_modules=1:halt_on_error=1'
 #     Replace with local llvm install path. libarcher.so must be presetn
 if(BUILD_TSAN)
   message(STATUS "Building with ThreadSanitizer enabled")
