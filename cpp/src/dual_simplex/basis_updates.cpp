@@ -1,6 +1,6 @@
 /* clang-format off */
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 /* clang-format on */
@@ -1656,7 +1656,7 @@ i_t basis_update_mpf_t<i_t, f_t>::b_solve(const sparse_vector_t<i_t, f_t>& rhs,
     solution.from_dense(solution_dense);
   }
   if (need_Lsol) { Lsol = solution; }
-  sum_L_ += static_cast<f_t>(solution.i.size()) / input_size;
+  if (input_size > 0.0) { sum_L_ += static_cast<f_t>(solution.i.size()) / input_size; }
 
 #ifdef CHECK_L_SOLVE
   std::vector<f_t> l_solve_dense;
@@ -1677,6 +1677,8 @@ i_t basis_update_mpf_t<i_t, f_t>::b_solve(const sparse_vector_t<i_t, f_t>& rhs,
 #endif
 
   const f_t rhs_size = static_cast<f_t>(solution.i.size());
+  // (nothing to solve, avoids 0/0 in statistics)
+  if (rhs_size == 0.0) { return 0; }
   estimate_solution_density(rhs_size, sum_U_, num_calls_U_, use_hypersparse);
   if (use_hypersparse) {
     u_solve(solution);
