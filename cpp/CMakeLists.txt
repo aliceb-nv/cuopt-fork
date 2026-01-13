@@ -125,8 +125,12 @@ list(APPEND CUOPT_CUDA_FLAGS -fopenmp)
 
 # Add jobserver flags for parallel compilation if PARALLEL_LEVEL is set
 if(PARALLEL_LEVEL AND NOT "${PARALLEL_LEVEL}" STREQUAL "")
-  message(STATUS "Enabling nvcc jobserver support for parallel builds")
-  list(APPEND CUOPT_CUDA_FLAGS --threads=0 --split-compile=0 --jobserver)
+  message(STATUS "Enabling nvcc parallel compilation support")
+  list(APPEND CUOPT_CUDA_FLAGS --threads=0 --split-compile=0)
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
+    message(STATUS "Enabling nvcc jobserver support (NVCC >= 13.0)")
+    list(APPEND CUOPT_CUDA_FLAGS --jobserver)
+  endif()
 endif()
 
 if(NOT DISABLE_OPENMP)
