@@ -1354,7 +1354,8 @@ i_t basis_update_mpf_t<i_t, f_t>::b_transpose_solve(const sparse_vector_t<i_t, f
     solution.from_dense(solution_dense);
   }
   UTsol = solution;
-  sum_U_transpose_ += static_cast<f_t>(solution.i.size()) / input_size;
+  // avoid div-by-zero FPE
+  if (input_size > 0.0) { sum_U_transpose_ += static_cast<f_t>(solution.i.size()) / input_size; }
 
 #ifdef CHECK_U_TRANSPOSE_SOLVE
   std::vector<f_t> UTsol_dense;
@@ -1383,7 +1384,8 @@ i_t basis_update_mpf_t<i_t, f_t>::b_transpose_solve(const sparse_vector_t<i_t, f
     l_transpose_solve(solution_dense);
     solution.from_dense(solution_dense);
   }
-  sum_L_transpose_ += static_cast<f_t>(solution.i.size()) / rhs_size;
+  // avoid div-by-zero FPE
+  if (rhs_size > 0.0) { sum_L_transpose_ += static_cast<f_t>(solution.i.size()) / rhs_size; }
 
 #ifdef CHECK_L_TRANSPOSE_SOLVE
   std::vector<f_t> solution_dense;
