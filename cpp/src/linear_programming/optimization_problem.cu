@@ -126,14 +126,12 @@ static bool csr_matrices_equivalent_with_permutation(const rmm::device_uvector<i
   rmm::device_uvector<i_t> this_cols(nnz, stream);
   rmm::device_uvector<f_t> this_vals(nnz, stream);
 
-  rmm::device_uvector<i_t> entry_indices(nnz, stream);
-  thrust::sequence(policy, entry_indices.begin(), entry_indices.end());
-
+  // upper_bound returns 1-based indices; convert to 0-based
   thrust::upper_bound(policy,
                       this_offsets.begin(),
                       this_offsets.end(),
-                      entry_indices.begin(),
-                      entry_indices.end(),
+                      thrust::make_counting_iterator<i_t>(0),
+                      thrust::make_counting_iterator<i_t>(nnz),
                       this_rows.begin());
   thrust::transform(
     policy, this_rows.begin(), this_rows.end(), this_rows.begin(), [] __device__(i_t r) {
@@ -151,8 +149,8 @@ static bool csr_matrices_equivalent_with_permutation(const rmm::device_uvector<i
   thrust::upper_bound(policy,
                       other_offsets.begin(),
                       other_offsets.end(),
-                      entry_indices.begin(),
-                      entry_indices.end(),
+                      thrust::make_counting_iterator<i_t>(0),
+                      thrust::make_counting_iterator<i_t>(nnz),
                       other_rows.begin());
   thrust::transform(
     policy, other_rows.begin(), other_rows.end(), other_rows.begin(), [] __device__(i_t r) {
@@ -259,19 +257,23 @@ bool optimization_problem_t<i_t, f_t>::is_equivalent(
   };
 
   // Compare variable-indexed arrays
+  if (c_.size() != other.c_.size()) { return false; }
   if (!permuted_eq(c_.begin(), c_.end(), other.c_.begin(), d_var_perm.begin())) { return false; }
+  if (variable_lower_bounds_.size() != other.variable_lower_bounds_.size()) { return false; }
   if (!permuted_eq(variable_lower_bounds_.begin(),
                    variable_lower_bounds_.end(),
                    other.variable_lower_bounds_.begin(),
                    d_var_perm.begin())) {
     return false;
   }
+  if (variable_upper_bounds_.size() != other.variable_upper_bounds_.size()) { return false; }
   if (!permuted_eq(variable_upper_bounds_.begin(),
                    variable_upper_bounds_.end(),
                    other.variable_upper_bounds_.begin(),
                    d_var_perm.begin())) {
     return false;
   }
+  if (variable_types_.size() != other.variable_types_.size()) { return false; }
   if (!permuted_eq(variable_types_.begin(),
                    variable_types_.end(),
                    other.variable_types_.begin(),
@@ -280,19 +282,23 @@ bool optimization_problem_t<i_t, f_t>::is_equivalent(
   }
 
   // Compare constraint-indexed arrays
+  if (b_.size() != other.b_.size()) { return false; }
   if (!permuted_eq(b_.begin(), b_.end(), other.b_.begin(), d_row_perm.begin())) { return false; }
+  if (constraint_lower_bounds_.size() != other.constraint_lower_bounds_.size()) { return false; }
   if (!permuted_eq(constraint_lower_bounds_.begin(),
                    constraint_lower_bounds_.end(),
                    other.constraint_lower_bounds_.begin(),
                    d_row_perm.begin())) {
     return false;
   }
+  if (constraint_upper_bounds_.size() != other.constraint_upper_bounds_.size()) { return false; }
   if (!permuted_eq(constraint_upper_bounds_.begin(),
                    constraint_upper_bounds_.end(),
                    other.constraint_upper_bounds_.begin(),
                    d_row_perm.begin())) {
     return false;
   }
+  if (row_types_.size() != other.row_types_.size()) { return false; }
   if (!permuted_eq(
         row_types_.begin(), row_types_.end(), other.row_types_.begin(), d_row_perm.begin())) {
     return false;

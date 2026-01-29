@@ -705,6 +705,7 @@ cuopt_int_t cuOptGetFloatParameter(cuOptSolverSettings settings,
  *            of size num_variables containing the initial primal values.
  * @param[in] num_variables - The number of variables (size of the primal_solution array).
  *
+ * @note All pointer arguments (primal_solution) refer to host memory.
  * @return A status code indicating success or failure.
  */
 cuopt_int_t cuOptSetInitialPrimalSolution(cuOptSolverSettings settings,
@@ -721,6 +722,7 @@ cuopt_int_t cuOptSetInitialPrimalSolution(cuOptSolverSettings settings,
  *            of size num_constraints containing the initial dual values.
  * @param[in] num_constraints - The number of constraints (size of the dual_solution array).
  *
+ * @note All pointer arguments (dual_solution) refer to host memory.
  * @return A status code indicating success or failure.
  */
 cuopt_int_t cuOptSetInitialDualSolution(cuOptSolverSettings settings,
@@ -740,6 +742,7 @@ cuopt_int_t cuOptSetInitialDualSolution(cuOptSolverSettings settings,
  *
  * @attention Currently unsupported with presolve on.
  *
+ * @note All pointer arguments (solution) refer to host memory.
  * @return A status code indicating success or failure.
  */
 cuopt_int_t cuOptAddMIPStart(cuOptSolverSettings settings,
