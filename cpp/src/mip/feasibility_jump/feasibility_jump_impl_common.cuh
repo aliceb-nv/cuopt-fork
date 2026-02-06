@@ -138,6 +138,8 @@ HDI std::pair<f_t, f_t> feas_score_constraint(
     cuopt_assert(isfinite(new_lhs), "");
     cuopt_assert(isfinite(old_slack) && isfinite(new_slack), "");
 
+    cstr_weight = std::max(cstr_weight, 0.0);
+
     f_t cstr_tolerance = fj.get_corrected_tolerance(cstr_idx);
 
     bool old_viol = fj.excess_score(cstr_idx, current_lhs, c_lb, c_ub) < -cstr_tolerance;
