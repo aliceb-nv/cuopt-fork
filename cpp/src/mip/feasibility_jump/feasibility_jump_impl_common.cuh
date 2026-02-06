@@ -1,6 +1,6 @@
 /* clang-format off */
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 /* clang-format on */
@@ -144,8 +144,8 @@ HDI std::pair<f_t, f_t> feas_score_constraint(
     bool new_viol =
       fj.excess_score(cstr_idx, current_lhs + cstr_coeff * delta, c_lb, c_ub) < -cstr_tolerance;
 
-    bool old_sat = old_lhs < rhs + cstr_tolerance;
-    bool new_sat = new_lhs < rhs + cstr_tolerance;
+    bool old_sat = old_lhs <= rhs + cstr_tolerance;
+    bool new_sat = new_lhs <= rhs + cstr_tolerance;
 
     // equality
     if (fj.pb.integer_equal(c_lb, c_ub)) {
