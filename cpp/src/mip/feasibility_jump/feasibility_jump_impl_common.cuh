@@ -147,7 +147,7 @@ HDI std::pair<f_t, f_t> feas_score_constraint(
     bool old_sat = old_lhs <= rhs + cstr_tolerance;
     bool new_sat = new_lhs <= rhs + cstr_tolerance;
 
-    // equality1
+    // equality
     if (fj.pb.integer_equal(c_lb, c_ub)) {
       if (!old_viol) cuopt_assert(old_sat == !old_viol, "");
       if (!new_viol) cuopt_assert(new_sat == !new_viol, "");
