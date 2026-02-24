@@ -251,11 +251,13 @@ papilo::PresolveStatus SingleLockDualAggregation<f_t>::execute(
 
     // Probe: replace cand and y's min/max contributions with their fixed test
     // values, then check if the resulting activity violates the row bound.
-    // Both candidate and master are binary [0,1], so min/max contributions simplify
-    auto evaluate = [&](f_t cand_coeff, bool is_upward, int y_col, f_t y_coef) -> bool {
+    // Both candidate and master are binary [0,1], so min/max contributions simplify.
+    // anti=false: direct (y_unfav=0 for upward, y_unfav=1 for downward)
+    // anti=true:  complement (y_unfav=1 for upward, y_unfav=0 for downward)
+    auto evaluate = [&](f_t cand_coeff, bool is_upward, int y_col, f_t y_coef, bool anti) -> bool {
       if (y_col < 0) return false;
       f_t cand_test = is_upward ? cand_coeff : f_t{0};
-      f_t y_test    = is_upward ? f_t{0} : y_coef;
+      f_t y_test    = (is_upward == anti) ? y_coef : f_t{0};
       f_t test      = cand_test + y_test;
 
       if (use_leq_check) {
@@ -285,20 +287,30 @@ papilo::PresolveStatus SingleLockDualAggregation<f_t>::execute(
 
       bool proven    = false;
       int master_col = -1;
+      bool is_anti   = false;
 
-      // For LEQ upward: y=0 zeroes out y's contribution, so the best master
-      // is the one with the most negative coefficient (maximizes probed_min).
-      // For LEQ downward: y=1 adds y's coefficient, so pick the most positive.
-      auto try_prove = [&](bool check, const top2_t& tracker) {
+      // For LEQ upward direct: y=0 zeroes out y's contribution, so the best
+      // master is the one with the most negative coefficient (maximizes
+      // probed_min). For anti (complement): y=1, so pick most positive instead.
+      auto try_prove = [&](bool check, const top2_t& direct_trk, const top2_t& anti_trk) {
         if (!check || proven) return;
-        auto [y, yc] = pick_master(tracker, cand);
-        if (evaluate(cand_coeff, is_upward, y, yc)) {
+        auto [yd, ycd] = pick_master(direct_trk, cand);
+        if (evaluate(cand_coeff, is_upward, yd, ycd, false)) {
           proven     = true;
-          master_col = y;
+          master_col = yd;
+          is_anti    = false;
+          return;
+        }
+        auto [ya, yca] = pick_master(anti_trk, cand);
+        if (evaluate(cand_coeff, is_upward, ya, yca, true)) {
+          proven     = true;
+          master_col = ya;
+          is_anti    = true;
+          return;
         }
       };
-      try_prove(use_leq_check, is_upward ? neg_y : pos_y);
-      try_prove(use_geq_check, is_upward ? pos_y : neg_y);
+      try_prove(use_leq_check, is_upward ? neg_y : pos_y, is_upward ? pos_y : neg_y);
+      try_prove(use_geq_check, is_upward ? pos_y : neg_y, is_upward ? neg_y : pos_y);
       if (!proven) continue;
 
       // The probe proves a one-directional implication (e.g. y=0 => x=0).
@@ -306,8 +318,10 @@ papilo::PresolveStatus SingleLockDualAggregation<f_t>::execute(
       // only safe if forcing x to its bound doesn't starve other variables of
       // capacity in the locking row. Verify the row becomes globally non-binding
       // when y is in its favorable state.
+      // For direct: favorable y=1 (upward) or y=0 (downward).
+      // For anti (complement): favorable state flips.
       f_t y_coef_val    = dense_row_coefs[master_col];
-      f_t fav_y_contrib = is_upward ? y_coef_val : 0.0;
+      f_t fav_y_contrib = (is_upward != is_anti) ? y_coef_val : f_t{0};
 
       auto check_side =
         [&](bool active, bool unbounded, f_t activity, f_t orig_y, f_t bound, bound_side side) {
@@ -326,7 +340,10 @@ papilo::PresolveStatus SingleLockDualAggregation<f_t>::execute(
       if (!proven) continue;
 
       substituted[cand] = true;
-      reductions.replaceCol(cand, master_col, f_t{1}, f_t{0});
+      if (is_anti)
+        reductions.replaceCol(cand, master_col, f_t{-1}, f_t{1});  // x = 1 - y
+      else
+        reductions.replaceCol(cand, master_col, f_t{1}, f_t{0});  // x = y
       ++n_substitutions;
     }
 
