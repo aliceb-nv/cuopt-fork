@@ -766,10 +766,13 @@ static void apply_move(fj_cpu_climber_t<i_t, f_t>& fj_cpu,
     cuopt_assert(fj_cpu.view.pb.integer_equal(new_val, round(new_val)), "new_val is not integer");
     new_val = round(new_val);
   }
+  // clamp to var bounds
+  new_val = std::min(std::max(new_val, get_lower(fj_cpu.h_var_bounds[var_idx].get())),
+                     get_upper(fj_cpu.h_var_bounds[var_idx].get()));
   fj_cpu.h_assignment[var_idx] = new_val;
 
   cuopt_assert((check_variable_within_bounds<i_t, f_t>(fj_cpu, var_idx, new_val)),
-               "1assignment not within bounds");
+               "assignment not within bounds");
   cuopt_assert(isfinite(new_val), "assignment is not finite");
 
   fj_cpu.h_incumbent_objective += fj_cpu.h_obj_coeffs[var_idx] * delta;
@@ -786,11 +789,11 @@ static void apply_move(fj_cpu_climber_t<i_t, f_t>& fj_cpu,
       fj_cpu.iterations_since_best = 0;
       CUOPT_LOG_TRACE("%sCPUFJ: new best objective: %g",
                       fj_cpu.log_prefix.c_str(),
-                      fj_cpu.pb_ptr->get_user_obj_from_solver_obj(fj_cpu.h_best_objective));
+                      fj_cpu.pb_ptr->get_user_obj_from_solver_obj(fj_cpu.h_incumbent_objective));
       if (fj_cpu.improvement_callback) {
         double current_work_units = fj_cpu.work_units_elapsed.load(std::memory_order_acquire);
         fj_cpu.improvement_callback(
-          fj_cpu.h_best_objective, fj_cpu.h_assignment, current_work_units);
+          fj_cpu.h_incumbent_objective, fj_cpu.h_assignment, current_work_units);
       }
       fj_cpu.feasible_found = true;
     }
@@ -1020,6 +1023,13 @@ static void recompute_lhs(fj_cpu_climber_t<i_t, f_t>& fj_cpu)
 {
   CPUFJ_NVTX_RANGE("CPUFJ::recompute_lhs");
   cuopt_assert(fj_cpu.h_lhs.size() == fj_cpu.view.pb.n_constraints, "h_lhs size mismatch");
+
+  // clamp to var bounds - defensive; apply_move should already have clamped appropriately
+  for (i_t var_idx = 0; var_idx < fj_cpu.view.pb.n_variables; ++var_idx) {
+    fj_cpu.h_assignment[var_idx] = std::min(
+      std::max(fj_cpu.h_assignment[var_idx].get(), get_lower(fj_cpu.h_var_bounds[var_idx].get())),
+      get_upper(fj_cpu.h_var_bounds[var_idx].get()));
+  }
 
   fj_cpu.violated_constraints.clear();
   fj_cpu.satisfied_constraints.clear();
