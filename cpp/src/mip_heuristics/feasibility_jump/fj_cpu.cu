@@ -769,7 +769,7 @@ static void apply_move(fj_cpu_climber_t<i_t, f_t>& fj_cpu,
   fj_cpu.h_assignment[var_idx] = new_val;
 
   cuopt_assert((check_variable_within_bounds<i_t, f_t>(fj_cpu, var_idx, new_val)),
-               "assignment not within bounds");
+               "1assignment not within bounds");
   cuopt_assert(isfinite(new_val), "assignment is not finite");
 
   fj_cpu.h_incumbent_objective += fj_cpu.h_obj_coeffs[var_idx] * delta;
