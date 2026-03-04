@@ -702,6 +702,21 @@ static void apply_move(fj_cpu_climber_t<i_t, f_t>& fj_cpu,
   raft::random::PCGenerator rng(fj_cpu.settings.seed + fj_cpu.iterations, 0, 0);
 
   cuopt_assert(var_idx < fj_cpu.view.pb.n_variables, "variable index out of bounds");
+  f_t old_val = fj_cpu.h_assignment[var_idx];
+  f_t new_val = old_val + delta;
+  if (is_integer_var<i_t, f_t>(fj_cpu, var_idx)) {
+    cuopt_assert(fj_cpu.view.pb.integer_equal(new_val, round(new_val)), "new_val is not integer");
+    new_val = round(new_val);
+  }
+  // clamp to var bounds
+  new_val = std::min(std::max(new_val, get_lower(fj_cpu.h_var_bounds[var_idx].get())),
+                     get_upper(fj_cpu.h_var_bounds[var_idx].get()));
+  delta   = new_val - old_val;
+  cuopt_assert(isfinite(new_val), "assignment is not finite");
+  cuopt_assert(isfinite(delta), "applied delta is not finite");
+  cuopt_assert((check_variable_within_bounds<i_t, f_t>(fj_cpu, var_idx, new_val)),
+               "assignment not within bounds");
+
   // Update the LHSs of all involved constraints.
   auto [offset_begin, offset_end] = reverse_range_for_var<i_t, f_t>(fj_cpu, var_idx);
 
@@ -761,20 +776,7 @@ static void apply_move(fj_cpu_climber_t<i_t, f_t>& fj_cpu,
   }
 
   // update the assignment and objective proper
-  f_t new_val = fj_cpu.h_assignment[var_idx] + delta;
-  if (is_integer_var<i_t, f_t>(fj_cpu, var_idx)) {
-    cuopt_assert(fj_cpu.view.pb.integer_equal(new_val, round(new_val)), "new_val is not integer");
-    new_val = round(new_val);
-  }
-  // clamp to var bounds
-  new_val = std::min(std::max(new_val, get_lower(fj_cpu.h_var_bounds[var_idx].get())),
-                     get_upper(fj_cpu.h_var_bounds[var_idx].get()));
   fj_cpu.h_assignment[var_idx] = new_val;
-
-  cuopt_assert((check_variable_within_bounds<i_t, f_t>(fj_cpu, var_idx, new_val)),
-               "assignment not within bounds");
-  cuopt_assert(isfinite(new_val), "assignment is not finite");
-
   fj_cpu.h_incumbent_objective += fj_cpu.h_obj_coeffs[var_idx] * delta;
   if (fj_cpu.h_incumbent_objective < fj_cpu.h_best_objective &&
       fj_cpu.violated_constraints.empty()) {

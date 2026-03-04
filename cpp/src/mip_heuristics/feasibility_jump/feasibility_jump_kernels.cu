@@ -590,13 +590,9 @@ __global__ void update_assignment_kernel(typename fj_t<i_t, f_t>::climber_data_t
   // update the assignment and objective proper
   if (FIRST_THREAD) {
     f_t new_val = fj.incumbent_assignment[var_idx] + fj.jump_move_delta[var_idx];
+
     cuopt_assert(fj.pb.check_variable_within_bounds(var_idx, new_val),
                  "assignment not within bounds");
-    // clamping to err on the safe size - assert catches this
-    auto bounds = fj.pb.variable_bounds[var_idx];
-    f_t lb      = get_lower(bounds);
-    f_t ub      = get_upper(bounds);
-    new_val     = min(max(new_val, lb), ub);
     cuopt_assert(isfinite(new_val), "assignment is not finite");
 
     if (fj.pb.is_integer_var(var_idx)) {
@@ -621,6 +617,7 @@ __global__ void update_assignment_kernel(typename fj_t<i_t, f_t>::climber_data_t
       }
     }
 
+    auto bounds          = fj.pb.variable_bounds[var_idx];
     i_t var_range        = get_upper(bounds) - get_lower(bounds);
     double delta_rel_err = fabs(fj.jump_move_delta[var_idx]) / var_range;
     if (delta_rel_err < fj.settings->parameters.small_move_tabu_threshold) {
