@@ -802,8 +802,7 @@ void problem_t<i_t, f_t>::recompute_auxilliary_data(bool check_representation)
   compute_binary_var_table();
   compute_vars_with_objective_coeffs();
   // TODO: speedup compute related variables
-  const double time_limit = 30.;
-  compute_related_variables(time_limit);
+  compute_related_variables(related_vars_time_limit);
   if (check_representation) cuopt_func_call(check_problem_representation(true));
 }
 

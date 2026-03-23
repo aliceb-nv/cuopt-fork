@@ -37,12 +37,33 @@ size_t sub_mip_recombiner_config_t::max_n_of_vars_from_other =
 template <typename i_t, typename f_t>
 std::vector<recombiner_enum_t> recombiner_t<i_t, f_t>::enabled_recombiners;
 
+namespace {
+diversity_config_t make_diversity_config(const mip_heuristic_hyper_params_t& hp)
+{
+  diversity_config_t c;
+  c.max_solutions                = hp.population_size;
+  c.time_ratio_on_init_lp        = hp.root_lp_time_ratio;
+  c.max_time_on_lp               = hp.root_lp_max_time;
+  c.initial_infeasibility_weight = hp.initial_infeasibility_weight;
+  return c;
+}
+
+rins_settings_t make_rins_settings(const mip_heuristic_hyper_params_t& hp)
+{
+  rins_settings_t s;
+  s.default_fixrate    = hp.rins_fix_rate;
+  s.default_time_limit = hp.rins_time_limit;
+  s.max_time_limit     = hp.rins_max_time_limit;
+  return s;
+}
+}  // namespace
+
 template <typename i_t, typename f_t>
 diversity_manager_t<i_t, f_t>::diversity_manager_t(mip_solver_context_t<i_t, f_t>& context_)
   : context(context_),
     branch_and_bound_ptr(nullptr),
     problem_ptr(context.problem_ptr),
-    diversity_config(),
+    diversity_config(make_diversity_config(context_.settings.heuristic_params)),
     population("population",
                context,
                *this,
@@ -54,7 +75,7 @@ diversity_manager_t<i_t, f_t>::diversity_manager_t(mip_solver_context_t<i_t, f_t
     lp_dual_optimal_solution(context.problem_ptr->n_constraints,
                              context.problem_ptr->handle_ptr->get_stream()),
     ls(context, lp_optimal_solution),
-    rins(context, *this),
+    rins(context, *this, make_rins_settings(context_.settings.heuristic_params)),
     timer(diversity_config.default_time_limit),
     bound_prop_recombiner(context,
                           context.problem_ptr->n_variables,
@@ -206,7 +227,8 @@ bool diversity_manager_t<i_t, f_t>::run_presolve(f_t time_limit, timer_t global_
       compute_probing_cache(ls.constraint_prop.bounds_update, *problem_ptr, probing_timer);
     if (problem_is_infeasible) { return false; }
   }
-  const bool remap_cache_ids = true;
+  const bool remap_cache_ids           = true;
+  problem_ptr->related_vars_time_limit = context.settings.heuristic_params.related_vars_time_limit;
   if (!global_timer.check_time_limit()) { trivial_presolve(*problem_ptr, remap_cache_ids); }
   if (!problem_ptr->empty && !check_bounds_sanity(*problem_ptr)) { return false; }
   // if (!presolve_timer.check_time_limit() && !context.settings.heuristics_only &&
@@ -394,7 +416,8 @@ solution_t<i_t, f_t> diversity_manager_t<i_t, f_t>::run_solver()
   problem_ptr->check_problem_representation(true);
   // have the structure ready for reusing later
   problem_ptr->compute_integer_fixed_problem();
-  recombiner_t<i_t, f_t>::init_enabled_recombiners(*problem_ptr);
+  recombiner_t<i_t, f_t>::init_enabled_recombiners(
+    *problem_ptr, context.settings.heuristic_params.enabled_recombiners);
   mab_recombiner.resize_mab_arm_stats(recombiner_t<i_t, f_t>::enabled_recombiners.size());
   // test problem is not ii
   cuopt_func_call(

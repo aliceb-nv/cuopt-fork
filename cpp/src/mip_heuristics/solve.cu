@@ -157,6 +157,7 @@ mip_solution_t<i_t, f_t> run_mip(detail::problem_t<i_t, f_t>& problem,
   // only call preprocess on scaled problem, so we can compute feasibility on the original problem
   scaled_problem.preprocess_problem();
   // cuopt_func_call((check_scaled_problem<i_t, f_t>(scaled_problem, saved_problem)));
+  scaled_problem.related_vars_time_limit = settings.heuristic_params.related_vars_time_limit;
   detail::trivial_presolve(scaled_problem);
 
   detail::mip_solver_t<i_t, f_t> solver(scaled_problem, settings, scaling, timer);
@@ -270,7 +271,9 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
       detail::sort_csr(op_problem);
       // allocate not more than 10% of the time limit to presolve.
       // Note that this is not the presolve time, but the time limit for presolve.
-      double presolve_time_limit = std::min(0.1 * time_limit, 60.0);
+      const auto& hp = settings.heuristic_params;
+      double presolve_time_limit =
+        std::min(hp.presolve_time_ratio * time_limit, hp.presolve_max_time);
       if (settings.determinism_mode == CUOPT_MODE_DETERMINISTIC) {
         presolve_time_limit = std::numeric_limits<double>::infinity();
       }

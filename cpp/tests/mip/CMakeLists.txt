@@ -49,3 +49,6 @@ ConfigureTest(MIP_TERMINATION_STATUS_TEST
 ConfigureTest(DETERMINISM_TEST
     ${CMAKE_CURRENT_SOURCE_DIR}/determinism_test.cu
 )
+ConfigureTest(HEURISTIC_HYPER_PARAMS_TEST
+    ${CMAKE_CURRENT_SOURCE_DIR}/heuristic_hyper_params_test.cu
+)

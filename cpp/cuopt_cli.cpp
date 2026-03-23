@@ -27,6 +27,7 @@
 #include <vector>
 
 #include <math_optimization/solution_reader.hpp>
+#include <mip_heuristics/heuristic_hyper_params_loader.hpp>
 
 #include <cuopt/version_config.hpp>
 
@@ -90,7 +91,8 @@ inline cuopt::init_logger_t dummy_logger(
 int run_single_file(const std::string& file_path,
                     const std::string& initial_solution_file,
                     bool solve_relaxation,
-                    const std::map<std::string, std::string>& settings_strings)
+                    const std::map<std::string, std::string>& settings_strings,
+                    const std::string& heuristic_config_file = "")
 {
   cuopt::linear_programming::solver_settings_t<int, double> settings;
 
@@ -177,6 +179,10 @@ int run_single_file(const std::string& file_path,
   try {
     if (is_mip) {
       auto& mip_settings = settings.get_mip_settings();
+      if (!heuristic_config_file.empty()) {
+        cuopt::linear_programming::fill_mip_heuristic_hyper_params(heuristic_config_file,
+                                                                   mip_settings.heuristic_params);
+      }
       auto solution = cuopt::linear_programming::solve_mip(problem_interface.get(), mip_settings);
     } else {
       auto& lp_settings = settings.get_pdlp_settings();
@@ -258,6 +264,16 @@ int set_cuda_module_loading(int argc, char* argv[])
  */
 int main(int argc, char* argv[])
 {
+  // Handle --dump-mip-heuristic-config before argparse so no other args are required
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--dump-mip-heuristic-config" && i + 1 < argc) {
+      cuopt::linear_programming::mip_heuristic_hyper_params_t defaults;
+      cuopt::linear_programming::dump_mip_heuristic_hyper_params(argv[i + 1], defaults);
+      return 0;
+    }
+  }
+
   if (set_cuda_module_loading(argc, argv) != 0) { return 1; }
 
   // Get the version string from the version_config.hpp file
@@ -285,6 +301,14 @@ int main(int argc, char* argv[])
     .help("enable/disable presolve (default: true for MIP problems, false for LP problems)")
     .default_value(true)
     .implicit_value(true);
+
+  program.add_argument("--mip-heuristic-config")
+    .help("path to MIP heuristic hyper-parameters config file (key = value format)")
+    .default_value(std::string(""));
+
+  program.add_argument("--dump-mip-heuristic-config")
+    .help("write default MIP heuristic hyper-parameters to the given file and exit")
+    .default_value(std::string(""));
 
   std::map<std::string, std::string> arg_name_to_param_name;
 
@@ -392,5 +416,8 @@ int main(int argc, char* argv[])
     RAFT_CUDA_TRY(cudaSetDevice(0));
   }
 
-  return run_single_file(file_name, initial_solution_file, solve_relaxation, settings_strings);
+  const auto heuristic_config = program.get<std::string>("--mip-heuristic-config");
+
+  return run_single_file(
+    file_name, initial_solution_file, solve_relaxation, settings_strings, heuristic_config);
 }

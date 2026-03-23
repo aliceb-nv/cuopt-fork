@@ -112,7 +112,8 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
   f_t time_limit             = context.settings.determinism_mode == CUOPT_MODE_DETERMINISTIC
                                  ? std::numeric_limits<f_t>::infinity()
                                  : timer_.remaining_time();
-  double presolve_time_limit = std::min(0.1 * time_limit, 60.0);
+  const auto& hp             = context.settings.heuristic_params;
+  double presolve_time_limit = std::min(hp.presolve_time_ratio * time_limit, hp.presolve_max_time);
   presolve_time_limit        = context.settings.determinism_mode == CUOPT_MODE_DETERMINISTIC
                                  ? std::numeric_limits<f_t>::infinity()
                                  : presolve_time_limit;
