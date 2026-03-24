@@ -32,8 +32,48 @@
 
 static char cuda_module_loading_env[] = "CUDA_MODULE_LOADING=EAGER";
 
+/**
+ * @file cuopt_cli.cpp
+ * @brief Command line interface for solving Linear Programming (LP) and Mixed Integer Programming
+ * (MIP) problems using cuOpt
+ *
+ * This CLI provides a simple interface to solve LP/MIP problems using cuOpt. It accepts MPS format
+ * input files and various solver parameters.
+ *
+ * Usage:
+ * ```
+ * cuopt_cli <mps_file_path> [OPTIONS]
+ * cuopt_cli [OPTIONS] <mps_file_path>
+ * ```
+ *
+ * Required arguments:
+ * - <mps_file_path>: Path to the MPS format input file containing the optimization problem
+ *
+ * Optional arguments:
+ * - --initial-solution: Path to initial solution file in SOL format
+ * - Various solver parameters that can be passed as command line arguments
+ *   (e.g. --max-iterations, --tolerance, etc.)
+ *
+ * Example:
+ * ```
+ * cuopt_cli problem.mps --max-iterations 1000
+ * ```
+ *
+ * The solver will read the MPS file, solve the optimization problem according to the specified
+ * parameters, and write the solution to a .sol file in the output directory.
+ */
+
+/**
+ * @brief Make an async memory resource for RMM
+ * @return std::shared_ptr<rmm::mr::cuda_async_memory_resource>
+ */
 inline auto make_async() { return std::make_shared<rmm::mr::cuda_async_memory_resource>(); }
 
+/**
+ * @brief Handle logger when error happens before logger is initialized
+ * @param settings Solver settings
+ * @return cuopt::init_logger_t
+ */
 inline cuopt::init_logger_t dummy_logger(
   const cuopt::linear_programming::solver_settings_t<int, double>& settings)
 {
@@ -41,6 +81,12 @@ inline cuopt::init_logger_t dummy_logger(
                               settings.template get_parameter<bool>(CUOPT_LOG_TO_CONSOLE));
 }
 
+/**
+ * @brief Run a single file
+ * @param file_path Path to the MPS format input file containing the optimization problem
+ * @param initial_solution_file Path to initial solution file in SOL format
+ * @param settings_strings Map of solver parameters
+ */
 int run_single_file(const std::string& file_path,
                     const std::string& initial_solution_file,
                     bool solve_relaxation,
@@ -80,6 +126,8 @@ int run_single_file(const std::string& file_path,
     return -1;
   }
 
+  // Determine memory backend and create problem using interface
+  // Create handle only for GPU memory backend (avoid CUDA init on CPU-only hosts)
   auto memory_backend = cuopt::linear_programming::get_memory_backend_type();
   std::unique_ptr<raft::handle_t> handle_ptr;
   std::unique_ptr<cuopt::linear_programming::optimization_problem_interface_t<int, double>>
@@ -95,6 +143,7 @@ int run_single_file(const std::string& file_path,
       std::make_unique<cuopt::linear_programming::cpu_optimization_problem_t<int, double>>();
   }
 
+  // Populate the problem from MPS data model
   cuopt::linear_programming::populate_from_mps_data_model(problem_interface.get(), mps_data_model);
 
   const bool is_mip = (problem_interface->get_problem_category() ==
@@ -136,7 +185,6 @@ int run_single_file(const std::string& file_path,
       auto solution     = cuopt::linear_programming::solve_lp(problem_interface.get(), lp_settings);
     }
   } catch (const std::exception& e) {
-    fprintf(stderr, "cuopt_cli error: %s\n", e.what());
     CUOPT_LOG_ERROR("Error: %s", e.what());
     return -1;
   }
@@ -144,17 +192,35 @@ int run_single_file(const std::string& file_path,
   return 0;
 }
 
+/**
+ * @brief Convert a parameter name to an argument name
+ * @param input Parameter name
+ * @return Argument name
+ */
 std::string param_name_to_arg_name(const std::string& input)
 {
   std::string result = "--";
   result += input;
+
+  // Replace underscores with hyphens
   std::replace(result.begin(), result.end(), '_', '-');
+
   return result;
 }
 
+/**
+ * @brief Set the CUDA module loading environment variable
+ * If the method is 0, set the CUDA module loading environment variable to EAGER
+ * This needs to be done before the first call to the CUDA API. In this file before dummy settings
+ * default constructor is called.
+ * @param argc Number of command line arguments
+ * @param argv Command line arguments
+ * @return 0 on success, 1 on failure
+ */
 int set_cuda_module_loading(int argc, char* argv[])
 {
-  int method_int = 0;
+  // Parse method_int from argv
+  int method_int = 0;  // Default value
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
     if ((arg == "--method" || arg == "-m") && i + 1 < argc) {
@@ -166,6 +232,7 @@ int set_cuda_module_loading(int argc, char* argv[])
       }
       break;
     }
+    // Also support --method=1 style
     if (arg.rfind("--method=", 0) == 0) {
       try {
         method_int = std::stoi(arg.substr(9));
@@ -185,9 +252,15 @@ int set_cuda_module_loading(int argc, char* argv[])
   return 0;
 }
 
+/**
+ * @brief Main function for the cuOpt CLI
+ * @param argc Number of command line arguments
+ * @param argv Command line arguments
+ * @return 0 on success, 1 on failure
+ */
 int main(int argc, char* argv[])
 {
-  // Handle --dump-hyper-params before argparse so no MPS file is required
+  // Handle --show-hyper-params before argparse so no other args are required
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
     if (arg == "--show-hyper-params") {
@@ -199,14 +272,18 @@ int main(int argc, char* argv[])
 
   if (set_cuda_module_loading(argc, argv) != 0) { return 1; }
 
+  // Get the version string from the version_config.hpp file
   const std::string version_string = std::string("cuOpt ") + std::to_string(CUOPT_VERSION_MAJOR) +
                                      "." + std::to_string(CUOPT_VERSION_MINOR) + "." +
                                      std::to_string(CUOPT_VERSION_PATCH);
 
+  // Create the argument parser
   argparse::ArgumentParser program("cuopt_cli", version_string);
 
+  // Define all arguments with appropriate defaults and help messages
   program.add_argument("filename").help("input mps file").nargs(1).required();
 
+  // FIXME: use a standard format for initial solution file
   program.add_argument("--initial-solution")
     .help("path to the initial solution .sol file")
     .default_value("");
@@ -232,6 +309,8 @@ int main(int argc, char* argv[])
 
   std::map<std::string, std::string> arg_name_to_param_name;
 
+  // Register --pdlp-precision with string-to-int mapping so that it flows
+  // through the settings_strings map like other settings.
   program.add_argument("--pdlp-precision")
     .help(
       "PDLP precision mode. default: native type, single: FP32 internally, "
@@ -241,6 +320,7 @@ int main(int argc, char* argv[])
   arg_name_to_param_name["--pdlp-precision"] = CUOPT_PDLP_PRECISION;
 
   {
+    // Add all solver settings as arguments
     cuopt::linear_programming::solver_settings_t<int, double> dummy_settings;
 
     auto int_params    = dummy_settings.get_int_parameters();
@@ -250,6 +330,7 @@ int main(int argc, char* argv[])
 
     for (auto& param : int_params) {
       std::string arg_name = param_name_to_arg_name(param.param_name);
+      // handle duplicate parameters appearing in MIP and LP settings
       if (arg_name_to_param_name.count(arg_name) == 0) {
         auto& arg = program.add_argument(arg_name.c_str()).default_value(param.default_value);
         if (param.is_hyperparameter) { arg.hidden(); }
@@ -283,8 +364,9 @@ int main(int argc, char* argv[])
         arg_name_to_param_name[arg_name] = param.param_name;
       }
     }
-  }
+  }  // done with solver settings
 
+  // Parse arguments
   try {
     program.parse_args(argc, argv);
   } catch (const std::runtime_error& err) {
@@ -293,9 +375,11 @@ int main(int argc, char* argv[])
     return 1;
   }
 
+  // Map symbolic pdlp-precision names to integer values
   static const std::map<std::string, std::string> precision_name_to_value = {
     {"default", "-1"}, {"single", "0"}, {"double", "1"}, {"mixed", "2"}};
 
+  // Read everything as a string
   std::map<std::string, std::string> settings_strings;
   for (auto& [arg_name, param_name] : arg_name_to_param_name) {
     if (program.is_used(arg_name.c_str())) {
@@ -307,15 +391,18 @@ int main(int argc, char* argv[])
       settings_strings[param_name] = val;
     }
   }
+  // Get the values
   std::string file_name = program.get<std::string>("filename");
 
   const auto initial_solution_file = program.get<std::string>("--initial-solution");
   const auto solve_relaxation      = program.get<bool>("--relaxation");
 
+  // Only initialize CUDA resources if using GPU memory backend (not remote execution)
   auto memory_backend = cuopt::linear_programming::get_memory_backend_type();
   std::vector<std::shared_ptr<rmm::mr::device_memory_resource>> memory_resources;
 
   if (memory_backend == cuopt::linear_programming::memory_backend_t::GPU) {
+    // All arguments are parsed as string, default values are parsed as int if unused.
     const auto num_gpus = program.is_used("--num-gpus")
                             ? std::stoi(program.get<std::string>("--num-gpus"))
                             : program.get<int>("--num-gpus");
