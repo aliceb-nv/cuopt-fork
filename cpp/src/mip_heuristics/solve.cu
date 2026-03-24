@@ -164,8 +164,9 @@ mip_solution_t<i_t, f_t> run_mip(detail::problem_t<i_t, f_t>& problem,
     if (timer.check_time_limit()) {
       CUOPT_LOG_INFO("Time limit reached before main solve");
       detail::solution_t<i_t, f_t> sol(problem);
-      auto stats             = solver.get_solver_stats();
-      stats.total_solve_time = timer.elapsed_time();
+      auto stats                 = solver.get_solver_stats();
+      stats.total_solve_time     = timer.elapsed_time();
+      sol.post_process_completed = true;
       return sol.get_solution(false, stats, false);
     }
     auto scaled_sol                 = solver.run_solver();
