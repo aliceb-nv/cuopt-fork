@@ -27,7 +27,7 @@
 #include <vector>
 
 #include <math_optimization/solution_reader.hpp>
-#include <mip_heuristics/heuristic_hyper_params_loader.hpp>
+#include <mip_heuristics/heuristics_hyper_params_loader.hpp>
 
 #include <cuopt/version_config.hpp>
 
@@ -180,8 +180,8 @@ int run_single_file(const std::string& file_path,
     if (is_mip) {
       auto& mip_settings = settings.get_mip_settings();
       if (!heuristic_config_file.empty()) {
-        cuopt::linear_programming::fill_mip_heuristic_hyper_params(heuristic_config_file,
-                                                                   mip_settings.heuristic_params);
+        cuopt::linear_programming::fill_mip_heuristics_hyper_params(heuristic_config_file,
+                                                                    mip_settings.heuristic_params);
       }
       auto solution = cuopt::linear_programming::solve_mip(problem_interface.get(), mip_settings);
     } else {
@@ -268,9 +268,9 @@ int main(int argc, char* argv[])
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
     if (arg == "--dump-mip-heuristic-config" && i + 1 < argc) {
-      cuopt::linear_programming::mip_heuristic_hyper_params_t defaults;
-      cuopt::linear_programming::dump_mip_heuristic_hyper_params(argv[i + 1], defaults);
-      return 0;
+      cuopt::linear_programming::mip_heuristics_hyper_params_t defaults;
+      bool ok = cuopt::linear_programming::dump_mip_heuristics_hyper_params(argv[i + 1], defaults);
+      return ok ? 0 : 1;
     }
   }
 

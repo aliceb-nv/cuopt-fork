@@ -38,7 +38,7 @@ template <typename i_t, typename f_t>
 std::vector<recombiner_enum_t> recombiner_t<i_t, f_t>::enabled_recombiners;
 
 namespace {
-diversity_config_t make_diversity_config(const mip_heuristic_hyper_params_t& hp)
+diversity_config_t make_diversity_config(const mip_heuristics_hyper_params_t& hp)
 {
   diversity_config_t c;
   c.max_solutions                = hp.population_size;
@@ -48,7 +48,7 @@ diversity_config_t make_diversity_config(const mip_heuristic_hyper_params_t& hp)
   return c;
 }
 
-rins_settings_t make_rins_settings(const mip_heuristic_hyper_params_t& hp)
+rins_settings_t make_rins_settings(const mip_heuristics_hyper_params_t& hp)
 {
   rins_settings_t s;
   s.default_fixrate    = hp.rins_fix_rate;

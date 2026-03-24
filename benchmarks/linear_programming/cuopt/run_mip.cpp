@@ -40,7 +40,7 @@
 
 #include "initial_problem_check.hpp"
 
-#include <mip_heuristics/heuristic_hyper_params_loader.hpp>
+#include <mip_heuristics/heuristics_hyper_params_loader.hpp>
 
 void merge_result_files(const std::string& out_dir,
                         const std::string& final_result_file,
@@ -219,8 +219,8 @@ int run_single_file(std::string file_path,
   settings.clique_cuts                   = -1;
   settings.seed                          = 42;
   if (!heuristic_config_file.empty()) {
-    cuopt::linear_programming::fill_mip_heuristic_hyper_params(heuristic_config_file,
-                                                               settings.heuristic_params);
+    cuopt::linear_programming::fill_mip_heuristics_hyper_params(heuristic_config_file,
+                                                                settings.heuristic_params);
   }
   cuopt::linear_programming::benchmark_info_t benchmark_info;
   settings.benchmark_info_ptr = &benchmark_info;
