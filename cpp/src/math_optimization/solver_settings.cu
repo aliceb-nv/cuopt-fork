@@ -101,16 +101,16 @@ solver_settings_t<i_t, f_t>::solver_settings_t() : pdlp_settings(), mip_settings
     {CUOPT_MIP_CUT_CHANGE_THRESHOLD, &mip_settings.cut_change_threshold, f_t(-1.0), std::numeric_limits<f_t>::infinity(), f_t(-1.0)},
     {CUOPT_MIP_CUT_MIN_ORTHOGONALITY, &mip_settings.cut_min_orthogonality, f_t(0.0), f_t(1.0), f_t(0.5)},
     // MIP heuristic hyper-parameters (hidden from --help)
-    {CUOPT_PRESOLVE_TIME_RATIO, &mip_settings.heuristic_params.presolve_time_ratio, f_t(0.0), f_t(1.0), f_t(0.1), true, "fraction of total time for presolve"},
-    {CUOPT_PRESOLVE_MAX_TIME, &mip_settings.heuristic_params.presolve_max_time, f_t(0.0), std::numeric_limits<f_t>::infinity(), f_t(60.0), true, "hard cap on presolve seconds"},
-    {CUOPT_ROOT_LP_TIME_RATIO, &mip_settings.heuristic_params.root_lp_time_ratio, f_t(0.0), f_t(1.0), f_t(0.1), true, "fraction of total time for root LP"},
-    {CUOPT_ROOT_LP_MAX_TIME, &mip_settings.heuristic_params.root_lp_max_time, f_t(0.0), std::numeric_limits<f_t>::infinity(), f_t(15.0), true, "hard cap on root LP seconds"},
-    {CUOPT_RINS_TIME_LIMIT, &mip_settings.heuristic_params.rins_time_limit, f_t(0.0), std::numeric_limits<f_t>::infinity(), f_t(3.0), true, "per-call RINS sub-MIP time"},
-    {CUOPT_RINS_MAX_TIME_LIMIT, &mip_settings.heuristic_params.rins_max_time_limit, f_t(0.0), std::numeric_limits<f_t>::infinity(), f_t(20.0), true, "ceiling for RINS adaptive time budget"},
-    {CUOPT_RINS_FIX_RATE, &mip_settings.heuristic_params.rins_fix_rate, f_t(0.0), f_t(1.0), f_t(0.5), true, "RINS variable fix rate"},
-    {CUOPT_INITIAL_INFEASIBILITY_WEIGHT, &mip_settings.heuristic_params.initial_infeasibility_weight, f_t(1e-9), std::numeric_limits<f_t>::infinity(), f_t(1000.0), true, "constraint violation penalty seed"},
-    {CUOPT_RELAXED_LP_TIME_LIMIT, &mip_settings.heuristic_params.relaxed_lp_time_limit, f_t(1e-9), std::numeric_limits<f_t>::infinity(), f_t(1.0), true, "base relaxed LP time cap in heuristics"},
-    {CUOPT_RELATED_VARS_TIME_LIMIT, &mip_settings.heuristic_params.related_vars_time_limit, f_t(1e-9), std::numeric_limits<f_t>::infinity(), f_t(30.0), true, "time for related-variable structure build"},
+    {CUOPT_HYPER_PRESOLVE_TIME_RATIO, &mip_settings.heuristic_params.presolve_time_ratio, f_t(0.0), f_t(1.0), f_t(0.1), true, "fraction of total time for presolve"},
+    {CUOPT_HYPER_PRESOLVE_MAX_TIME, &mip_settings.heuristic_params.presolve_max_time, f_t(0.0), std::numeric_limits<f_t>::infinity(), f_t(60.0), true, "hard cap on presolve seconds"},
+    {CUOPT_HYPER_ROOT_LP_TIME_RATIO, &mip_settings.heuristic_params.root_lp_time_ratio, f_t(0.0), f_t(1.0), f_t(0.1), true, "fraction of total time for root LP"},
+    {CUOPT_HYPER_ROOT_LP_MAX_TIME, &mip_settings.heuristic_params.root_lp_max_time, f_t(0.0), std::numeric_limits<f_t>::infinity(), f_t(15.0), true, "hard cap on root LP seconds"},
+    {CUOPT_HYPER_RINS_TIME_LIMIT, &mip_settings.heuristic_params.rins_time_limit, f_t(0.0), std::numeric_limits<f_t>::infinity(), f_t(3.0), true, "per-call RINS sub-MIP time"},
+    {CUOPT_HYPER_RINS_MAX_TIME_LIMIT, &mip_settings.heuristic_params.rins_max_time_limit, f_t(0.0), std::numeric_limits<f_t>::infinity(), f_t(20.0), true, "ceiling for RINS adaptive time budget"},
+    {CUOPT_HYPER_RINS_FIX_RATE, &mip_settings.heuristic_params.rins_fix_rate, f_t(0.0), f_t(1.0), f_t(0.5), true, "RINS variable fix rate"},
+    {CUOPT_HYPER_INITIAL_INFEASIBILITY_WEIGHT, &mip_settings.heuristic_params.initial_infeasibility_weight, f_t(1e-9), std::numeric_limits<f_t>::infinity(), f_t(1000.0), true, "constraint violation penalty seed"},
+    {CUOPT_HYPER_RELAXED_LP_TIME_LIMIT, &mip_settings.heuristic_params.relaxed_lp_time_limit, f_t(1e-9), std::numeric_limits<f_t>::infinity(), f_t(1.0), true, "base relaxed LP time cap in heuristics"},
+    {CUOPT_HYPER_RELATED_VARS_TIME_LIMIT, &mip_settings.heuristic_params.related_vars_time_limit, f_t(1e-9), std::numeric_limits<f_t>::infinity(), f_t(30.0), true, "time for related-variable structure build"},
    };
 
   // Int parameters
@@ -142,13 +142,13 @@ solver_settings_t<i_t, f_t>::solver_settings_t() : pdlp_settings(), mip_settings
     {CUOPT_MIP_RELIABILITY_BRANCHING, &mip_settings.reliability_branching, -1, std::numeric_limits<i_t>::max(), -1},
     {CUOPT_PDLP_PRECISION, reinterpret_cast<int*>(&pdlp_settings.pdlp_precision), CUOPT_PDLP_DEFAULT_PRECISION, CUOPT_PDLP_MIXED_PRECISION, CUOPT_PDLP_DEFAULT_PRECISION},
     // MIP heuristic hyper-parameters (hidden from --help)
-    {CUOPT_POPULATION_SIZE, &mip_settings.heuristic_params.population_size, 1, std::numeric_limits<i_t>::max(), 32, true, "max solutions in pool"},
-    {CUOPT_NUM_CPUFJ_THREADS, &mip_settings.heuristic_params.num_cpufj_threads, 0, std::numeric_limits<i_t>::max(), 8, true, "parallel CPU FJ climbers"},
-    {CUOPT_STAGNATION_TRIGGER, &mip_settings.heuristic_params.stagnation_trigger, 1, std::numeric_limits<i_t>::max(), 3, true, "FP loops w/o improvement before recombination"},
-    {CUOPT_MAX_ITERS_WITHOUT_IMPROVEMENT, &mip_settings.heuristic_params.max_iterations_without_improvement, 1, std::numeric_limits<i_t>::max(), 8, true, "diversity step depth after stagnation"},
-    {CUOPT_N_OF_MINIMUMS_FOR_EXIT, &mip_settings.heuristic_params.n_of_minimums_for_exit, 1, std::numeric_limits<i_t>::max(), 7000, true, "FJ baseline local-minima exit threshold"},
-    {CUOPT_ENABLED_RECOMBINERS, &mip_settings.heuristic_params.enabled_recombiners, 0, 15, 15, true, "bitmask: 1=BP 2=FP 4=LS 8=SubMIP"},
-    {CUOPT_CYCLE_DETECTION_LENGTH, &mip_settings.heuristic_params.cycle_detection_length, 1, std::numeric_limits<i_t>::max(), 30, true, "FP assignment cycle ring buffer length"},
+    {CUOPT_HYPER_POPULATION_SIZE, &mip_settings.heuristic_params.population_size, 1, std::numeric_limits<i_t>::max(), 32, true, "max solutions in pool"},
+    {CUOPT_HYPER_NUM_CPUFJ_THREADS, &mip_settings.heuristic_params.num_cpufj_threads, 0, std::numeric_limits<i_t>::max(), 8, true, "parallel CPU FJ climbers"},
+    {CUOPT_HYPER_STAGNATION_TRIGGER, &mip_settings.heuristic_params.stagnation_trigger, 1, std::numeric_limits<i_t>::max(), 3, true, "FP loops w/o improvement before recombination"},
+    {CUOPT_HYPER_MAX_ITERS_WITHOUT_IMPROVEMENT, &mip_settings.heuristic_params.max_iterations_without_improvement, 1, std::numeric_limits<i_t>::max(), 8, true, "diversity step depth after stagnation"},
+    {CUOPT_HYPER_N_OF_MINIMUMS_FOR_EXIT, &mip_settings.heuristic_params.n_of_minimums_for_exit, 1, std::numeric_limits<i_t>::max(), 7000, true, "FJ baseline local-minima exit threshold"},
+    {CUOPT_HYPER_ENABLED_RECOMBINERS, &mip_settings.heuristic_params.enabled_recombiners, 0, 15, 15, true, "bitmask: 1=BP 2=FP 4=LS 8=SubMIP"},
+    {CUOPT_HYPER_CYCLE_DETECTION_LENGTH, &mip_settings.heuristic_params.cycle_detection_length, 1, std::numeric_limits<i_t>::max(), 30, true, "FP assignment cycle ring buffer length"},
   };
 
     // Bool parameters

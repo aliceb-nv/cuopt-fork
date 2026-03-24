@@ -57,23 +57,23 @@ TEST_F(HeuristicsHyperParamsTest, CustomValuesRoundTrip)
 {
   {
     std::ofstream f(tmp_path);
-    f << "population_size = 64\n";
-    f << "num_cpufj_threads = 4\n";
-    f << "presolve_time_ratio = 0.2\n";
-    f << "presolve_max_time = 120\n";
-    f << "root_lp_time_ratio = 0.05\n";
-    f << "root_lp_max_time = 30\n";
-    f << "rins_time_limit = 5\n";
-    f << "rins_max_time_limit = 40\n";
-    f << "rins_fix_rate = 0.7\n";
-    f << "stagnation_trigger = 5\n";
-    f << "max_iterations_without_improvement = 12\n";
-    f << "initial_infeasibility_weight = 500\n";
-    f << "n_of_minimums_for_exit = 10000\n";
-    f << "enabled_recombiners = 5\n";
-    f << "cycle_detection_length = 50\n";
-    f << "relaxed_lp_time_limit = 2\n";
-    f << "related_vars_time_limit = 60\n";
+    f << "hyper_population_size = 64\n";
+    f << "hyper_num_cpufj_threads = 4\n";
+    f << "hyper_presolve_time_ratio = 0.2\n";
+    f << "hyper_presolve_max_time = 120\n";
+    f << "hyper_root_lp_time_ratio = 0.05\n";
+    f << "hyper_root_lp_max_time = 30\n";
+    f << "hyper_rins_time_limit = 5\n";
+    f << "hyper_rins_max_time_limit = 40\n";
+    f << "hyper_rins_fix_rate = 0.7\n";
+    f << "hyper_stagnation_trigger = 5\n";
+    f << "hyper_max_iterations_without_improvement = 12\n";
+    f << "hyper_initial_infeasibility_weight = 500\n";
+    f << "hyper_n_of_minimums_for_exit = 10000\n";
+    f << "hyper_enabled_recombiners = 5\n";
+    f << "hyper_cycle_detection_length = 50\n";
+    f << "hyper_relaxed_lp_time_limit = 2\n";
+    f << "hyper_related_vars_time_limit = 60\n";
   }
 
   settings_t settings;
@@ -103,8 +103,8 @@ TEST_F(HeuristicsHyperParamsTest, PartialConfigKeepsDefaults)
 {
   {
     std::ofstream f(tmp_path);
-    f << "population_size = 128\n";
-    f << "rins_fix_rate = 0.3\n";
+    f << "hyper_population_size = 128\n";
+    f << "hyper_rins_fix_rate = 0.3\n";
   }
 
   settings_t settings;
@@ -128,7 +128,7 @@ TEST_F(HeuristicsHyperParamsTest, CommentsAndBlankLinesIgnored)
     f << "# This is a comment\n";
     f << "\n";
     f << "# Another comment\n";
-    f << "population_size = 42\n";
+    f << "hyper_population_size = 42\n";
     f << "\n";
   }
 
@@ -151,7 +151,7 @@ TEST_F(HeuristicsHyperParamsTest, BadNumericValueThrows)
 {
   {
     std::ofstream f(tmp_path);
-    f << "population_size = not_a_number\n";
+    f << "hyper_population_size = not_a_number\n";
   }
   settings_t settings;
   EXPECT_THROW(settings.load_parameters_from_file(tmp_path), cuopt::logic_error);
@@ -161,7 +161,7 @@ TEST_F(HeuristicsHyperParamsTest, TrailingJunkSpaceSeparatedThrows)
 {
   {
     std::ofstream f(tmp_path);
-    f << "population_size = 64 foo\n";
+    f << "hyper_population_size = 64 foo\n";
   }
   settings_t settings;
   EXPECT_THROW(settings.load_parameters_from_file(tmp_path), cuopt::logic_error);
@@ -171,7 +171,7 @@ TEST_F(HeuristicsHyperParamsTest, TrailingJunkNoSpaceThrows)
 {
   {
     std::ofstream f(tmp_path);
-    f << "population_size = 64foo\n";
+    f << "hyper_population_size = 64foo\n";
   }
   settings_t settings;
   EXPECT_THROW(settings.load_parameters_from_file(tmp_path), cuopt::logic_error);
@@ -181,7 +181,7 @@ TEST_F(HeuristicsHyperParamsTest, TrailingJunkFloatThrows)
 {
   {
     std::ofstream f(tmp_path);
-    f << "rins_fix_rate = 0.5abc\n";
+    f << "hyper_rins_fix_rate = 0.5abc\n";
   }
   settings_t settings;
   EXPECT_THROW(settings.load_parameters_from_file(tmp_path), cuopt::logic_error);
@@ -191,7 +191,7 @@ TEST_F(HeuristicsHyperParamsTest, RangeViolationCycleDetectionThrows)
 {
   {
     std::ofstream f(tmp_path);
-    f << "cycle_detection_length = 0\n";
+    f << "hyper_cycle_detection_length = 0\n";
   }
   settings_t settings;
   EXPECT_THROW(settings.load_parameters_from_file(tmp_path), cuopt::logic_error);
@@ -201,7 +201,7 @@ TEST_F(HeuristicsHyperParamsTest, RangeViolationFixRateThrows)
 {
   {
     std::ofstream f(tmp_path);
-    f << "rins_fix_rate = 2.0\n";
+    f << "hyper_rins_fix_rate = 2.0\n";
   }
   settings_t settings;
   EXPECT_THROW(settings.load_parameters_from_file(tmp_path), cuopt::logic_error);
@@ -226,7 +226,7 @@ TEST_F(HeuristicsHyperParamsTest, IndentedCommentAndWhitespaceLinesIgnored)
     std::ofstream f(tmp_path);
     f << "   # indented comment\n";
     f << "  \t  \n";
-    f << "population_size = 99\n";
+    f << "hyper_population_size = 99\n";
   }
   settings_t settings;
   settings.load_parameters_from_file(tmp_path);
@@ -237,7 +237,7 @@ TEST_F(HeuristicsHyperParamsTest, MixedSolverAndHyperParamsFromFile)
 {
   {
     std::ofstream f(tmp_path);
-    f << "population_size = 100\n";
+    f << "hyper_population_size = 100\n";
     f << "time_limit = 42\n";
   }
   settings_t settings;
