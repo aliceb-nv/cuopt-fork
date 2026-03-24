@@ -77,6 +77,25 @@
 #define CUOPT_RANDOM_SEED                     "random_seed"
 #define CUOPT_PDLP_PRECISION                  "pdlp_precision"
 
+/* @brief MIP heuristic hyper-parameter names */
+#define CUOPT_POPULATION_SIZE               "population_size"
+#define CUOPT_NUM_CPUFJ_THREADS             "num_cpufj_threads"
+#define CUOPT_PRESOLVE_TIME_RATIO           "presolve_time_ratio"
+#define CUOPT_PRESOLVE_MAX_TIME             "presolve_max_time"
+#define CUOPT_ROOT_LP_TIME_RATIO            "root_lp_time_ratio"
+#define CUOPT_ROOT_LP_MAX_TIME              "root_lp_max_time"
+#define CUOPT_RINS_TIME_LIMIT               "rins_time_limit"
+#define CUOPT_RINS_MAX_TIME_LIMIT           "rins_max_time_limit"
+#define CUOPT_RINS_FIX_RATE                 "rins_fix_rate"
+#define CUOPT_STAGNATION_TRIGGER            "stagnation_trigger"
+#define CUOPT_MAX_ITERS_WITHOUT_IMPROVEMENT "max_iterations_without_improvement"
+#define CUOPT_INITIAL_INFEASIBILITY_WEIGHT  "initial_infeasibility_weight"
+#define CUOPT_N_OF_MINIMUMS_FOR_EXIT        "n_of_minimums_for_exit"
+#define CUOPT_ENABLED_RECOMBINERS           "enabled_recombiners"
+#define CUOPT_CYCLE_DETECTION_LENGTH        "cycle_detection_length"
+#define CUOPT_RELAXED_LP_TIME_LIMIT         "relaxed_lp_time_limit"
+#define CUOPT_RELATED_VARS_TIME_LIMIT       "related_vars_time_limit"
+
 /* @brief MIP determinism mode constants */
 #define CUOPT_MODE_OPPORTUNISTIC 0
 #define CUOPT_MODE_DETERMINISTIC 1

@@ -14,11 +14,9 @@ namespace cuopt::linear_programming {
  *
  * All fields carry their actual defaults. A config file only needs to list
  * the knobs being changed; omitted keys keep the values shown here.
- * Loadable via fill_mip_heuristics_hyper_params(); dumpable via
- * dump_mip_heuristics_hyper_params().
+ * These are registered in the unified parameter framework via solver_settings_t
+ * and can be loaded from a config file with load_parameters_from_file().
  */
-// TODO: unify field declarations, loader tables, and dump logic via X macros
-// so that adding a parameter is a single-line change.
 struct mip_heuristics_hyper_params_t {
   int population_size                    = 32;      // max solutions in pool
   int num_cpufj_threads                  = 8;       // parallel CPU FJ climbers

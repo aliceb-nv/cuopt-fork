@@ -40,8 +40,6 @@
 
 #include "initial_problem_check.hpp"
 
-#include <mip_heuristics/heuristics_hyper_params_loader.hpp>
-
 void merge_result_files(const std::string& out_dir,
                         const std::string& final_result_file,
                         int n_gpus,
@@ -152,8 +150,7 @@ int run_single_file(std::string file_path,
                     int reliability_branching,
                     double time_limit,
                     double work_limit,
-                    bool deterministic,
-                    const std::string& heuristic_config_file = "")
+                    bool deterministic)
 {
   const raft::handle_t handle_{};
   cuopt::linear_programming::mip_solver_settings_t<int, double> settings;
@@ -218,10 +215,6 @@ int run_single_file(std::string file_path,
   settings.reliability_branching         = reliability_branching;
   settings.clique_cuts                   = -1;
   settings.seed                          = 42;
-  if (!heuristic_config_file.empty()) {
-    cuopt::linear_programming::fill_mip_heuristics_hyper_params(heuristic_config_file,
-                                                                settings.heuristic_params);
-  }
   cuopt::linear_programming::benchmark_info_t benchmark_info;
   settings.benchmark_info_ptr = &benchmark_info;
   auto start_run_solver       = std::chrono::high_resolution_clock::now();
@@ -277,8 +270,7 @@ void run_single_file_mp(std::string file_path,
                         int reliability_branching,
                         double time_limit,
                         double work_limit,
-                        bool deterministic,
-                        const std::string& heuristic_config_file = "")
+                        bool deterministic)
 {
   std::cout << "running file " << file_path << " on gpu : " << device << std::endl;
   auto memory_resource = make_async();
@@ -296,8 +288,7 @@ void run_single_file_mp(std::string file_path,
                                   reliability_branching,
                                   time_limit,
                                   work_limit,
-                                  deterministic,
-                                  heuristic_config_file);
+                                  deterministic);
   // this is a bad design to communicate the result but better than adding complexity of IPC or
   // pipes
   exit(sol_found);
@@ -395,10 +386,6 @@ int main(int argc, char* argv[])
     .default_value(false)
     .implicit_value(true);
 
-  program.add_argument("--mip-heuristic-config")
-    .help("path to MIP heuristic hyper-parameters config file (key = value format)")
-    .default_value(std::string(""));
-
   // Parse arguments
   try {
     program.parse_args(argc, argv);
@@ -422,15 +409,14 @@ int main(int argc, char* argv[])
   std::string result_file;
   int batch_num = -1;
 
-  bool heuristics_only              = program.get<std::string>("--heuristics-only")[0] == 't';
-  int num_cpu_threads               = program.get<int>("--num-cpu-threads");
-  bool write_log_file               = program.get<std::string>("--write-log-file")[0] == 't';
-  bool log_to_console               = program.get<std::string>("--log-to-console")[0] == 't';
-  double memory_limit               = program.get<double>("--memory-limit");
-  bool track_allocations            = program.get<std::string>("--track-allocations")[0] == 't';
-  int reliability_branching         = program.get<int>("--reliability-branching");
-  bool deterministic                = program.get<bool>("--determinism");
-  std::string heuristic_config_file = program.get<std::string>("--mip-heuristic-config");
+  bool heuristics_only      = program.get<std::string>("--heuristics-only")[0] == 't';
+  int num_cpu_threads       = program.get<int>("--num-cpu-threads");
+  bool write_log_file       = program.get<std::string>("--write-log-file")[0] == 't';
+  bool log_to_console       = program.get<std::string>("--log-to-console")[0] == 't';
+  double memory_limit       = program.get<double>("--memory-limit");
+  bool track_allocations    = program.get<std::string>("--track-allocations")[0] == 't';
+  int reliability_branching = program.get<int>("--reliability-branching");
+  bool deterministic        = program.get<bool>("--determinism");
 
   if (num_cpu_threads < 0) {
     num_cpu_threads = omp_get_max_threads() / n_gpus;
@@ -530,8 +516,7 @@ int main(int argc, char* argv[])
                                reliability_branching,
                                time_limit,
                                work_limit,
-                               deterministic,
-                               heuristic_config_file);
+                               deterministic);
           } else if (sys_pid < 0) {
             std::cerr << "Fork failed!" << std::endl;
             exit(1);
@@ -574,8 +559,7 @@ int main(int argc, char* argv[])
                     reliability_branching,
                     time_limit,
                     work_limit,
-                    deterministic,
-                    heuristic_config_file);
+                    deterministic);
   }
 
   return 0;
