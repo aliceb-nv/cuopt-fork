@@ -190,11 +190,6 @@ int main(int argc, char* argv[])
   // Handle --dump-hyper-params before argparse so no MPS file is required
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
-    if (arg == "--dump-hyper-params" && i + 1 < argc) {
-      cuopt::linear_programming::solver_settings_t<int, double> settings;
-      bool ok = settings.dump_parameters_to_file(argv[i + 1], true);
-      return ok ? 0 : 1;
-    }
     if (arg == "--show-hyper-params") {
       cuopt::linear_programming::solver_settings_t<int, double> settings;
       settings.dump_parameters_to_file("/dev/stdout", true);
@@ -228,10 +223,6 @@ int main(int argc, char* argv[])
 
   program.add_argument("--params-file")
     .help("path to parameter config file (key = value format, supports all parameters)")
-    .default_value(std::string(""));
-
-  program.add_argument("--dump-hyper-params")
-    .help("write default hyper-parameters to the given file and exit")
     .default_value(std::string(""));
 
   program.add_argument("--show-hyper-params")
