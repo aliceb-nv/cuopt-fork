@@ -77,7 +77,7 @@ TEST_F(HeuristicsHyperParamsTest, CustomValuesRoundTrip)
   fill_mip_heuristics_hyper_params(tmp_path, loaded);
 
   EXPECT_EQ(loaded.population_size, 64);
-  codex EXPECT_EQ(loaded.num_cpufj_threads, 4);
+  EXPECT_EQ(loaded.num_cpufj_threads, 4);
   EXPECT_DOUBLE_EQ(loaded.presolve_time_ratio, 0.2);
   EXPECT_DOUBLE_EQ(loaded.presolve_max_time, 120.0);
   EXPECT_DOUBLE_EQ(loaded.root_lp_time_ratio, 0.05);
