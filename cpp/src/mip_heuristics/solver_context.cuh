@@ -66,8 +66,8 @@ struct mip_solver_context_t {
   work_unit_scheduler_t work_unit_scheduler_{5.0};
 
   early_cpufj_t<i_t, f_t>* early_cpufj_ptr{nullptr};
-  // Best objective from early heuristics, in user-space (sense-aware, representation-
-  // invariant).  Must be converted to the target solver-space before use:
+  // Best objective from early heuristics, in user-space.
+  // Must be converted to the target solver-space before use:
   //   - B&B: problem_ptr->get_solver_obj_from_user_obj(initial_cutoff)
   //   - CPUFJ: papilo_problem.get_solver_obj_from_user_obj(initial_cutoff)
   // Use std::isfinite() to check whether a valid cutoff exists.

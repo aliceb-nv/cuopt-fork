@@ -48,8 +48,6 @@
 
 #include <cuda_profiler_api.h>
 
-#include <cmath>
-
 namespace cuopt::linear_programming {
 
 // This serves as both a warm up but also a mandatory initial call to setup cuSparse and cuBLAS
