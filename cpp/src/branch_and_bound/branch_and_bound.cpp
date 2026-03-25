@@ -2604,7 +2604,7 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
         if (num_cutoff > 0) {
           settings_.log.printf(
             "SB propagation infeasible with cutoff-based tightenings: incumbent is optimal\n");
-          cuopt_assert(incumbent_.has_incumbent);
+          assert(incumbent_.has_incumbent);
           solver_status_ = mip_status_t::OPTIMAL;
           set_final_solution(solution, upper_bound_.load());
           return solver_status_;
@@ -2651,7 +2651,7 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
         if (num_cutoff > 0) {
           settings_.log.printf(
             "Root LP infeasible after SB tightening with cutoffs: incumbent is optimal\n");
-          cuopt_assert(incumbent_.has_incumbent);
+          assert(incumbent_.has_incumbent);
           solver_status_ = mip_status_t::OPTIMAL;
           set_final_solution(solution, upper_bound_.load());
           return solver_status_;
@@ -2684,7 +2684,7 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
       if (!feasible) {
         settings_.log.printf(
           "RC propagation infeasible: no solution beats the incumbent, incumbent is optimal\n");
-        cuopt_assert(incumbent_.has_incumbent);
+        assert(incumbent_.has_incumbent);
         solver_status_ = mip_status_t::OPTIMAL;
         set_final_solution(solution, upper_bound_.load());
         return solver_status_;
@@ -2725,7 +2725,7 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
         }
       } else if (lp_status == dual::status_t::DUAL_UNBOUNDED) {
         settings_.log.printf("Root LP infeasible after RC tightening: incumbent is optimal\n");
-        cuopt_assert(incumbent_.has_incumbent);
+        assert(incumbent_.has_incumbent);
         solver_status_ = mip_status_t::OPTIMAL;
         set_final_solution(solution, upper_bound_.load());
         return solver_status_;
