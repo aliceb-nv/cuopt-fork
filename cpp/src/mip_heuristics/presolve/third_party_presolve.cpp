@@ -17,6 +17,7 @@
 #else
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstringop-overflow"
+#pragma GCC diagnostic ignored "-Wnarrowing"
 #endif
 #include <papilo/core/Presolve.hpp>
 #include <papilo/core/ProblemBuilder.hpp>
