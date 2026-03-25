@@ -527,6 +527,7 @@ void strong_branching(const user_problem_t<i_t, f_t>& original_problem,
                       f_t root_obj,
                       const std::vector<variable_status_t>& root_vstatus,
                       const std::vector<f_t>& edge_norms,
+                      f_t upper_bound,
                       pseudo_costs_t<i_t, f_t>& pc);
 
 }  // namespace cuopt::linear_programming::dual_simplex

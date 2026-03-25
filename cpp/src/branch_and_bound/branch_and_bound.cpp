@@ -72,6 +72,29 @@ i_t fractional_variables(const simplex_solver_settings_t<i_t, f_t>& settings,
 }
 
 template <typename i_t, typename f_t>
+i_t prune_fixed_fractional_variables(const std::vector<f_t>& lower_bounds,
+                                     const std::vector<f_t>& upper_bounds,
+                                     const simplex_solver_settings_t<i_t, f_t>& settings,
+                                     std::vector<i_t>& fractional)
+{
+  std::vector<i_t> new_fractional;
+  new_fractional.reserve(fractional.size());
+
+  i_t num_fixed = 0;
+  for (i_t k = 0; k < (i_t)fractional.size(); k++) {
+    const i_t j = fractional[k];
+    if (std::abs(upper_bounds[j] - lower_bounds[j]) < settings.fixed_tol) {
+      num_fixed++;
+    } else {
+      new_fractional.push_back(j);
+    }
+  }
+
+  fractional = std::move(new_fractional);
+  return num_fixed;
+}
+
+template <typename i_t, typename f_t>
 void full_variable_types(const user_problem_t<i_t, f_t>& original_problem,
                          const lp_problem_t<i_t, f_t>& original_lp,
                          std::vector<variable_type_t>& var_types)
@@ -2458,6 +2481,7 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
                                root_objective_,
                                root_vstatus_,
                                edge_norms_,
+                               upper_bound_.load(),
                                pc_);
   }
 
@@ -2467,6 +2491,184 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
     return solver_status_;
   }
 
+  // Exploit infeasible/fathomed branches from strong branching for bounds tightening.
+  // If branching down on x_j is infeasible, we can tighten lb[j] = ceil(x_j*).
+  // If branching up on x_j is infeasible, we can tighten ub[j] = floor(x_j*).
+  // With an incumbent, branches whose objective exceeds the cutoff yield the same deductions.
+  {
+    const f_t current_upper = upper_bound_.load();
+    i_t num_tightened       = 0;
+    i_t num_infeasible      = 0;
+    i_t num_cutoff          = 0;
+    for (i_t k = 0; k < (i_t)fractional.size(); k++) {
+      const i_t j          = fractional[k];
+      const f_t sb_down    = pc_.strong_branch_down[k];
+      const f_t sb_up      = pc_.strong_branch_up[k];
+      bool down_infeasible = std::isinf(sb_down);
+      bool up_infeasible   = std::isinf(sb_up);
+      bool down_cutoff     = false;
+      bool up_cutoff       = false;
+
+      if (!down_infeasible && std::isfinite(sb_down) && std::isfinite(current_upper)) {
+        down_cutoff     = (sb_down + root_objective_ > current_upper + settings_.dual_tol);
+        down_infeasible = down_cutoff;
+      }
+      if (!up_infeasible && std::isfinite(sb_up) && std::isfinite(current_upper)) {
+        up_cutoff     = (sb_up + root_objective_ > current_upper + settings_.dual_tol);
+        up_infeasible = up_cutoff;
+      }
+
+      if (down_infeasible && up_infeasible) {
+        bool truly_infeasible = std::isinf(sb_down) && std::isinf(sb_up);
+        if (truly_infeasible) {
+          settings_.log.printf("Strong branching: both branches infeasible for variable %d\n", j);
+          return mip_status_t::INFEASIBLE;
+        }
+        // Might happen if the incumbent is already the optimal
+        settings_.log.printf("Strong branching: both branches fathomed for variable %d\n", j);
+        bool has_incumbent = false;
+        mutex_upper_.lock();
+        has_incumbent = incumbent_.has_incumbent;
+        mutex_upper_.unlock();
+        assert(has_incumbent);
+        solver_status_ = mip_status_t::OPTIMAL;
+        set_final_solution(solution, upper_bound_.load());
+        return solver_status_;
+      }
+      if (down_infeasible) {
+        mutex_original_lp_.lock();
+        f_t new_lb = std::ceil(root_relax_soln_.x[j]);
+        if (new_lb > original_lp_.lower[j]) {
+          settings_.log.debug("SB tighten var %d: lb %e -> %e (%s)",
+                              j,
+                              original_lp_.lower[j],
+                              new_lb,
+                              down_cutoff ? "cutoff" : "infeasible");
+          original_lp_.lower[j] = new_lb;
+          num_tightened++;
+          if (down_cutoff) {
+            num_cutoff++;
+          } else {
+            num_infeasible++;
+          }
+        }
+        mutex_original_lp_.unlock();
+      }
+      if (up_infeasible) {
+        mutex_original_lp_.lock();
+        f_t new_ub = std::floor(root_relax_soln_.x[j]);
+        if (new_ub < original_lp_.upper[j]) {
+          settings_.log.debug("SB tighten var %d: ub %e -> %e (%s)",
+                              j,
+                              original_lp_.upper[j],
+                              new_ub,
+                              up_cutoff ? "cutoff" : "infeasible");
+          original_lp_.upper[j] = new_ub;
+          num_tightened++;
+          if (up_cutoff) {
+            num_cutoff++;
+          } else {
+            num_infeasible++;
+          }
+        }
+        mutex_original_lp_.unlock();
+      }
+    }
+    if (num_tightened > 0) {
+      settings_.log.printf(
+        "Strong branching bounds tightening: %d tightened (%d infeasible, %d cutoff)\n",
+        num_tightened,
+        num_infeasible,
+        num_cutoff);
+
+      std::vector<bool> bounds_changed(original_lp_.num_cols, true);
+      std::vector<char> row_sense;
+      std::vector<f_t> new_lower;
+      std::vector<f_t> new_upper;
+      mutex_original_lp_.lock();
+      new_lower = original_lp_.lower;
+      new_upper = original_lp_.upper;
+      mutex_original_lp_.unlock();
+      bounds_strengthening_t<i_t, f_t> sb_presolve(original_lp_, Arow_, row_sense, var_types_);
+      bool feasible =
+        sb_presolve.bounds_strengthening(settings_, bounds_changed, new_lower, new_upper);
+      i_t num_fixed = 0;
+      if (feasible) {
+        num_fixed = prune_fixed_fractional_variables(new_lower, new_upper, settings_, fractional);
+      }
+      mutex_original_lp_.lock();
+      original_lp_.lower = new_lower;
+      original_lp_.upper = new_upper;
+      mutex_original_lp_.unlock();
+      if (!feasible) {
+        if (num_cutoff > 0) {
+          settings_.log.printf(
+            "SB propagation infeasible with cutoff-based tightenings: incumbent is optimal\n");
+          assert(incumbent_.has_incumbent);
+          solver_status_ = mip_status_t::OPTIMAL;
+          set_final_solution(solution, upper_bound_.load());
+          return solver_status_;
+        }
+        settings_.log.printf("Strong branching bounds propagation detected infeasibility\n");
+        return mip_status_t::INFEASIBLE;
+      }
+      if (num_fixed > 0) {
+        settings_.log.printf(
+          "Strong branching bounds tightening: %d variables fixed (%d from propagation)\n",
+          num_fixed,
+          num_fixed - num_tightened);
+      }
+
+      // Re-solve the root LP so that root_relax_soln_, root_objective_, and root_vstatus_
+      // are consistent with the tightened bounds before branching or reduced-cost strengthening.
+      lp_settings.concurrent_halt = NULL;
+      i_t iter                    = 0;
+      bool initialize_basis       = false;
+      dual::status_t lp_status    = dual_phase2_with_advanced_basis(2,
+                                                                 0,
+                                                                 initialize_basis,
+                                                                 exploration_stats_.start_time,
+                                                                 original_lp_,
+                                                                 lp_settings,
+                                                                 root_vstatus_,
+                                                                 basis_update,
+                                                                 basic_list,
+                                                                 nonbasic_list,
+                                                                 root_relax_soln_,
+                                                                 iter,
+                                                                 edge_norms_);
+      exploration_stats_.total_lp_iters += iter;
+      root_objective_ = compute_objective(original_lp_, root_relax_soln_.x);
+      if (lp_status == dual::status_t::OPTIMAL) {
+        fractional.clear();
+        num_fractional =
+          fractional_variables(settings_, root_relax_soln_.x, var_types_, fractional);
+        if (num_fractional == 0) {
+          set_solution_at_root(solution, cut_info);
+          return mip_status_t::OPTIMAL;
+        }
+      } else if (lp_status == dual::status_t::DUAL_UNBOUNDED) {
+        if (num_cutoff > 0) {
+          settings_.log.printf(
+            "Root LP infeasible after SB tightening with cutoffs: incumbent is optimal\n");
+          assert(incumbent_.has_incumbent);
+          solver_status_ = mip_status_t::OPTIMAL;
+          set_final_solution(solution, upper_bound_.load());
+          return solver_status_;
+        }
+        settings_.log.printf("Root LP infeasible after SB tightening\n");
+        return mip_status_t::INFEASIBLE;
+      } else if (lp_status == dual::status_t::TIME_LIMIT) {
+        solver_status_ = mip_status_t::TIME_LIMIT;
+        set_final_solution(solution, root_objective_);
+        return solver_status_;
+      } else {
+        settings_.log.printf("LP re-solve after SB tightening returned status %d\n", lp_status);
+        return mip_status_t::NUMERICAL;
+      }
+    }
+  }
+
   if (settings_.reduced_cost_strengthening >= 2 && upper_bound_.load() < last_upper_bound) {
     std::vector<f_t> lower_bounds;
     std::vector<f_t> upper_bounds;
@@ -2474,39 +2676,66 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
     if (num_fixed > 0) {
       std::vector<bool> bounds_changed(original_lp_.num_cols, true);
       std::vector<char> row_sense;
-
+      std::vector<f_t> new_lower = lower_bounds;
+      std::vector<f_t> new_upper = upper_bounds;
       bounds_strengthening_t<i_t, f_t> node_presolve(original_lp_, Arow_, row_sense, var_types_);
-
-      mutex_original_lp_.lock();
-      original_lp_.lower = lower_bounds;
-      original_lp_.upper = upper_bounds;
-      bool feasible      = node_presolve.bounds_strengthening(
-        settings_, bounds_changed, original_lp_.lower, original_lp_.upper);
-      mutex_original_lp_.unlock();
+      bool feasible =
+        node_presolve.bounds_strengthening(settings_, bounds_changed, new_lower, new_upper);
       if (!feasible) {
-        settings_.log.printf("Bound strengthening failed\n");
-        return mip_status_t::NUMERICAL;  // We had a feasible integer solution, but bound
-                                         // strengthening thinks we are infeasible.
+        settings_.log.printf(
+          "RC propagation infeasible: no solution beats the incumbent, incumbent is optimal\n");
+        assert(incumbent_.has_incumbent);
+        solver_status_ = mip_status_t::OPTIMAL;
+        set_final_solution(solution, upper_bound_.load());
+        return solver_status_;
       }
-      // Go through and check the fractional variables and remove any that are now fixed to their
-      // bounds
-      std::vector<i_t> to_remove(fractional.size(), 0);
-      i_t num_to_remove = 0;
-      for (i_t k = 0; k < fractional.size(); k++) {
-        const i_t j = fractional[k];
-        if (std::abs(original_lp_.upper[j] - original_lp_.lower[j]) < settings_.fixed_tol) {
-          to_remove[k] = 1;
-          num_to_remove++;
+      prune_fixed_fractional_variables(new_lower, new_upper, settings_, fractional);
+      mutex_original_lp_.lock();
+      original_lp_.lower = new_lower;
+      original_lp_.upper = new_upper;
+      mutex_original_lp_.unlock();
+
+      // Re-solve the root LP so that root_relax_soln_, root_objective_, and root_vstatus_
+      // are consistent with the tightened bounds.
+      lp_settings.concurrent_halt = NULL;
+      i_t iter                    = 0;
+      bool initialize_basis       = false;
+      dual::status_t lp_status    = dual_phase2_with_advanced_basis(2,
+                                                                 0,
+                                                                 initialize_basis,
+                                                                 exploration_stats_.start_time,
+                                                                 original_lp_,
+                                                                 lp_settings,
+                                                                 root_vstatus_,
+                                                                 basis_update,
+                                                                 basic_list,
+                                                                 nonbasic_list,
+                                                                 root_relax_soln_,
+                                                                 iter,
+                                                                 edge_norms_);
+      exploration_stats_.total_lp_iters += iter;
+      root_objective_ = compute_objective(original_lp_, root_relax_soln_.x);
+      if (lp_status == dual::status_t::OPTIMAL) {
+        fractional.clear();
+        num_fractional =
+          fractional_variables(settings_, root_relax_soln_.x, var_types_, fractional);
+        if (num_fractional == 0) {
+          set_solution_at_root(solution, cut_info);
+          return mip_status_t::OPTIMAL;
         }
-      }
-      if (num_to_remove > 0) {
-        std::vector<i_t> new_fractional;
-        new_fractional.reserve(fractional.size() - num_to_remove);
-        for (i_t k = 0; k < fractional.size(); k++) {
-          if (!to_remove[k]) { new_fractional.push_back(fractional[k]); }
-        }
-        fractional     = new_fractional;
-        num_fractional = fractional.size();
+      } else if (lp_status == dual::status_t::DUAL_UNBOUNDED) {
+        settings_.log.printf("Root LP infeasible after RC tightening: incumbent is optimal\n");
+        assert(incumbent_.has_incumbent);
+        solver_status_ = mip_status_t::OPTIMAL;
+        set_final_solution(solution, upper_bound_.load());
+        return solver_status_;
+      } else if (lp_status == dual::status_t::TIME_LIMIT) {
+        solver_status_ = mip_status_t::TIME_LIMIT;
+        set_final_solution(solution, root_objective_);
+        return solver_status_;
+      } else {
+        settings_.log.printf("LP re-solve after RC tightening returned status %d\n", lp_status);
+        return mip_status_t::NUMERICAL;
       }
     }
   }

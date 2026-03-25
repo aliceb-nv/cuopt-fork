@@ -34,6 +34,7 @@ void strong_branch_helper(i_t start,
                           const std::vector<f_t>& root_soln,
                           const std::vector<variable_status_t>& root_vstatus,
                           const std::vector<f_t>& edge_norms,
+                          f_t upper_bound,
                           pseudo_costs_t<i_t, f_t>& pc)
 {
   raft::common::nvtx::range scope("BB::strong_branch_helper");
@@ -62,6 +63,7 @@ void strong_branch_helper(i_t start,
       if (elapsed_time > settings.time_limit) { break; }
       child_settings.time_limit      = std::max(0.0, settings.time_limit - elapsed_time);
       child_settings.iteration_limit = 200;
+      child_settings.cut_off         = upper_bound + settings.dual_tol;
       lp_solution_t<i_t, f_t> solution(original_lp.num_rows, original_lp.num_cols);
       i_t iter                               = 0;
       std::vector<variable_status_t> vstatus = root_vstatus;
@@ -80,7 +82,8 @@ void strong_branch_helper(i_t start,
       if (status == dual::status_t::DUAL_UNBOUNDED) {
         // LP was infeasible
         obj = std::numeric_limits<f_t>::infinity();
-      } else if (status == dual::status_t::OPTIMAL || status == dual::status_t::ITERATION_LIMIT) {
+      } else if (status == dual::status_t::OPTIMAL || status == dual::status_t::ITERATION_LIMIT ||
+                 status == dual::status_t::CUTOFF) {
         obj = compute_objective(child_problem, solution.x);
       } else {
         settings.log.debug("Thread id %2d remaining %d variable %d branch %d status %d\n",
@@ -307,6 +310,7 @@ void strong_branching(const user_problem_t<i_t, f_t>& original_problem,
                       f_t root_obj,
                       const std::vector<variable_status_t>& root_vstatus,
                       const std::vector<f_t>& edge_norms,
+                      f_t upper_bound,
                       pseudo_costs_t<i_t, f_t>& pc)
 {
   pc.resize(original_lp.num_cols);
@@ -432,6 +436,7 @@ void strong_branching(const user_problem_t<i_t, f_t>& original_problem,
                              root_soln,
                              root_vstatus,
                              edge_norms,
+                             upper_bound,
                              pc);
       }
     }
@@ -786,6 +791,7 @@ template void strong_branching<int, double>(const user_problem_t<int, double>& o
                                             double root_obj,
                                             const std::vector<variable_status_t>& root_vstatus,
                                             const std::vector<double>& edge_norms,
+                                            double upper_bound,
                                             pseudo_costs_t<int, double>& pc);
 
 #endif
