@@ -2609,46 +2609,46 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
           "Strong branching bounds tightening: %d variables fixed (%d from propagation)\n",
           num_fixed,
           num_fixed - num_tightened);
-        num_fractional = fractional.size();
       }
 
-      // If no fractionals remain after the fixings - perform a resolve
-      // to get fractionals to branch on, or return optimality if the root relaxation is integer
-      if (num_fractional == 0) {
-        lp_settings.concurrent_halt = NULL;
-        i_t iter                    = 0;
-        bool initialize_basis       = false;
-        dual::status_t lp_status    = dual_phase2_with_advanced_basis(2,
-                                                                   0,
-                                                                   initialize_basis,
-                                                                   exploration_stats_.start_time,
-                                                                   original_lp_,
-                                                                   lp_settings,
-                                                                   root_vstatus_,
-                                                                   basis_update,
-                                                                   basic_list,
-                                                                   nonbasic_list,
-                                                                   root_relax_soln_,
-                                                                   iter,
-                                                                   edge_norms_);
-        exploration_stats_.total_lp_iters += iter;
-        root_objective_ = compute_objective(original_lp_, root_relax_soln_.x);
-        if (lp_status == dual::status_t::OPTIMAL) {
-          fractional.clear();
-          num_fractional =
-            fractional_variables(settings_, root_relax_soln_.x, var_types_, fractional);
-          if (num_fractional == 0) {
-            set_solution_at_root(solution, cut_info);
-            return mip_status_t::OPTIMAL;
-          }
-        } else if (lp_status == dual::status_t::TIME_LIMIT) {
-          solver_status_ = mip_status_t::TIME_LIMIT;
-          set_final_solution(solution, root_objective_);
-          return solver_status_;
-        } else {
-          settings_.log.printf("LP re-solve after SB tightening returned status %d\n", lp_status);
-          return mip_status_t::NUMERICAL;
+      // Re-solve the root LP so that root_relax_soln_, root_objective_, and root_vstatus_
+      // are consistent with the tightened bounds before branching or reduced-cost strengthening.
+      lp_settings.concurrent_halt = NULL;
+      i_t iter                    = 0;
+      bool initialize_basis       = false;
+      dual::status_t lp_status    = dual_phase2_with_advanced_basis(2,
+                                                                 0,
+                                                                 initialize_basis,
+                                                                 exploration_stats_.start_time,
+                                                                 original_lp_,
+                                                                 lp_settings,
+                                                                 root_vstatus_,
+                                                                 basis_update,
+                                                                 basic_list,
+                                                                 nonbasic_list,
+                                                                 root_relax_soln_,
+                                                                 iter,
+                                                                 edge_norms_);
+      exploration_stats_.total_lp_iters += iter;
+      root_objective_ = compute_objective(original_lp_, root_relax_soln_.x);
+      if (lp_status == dual::status_t::OPTIMAL) {
+        fractional.clear();
+        num_fractional =
+          fractional_variables(settings_, root_relax_soln_.x, var_types_, fractional);
+        if (num_fractional == 0) {
+          set_solution_at_root(solution, cut_info);
+          return mip_status_t::OPTIMAL;
         }
+      } else if (lp_status == dual::status_t::INFEASIBLE) {
+        settings_.log.printf("Root LP infeasible after SB tightening\n");
+        return mip_status_t::INFEASIBLE;
+      } else if (lp_status == dual::status_t::TIME_LIMIT) {
+        solver_status_ = mip_status_t::TIME_LIMIT;
+        set_final_solution(solution, root_objective_);
+        return solver_status_;
+      } else {
+        settings_.log.printf("LP re-solve after SB tightening returned status %d\n", lp_status);
+        return mip_status_t::NUMERICAL;
       }
     }
   }
@@ -2670,49 +2670,50 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
         return mip_status_t::NUMERICAL;  // We had a feasible integer solution, but bound
                                          // strengthening thinks we are infeasible.
       }
-      i_t num_fixed = prune_fixed_fractional_variables(new_lower, new_upper, settings_, fractional);
+      prune_fixed_fractional_variables(new_lower, new_upper, settings_, fractional);
       mutex_original_lp_.lock();
       original_lp_.lower = new_lower;
       original_lp_.upper = new_upper;
       mutex_original_lp_.unlock();
-      if (num_fixed > 0) {
-        num_fractional = fractional.size();
+
+      // Re-solve the root LP so that root_relax_soln_, root_objective_, and root_vstatus_
+      // are consistent with the tightened bounds.
+      lp_settings.concurrent_halt = NULL;
+      i_t iter                    = 0;
+      bool initialize_basis       = false;
+      dual::status_t lp_status    = dual_phase2_with_advanced_basis(2,
+                                                                 0,
+                                                                 initialize_basis,
+                                                                 exploration_stats_.start_time,
+                                                                 original_lp_,
+                                                                 lp_settings,
+                                                                 root_vstatus_,
+                                                                 basis_update,
+                                                                 basic_list,
+                                                                 nonbasic_list,
+                                                                 root_relax_soln_,
+                                                                 iter,
+                                                                 edge_norms_);
+      exploration_stats_.total_lp_iters += iter;
+      root_objective_ = compute_objective(original_lp_, root_relax_soln_.x);
+      if (lp_status == dual::status_t::OPTIMAL) {
+        fractional.clear();
+        num_fractional =
+          fractional_variables(settings_, root_relax_soln_.x, var_types_, fractional);
         if (num_fractional == 0) {
-          lp_settings.concurrent_halt = NULL;
-          i_t iter                    = 0;
-          bool initialize_basis       = false;
-          dual::status_t lp_status    = dual_phase2_with_advanced_basis(2,
-                                                                     0,
-                                                                     initialize_basis,
-                                                                     exploration_stats_.start_time,
-                                                                     original_lp_,
-                                                                     lp_settings,
-                                                                     root_vstatus_,
-                                                                     basis_update,
-                                                                     basic_list,
-                                                                     nonbasic_list,
-                                                                     root_relax_soln_,
-                                                                     iter,
-                                                                     edge_norms_);
-          exploration_stats_.total_lp_iters += iter;
-          root_objective_ = compute_objective(original_lp_, root_relax_soln_.x);
-          if (lp_status == dual::status_t::OPTIMAL) {
-            fractional.clear();
-            num_fractional =
-              fractional_variables(settings_, root_relax_soln_.x, var_types_, fractional);
-            if (num_fractional == 0) {
-              set_solution_at_root(solution, cut_info);
-              return mip_status_t::OPTIMAL;
-            }
-          } else if (lp_status == dual::status_t::TIME_LIMIT) {
-            solver_status_ = mip_status_t::TIME_LIMIT;
-            set_final_solution(solution, root_objective_);
-            return solver_status_;
-          } else {
-            settings_.log.printf("LP re-solve after RC tightening returned status %d\n", lp_status);
-            return mip_status_t::NUMERICAL;
-          }
+          set_solution_at_root(solution, cut_info);
+          return mip_status_t::OPTIMAL;
         }
+      } else if (lp_status == dual::status_t::INFEASIBLE) {
+        settings_.log.printf("Root LP infeasible after RC tightening\n");
+        return mip_status_t::INFEASIBLE;
+      } else if (lp_status == dual::status_t::TIME_LIMIT) {
+        solver_status_ = mip_status_t::TIME_LIMIT;
+        set_final_solution(solution, root_objective_);
+        return solver_status_;
+      } else {
+        settings_.log.printf("LP re-solve after RC tightening returned status %d\n", lp_status);
+        return mip_status_t::NUMERICAL;
       }
     }
   }
