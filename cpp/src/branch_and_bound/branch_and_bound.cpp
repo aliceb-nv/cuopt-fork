@@ -2601,6 +2601,14 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
       original_lp_.upper = new_upper;
       mutex_original_lp_.unlock();
       if (!feasible) {
+        if (num_cutoff > 0) {
+          settings_.log.printf(
+            "SB propagation infeasible with cutoff-based tightenings: incumbent is optimal\n");
+          cuopt_assert(incumbent_.has_incumbent);
+          solver_status_ = mip_status_t::OPTIMAL;
+          set_final_solution(solution, upper_bound_.load());
+          return solver_status_;
+        }
         settings_.log.printf("Strong branching bounds propagation detected infeasibility\n");
         return mip_status_t::INFEASIBLE;
       }
@@ -2639,7 +2647,15 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
           set_solution_at_root(solution, cut_info);
           return mip_status_t::OPTIMAL;
         }
-      } else if (lp_status == dual::status_t::INFEASIBLE) {
+      } else if (lp_status == dual::status_t::DUAL_UNBOUNDED) {
+        if (num_cutoff > 0) {
+          settings_.log.printf(
+            "Root LP infeasible after SB tightening with cutoffs: incumbent is optimal\n");
+          cuopt_assert(incumbent_.has_incumbent);
+          solver_status_ = mip_status_t::OPTIMAL;
+          set_final_solution(solution, upper_bound_.load());
+          return solver_status_;
+        }
         settings_.log.printf("Root LP infeasible after SB tightening\n");
         return mip_status_t::INFEASIBLE;
       } else if (lp_status == dual::status_t::TIME_LIMIT) {
@@ -2666,9 +2682,12 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
       bool feasible =
         node_presolve.bounds_strengthening(settings_, bounds_changed, new_lower, new_upper);
       if (!feasible) {
-        settings_.log.printf("Bound strengthening failed\n");
-        return mip_status_t::NUMERICAL;  // We had a feasible integer solution, but bound
-                                         // strengthening thinks we are infeasible.
+        settings_.log.printf(
+          "RC propagation infeasible: no solution beats the incumbent, incumbent is optimal\n");
+        cuopt_assert(incumbent_.has_incumbent);
+        solver_status_ = mip_status_t::OPTIMAL;
+        set_final_solution(solution, upper_bound_.load());
+        return solver_status_;
       }
       prune_fixed_fractional_variables(new_lower, new_upper, settings_, fractional);
       mutex_original_lp_.lock();
@@ -2704,9 +2723,12 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
           set_solution_at_root(solution, cut_info);
           return mip_status_t::OPTIMAL;
         }
-      } else if (lp_status == dual::status_t::INFEASIBLE) {
-        settings_.log.printf("Root LP infeasible after RC tightening\n");
-        return mip_status_t::INFEASIBLE;
+      } else if (lp_status == dual::status_t::DUAL_UNBOUNDED) {
+        settings_.log.printf("Root LP infeasible after RC tightening: incumbent is optimal\n");
+        cuopt_assert(incumbent_.has_incumbent);
+        solver_status_ = mip_status_t::OPTIMAL;
+        set_final_solution(solution, upper_bound_.load());
+        return solver_status_;
       } else if (lp_status == dual::status_t::TIME_LIMIT) {
         solver_status_ = mip_status_t::TIME_LIMIT;
         set_final_solution(solution, root_objective_);
