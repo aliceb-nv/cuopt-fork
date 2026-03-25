@@ -646,6 +646,7 @@ std::optional<third_party_presolve_result_t<i_t, f_t>> third_party_presolve_t<i_
   set_presolve_parameters(
     papilo_presolver, category, op_problem.get_n_constraints(), op_problem.get_n_variables());
 
+  // Disable papilo logs
   papilo_presolver.setVerbosityLevel(papilo::VerbosityLevel::kQuiet);
 
   auto result = papilo_presolver.apply(papilo_problem);

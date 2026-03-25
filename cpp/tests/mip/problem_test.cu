@@ -8,6 +8,7 @@
 #include "../linear_programming/utilities/pdlp_test_utilities.cuh"
 
 #include <cuopt/linear_programming/solve.hpp>
+#include <mip_heuristics/presolve/third_party_presolve.hpp>
 #include <mip_heuristics/presolve/trivial_presolve.cuh>
 #include <mip_heuristics/problem/problem.cuh>
 #include <mps_parser/mps_data_model.hpp>
@@ -483,5 +484,38 @@ TEST(optimization_problem_t_DeathTest, test_check_problem_validity)
   EXPECT_DEATH({ problem2.check_problem_representation(true, false); }, "");
 }
 #endif
+
+TEST(problem, find_implied_integers)
+{
+  const raft::handle_t handle_{};
+
+  auto path           = make_path_absolute("mip/fiball.mps");
+  auto mps_data_model = cuopt::mps_parser::parse_mps<int, double>(path, false);
+  auto op_problem     = mps_data_model_to_optimization_problem(&handle_, mps_data_model);
+  auto presolver      = std::make_unique<detail::third_party_presolve_t<int, double>>();
+  auto result         = presolver->apply(op_problem,
+                                 cuopt::linear_programming::problem_category_t::MIP,
+                                 cuopt::linear_programming::presolver_t::Papilo,
+                                 false,
+                                 1e-6,
+                                 1e-12,
+                                 20,
+                                 1);
+  ASSERT_TRUE(result.has_value());
+
+  auto problem = detail::problem_t<int, double>(result->reduced_problem);
+  problem.set_implied_integers(result->implied_integer_indices);
+  ASSERT_TRUE(result->implied_integer_indices.size() > 0);
+  auto var_types = host_copy(problem.variable_types, handle_.get_stream());
+  // Find the index of the one continuous variable
+  auto it = std::find_if(var_types.begin(), var_types.end(), [](var_t var_type) {
+    return var_type == var_t::CONTINUOUS;
+  });
+  ASSERT_NE(it, var_types.end());
+  ASSERT_EQ(problem.presolve_data.var_flags.size(), var_types.size());
+  // Ensure it is an implied integer
+  EXPECT_EQ(problem.presolve_data.var_flags.element(it - var_types.begin(), handle_.get_stream()),
+            ((int)detail::problem_t<int, double>::var_flags_t::VAR_IMPLIED_INTEGER));
+}
 
 }  // namespace cuopt::linear_programming::test

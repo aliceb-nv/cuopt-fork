@@ -37,7 +37,7 @@ ConfigureTest(EMPTY_FIXED_PROBLEMS_TEST
     ${CMAKE_CURRENT_SOURCE_DIR}/empty_fixed_problems_test.cu
 )
 ConfigureTest(PRESOLVE_TEST
-    ${CMAKE_CURRENT_SOURCE_DIR}/presolve_test.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/presolve_test.cpp
 )
 # Disable for now
 # ConfigureTest(FEASIBILITY_JUMP_TEST

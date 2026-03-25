@@ -37,20 +37,6 @@ class SingleLockDualAggregation : public papilo::PresolveMethod<f_t> {
                                  papilo::Reductions<f_t>& reductions,
                                  const papilo::Timer& timer,
                                  int& reason_of_infeasibility) override;
-
- private:
-  bool is_binary_or_implied(int col,
-                            const papilo::Flags<papilo::ColFlag>* col_flags,
-                            const f_t* lower_bounds,
-                            const f_t* upper_bounds) const
-  {
-    if (!col_flags[col].test(papilo::ColFlag::kIntegral) &&
-        !col_flags[col].test(papilo::ColFlag::kImplInt))
-      return false;
-    if (col_flags[col].test(papilo::ColFlag::kLbInf)) return false;
-    if (col_flags[col].test(papilo::ColFlag::kUbInf)) return false;
-    return lower_bounds[col] == 0.0 && upper_bounds[col] == 1.0;
-  }
 };
 
 }  // namespace cuopt::linear_programming::detail
