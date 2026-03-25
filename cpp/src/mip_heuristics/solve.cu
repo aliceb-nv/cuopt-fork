@@ -328,7 +328,7 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
     // Track best incumbent found during presolve (shared across CPU and GPU FJ).
     // early_best_objective is in the original problem's solver-space (always minimization),
     // used for fast comparison in the callback.
-    // early_best_user_obj is the corresponding user-space objective (representation-invariant),
+    // early_best_user_obj is the corresponding user-space objective,
     // passed to run_mip for correct cross-space conversion.
     std::atomic<f_t> early_best_objective{std::numeric_limits<f_t>::infinity()};
     f_t early_best_user_obj{std::numeric_limits<f_t>::infinity()};
@@ -427,7 +427,7 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
       op_problem.write_to_mps(settings.user_problem_file);
     }
 
-    // early_best_user_obj is in user-space (representation-invariant).
+    // early_best_user_obj is in user-space.
     // run_mip stores it in context.initial_cutoff and converts to target spaces as needed.
     auto sol = run_mip(problem, settings, timer, early_best_user_obj);
 
