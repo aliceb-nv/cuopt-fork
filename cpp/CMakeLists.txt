@@ -109,8 +109,12 @@ if(BUILD_MSAN)
   add_link_options(-fsanitize=memory)
 endif(BUILD_MSAN)
 
+# Note: -UNDEBUG is applied via CUOPT_CXX_FLAGS / CUOPT_CUDA_FLAGS (not add_definitions)
+# to avoid leaking into dependencies that are built in-tree.
 if(DEFINE_ASSERT)
   add_definitions(-DASSERT_MODE)
+  list(APPEND CUOPT_CXX_FLAGS -UNDEBUG)
+  list(APPEND CUOPT_CUDA_FLAGS -UNDEBUG)
 endif(DEFINE_ASSERT)
 
 if(DEFINE_BENCHMARK)
@@ -183,13 +187,6 @@ elseif(CMAKE_CUDA_LINEINFO)
   list(APPEND CUOPT_CUDA_FLAGS -lineinfo)
   set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} -lineinfo")
 endif(CMAKE_BUILD_TYPE MATCHES Debug)
-
-# Undefine NDEBUG if assert mode is on
-if(DEFINE_ASSERT)
-  message(STATUS "Undefining NDEBUG with assert mode enabled")
-  add_definitions(-UNDEBUG)
-endif()
-
 
 # ##################################################################################################
 # - find CPM based dependencies  ------------------------------------------------------------------
@@ -543,6 +540,12 @@ endif()
 option(BUILD_MIP_BENCHMARKS "Build MIP benchmarks" OFF)
 if(BUILD_MIP_BENCHMARKS AND NOT BUILD_LP_ONLY)
   add_executable(solve_MIP ../benchmarks/linear_programming/cuopt/run_mip.cpp)
+  target_include_directories(solve_MIP
+    PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    PUBLIC
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+  )
 
   set_target_properties(solve_MIP
     PROPERTIES
