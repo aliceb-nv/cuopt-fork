@@ -213,10 +213,11 @@ int run_single_file(std::string file_path,
   settings.tolerances.absolute_tolerance = 1e-6;
   settings.presolver                     = cuopt::linear_programming::presolver_t::Default;
   settings.reliability_branching         = reliability_branching;
-  settings.clique_cuts                   = -1;
+  settings.clique_cuts                   = 0;
   settings.seed                          = 42;
   cuopt::linear_programming::benchmark_info_t benchmark_info;
   settings.benchmark_info_ptr = &benchmark_info;
+  settings.user_problem_file  = "presolved.mps";
   auto start_run_solver       = std::chrono::high_resolution_clock::now();
   auto solution = cuopt::linear_programming::solve_mip(&handle_, mps_data_model, settings);
   CUOPT_LOG_INFO(
