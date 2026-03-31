@@ -296,6 +296,7 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
     if (std::isfinite(context.initial_cutoff)) {
       f_t bb_cutoff = context.problem_ptr->get_solver_obj_from_user_obj(context.initial_cutoff);
       branch_and_bound->set_initial_cutoff(bb_cutoff);
+      dm.population.best_feasible_objective = bb_cutoff;
       CUOPT_LOG_INFO("B&B using initial cutoff %.6e (user-space: %.6e) from early heuristics",
                      bb_cutoff,
                      context.initial_cutoff);
