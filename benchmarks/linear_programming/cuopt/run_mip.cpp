@@ -217,7 +217,6 @@ int run_single_file(std::string file_path,
   settings.seed                          = 42;
   cuopt::linear_programming::benchmark_info_t benchmark_info;
   settings.benchmark_info_ptr = &benchmark_info;
-  settings.user_problem_file  = "presolved.mps";
   auto start_run_solver       = std::chrono::high_resolution_clock::now();
   auto solution = cuopt::linear_programming::solve_mip(&handle_, mps_data_model, settings);
   CUOPT_LOG_INFO(
@@ -225,7 +224,7 @@ int run_single_file(std::string file_path,
     benchmark_info.objective_of_initial_population,
     benchmark_info.last_improvement_of_best_feasible,
     benchmark_info.last_improvement_after_recombination);
-  solution.write_to_sol_file(base_filename + ".sol", handle_.get_stream());
+  // solution.write_to_sol_file(base_filename + ".sol", handle_.get_stream());
   std::chrono::milliseconds duration;
   auto end = std::chrono::high_resolution_clock::now();
   duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start_run_solver);
