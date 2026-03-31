@@ -202,6 +202,33 @@ std::vector<candidate_t> collect_candidates(const papilo::Problem<f_t>& problem,
 // processed together in a single O(L) scan.
 // =========================================================================
 
+// can't use "check_if_substitution_generates_huge_or_small_coefficients" directly since it expects
+// equality rows only
+template <typename f_t>
+bool substitution_numerically_stable(const papilo::ConstraintMatrix<f_t>& constraint_matrix,
+                                     int cand_col)
+{
+  auto col_coeff       = constraint_matrix.getColumnCoefficients(cand_col);
+  const int* rows      = col_coeff.getIndices();
+  const f_t* col_vals  = col_coeff.getValues();
+  const int col_length = col_coeff.getLength();
+
+  for (int k = 0; k < col_length; ++k) {
+    int r             = rows[k];
+    f_t abs_cand      = std::abs(col_vals[k]);
+    auto row_coeff    = constraint_matrix.getRowCoefficients(r);
+    const f_t* rvals  = row_coeff.getValues();
+    const int rlength = row_coeff.getLength();
+
+    f_t row_max = 0;
+    for (int p = 0; p < rlength; ++p)
+      row_max = std::max(row_max, std::abs(rvals[p]));
+
+    if (abs_cand > 1e6 * row_max || abs_cand * 1e6 < row_max) return false;
+  }
+  return true;
+}
+
 template <typename f_t>
 int try_substitutions_for_row(const papilo::Problem<f_t>& problem,
                               const papilo::Num<f_t>& num,
@@ -220,7 +247,6 @@ int try_substitutions_for_row(const papilo::Problem<f_t>& problem,
   const auto& col_flags         = domains.flags;
   const auto& lower_bounds      = domains.lower_bounds;
   const auto& upper_bounds      = domains.upper_bounds;
-  const f_t tol                 = num.getFeasTol();
 
   auto row_coeff   = constraint_matrix.getRowCoefficients(row);
   const int* cols  = row_coeff.getIndices();
@@ -283,11 +309,11 @@ int try_substitutions_for_row(const papilo::Problem<f_t>& problem,
 
     if (use_leq_check) {
       f_t probed_min = A_min - std::min(f_t{0}, cand_coeff) - std::min(f_t{0}, y_coef) + test;
-      if (probed_min > rhs_values[row] + tol) return true;
+      if (num.isFeasGT(probed_min, rhs_values[row])) return true;
     }
     if (use_geq_check) {
       f_t probed_max = A_max - std::max(f_t{0}, cand_coeff) - std::max(f_t{0}, y_coef) + test;
-      if (probed_max < lhs_values[row] - tol) return true;
+      if (num.isFeasLT(probed_max, lhs_values[row])) return true;
     }
     return false;
   };
@@ -354,13 +380,15 @@ int try_substitutions_for_row(const papilo::Problem<f_t>& problem,
           return;
         }
         f_t fav = activity - orig_y + fav_y_contrib;
-        if (side == UPPER ? fav > bound + tol : fav < bound - tol) proven = false;
+        if (side == UPPER ? num.isFeasGT(fav, bound) : num.isFeasLT(fav, bound)) proven = false;
       };
     check_side(
       has_rhs, can_reach_pos_inf, A_max, std::max(f_t{0}, y_coef_val), rhs_values[row], UPPER);
     check_side(
       has_lhs, can_reach_neg_inf, A_min, std::min(f_t{0}, y_coef_val), lhs_values[row], LOWER);
     if (!proven) continue;
+
+    if (!substitution_numerically_stable(constraint_matrix, cand)) continue;
 
     substituted[cand] = true;
     if (is_anti)
