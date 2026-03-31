@@ -37,45 +37,24 @@ size_t sub_mip_recombiner_config_t::max_n_of_vars_from_other =
 template <typename i_t, typename f_t>
 std::vector<recombiner_enum_t> recombiner_t<i_t, f_t>::enabled_recombiners;
 
-namespace {
-diversity_config_t make_diversity_config(const mip_heuristics_hyper_params_t& hp)
-{
-  diversity_config_t c;
-  c.max_solutions                = hp.population_size;
-  c.time_ratio_on_init_lp        = hp.root_lp_time_ratio;
-  c.max_time_on_lp               = hp.root_lp_max_time;
-  c.initial_infeasibility_weight = hp.initial_infeasibility_weight;
-  return c;
-}
-
-rins_settings_t make_rins_settings(const mip_heuristics_hyper_params_t& hp)
-{
-  rins_settings_t s;
-  s.default_fixrate    = hp.rins_fix_rate;
-  s.default_time_limit = hp.rins_time_limit;
-  s.max_time_limit     = hp.rins_max_time_limit;
-  return s;
-}
-}  // namespace
-
 template <typename i_t, typename f_t>
 diversity_manager_t<i_t, f_t>::diversity_manager_t(mip_solver_context_t<i_t, f_t>& context_)
   : context(context_),
     branch_and_bound_ptr(nullptr),
     problem_ptr(context.problem_ptr),
-    diversity_config(make_diversity_config(context_.settings.heuristic_params)),
     population("population",
                context,
                *this,
                diversity_config.max_var_diff,
-               diversity_config.max_solutions,
-               diversity_config.initial_infeasibility_weight * context.problem_ptr->n_constraints),
+               context_.settings.heuristic_params.population_size,
+               context_.settings.heuristic_params.initial_infeasibility_weight *
+                 context.problem_ptr->n_constraints),
     lp_optimal_solution(context.problem_ptr->n_variables,
                         context.problem_ptr->handle_ptr->get_stream()),
     lp_dual_optimal_solution(context.problem_ptr->n_constraints,
                              context.problem_ptr->handle_ptr->get_stream()),
     ls(context, lp_optimal_solution),
-    rins(context, *this, make_rins_settings(context_.settings.heuristic_params)),
+    rins(context, *this),
     timer(diversity_config.default_time_limit),
     bound_prop_recombiner(context,
                           context.problem_ptr->n_variables,
@@ -404,10 +383,10 @@ solution_t<i_t, f_t> diversity_manager_t<i_t, f_t>::run_solver()
     return population.best_feasible();
   }
 
-  population.timer     = timer;
-  const f_t time_limit = timer.remaining_time();
-  const f_t lp_time_limit =
-    std::min(diversity_config.max_time_on_lp, time_limit * diversity_config.time_ratio_on_init_lp);
+  population.timer        = timer;
+  const f_t time_limit    = timer.remaining_time();
+  const auto& hp          = context.settings.heuristic_params;
+  const f_t lp_time_limit = std::min(hp.root_lp_max_time, time_limit * hp.root_lp_time_ratio);
   // after every change to the problem, we should resize all the relevant vars
   // we need to encapsulate that to prevent repetitions
   recombine_stats.reset();

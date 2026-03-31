@@ -31,8 +31,8 @@ rins_t<i_t, f_t>::rins_t(mip_solver_context_t<i_t, f_t>& context_,
                          rins_settings_t settings_)
   : context(context_), problem_ptr(context.problem_ptr), dm(dm_), settings(settings_)
 {
-  fixrate    = settings.default_fixrate;
-  time_limit = settings.default_time_limit;
+  fixrate    = context.settings.heuristic_params.rins_fix_rate;
+  time_limit = context.settings.heuristic_params.rins_time_limit;
 }
 
 template <typename i_t, typename f_t>
@@ -295,7 +295,8 @@ void rins_t<i_t, f_t>::run_rins()
     CUOPT_LOG_DEBUG("RINS submip time limit");
     // do goldilocks update
     fixrate    = std::min(fixrate + f_t(0.05), static_cast<f_t>(settings.max_fixrate));
-    time_limit = std::min(time_limit + f_t(2), static_cast<f_t>(settings.max_time_limit));
+    time_limit = std::min(time_limit + f_t(2),
+                          static_cast<f_t>(context.settings.heuristic_params.rins_max_time_limit));
   } else if (branch_and_bound_status == dual_simplex::mip_status_t::INFEASIBLE) {
     CUOPT_LOG_DEBUG("RINS submip infeasible");
     // do goldilocks update, decreasing fixrate
@@ -304,7 +305,8 @@ void rins_t<i_t, f_t>::run_rins()
     CUOPT_LOG_DEBUG("RINS solution not found");
     // do goldilocks update
     fixrate    = std::min(fixrate + f_t(0.05), static_cast<f_t>(settings.max_fixrate));
-    time_limit = std::min(time_limit + f_t(2), static_cast<f_t>(settings.max_time_limit));
+    time_limit = std::min(time_limit + f_t(2),
+                          static_cast<f_t>(context.settings.heuristic_params.rins_max_time_limit));
   }
 
   cpu_fj_thread.stop_cpu_solver();
