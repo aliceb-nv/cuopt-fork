@@ -24,8 +24,6 @@
 
 namespace cuopt::linear_programming::detail::test {
 
-namespace {
-
 struct papilo_harness_t {
   papilo::Num<double> num;
   papilo::Reductions<double> reductions;
@@ -94,8 +92,6 @@ papilo::Problem<double> build_problem(int nrows,
   }
   return builder.build();
 }
-
-}  // namespace
 
 // x has one up-lock in a LEQ row. Probe proves y=0 => x=0 via activity.
 // Favorable-state check passes. Result: x = y (direct substitution).
