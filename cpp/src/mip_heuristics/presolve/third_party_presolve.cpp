@@ -513,10 +513,8 @@ void set_presolve_methods(papilo::Presolve<f_t>& presolver,
   using uptr = std::unique_ptr<papilo::PresolveMethod<f_t>>;
 
   if (category == problem_category_t::MIP) {
-    // cuOpt custom presolvers
+    // cuOpt custom GF2 presolver
     presolver.addPresolveMethod(uptr(new cuopt::linear_programming::detail::GF2Presolve<f_t>()));
-    presolver.addPresolveMethod(
-      uptr(new cuopt::linear_programming::detail::SingleLockDualAggregation<f_t>()));
   }
   // fast presolvers
   presolver.addPresolveMethod(uptr(new papilo::SingletonCols<f_t>()));
@@ -544,6 +542,8 @@ void set_presolve_methods(papilo::Presolve<f_t>& presolver,
     presolver.addPresolveMethod(uptr(new papilo::SimpleSubstitution<f_t>()));
     presolver.addPresolveMethod(uptr(new papilo::Sparsify<f_t>()));
     presolver.addPresolveMethod(uptr(new papilo::Substitution<f_t>()));
+    presolver.addPresolveMethod(
+      uptr(new cuopt::linear_programming::detail::SingleLockDualAggregation<f_t>()));
   } else {
     CUOPT_LOG_INFO("Disabling the presolver methods that do not support dual postsolve");
   }
