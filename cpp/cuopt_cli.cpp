@@ -85,27 +85,13 @@ inline cuopt::init_logger_t dummy_logger(
  * @brief Run a single file
  * @param file_path Path to the MPS format input file containing the optimization problem
  * @param initial_solution_file Path to initial solution file in SOL format
- * @param settings_strings Map of solver parameters
+ * @param settings Merged solver settings (config file loaded in main, then CLI overrides applied)
  */
 int run_single_file(const std::string& file_path,
                     const std::string& initial_solution_file,
                     bool solve_relaxation,
-                    const std::map<std::string, std::string>& settings_strings,
-                    const std::string& params_file = "")
+                    cuopt::linear_programming::solver_settings_t<int, double>& settings)
 {
-  cuopt::linear_programming::solver_settings_t<int, double> settings;
-
-  try {
-    if (!params_file.empty()) { settings.load_parameters_from_file(params_file); }
-    for (auto& [key, val] : settings_strings) {
-      settings.set_parameter_from_string(key, val);
-    }
-  } catch (const std::exception& e) {
-    auto log = dummy_logger(settings);
-    CUOPT_LOG_ERROR("Error: %s", e.what());
-    return -1;
-  }
-
   std::string base_filename = file_path.substr(file_path.find_last_of("/\\") + 1);
 
   constexpr bool input_mps_strict = false;
@@ -397,16 +383,26 @@ int main(int argc, char* argv[])
 
   const auto initial_solution_file = program.get<std::string>("--initial-solution");
   const auto solve_relaxation      = program.get<bool>("--relaxation");
+  const auto params_file           = program.get<std::string>("--params-file");
+
+  cuopt::linear_programming::solver_settings_t<int, double> settings;
+  try {
+    if (!params_file.empty()) { settings.load_parameters_from_file(params_file); }
+    for (auto& [key, val] : settings_strings) {
+      settings.set_parameter_from_string(key, val);
+    }
+  } catch (const std::exception& e) {
+    auto log = dummy_logger(settings);
+    CUOPT_LOG_ERROR("Error: %s", e.what());
+    return -1;
+  }
 
   // Only initialize CUDA resources if using GPU memory backend (not remote execution)
   auto memory_backend = cuopt::linear_programming::get_memory_backend_type();
   std::vector<std::shared_ptr<rmm::mr::device_memory_resource>> memory_resources;
 
   if (memory_backend == cuopt::linear_programming::memory_backend_t::GPU) {
-    // All arguments are parsed as string, default values are parsed as int if unused.
-    const auto num_gpus = program.is_used("--num-gpus")
-                            ? std::stoi(program.get<std::string>("--num-gpus"))
-                            : program.get<int>("--num-gpus");
+    const int num_gpus = settings.get_parameter<int>(CUOPT_NUM_GPUS);
 
     for (int i = 0; i < std::min(raft::device_setter::get_device_count(), num_gpus); ++i) {
       RAFT_CUDA_TRY(cudaSetDevice(i));
@@ -416,8 +412,5 @@ int main(int argc, char* argv[])
     RAFT_CUDA_TRY(cudaSetDevice(0));
   }
 
-  const auto params_file = program.get<std::string>("--params-file");
-
-  return run_single_file(
-    file_name, initial_solution_file, solve_relaxation, settings_strings, params_file);
+  return run_single_file(file_name, initial_solution_file, solve_relaxation, settings);
 }
