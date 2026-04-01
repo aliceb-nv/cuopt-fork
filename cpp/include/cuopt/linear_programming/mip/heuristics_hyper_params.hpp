@@ -24,7 +24,7 @@ struct mip_heuristics_hyper_params_t {
   double presolve_max_time               = 60.0;    // hard cap on presolve seconds
   double root_lp_time_ratio              = 0.1;     // fraction of total time for root LP
   double root_lp_max_time                = 15.0;    // hard cap on root LP seconds
-  double rins_time_limit                 = 10.0;    // per-call RINS sub-MIP time (former fixed cap)
+  double rins_time_limit                 = 3.0;     // per-call RINS sub-MIP time
   double rins_max_time_limit             = 20.0;    // ceiling for RINS adaptive time budget
   double rins_fix_rate                   = 0.5;     // RINS variable fix rate
   int stagnation_trigger                 = 3;       // FP loops w/o improvement before recombination
