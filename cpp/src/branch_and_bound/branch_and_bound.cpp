@@ -250,6 +250,7 @@ branch_and_bound_t<i_t, f_t>::branch_and_bound_t(
     original_lp_(user_problem.handle_ptr, 1, 1, 1),
     Arow_(1, 1, 0),
     incumbent_(1),
+    external_incumbent_(1),
     root_relax_soln_(1, 1),
     root_crossover_soln_(1, 1),
     pc_(1),
@@ -304,6 +305,24 @@ f_t branch_and_bound_t<i_t, f_t>::get_lower_bound()
     return root_objective_;
   } else {
     return -inf;
+  }
+}
+
+template <typename i_t, typename f_t>
+void branch_and_bound_t<i_t, f_t>::set_initial_cutoff(f_t bound)
+{
+  std::lock_guard<omp_mutex_t> lock(mutex_upper_);
+  if (bound < upper_bound_) { upper_bound_ = bound; }
+}
+
+template <typename i_t, typename f_t>
+void branch_and_bound_t<i_t, f_t>::set_external_incumbent(f_t objective,
+                                                          const std::vector<f_t>& solution)
+{
+  std::lock_guard<omp_mutex_t> lock(mutex_upper_);
+  if (objective < upper_bound_) { upper_bound_ = objective; }
+  if (!external_incumbent_.has_incumbent || objective <= external_incumbent_.objective) {
+    external_incumbent_.set_incumbent_solution(objective, solution);
   }
 }
 
@@ -673,6 +692,7 @@ void branch_and_bound_t<i_t, f_t>::set_solution_at_root(mip_solution_t<i_t, f_t>
   // We should be done here
   uncrush_primal_solution(original_problem_, original_lp_, incumbent_.x, solution.x);
   solution.objective          = incumbent_.objective;
+  solution.has_incumbent      = true;
   solution.lower_bound        = root_objective_;
   solution.nodes_explored     = 0;
   solution.simplex_iterations = root_relax_soln_.iterations;
@@ -734,7 +754,9 @@ void branch_and_bound_t<i_t, f_t>::set_final_solution(mip_solution_t<i_t, f_t>& 
   if (gap <= settings_.absolute_mip_gap_tol || gap_rel <= settings_.relative_mip_gap_tol) {
     solver_status_ = mip_status_t::OPTIMAL;
 #ifdef CHECK_CUTS_AGAINST_SAVED_SOLUTION
-    if (settings_.sub_mip == 0) { write_solution_for_cut_verification(original_lp_, incumbent_.x); }
+    if (settings_.sub_mip == 0 && has_solver_space_incumbent()) {
+      write_solution_for_cut_verification(original_lp_, incumbent_.x);
+    }
 #endif
     if (gap > 0 && gap <= settings_.absolute_mip_gap_tol) {
       settings_.log.printf("Optimal solution found within absolute MIP gap tolerance (%.1e)\n",
@@ -752,7 +774,7 @@ void branch_and_bound_t<i_t, f_t>::set_final_solution(mip_solution_t<i_t, f_t>& 
 
   if (solver_status_ == mip_status_t::UNSET) {
     if (exploration_stats_.nodes_explored > 0 && exploration_stats_.nodes_unexplored == 0 &&
-        upper_bound_ == inf) {
+        !has_any_incumbent()) {
       settings_.log.printf("Integer infeasible.\n");
       solver_status_ = mip_status_t::INFEASIBLE;
       if (settings_.heuristic_preemption_callback != nullptr) {
@@ -761,11 +783,15 @@ void branch_and_bound_t<i_t, f_t>::set_final_solution(mip_solution_t<i_t, f_t>& 
     }
   }
 
-  if (upper_bound_ != inf) {
-    assert(incumbent_.has_incumbent);
+  if (has_solver_space_incumbent()) {
     uncrush_primal_solution(original_problem_, original_lp_, incumbent_.x, solution.x);
+    solution.objective     = incumbent_.objective;
+    solution.has_incumbent = true;
+  } else if (has_external_incumbent()) {
+    solution.x             = external_incumbent_.x;
+    solution.objective     = external_incumbent_.objective;
+    solution.has_incumbent = true;
   }
-  solution.objective          = incumbent_.objective;
   solution.lower_bound        = lower_bound;
   solution.nodes_explored     = exploration_stats_.nodes_explored;
   solution.simplex_iterations = exploration_stats_.total_lp_iters;
@@ -1610,7 +1636,7 @@ void branch_and_bound_t<i_t, f_t>::run_scheduler()
   diving_heuristics_settings_t<i_t, f_t> diving_settings = settings_.diving_settings;
   const i_t num_workers                                  = 2 * settings_.num_threads;
 
-  if (!std::isfinite(upper_bound_)) { diving_settings.guided_diving = false; }
+  if (!has_solver_space_incumbent()) { diving_settings.guided_diving = false; }
   std::vector<search_strategy_t> strategies = get_search_strategies(diving_settings);
   std::array<i_t, num_search_strategies> max_num_workers_per_type =
     get_max_workers(num_workers, strategies);
@@ -1646,7 +1672,7 @@ void branch_and_bound_t<i_t, f_t>::run_scheduler()
     // If the guided diving was disabled previously due to the lack of an incumbent solution,
     // re-enable as soon as a new incumbent is found.
     if (settings_.diving_settings.guided_diving != diving_settings.guided_diving) {
-      if (std::isfinite(upper_bound_)) {
+      if (has_solver_space_incumbent()) {
         diving_settings.guided_diving = settings_.diving_settings.guided_diving;
         strategies                    = get_search_strategies(diving_settings);
         max_num_workers_per_type      = get_max_workers(num_workers, strategies);
@@ -3535,7 +3561,7 @@ f_t branch_and_bound_t<i_t, f_t>::deterministic_compute_lower_bound()
   }
 
   // Tree is exhausted
-  if (lower_bound == std::numeric_limits<f_t>::infinity() && incumbent_.has_incumbent) {
+  if (lower_bound == std::numeric_limits<f_t>::infinity() && has_any_incumbent()) {
     lower_bound = upper_bound_.load();
   }
 

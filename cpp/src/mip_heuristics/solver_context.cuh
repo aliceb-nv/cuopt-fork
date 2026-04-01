@@ -70,8 +70,12 @@ struct mip_solver_context_t {
   // Must be converted to the target solver-space before use:
   //   - B&B: problem_ptr->get_solver_obj_from_user_obj(initial_cutoff)
   //   - CPUFJ: papilo_problem.get_solver_obj_from_user_obj(initial_cutoff)
-  // Use std::isfinite() to check whether a valid cutoff exists.
+  // Use std::isfinite() to check whether a valid upper bound exists.
   f_t initial_cutoff{std::numeric_limits<f_t>::infinity()};
+
+  // Matching incumbent in the original output space when the pruning upper bound comes from
+  // external heuristics rather than a B&B solver-space incumbent.
+  std::vector<f_t> initial_incumbent_assignment{};
 };
 
 }  // namespace cuopt::linear_programming::detail

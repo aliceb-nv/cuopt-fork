@@ -83,7 +83,8 @@ template <typename i_t, typename f_t>
 mip_solution_t<i_t, f_t> run_mip(detail::problem_t<i_t, f_t>& problem,
                                  mip_solver_settings_t<i_t, f_t> const& settings,
                                  timer_t& timer,
-                                 f_t initial_cutoff = std::numeric_limits<f_t>::infinity())
+                                 f_t initial_cutoff = std::numeric_limits<f_t>::infinity(),
+                                 const std::vector<f_t>& initial_incumbent_assignment = {})
 {
   try {
     raft::common::nvtx::range fun_scope("run_mip");
@@ -185,7 +186,8 @@ mip_solution_t<i_t, f_t> run_mip(detail::problem_t<i_t, f_t>& problem,
     detail::mip_solver_t<i_t, f_t> solver(scaled_problem, settings, scaling, timer);
     // initial_cutoff is in user-space (representation-invariant).
     // It will be converted to the target solver-space at each consumption point.
-    solver.context.initial_cutoff = initial_cutoff;
+    solver.context.initial_cutoff               = initial_cutoff;
+    solver.context.initial_incumbent_assignment = initial_incumbent_assignment;
     if (timer.check_time_limit()) {
       CUOPT_LOG_INFO("Time limit reached before main solve");
       detail::solution_t<i_t, f_t> sol(problem);
@@ -210,10 +212,14 @@ mip_solution_t<i_t, f_t> run_mip(detail::problem_t<i_t, f_t>& problem,
       auto mip_callbacks  = settings.get_mip_callbacks();
       f_t no_bound = problem.presolve_data.objective_scaling_factor >= 0 ? (f_t)-1e20 : (f_t)1e20;
       auto incumbent_callback =
-        [presolver_ptr, mip_callbacks, no_bound](
+        [presolver_ptr,
+         mip_callbacks,
+         no_bound,
+         initial_incumbent_assignment_ptr = &solver.context.initial_incumbent_assignment](
           f_t solver_obj, f_t user_obj, const std::vector<f_t>& assignment) {
           std::vector<f_t> user_assignment;
           presolver_ptr->uncrush_primal_solution(assignment, user_assignment);
+          *initial_incumbent_assignment_ptr = user_assignment;
           invoke_solution_callbacks(mip_callbacks, user_obj, user_assignment, no_bound);
         };
       early_cpufj = std::make_unique<detail::early_cpufj_t<i_t, f_t>>(
@@ -349,6 +355,7 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
     // passed to run_mip for correct cross-space conversion.
     std::atomic<f_t> early_best_objective{std::numeric_limits<f_t>::infinity()};
     f_t early_best_user_obj{std::numeric_limits<f_t>::infinity()};
+    std::vector<f_t> early_best_user_assignment;
     std::mutex early_callback_mutex;
 
     bool run_early_fj = run_presolve && settings.determinism_mode != CUOPT_MODE_DETERMINISTIC &&
@@ -357,6 +364,7 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
     if (run_early_fj) {
       auto early_fj_callback = [&early_best_objective,
                                 &early_best_user_obj,
+                                &early_best_user_assignment,
                                 &early_callback_mutex,
                                 mip_callbacks = settings.get_mip_callbacks(),
                                 no_bound](
@@ -364,8 +372,9 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
         std::lock_guard<std::mutex> lock(early_callback_mutex);
         if (solver_obj >= early_best_objective.load()) { return; }
         early_best_objective.store(solver_obj);
-        early_best_user_obj  = user_obj;
-        auto user_assignment = assignment;
+        early_best_user_obj        = user_obj;
+        early_best_user_assignment = assignment;
+        auto user_assignment       = assignment;
         invoke_solution_callbacks(mip_callbacks, user_obj, user_assignment, no_bound);
       };
 
@@ -451,7 +460,7 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
 
     // early_best_user_obj is in user-space.
     // run_mip stores it in context.initial_cutoff and converts to target spaces as needed.
-    auto sol = run_mip(problem, settings, timer, early_best_user_obj);
+    auto sol = run_mip(problem, settings, timer, early_best_user_obj, early_best_user_assignment);
 
     if (run_presolve) {
       auto status_to_skip = sol.get_termination_status() == mip_termination_status_t::TimeLimit ||

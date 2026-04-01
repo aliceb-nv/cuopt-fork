@@ -290,12 +290,15 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
       context.problem_ptr->clique_table);
     context.branch_and_bound_ptr = branch_and_bound.get();
 
-    // Convert initial_cutoff from user-space to B&B's internal objective space.
+    // Convert the best external upper bound from user-space to B&B's internal objective space.
     // context.problem_ptr is the post-trivial-presolve problem, whose get_solver_obj_from_user_obj
     // produces values in the same space as B&B node lower bounds.
     if (std::isfinite(context.initial_cutoff)) {
       f_t bb_cutoff = context.problem_ptr->get_solver_obj_from_user_obj(context.initial_cutoff);
       branch_and_bound->set_initial_cutoff(bb_cutoff);
+      if (!context.initial_incumbent_assignment.empty()) {
+        branch_and_bound->set_external_incumbent(bb_cutoff, context.initial_incumbent_assignment);
+      }
       dm.population.best_feasible_objective = bb_cutoff;
       CUOPT_LOG_INFO("B&B using initial cutoff %.6e (user-space: %.6e) from early heuristics",
                      bb_cutoff,
