@@ -203,6 +203,7 @@ problem_t<i_t, f_t>::problem_t(const problem_t<i_t, f_t>& problem_)
     clique_table(problem_.clique_table),
     vars_with_objective_coeffs(problem_.vars_with_objective_coeffs),
     expensive_to_fix_vars(problem_.expensive_to_fix_vars),
+    related_vars_time_limit(problem_.related_vars_time_limit),
     Q_offsets(problem_.Q_offsets),
     Q_indices(problem_.Q_indices),
     Q_values(problem_.Q_values)
@@ -260,6 +261,7 @@ problem_t<i_t, f_t>::problem_t(const problem_t<i_t, f_t>& problem_,
     clique_table(problem_.clique_table),
     vars_with_objective_coeffs(problem_.vars_with_objective_coeffs),
     expensive_to_fix_vars(problem_.expensive_to_fix_vars),
+    related_vars_time_limit(problem_.related_vars_time_limit),
     Q_offsets(problem_.Q_offsets),
     Q_indices(problem_.Q_indices),
     Q_values(problem_.Q_values)
@@ -360,6 +362,7 @@ problem_t<i_t, f_t>::problem_t(const problem_t<i_t, f_t>& problem_, bool no_deep
     fixing_helpers(problem_.fixing_helpers, handle_ptr),
     vars_with_objective_coeffs(problem_.vars_with_objective_coeffs),
     expensive_to_fix_vars(problem_.expensive_to_fix_vars),
+    related_vars_time_limit(problem_.related_vars_time_limit),
     Q_offsets(problem_.Q_offsets),
     Q_indices(problem_.Q_indices),
     Q_values(problem_.Q_values)

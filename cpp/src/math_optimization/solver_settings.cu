@@ -11,6 +11,7 @@
 #include <utilities/logger.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -37,6 +38,7 @@ bool string_to_float(const std::string& value, f_t& result)
     size_t pos = 0;
     if constexpr (std::is_same_v<f_t, float>) { result = std::stof(value, &pos); }
     if constexpr (std::is_same_v<f_t, double>) { result = std::stod(value, &pos); }
+    if (std::isnan(result)) { return false; }
     return pos == value.size();
   } catch (const std::exception&) {
     return false;
