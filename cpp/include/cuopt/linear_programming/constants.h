@@ -78,24 +78,28 @@
 #define CUOPT_RANDOM_SEED                     "random_seed"
 #define CUOPT_PDLP_PRECISION                  "pdlp_precision"
 
-/* @brief MIP heuristic hyper-parameter names */
-#define CUOPT_HYPER_POPULATION_SIZE               "hyper_population_size"
-#define CUOPT_HYPER_NUM_CPUFJ_THREADS             "hyper_num_cpufj_threads"
-#define CUOPT_HYPER_PRESOLVE_TIME_RATIO           "hyper_presolve_time_ratio"
-#define CUOPT_HYPER_PRESOLVE_MAX_TIME             "hyper_presolve_max_time"
-#define CUOPT_HYPER_ROOT_LP_TIME_RATIO            "hyper_root_lp_time_ratio"
-#define CUOPT_HYPER_ROOT_LP_MAX_TIME              "hyper_root_lp_max_time"
-#define CUOPT_HYPER_RINS_TIME_LIMIT               "hyper_rins_time_limit"
-#define CUOPT_HYPER_RINS_MAX_TIME_LIMIT           "hyper_rins_max_time_limit"
-#define CUOPT_HYPER_RINS_FIX_RATE                 "hyper_rins_fix_rate"
-#define CUOPT_HYPER_STAGNATION_TRIGGER            "hyper_stagnation_trigger"
-#define CUOPT_HYPER_MAX_ITERS_WITHOUT_IMPROVEMENT "hyper_max_iterations_without_improvement"
-#define CUOPT_HYPER_INITIAL_INFEASIBILITY_WEIGHT  "hyper_initial_infeasibility_weight"
-#define CUOPT_HYPER_N_OF_MINIMUMS_FOR_EXIT        "hyper_n_of_minimums_for_exit"
-#define CUOPT_HYPER_ENABLED_RECOMBINERS           "hyper_enabled_recombiners"
-#define CUOPT_HYPER_CYCLE_DETECTION_LENGTH        "hyper_cycle_detection_length"
-#define CUOPT_HYPER_RELAXED_LP_TIME_LIMIT         "hyper_relaxed_lp_time_limit"
-#define CUOPT_HYPER_RELATED_VARS_TIME_LIMIT       "hyper_related_vars_time_limit"
+#define CUOPT_MIP_HYPER_HEURISTIC_POPULATION_SIZE     "mip_hyper_heuristic_population_size"
+#define CUOPT_MIP_HYPER_HEURISTIC_NUM_CPUFJ_THREADS   "mip_hyper_heuristic_num_cpufj_threads"
+#define CUOPT_MIP_HYPER_HEURISTIC_PRESOLVE_TIME_RATIO "mip_hyper_heuristic_presolve_time_ratio"
+#define CUOPT_MIP_HYPER_HEURISTIC_PRESOLVE_MAX_TIME   "mip_hyper_heuristic_presolve_max_time"
+#define CUOPT_MIP_HYPER_HEURISTIC_ROOT_LP_TIME_RATIO  "mip_hyper_heuristic_root_lp_time_ratio"
+#define CUOPT_MIP_HYPER_HEURISTIC_ROOT_LP_MAX_TIME    "mip_hyper_heuristic_root_lp_max_time"
+#define CUOPT_MIP_HYPER_HEURISTIC_RINS_TIME_LIMIT     "mip_hyper_heuristic_rins_time_limit"
+#define CUOPT_MIP_HYPER_HEURISTIC_RINS_MAX_TIME_LIMIT "mip_hyper_heuristic_rins_max_time_limit"
+#define CUOPT_MIP_HYPER_HEURISTIC_RINS_FIX_RATE       "mip_hyper_heuristic_rins_fix_rate"
+#define CUOPT_MIP_HYPER_HEURISTIC_STAGNATION_TRIGGER  "mip_hyper_heuristic_stagnation_trigger"
+#define CUOPT_MIP_HYPER_HEURISTIC_MAX_ITERS_WITHOUT_IMPROVEMENT \
+  "mip_hyper_heuristic_max_iterations_without_improvement"
+#define CUOPT_MIP_HYPER_HEURISTIC_INITIAL_INFEASIBILITY_WEIGHT \
+  "mip_hyper_heuristic_initial_infeasibility_weight"
+#define CUOPT_MIP_HYPER_HEURISTIC_N_OF_MINIMUMS_FOR_EXIT \
+  "mip_hyper_heuristic_n_of_minimums_for_exit"
+#define CUOPT_MIP_HYPER_HEURISTIC_ENABLED_RECOMBINERS "mip_hyper_heuristic_enabled_recombiners"
+#define CUOPT_MIP_HYPER_HEURISTIC_CYCLE_DETECTION_LENGTH \
+  "mip_hyper_heuristic_cycle_detection_length"
+#define CUOPT_MIP_HYPER_HEURISTIC_RELAXED_LP_TIME_LIMIT "mip_hyper_heuristic_relaxed_lp_time_limit"
+#define CUOPT_MIP_HYPER_HEURISTIC_RELATED_VARS_TIME_LIMIT \
+  "mip_hyper_heuristic_related_vars_time_limit"
 
 /* @brief MIP determinism mode constants */
 #define CUOPT_MODE_OPPORTUNISTIC 0

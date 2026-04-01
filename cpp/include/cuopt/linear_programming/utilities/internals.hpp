@@ -79,19 +79,13 @@ class base_solution_t {
 
 template <typename T>
 struct parameter_info_t {
-  parameter_info_t(std::string_view param_name,
-                   T* value,
-                   T min,
-                   T max,
-                   T def,
-                   bool is_hyperparameter  = false,
-                   const char* description = "")
+  parameter_info_t(
+    std::string_view param_name, T* value, T min, T max, T def, const char* description = "")
     : param_name(param_name),
       value_ptr(value),
       min_value(min),
       max_value(max),
       default_value(def),
-      is_hyperparameter(is_hyperparameter),
       description(description)
   {
   }
@@ -100,28 +94,18 @@ struct parameter_info_t {
   T min_value;
   T max_value;
   T default_value;
-  bool is_hyperparameter;
   const char* description;
 };
 
 template <>
 struct parameter_info_t<bool> {
-  parameter_info_t(std::string_view name,
-                   bool* value,
-                   bool def,
-                   bool is_hyperparameter  = false,
-                   const char* description = "")
-    : param_name(name),
-      value_ptr(value),
-      default_value(def),
-      is_hyperparameter(is_hyperparameter),
-      description(description)
+  parameter_info_t(std::string_view name, bool* value, bool def, const char* description = "")
+    : param_name(name), value_ptr(value), default_value(def), description(description)
   {
   }
   std::string param_name;
   bool* value_ptr;
   bool default_value;
-  bool is_hyperparameter;
   const char* description;
 };
 
@@ -130,19 +114,13 @@ struct parameter_info_t<std::string> {
   parameter_info_t(std::string_view name,
                    std::string* value,
                    std::string def,
-                   bool is_hyperparameter  = false,
                    const char* description = "")
-    : param_name(name),
-      value_ptr(value),
-      default_value(def),
-      is_hyperparameter(is_hyperparameter),
-      description(description)
+    : param_name(name), value_ptr(value), default_value(def), description(description)
   {
   }
   std::string param_name;
   std::string* value_ptr;
   std::string default_value;
-  bool is_hyperparameter;
   const char* description;
 };
 

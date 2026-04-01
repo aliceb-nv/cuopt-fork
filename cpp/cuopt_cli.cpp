@@ -261,10 +261,10 @@ int set_cuda_module_loading(int argc, char* argv[])
  */
 int main(int argc, char* argv[])
 {
-  // Handle --show-hyper-params before argparse so no other args are required
+  // Handle --dump-hyper-params before argparse so no other args are required
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
-    if (arg == "--show-hyper-params") {
+    if (arg == "--dump-hyper-params") {
       cuopt::linear_programming::solver_settings_t<int, double> settings;
       settings.dump_parameters_to_file("/dev/stdout", true);
       return 0;
@@ -303,7 +303,7 @@ int main(int argc, char* argv[])
     .help("path to parameter config file (key = value format, supports all parameters)")
     .default_value(std::string(""));
 
-  program.add_argument("--show-hyper-params")
+  program.add_argument("--dump-hyper-params")
     .help("print hyper-parameters in config-file format and exit")
     .default_value(false)
     .implicit_value(true);
@@ -334,7 +334,7 @@ int main(int argc, char* argv[])
       // handle duplicate parameters appearing in MIP and LP settings
       if (arg_name_to_param_name.count(arg_name) == 0) {
         auto& arg = program.add_argument(arg_name.c_str()).default_value(param.default_value);
-        if (param.is_hyperparameter) { arg.hidden(); }
+        if (param.param_name.find("hyper_") != std::string::npos) { arg.hidden(); }
         arg_name_to_param_name[arg_name] = param.param_name;
       }
     }
@@ -343,7 +343,7 @@ int main(int argc, char* argv[])
       std::string arg_name = param_name_to_arg_name(param.param_name);
       if (arg_name_to_param_name.count(arg_name) == 0) {
         auto& arg = program.add_argument(arg_name.c_str()).default_value(param.default_value);
-        if (param.is_hyperparameter) { arg.hidden(); }
+        if (param.param_name.find("hyper_") != std::string::npos) { arg.hidden(); }
         arg_name_to_param_name[arg_name] = param.param_name;
       }
     }
@@ -352,7 +352,7 @@ int main(int argc, char* argv[])
       std::string arg_name = param_name_to_arg_name(param.param_name);
       if (arg_name_to_param_name.count(arg_name) == 0) {
         auto& arg = program.add_argument(arg_name.c_str()).default_value(param.default_value);
-        if (param.is_hyperparameter) { arg.hidden(); }
+        if (param.param_name.find("hyper_") != std::string::npos) { arg.hidden(); }
         arg_name_to_param_name[arg_name] = param.param_name;
       }
     }
@@ -361,7 +361,7 @@ int main(int argc, char* argv[])
       std::string arg_name = param_name_to_arg_name(param.param_name);
       if (arg_name_to_param_name.count(arg_name) == 0) {
         auto& arg = program.add_argument(arg_name.c_str()).default_value(param.default_value);
-        if (param.is_hyperparameter) { arg.hidden(); }
+        if (param.param_name.find("hyper_") != std::string::npos) { arg.hidden(); }
         arg_name_to_param_name[arg_name] = param.param_name;
       }
     }
