@@ -217,19 +217,12 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
                                  : presolve_time_limit;
   bool presolve_success      = run_presolve ? dm.run_presolve(presolve_time_limit, timer_) : true;
 
-  // Stop early CPUFJ after cuopt presolve (probing cache) but before main solve
+  // Stop early CPUFJ after cuopt presolve (probing cache) but before main solve.
   if (context.early_cpufj_ptr) {
     context.early_cpufj_ptr->stop();
     if (context.early_cpufj_ptr->solution_found()) {
-      // Compare in user-space (representation-invariant) to pick the tighter upper bound.
-      f_t cpufj_user_obj = context.early_cpufj_ptr->get_best_user_objective();
-      bool should_update =
-        !std::isfinite(context.initial_upper_bound) ||
-        (context.problem_ptr->maximize ? cpufj_user_obj > context.initial_upper_bound
-                                       : cpufj_user_obj < context.initial_upper_bound);
-      if (should_update) { context.initial_upper_bound = cpufj_user_obj; }
       CUOPT_LOG_INFO("Early CPUFJ found incumbent with user-space objective %g during presolve",
-                     cpufj_user_obj);
+                     context.early_cpufj_ptr->get_best_user_objective());
     }
   }
 
@@ -481,22 +474,6 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
     context.stats.num_simplex_iterations = branch_and_bound_solution.simplex_iterations;
   }
   sol.compute_feasibility();
-
-  // If the population has no feasible solution but early heuristics found an OG-space incumbent,
-  // use that instead. Any population incumbent is guaranteed at least as good
-  // (best_feasible_objective was seeded from the early heuristic bound), so this only fires when
-  // the population is empty.
-  if (!sol.get_feasible() && !context.initial_incumbent_assignment.empty()) {
-    cuopt_assert(
-      context.initial_incumbent_assignment.size() == (size_t)context.problem_ptr->n_variables,
-      "Early heuristic incumbent size mismatch");
-    raft::copy(sol.assignment.data(),
-               context.initial_incumbent_assignment.data(),
-               context.initial_incumbent_assignment.size(),
-               sol.handle_ptr->get_stream());
-    sol.compute_feasibility();
-    CUOPT_LOG_DEBUG("Using early heuristic incumbent (no solver-space incumbent found)");
-  }
 
   rmm::device_scalar<i_t> is_feasible(sol.handle_ptr->get_stream());
   sol.test_variable_bounds(true, is_feasible.data());

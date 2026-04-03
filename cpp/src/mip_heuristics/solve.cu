@@ -83,8 +83,8 @@ template <typename i_t, typename f_t>
 mip_solution_t<i_t, f_t> run_mip(detail::problem_t<i_t, f_t>& problem,
                                  mip_solver_settings_t<i_t, f_t> const& settings,
                                  timer_t& timer,
-                                 f_t initial_upper_bound = std::numeric_limits<f_t>::infinity(),
-                                 const std::vector<f_t>& initial_incumbent_assignment = {})
+                                 f_t& initial_upper_bound,
+                                 std::vector<f_t>& initial_incumbent_assignment)
 {
   try {
     raft::common::nvtx::range fun_scope("run_mip");
@@ -211,20 +211,17 @@ mip_solution_t<i_t, f_t> run_mip(detail::problem_t<i_t, f_t>& problem,
       auto* presolver_ptr = problem.presolve_data.papilo_presolve_ptr;
       auto mip_callbacks  = settings.get_mip_callbacks();
       f_t no_bound = problem.presolve_data.objective_scaling_factor >= 0 ? (f_t)-1e20 : (f_t)1e20;
-      auto incumbent_callback = [presolver_ptr,
-                                 mip_callbacks,
-                                 no_bound,
-                                 initial_incumbent_assignment_ptr =
-                                   &solver.context.initial_incumbent_assignment](
+      auto incumbent_callback = [presolver_ptr, mip_callbacks, no_bound, ctx_ptr = &solver.context](
                                   f_t solver_obj,
                                   f_t user_obj,
                                   const std::vector<f_t>& assignment,
                                   const char* heuristic_name) {
         std::vector<f_t> user_assignment;
         presolver_ptr->uncrush_primal_solution(assignment, user_assignment);
-        *initial_incumbent_assignment_ptr = user_assignment;
+        ctx_ptr->initial_incumbent_assignment = user_assignment;
+        ctx_ptr->initial_upper_bound          = user_obj;
         CUOPT_LOG_INFO(
-          "New solution from early primal heuristics (%s). Objective %g", heuristic_name, user_obj);
+          "New solution from early %s (presolved). Objective %g", heuristic_name, user_obj);
         invoke_solution_callbacks(mip_callbacks, user_obj, user_assignment, no_bound);
       };
       early_cpufj = std::make_unique<detail::early_cpufj_t<i_t, f_t>>(
@@ -255,6 +252,10 @@ mip_solution_t<i_t, f_t> run_mip(detail::problem_t<i_t, f_t>& problem,
 
     auto sol = scaled_sol.get_solution(
       is_feasible_before_scaling || is_feasible_after_unscaling, solver.get_solver_stats(), false);
+
+    // Write back the (possibly updated) incumbent from the papilo-phase callback.
+    initial_upper_bound          = solver.context.initial_upper_bound;
+    initial_incumbent_assignment = solver.context.initial_incumbent_assignment;
 
     int hidesol =
       std::getenv("CUOPT_MIP_HIDE_SOLUTION") ? atoi(std::getenv("CUOPT_MIP_HIDE_SOLUTION")) : 0;
@@ -529,6 +530,31 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
         // the full problem
         full_sol.post_process_completed = true;  // hack
         sol                             = full_sol.get_solution(true, full_stats);
+      }
+    }
+
+    // Use the early heuristic OG-space incumbent if it is better than what the solver-space
+    // pipeline returned (or if the pipeline returned no feasible solution at all).
+    if (!early_best_user_assignment.empty()) {
+      bool sol_has_incumbent =
+        sol.get_termination_status() == mip_termination_status_t::FeasibleFound ||
+        sol.get_termination_status() == mip_termination_status_t::Optimal;
+      bool is_maximization = problem.presolve_data.objective_scaling_factor < 0;
+      bool early_heuristic_is_better =
+        !sol_has_incumbent || (is_maximization ? early_best_user_obj > sol.get_objective_value()
+                                               : early_best_user_obj < sol.get_objective_value());
+      if (early_heuristic_is_better) {
+        detail::problem_t<i_t, f_t> full_problem(op_problem);
+        detail::solution_t<i_t, f_t> fallback_sol(full_problem);
+        fallback_sol.copy_new_assignment(early_best_user_assignment);
+        fallback_sol.compute_feasibility();
+        if (fallback_sol.get_feasible()) {
+          auto stats = sol.get_stats();
+          stats.presolve_time += presolve_time;
+          fallback_sol.post_process_completed = true;
+          sol                                 = fallback_sol.get_solution(true, stats);
+          CUOPT_LOG_DEBUG("Using early heuristic incumbent (objective %g)", early_best_user_obj);
+        }
       }
     }
 
