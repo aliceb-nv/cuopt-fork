@@ -530,7 +530,7 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
         // FIXME:: reduced_solution.get_stats() is not correct, we need to compute the stats for
         // the full problem
         full_sol.post_process_completed = true;  // hack
-        sol                             = full_sol.get_solution(true, full_stats);
+        sol                             = full_sol.get_solution(true, full_stats, false);
       }
     }
 
@@ -553,10 +553,15 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
           auto stats                          = sol.get_stats();
           stats.presolve_time                 = cuopt_presolve_time + presolve_time;
           fallback_sol.post_process_completed = true;
-          sol                                 = fallback_sol.get_solution(true, stats);
+          sol                                 = fallback_sol.get_solution(true, stats, false);
           CUOPT_LOG_DEBUG("Using early heuristic incumbent (objective %g)", early_best_user_obj);
         }
       }
+    }
+
+    if (sol.get_termination_status() == mip_termination_status_t::FeasibleFound ||
+        sol.get_termination_status() == mip_termination_status_t::Optimal) {
+      sol.log_detailed_summary();
     }
 
     if (settings.sol_file != "") {
