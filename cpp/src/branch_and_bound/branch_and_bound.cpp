@@ -317,8 +317,6 @@ template <typename i_t, typename f_t>
 void branch_and_bound_t<i_t, f_t>::set_initial_upper_bound(f_t bound)
 {
   upper_bound_ = bound;
-  CUOPT_LOG_DEBUG(
-    "B&B using initial upper bound %.6e (user-space: %.6e) from early heuristics", bound, bound);
 }
 
 template <typename i_t, typename f_t>

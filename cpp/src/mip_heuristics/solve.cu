@@ -488,6 +488,7 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
     // early_best_user_obj is in user-space.
     // run_mip stores it in context.initial_upper_bound and converts to target spaces as needed.
     auto sol = run_mip(problem, settings, timer, early_best_user_obj, early_best_user_assignment);
+    const f_t cuopt_presolve_time = sol.get_stats().presolve_time;
 
     if (run_presolve) {
       auto status_to_skip = sol.get_termination_status() == mip_termination_status_t::TimeLimit ||
@@ -524,7 +525,7 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
 
         auto full_stats = sol.get_stats();
         // add third party presolve time to cuopt presolve time
-        full_stats.presolve_time += presolve_time;
+        full_stats.presolve_time = cuopt_presolve_time + presolve_time;
 
         // FIXME:: reduced_solution.get_stats() is not correct, we need to compute the stats for
         // the full problem
@@ -549,8 +550,8 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
         fallback_sol.copy_new_assignment(early_best_user_assignment);
         fallback_sol.compute_feasibility();
         if (fallback_sol.get_feasible()) {
-          auto stats = sol.get_stats();
-          stats.presolve_time += presolve_time;
+          auto stats                          = sol.get_stats();
+          stats.presolve_time                 = cuopt_presolve_time + presolve_time;
           fallback_sol.post_process_completed = true;
           sol                                 = fallback_sol.get_solution(true, stats);
           CUOPT_LOG_DEBUG("Using early heuristic incumbent (objective %g)", early_best_user_obj);
