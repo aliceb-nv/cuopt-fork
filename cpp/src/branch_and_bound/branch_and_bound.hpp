@@ -120,23 +120,12 @@ class branch_and_bound_t {
 
   void set_concurrent_lp_root_solve(bool enable) { enable_concurrent_lp_root_solve_ = enable; }
 
-  // Seed the global pruning upper bound from an external source (e.g., early FJ during presolve).
+  // Seed the global upper bound from an external source (e.g., early FJ during presolve).
   // `bound` must be in B&B's internal objective space.
-  void set_initial_cutoff(f_t bound);
+  void set_initial_upper_bound(f_t bound);
 
-  // Store an incumbent that exists outside of B&B's solver space. The objective must match
-  // B&B's internal objective space while `solution` lives in the caller's original output space.
-  void set_external_incumbent(f_t objective, const std::vector<f_t>& solution);
-
-  // Effective pruning upper bound.
-  f_t get_cutoff() const { return upper_bound_.load(); }
-
+  f_t get_upper_bound() const { return upper_bound_.load(); }
   bool has_solver_space_incumbent() const { return incumbent_.has_incumbent; }
-  bool has_external_incumbent() const { return external_incumbent_.has_incumbent; }
-  bool has_any_incumbent() const
-  {
-    return has_solver_space_incumbent() || has_external_incumbent();
-  }
 
   // Repair a low-quality solution from the heuristics.
   bool repair_solution(const std::vector<f_t>& leaf_edge_norms,
@@ -203,17 +192,13 @@ class branch_and_bound_t {
   // Mutex for upper bound
   omp_mutex_t mutex_upper_;
 
-  // Global numeric pruning upper bound in B&B's internal objective space.
-  // During the transition away from cutoff as a separate concept, this may become finite before a
-  // solver-space incumbent is available in `incumbent_`.
+  // Global upper bound in B&B's internal objective space.
+  // A finite value implies an incumbent exists somewhere (solver-space in incumbent_, or
+  // original-space in the mip_solver_context_t), but does NOT imply incumbent_.has_incumbent.
   omp_atomic_t<f_t> upper_bound_;
 
   // Solver-space incumbent tracked directly by B&B.
   mip_solution_t<i_t, f_t> incumbent_;
-
-  // External incumbent stored in the caller-visible output space for cases where we have an
-  // incumbent objective but cannot materialize a solver-space incumbent vector.
-  mip_solution_t<i_t, f_t> external_incumbent_;
 
   // Structure with the general info of the solver.
   branch_and_bound_stats_t<i_t, f_t> exploration_stats_;

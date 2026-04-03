@@ -221,13 +221,13 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
   if (context.early_cpufj_ptr) {
     context.early_cpufj_ptr->stop();
     if (context.early_cpufj_ptr->solution_found()) {
-      // Compare in user-space (representation-invariant) to pick the tighter cutoff.
+      // Compare in user-space (representation-invariant) to pick the tighter upper bound.
       f_t cpufj_user_obj = context.early_cpufj_ptr->get_best_user_objective();
       bool should_update =
-        !std::isfinite(context.initial_cutoff) ||
-        (context.problem_ptr->maximize ? cpufj_user_obj > context.initial_cutoff
-                                       : cpufj_user_obj < context.initial_cutoff);
-      if (should_update) { context.initial_cutoff = cpufj_user_obj; }
+        !std::isfinite(context.initial_upper_bound) ||
+        (context.problem_ptr->maximize ? cpufj_user_obj > context.initial_upper_bound
+                                       : cpufj_user_obj < context.initial_upper_bound);
+      if (should_update) { context.initial_upper_bound = cpufj_user_obj; }
       CUOPT_LOG_INFO("Early CPUFJ found incumbent with user-space objective %g during presolve",
                      cpufj_user_obj);
     }
@@ -404,16 +404,13 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
     // Convert the best external upper bound from user-space to B&B's internal objective space.
     // context.problem_ptr is the post-trivial-presolve problem, whose get_solver_obj_from_user_obj
     // produces values in the same space as B&B node lower bounds.
-    if (std::isfinite(context.initial_cutoff)) {
-      f_t bb_cutoff = context.problem_ptr->get_solver_obj_from_user_obj(context.initial_cutoff);
-      branch_and_bound->set_initial_cutoff(bb_cutoff);
-      if (!context.initial_incumbent_assignment.empty()) {
-        branch_and_bound->set_external_incumbent(bb_cutoff, context.initial_incumbent_assignment);
-      }
-      dm.population.best_feasible_objective = bb_cutoff;
-      CUOPT_LOG_INFO("B&B using initial cutoff %.6e (user-space: %.6e) from early heuristics",
-                     bb_cutoff,
-                     context.initial_cutoff);
+    if (std::isfinite(context.initial_upper_bound)) {
+      f_t bb_ub = context.problem_ptr->get_solver_obj_from_user_obj(context.initial_upper_bound);
+      branch_and_bound->set_initial_upper_bound(bb_ub);
+      dm.population.best_feasible_objective = bb_ub;
+      CUOPT_LOG_DEBUG("B&B using initial upper bound %.6e (user-space: %.6e) from early heuristics",
+                      bb_ub,
+                      context.initial_upper_bound);
     }
 
     auto* stats_ptr = &context.stats;
@@ -484,9 +481,25 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
     context.stats.num_simplex_iterations = branch_and_bound_solution.simplex_iterations;
   }
   sol.compute_feasibility();
+
+  // If the population has no feasible solution but early heuristics found an OG-space incumbent,
+  // use that instead. Any population incumbent is guaranteed at least as good
+  // (best_feasible_objective was seeded from the early heuristic bound), so this only fires when
+  // the population is empty.
+  if (!sol.get_feasible() && !context.initial_incumbent_assignment.empty()) {
+    cuopt_assert(
+      context.initial_incumbent_assignment.size() == (size_t)context.problem_ptr->n_variables,
+      "Early heuristic incumbent size mismatch");
+    raft::copy(sol.assignment.data(),
+               context.initial_incumbent_assignment.data(),
+               context.initial_incumbent_assignment.size(),
+               sol.handle_ptr->get_stream());
+    sol.compute_feasibility();
+    CUOPT_LOG_DEBUG("Using early heuristic incumbent (no solver-space incumbent found)");
+  }
+
   rmm::device_scalar<i_t> is_feasible(sol.handle_ptr->get_stream());
   sol.test_variable_bounds(true, is_feasible.data());
-  // test_variable_bounds clears is_feasible if the test is failed
   if (!is_feasible.value(sol.handle_ptr->get_stream())) {
     CUOPT_LOG_ERROR(
       "Solution is not feasible due to variable bounds, returning infeasible solution!");

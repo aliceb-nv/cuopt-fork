@@ -208,7 +208,7 @@ class population_t {
   std::atomic<bool> early_exit_primal_generation = false;
   std::atomic<bool> solutions_in_external_queue_ = false;
   // Best known primal upper bound used to gate callbacks and external-solution handling. This may
-  // be seeded from an incumbent objective before a matching population solution exists.
+  // be seeded from an early-FJ incumbent objective before a matching population solution exists.
   f_t best_feasible_objective = std::numeric_limits<f_t>::max();
   assignment_hash_map_t<i_t, f_t> population_hash_map;
   cuopt::timer_t timer;

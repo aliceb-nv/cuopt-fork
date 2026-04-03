@@ -83,7 +83,7 @@ template <typename i_t, typename f_t>
 mip_solution_t<i_t, f_t> run_mip(detail::problem_t<i_t, f_t>& problem,
                                  mip_solver_settings_t<i_t, f_t> const& settings,
                                  timer_t& timer,
-                                 f_t initial_cutoff = std::numeric_limits<f_t>::infinity(),
+                                 f_t initial_upper_bound = std::numeric_limits<f_t>::infinity(),
                                  const std::vector<f_t>& initial_incumbent_assignment = {})
 {
   try {
@@ -184,9 +184,9 @@ mip_solution_t<i_t, f_t> run_mip(detail::problem_t<i_t, f_t>& problem,
     detail::trivial_presolve(scaled_problem);
 
     detail::mip_solver_t<i_t, f_t> solver(scaled_problem, settings, scaling, timer);
-    // initial_cutoff is in user-space (representation-invariant).
+    // initial_upper_bound is in user-space (representation-invariant).
     // It will be converted to the target solver-space at each consumption point.
-    solver.context.initial_cutoff               = initial_cutoff;
+    solver.context.initial_upper_bound          = initial_upper_bound;
     solver.context.initial_incumbent_assignment = initial_incumbent_assignment;
     if (timer.check_time_limit()) {
       CUOPT_LOG_INFO("Time limit reached before main solve");
@@ -198,11 +198,11 @@ mip_solution_t<i_t, f_t> run_mip(detail::problem_t<i_t, f_t>& problem,
     }
 
     // Run early CPUFJ on papilo-presolved problem during cuOpt presolve (probing cache).
-    // Stopped by run_solver after presolve completes; its best objective feeds into initial_cutoff.
-    // This CPUFJ operates on *problem.original_problem_ptr (papilo-presolved
+    // Stopped by run_solver after presolve completes; its best objective feeds into
+    // initial_upper_bound. This CPUFJ operates on *problem.original_problem_ptr (papilo-presolved
     // optimization_problem_t). Its solver-space differs from both the first-pass FJ (original
-    // problem) and B&B (post-trivial- presolve), so initial_cutoff (user-space) is converted via
-    // problem.get_solver_obj_from_user_obj.
+    // problem) and B&B (post-trivial- presolve), so initial_upper_bound (user-space) is converted
+    // via problem.get_solver_obj_from_user_obj.
     std::unique_ptr<detail::early_cpufj_t<i_t, f_t>> early_cpufj;
     bool run_early_cpufj = problem.has_papilo_presolve_data() &&
                            settings.determinism_mode != CUOPT_MODE_DETERMINISTIC &&
@@ -211,23 +211,28 @@ mip_solution_t<i_t, f_t> run_mip(detail::problem_t<i_t, f_t>& problem,
       auto* presolver_ptr = problem.presolve_data.papilo_presolve_ptr;
       auto mip_callbacks  = settings.get_mip_callbacks();
       f_t no_bound = problem.presolve_data.objective_scaling_factor >= 0 ? (f_t)-1e20 : (f_t)1e20;
-      auto incumbent_callback =
-        [presolver_ptr,
-         mip_callbacks,
-         no_bound,
-         initial_incumbent_assignment_ptr = &solver.context.initial_incumbent_assignment](
-          f_t solver_obj, f_t user_obj, const std::vector<f_t>& assignment) {
-          std::vector<f_t> user_assignment;
-          presolver_ptr->uncrush_primal_solution(assignment, user_assignment);
-          *initial_incumbent_assignment_ptr = user_assignment;
-          invoke_solution_callbacks(mip_callbacks, user_obj, user_assignment, no_bound);
-        };
+      auto incumbent_callback = [presolver_ptr,
+                                 mip_callbacks,
+                                 no_bound,
+                                 initial_incumbent_assignment_ptr =
+                                   &solver.context.initial_incumbent_assignment](
+                                  f_t solver_obj,
+                                  f_t user_obj,
+                                  const std::vector<f_t>& assignment,
+                                  const char* heuristic_name) {
+        std::vector<f_t> user_assignment;
+        presolver_ptr->uncrush_primal_solution(assignment, user_assignment);
+        *initial_incumbent_assignment_ptr = user_assignment;
+        CUOPT_LOG_INFO(
+          "New solution from early primal heuristics (%s). Objective %g", heuristic_name, user_obj);
+        invoke_solution_callbacks(mip_callbacks, user_obj, user_assignment, no_bound);
+      };
       early_cpufj = std::make_unique<detail::early_cpufj_t<i_t, f_t>>(
         *problem.original_problem_ptr, settings.get_tolerances(), incumbent_callback);
-      // Convert initial_cutoff from user-space to the CPUFJ's solver-space (papilo-presolved).
+      // Convert initial_upper_bound from user-space to the CPUFJ's solver-space (papilo-presolved).
       // problem.get_solver_obj_from_user_obj uses the papilo offset/scale (matching the CPUFJ).
-      if (std::isfinite(initial_cutoff)) {
-        early_cpufj->set_best_objective(problem.get_solver_obj_from_user_obj(initial_cutoff));
+      if (std::isfinite(initial_upper_bound)) {
+        early_cpufj->set_best_objective(problem.get_solver_obj_from_user_obj(initial_upper_bound));
       }
       early_cpufj->start();
       solver.context.early_cpufj_ptr = early_cpufj.get();
@@ -362,19 +367,29 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
                         op_problem.get_n_integers() > 0 && op_problem.get_n_constraints() > 0;
     f_t no_bound = problem.presolve_data.objective_scaling_factor >= 0 ? (f_t)-1e20 : (f_t)1e20;
     if (run_early_fj) {
+      auto early_fj_start    = std::chrono::steady_clock::now();
       auto early_fj_callback = [&early_best_objective,
                                 &early_best_user_obj,
                                 &early_best_user_assignment,
                                 &early_callback_mutex,
+                                &early_fj_start,
                                 mip_callbacks = settings.get_mip_callbacks(),
-                                no_bound](
-                                 f_t solver_obj, f_t user_obj, const std::vector<f_t>& assignment) {
+                                no_bound](f_t solver_obj,
+                                          f_t user_obj,
+                                          const std::vector<f_t>& assignment,
+                                          const char* heuristic_name) {
         std::lock_guard<std::mutex> lock(early_callback_mutex);
         if (solver_obj >= early_best_objective.load()) { return; }
         early_best_objective.store(solver_obj);
         early_best_user_obj        = user_obj;
         early_best_user_assignment = assignment;
-        auto user_assignment       = assignment;
+        double elapsed =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - early_fj_start).count();
+        CUOPT_LOG_INFO("New solution from early primal heuristics (%s). Objective %g. Time %.2f",
+                       heuristic_name,
+                       user_obj,
+                       elapsed);
+        auto user_assignment = assignment;
         invoke_solution_callbacks(mip_callbacks, user_obj, user_assignment, no_bound);
       };
 
@@ -382,13 +397,13 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
       early_cpufj = std::make_unique<detail::early_cpufj_t<i_t, f_t>>(
         op_problem, settings.get_tolerances(), early_fj_callback);
       early_cpufj->start();
-      CUOPT_LOG_INFO("Started early CPUFJ on original problem");
+      CUOPT_LOG_DEBUG("Started early CPUFJ on original problem");
 
       // Start early GPU FJ (uses GPU while CPU is busy with Papilo)
       early_gpufj =
         std::make_unique<detail::early_gpufj_t<i_t, f_t>>(op_problem, settings, early_fj_callback);
       early_gpufj->start();
-      CUOPT_LOG_INFO("Started early GPUFJ during presolve");
+      CUOPT_LOG_DEBUG("Started early GPUFJ during presolve");
     }
 
     auto constexpr const dual_postsolve = false;
@@ -444,8 +459,8 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
     if (early_gpufj) {
       early_gpufj->stop();
       if (early_gpufj->solution_found()) {
-        CUOPT_LOG_INFO("Early GPU FJ found incumbent with objective %.6e during presolve",
-                       early_gpufj->get_best_objective());
+        CUOPT_LOG_DEBUG("Early GPU FJ found incumbent with objective %.6e during presolve",
+                        early_gpufj->get_best_objective());
       }
       early_gpufj.reset();  // Free GPU memory
     }
@@ -453,8 +468,9 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
     if (early_cpufj && run_presolve && presolve_result_opt.has_value()) {
       early_cpufj->stop();
       if (early_cpufj->solution_found()) {
-        CUOPT_LOG_INFO("Early CPUFJ (original) found incumbent with objective %.6e",
-                       early_cpufj->get_best_objective());
+        CUOPT_LOG_DEBUG(
+          "Early CPUFJ (original) found incumbent with objective %.6e during presolve",
+          early_cpufj->get_best_objective());
       }
       early_cpufj.reset();
     }
@@ -469,7 +485,7 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
     }
 
     // early_best_user_obj is in user-space.
-    // run_mip stores it in context.initial_cutoff and converts to target spaces as needed.
+    // run_mip stores it in context.initial_upper_bound and converts to target spaces as needed.
     auto sol = run_mip(problem, settings, timer, early_best_user_obj, early_best_user_assignment);
 
     if (run_presolve) {
