@@ -247,12 +247,17 @@ int set_cuda_module_loading(int argc, char* argv[])
  */
 int main(int argc, char* argv[])
 {
-  // Handle --dump-hyper-params before argparse so no other args are required
+  // Handle dump flags before argparse so no other args are required
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
     if (arg == "--dump-hyper-params") {
       cuopt::linear_programming::solver_settings_t<int, double> settings;
       settings.dump_parameters_to_file("/dev/stdout", true);
+      return 0;
+    }
+    if (arg == "--dump-params") {
+      cuopt::linear_programming::solver_settings_t<int, double> settings;
+      settings.dump_parameters_to_file("/dev/stdout", false);
       return 0;
     }
   }
@@ -290,7 +295,12 @@ int main(int argc, char* argv[])
     .default_value(std::string(""));
 
   program.add_argument("--dump-hyper-params")
-    .help("print hyper-parameters in config-file format and exit")
+    .help("print hyper-parameters only in config file format and exit")
+    .default_value(false)
+    .implicit_value(true);
+
+  program.add_argument("--dump-params")
+    .help("print all parameters in config file format and exit")
     .default_value(false)
     .implicit_value(true);
 
