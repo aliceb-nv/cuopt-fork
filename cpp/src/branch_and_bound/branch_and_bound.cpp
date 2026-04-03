@@ -205,7 +205,11 @@ std::string user_mip_gap(f_t obj_value, f_t lower_bound)
   } else {
     constexpr int BUFFER_LEN = 32;
     char buffer[BUFFER_LEN];
-    snprintf(buffer, BUFFER_LEN - 1, "%5.1f%%", user_mip_gap * 100);
+    if (user_mip_gap > 1e-3) {
+      snprintf(buffer, BUFFER_LEN - 1, "%5.1f%%", user_mip_gap * 100);
+    } else {
+      snprintf(buffer, BUFFER_LEN - 1, "%5.2f%%", user_mip_gap * 100);
+    }
     return std::string(buffer);
   }
 }
@@ -243,9 +247,11 @@ branch_and_bound_t<i_t, f_t>::branch_and_bound_t(
   const user_problem_t<i_t, f_t>& user_problem,
   const simplex_solver_settings_t<i_t, f_t>& solver_settings,
   f_t start_time,
+  const probing_implied_bound_t<i_t, f_t>& probing_implied_bound,
   std::shared_ptr<detail::clique_table_t<i_t, f_t>> clique_table)
   : original_problem_(user_problem),
     settings_(solver_settings),
+    probing_implied_bound_(probing_implied_bound),
     clique_table_(std::move(clique_table)),
     original_lp_(user_problem.handle_ptr, 1, 1, 1),
     Arow_(1, 1, 0),
@@ -556,7 +562,7 @@ template <typename i_t, typename f_t>
 bool branch_and_bound_t<i_t, f_t>::repair_solution(const std::vector<f_t>& edge_norms,
                                                    const std::vector<f_t>& potential_solution,
                                                    f_t& repaired_obj,
-                                                   std::vector<f_t>& repaired_solution) const
+                                                   std::vector<f_t>& repaired_solution)
 {
   bool feasible = false;
   repaired_obj  = std::numeric_limits<f_t>::quiet_NaN();
@@ -579,9 +585,10 @@ bool branch_and_bound_t<i_t, f_t>::repair_solution(const std::vector<f_t>& edge_
   i_t iter                               = 0;
   f_t lp_start_time                      = tic();
   simplex_solver_settings_t lp_settings  = settings_;
+  lp_settings.concurrent_halt            = &node_concurrent_halt_;
   std::vector<variable_status_t> vstatus = root_vstatus_;
   lp_settings.set_log(false);
-  lp_settings.inside_mip           = true;
+  lp_settings.inside_mip           = 2;
   std::vector<f_t> leaf_edge_norms = edge_norms;
   // should probably set the cut off here lp_settings.cut_off
   dual::status_t lp_status = dual_phase2(
@@ -724,12 +731,6 @@ void branch_and_bound_t<i_t, f_t>::set_final_solution(mip_solution_t<i_t, f_t>& 
                        obj,
                        is_maximization ? "Upper" : "Lower",
                        user_bound);
-  {
-    const f_t root_lp_obj = root_lp_current_lower_bound_.load();
-    if (std::isfinite(root_lp_obj)) {
-      settings_.log.printf("Root LP dual objective (last): %.16e\n", root_lp_obj);
-    }
-  }
 
   if (gap <= settings_.absolute_mip_gap_tol || gap_rel <= settings_.relative_mip_gap_tol) {
     solver_status_ = mip_status_t::OPTIMAL;
@@ -839,11 +840,10 @@ branch_variable_t<i_t> branch_and_bound_t<i_t, f_t>::variable_selection(
       if (settings_.reliability_branching != 0) {
         branch_var = pc_.reliable_variable_selection(node_ptr,
                                                      fractional,
-                                                     solution,
-                                                     settings_,
-                                                     var_types_,
                                                      worker,
+                                                     var_types_,
                                                      exploration_stats_,
+                                                     settings_,
                                                      upper_bound_,
                                                      worker_pool_.num_idle_workers(),
                                                      log);
@@ -1175,7 +1175,6 @@ std::pair<node_status_t, rounding_direction_t> branch_and_bound_t<i_t, f_t>::upd
   dual::status_t lp_status,
   Policy& policy)
 {
-  constexpr f_t inf                      = std::numeric_limits<f_t>::infinity();
   const f_t abs_fathom_tol               = settings_.absolute_mip_gap_tol / 10;
   lp_problem_t<i_t, f_t>& leaf_problem   = worker->leaf_problem;
   lp_solution_t<i_t, f_t>& leaf_solution = worker->leaf_solution;
@@ -1336,6 +1335,7 @@ dual::status_t branch_and_bound_t<i_t, f_t>::solve_node_lp(
   assert(leaf_vstatus.size() == worker->leaf_problem.num_cols);
 
   simplex_solver_settings_t lp_settings = settings_;
+  lp_settings.concurrent_halt           = &node_concurrent_halt_;
   lp_settings.set_log(false);
   f_t cutoff = get_cutoff();
   if (original_lp_.objective_is_integral) {
@@ -1432,13 +1432,15 @@ void branch_and_bound_t<i_t, f_t>::plunge_with(branch_and_bound_worker_t<i_t, f_
   worker->recompute_basis  = true;
   worker->recompute_bounds = true;
 
-  while (stack.size() > 0 && solver_status_ == mip_status_t::UNSET) {
+  f_t lower_bound = get_lower_bound();
+  f_t upper_bound = upper_bound_;
+  f_t rel_gap     = user_relative_gap(original_lp_, upper_bound, lower_bound);
+  f_t abs_gap     = upper_bound - lower_bound;
+
+  while (stack.size() > 0 && (solver_status_ == mip_status_t::UNSET && is_running_) &&
+         rel_gap > settings_.relative_mip_gap_tol && abs_gap > settings_.absolute_mip_gap_tol) {
     mip_node_t<i_t, f_t>* node_ptr = stack.front();
     stack.pop_front();
-
-    f_t lower_bound = node_ptr->lower_bound;
-    f_t upper_bound = upper_bound_;
-    f_t rel_gap     = user_relative_gap(original_lp_, upper_bound, lower_bound);
 
     // This is based on three assumptions:
     // - The stack only contains sibling nodes, i.e., the current node and it sibling (if
@@ -1446,9 +1448,9 @@ void branch_and_bound_t<i_t, f_t>::plunge_with(branch_and_bound_worker_t<i_t, f_
     // - The current node and its siblings uses the lower bound of the parent before solving the LP
     // relaxation
     // - The lower bound of the parent is lower or equal to its children
-    worker->lower_bound = lower_bound;
+    worker->lower_bound = node_ptr->lower_bound;
 
-    if (lower_bound > get_cutoff()) {
+    if (node_ptr->lower_bound > get_cutoff()) {
       search_tree_.graphviz_node(settings_.log, node_ptr, "cutoff", node_ptr->lower_bound);
       search_tree_.update(node_ptr, node_status_t::FATHOMED);
       worker->recompute_basis  = true;
@@ -1471,6 +1473,9 @@ void branch_and_bound_t<i_t, f_t>::plunge_with(branch_and_bound_worker_t<i_t, f_
 
     if (lp_status == dual::status_t::TIME_LIMIT) {
       solver_status_ = mip_status_t::TIME_LIMIT;
+      break;
+    } else if (lp_status == dual::status_t::CONCURRENT_LIMIT) {
+      stack.push_front(node_ptr);
       break;
     } else if (lp_status == dual::status_t::ITERATION_LIMIT) {
       break;
@@ -1517,6 +1522,28 @@ void branch_and_bound_t<i_t, f_t>::plunge_with(branch_and_bound_worker_t<i_t, f_
         stack.push_front(node_ptr->get_down_child());
       }
     }
+
+    lower_bound = get_lower_bound();
+    upper_bound = upper_bound_;
+    rel_gap     = user_relative_gap(original_lp_, upper_bound, lower_bound);
+    abs_gap     = upper_bound - lower_bound;
+  }
+
+  lower_bound = get_lower_bound();
+  upper_bound = upper_bound_;
+  rel_gap     = user_relative_gap(original_lp_, upper_bound, lower_bound);
+  abs_gap     = upper_bound - lower_bound;
+
+  if (stack.size() > 0 &&
+      (rel_gap <= settings_.relative_mip_gap_tol || abs_gap <= settings_.absolute_mip_gap_tol)) {
+    // If the solver converged according to the gap rules, but we still have nodes to explore
+    // in the stack, then we should add all the pending nodes back to the heap so the lower
+    // bound of the solver is set to the correct value.
+    while (!stack.empty()) {
+      auto node = stack.front();
+      stack.pop_front();
+      node_queue_.push(node);
+    }
   }
 
   if (settings_.num_threads > 1) {
@@ -1549,14 +1576,17 @@ void branch_and_bound_t<i_t, f_t>::dive_with(branch_and_bound_worker_t<i_t, f_t>
   dive_stats.nodes_explored      = 0;
   dive_stats.nodes_unexplored    = 1;
 
-  while (stack.size() > 0 && solver_status_ == mip_status_t::UNSET && is_running_) {
+  f_t lower_bound = get_lower_bound();
+  f_t upper_bound = upper_bound_;
+  f_t rel_gap     = user_relative_gap(original_lp_, upper_bound, lower_bound);
+  f_t abs_gap     = upper_bound - lower_bound;
+
+  while (stack.size() > 0 && (solver_status_ == mip_status_t::UNSET && is_running_) &&
+         rel_gap > settings_.relative_mip_gap_tol && abs_gap > settings_.absolute_mip_gap_tol) {
     mip_node_t<i_t, f_t>* node_ptr = stack.front();
     stack.pop_front();
 
-    f_t lower_bound     = node_ptr->lower_bound;
-    f_t upper_bound     = upper_bound_;
-    f_t rel_gap         = user_relative_gap(original_lp_, upper_bound, lower_bound);
-    worker->lower_bound = lower_bound;
+    worker->lower_bound = node_ptr->lower_bound;
 
     if (node_ptr->lower_bound > get_cutoff()) {
       worker->recompute_basis  = true;
@@ -1571,6 +1601,8 @@ void branch_and_bound_t<i_t, f_t>::dive_with(branch_and_bound_worker_t<i_t, f_t>
 
     if (lp_status == dual::status_t::TIME_LIMIT) {
       solver_status_ = mip_status_t::TIME_LIMIT;
+      break;
+    } else if (lp_status == dual::status_t::CONCURRENT_LIMIT) {
       break;
     } else if (lp_status == dual::status_t::ITERATION_LIMIT) {
       break;
@@ -1598,6 +1630,11 @@ void branch_and_bound_t<i_t, f_t>::dive_with(branch_and_bound_worker_t<i_t, f_t>
     if (stack.size() > 1 && stack.front()->depth - stack.back()->depth > diving_backtrack_limit) {
       stack.pop_back();
     }
+
+    lower_bound = get_lower_bound();
+    upper_bound = upper_bound_;
+    rel_gap     = user_relative_gap(original_lp_, upper_bound, lower_bound);
+    abs_gap     = upper_bound - lower_bound;
   }
 
   worker_pool_.return_worker_to_pool(worker);
@@ -1637,9 +1674,6 @@ void branch_and_bound_t<i_t, f_t>::run_scheduler()
          rel_gap > settings_.relative_mip_gap_tol &&
          (active_workers_per_strategy_[0] > 0 || node_queue_.best_first_queue_size() > 0)) {
     bool launched_any_task = false;
-    lower_bound            = get_lower_bound();
-    abs_gap                = upper_bound_ - lower_bound;
-    rel_gap                = user_relative_gap(original_lp_, upper_bound_.load(), lower_bound);
 
     repair_heuristic_solutions();
 
@@ -1740,6 +1774,16 @@ void branch_and_bound_t<i_t, f_t>::run_scheduler()
       }
     }
 
+    lower_bound = get_lower_bound();
+    abs_gap     = upper_bound_ - lower_bound;
+    rel_gap     = user_relative_gap(original_lp_, upper_bound_.load(), lower_bound);
+
+    if (abs_gap <= settings_.absolute_mip_gap_tol || rel_gap <= settings_.relative_mip_gap_tol) {
+      node_concurrent_halt_ = 1;
+      solver_status_        = mip_status_t::OPTIMAL;
+      break;
+    }
+
     // If no new task was launched in this iteration, suspend temporarily the
     // execution of the scheduler. As of 8/Jan/2026, GCC does not
     // implement taskyield, but LLVM does.
@@ -1759,10 +1803,6 @@ void branch_and_bound_t<i_t, f_t>::single_threaded_solve()
   while (solver_status_ == mip_status_t::UNSET && abs_gap > settings_.absolute_mip_gap_tol &&
          rel_gap > settings_.relative_mip_gap_tol && node_queue_.best_first_queue_size() > 0) {
     bool launched_any_task = false;
-    lower_bound            = get_lower_bound();
-    abs_gap                = upper_bound_ - lower_bound;
-    rel_gap                = user_relative_gap(original_lp_, upper_bound_.load(), lower_bound);
-
     repair_heuristic_solutions();
 
     f_t now = toc(exploration_stats_.start_time);
@@ -1800,6 +1840,15 @@ void branch_and_bound_t<i_t, f_t>::single_threaded_solve()
 
     worker.init_best_first(start_node.value(), original_lp_);
     plunge_with(&worker);
+
+    lower_bound = get_lower_bound();
+    abs_gap     = upper_bound_ - lower_bound;
+    rel_gap     = user_relative_gap(original_lp_, upper_bound_.load(), lower_bound);
+
+    if (abs_gap <= settings_.absolute_mip_gap_tol || rel_gap <= settings_.relative_mip_gap_tol) {
+      solver_status_ = mip_status_t::OPTIMAL;
+      break;
+    }
   }
 }
 
@@ -1923,18 +1972,21 @@ lp_status_t branch_and_bound_t<i_t, f_t>::solve_root_relaxation(
       set_uninitialized_steepest_edge_norms<i_t, f_t>(original_lp_, basic_list, edge_norms);
       user_objective = root_crossover_soln_.user_objective;
       iter           = root_crossover_soln_.iterations;
-      solver_name    = "Barrier/PDLP and Crossover";
+      solver_name    = method_to_string(root_relax_solved_by);
+
     } else {
-      root_status    = root_status_future.get();
-      user_objective = root_relax_soln_.user_objective;
-      iter           = root_relax_soln_.iterations;
-      solver_name    = "Dual Simplex";
+      root_status          = root_status_future.get();
+      user_objective       = root_relax_soln_.user_objective;
+      iter                 = root_relax_soln_.iterations;
+      root_relax_solved_by = DualSimplex;
+      solver_name          = "Dual Simplex";
     }
   } else {
-    root_status    = root_status_future.get();
-    user_objective = root_relax_soln_.user_objective;
-    iter           = root_relax_soln_.iterations;
-    solver_name    = "Dual Simplex";
+    root_status          = root_status_future.get();
+    user_objective       = root_relax_soln_.user_objective;
+    iter                 = root_relax_soln_.iterations;
+    root_relax_solved_by = DualSimplex;
+    solver_name          = "Dual Simplex";
   }
 
   settings_.log.printf("\n");
@@ -2151,6 +2203,7 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
                                             new_slacks_,
                                             var_types_,
                                             original_problem_,
+                                            probing_implied_bound_,
                                             clique_table_,
                                             &clique_table_future_,
                                             &signal_extend_cliques_);
@@ -2447,6 +2500,7 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
   set_uninitialized_steepest_edge_norms(original_lp_, basic_list, edge_norms_);
 
   pc_.resize(original_lp_.num_cols);
+  original_lp_.A.transpose(pc_.AT);
   {
     raft::common::nvtx::range scope_sb("BB::strong_branching");
     strong_branching<i_t, f_t>(original_problem_,
@@ -2454,11 +2508,15 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
                                settings_,
                                exploration_stats_.start_time,
                                var_types_,
-                               root_relax_soln_.x,
+                               root_relax_soln_,
                                fractional,
                                root_objective_,
+                               upper_bound_,
                                root_vstatus_,
                                edge_norms_,
+                               basic_list,
+                               nonbasic_list,
+                               basis_update,
                                pc_);
   }
 
@@ -2529,6 +2587,7 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
   node_queue_.push(search_tree_.root.get_up_child());
 
   settings_.log.printf("Exploring the B&B tree using %d threads\n\n", settings_.num_threads);
+  node_concurrent_halt_ = 0;
 
   exploration_stats_.nodes_explored       = 0;
   exploration_stats_.nodes_unexplored     = 2;
