@@ -208,20 +208,28 @@ mip_solution_t<i_t, f_t> run_mip(detail::problem_t<i_t, f_t>& problem,
                            settings.determinism_mode != CUOPT_MODE_DETERMINISTIC &&
                            problem.original_problem_ptr->get_n_integers() > 0;
     if (run_early_cpufj) {
+      auto early_fj_start = std::chrono::steady_clock::now();
       auto* presolver_ptr = problem.presolve_data.papilo_presolve_ptr;
       auto mip_callbacks  = settings.get_mip_callbacks();
       f_t no_bound = problem.presolve_data.objective_scaling_factor >= 0 ? (f_t)-1e20 : (f_t)1e20;
-      auto incumbent_callback = [presolver_ptr, mip_callbacks, no_bound, ctx_ptr = &solver.context](
-                                  f_t solver_obj,
-                                  f_t user_obj,
-                                  const std::vector<f_t>& assignment,
-                                  const char* heuristic_name) {
+      auto incumbent_callback = [presolver_ptr,
+                                 mip_callbacks,
+                                 no_bound,
+                                 ctx_ptr = &solver.context,
+                                 early_fj_start](f_t solver_obj,
+                                                 f_t user_obj,
+                                                 const std::vector<f_t>& assignment,
+                                                 const char* heuristic_name) {
         std::vector<f_t> user_assignment;
         presolver_ptr->uncrush_primal_solution(assignment, user_assignment);
         ctx_ptr->initial_incumbent_assignment = user_assignment;
         ctx_ptr->initial_upper_bound          = user_obj;
-        CUOPT_LOG_INFO(
-          "New solution from early %s (presolved). Objective %g", heuristic_name, user_obj);
+        double elapsed =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - early_fj_start).count();
+        CUOPT_LOG_INFO("New solution from early primal heuristics (%s). Objective %+.6e. Time %.2f",
+                       heuristic_name,
+                       user_obj,
+                       elapsed);
         invoke_solution_callbacks(mip_callbacks, user_obj, user_assignment, no_bound);
       };
       early_cpufj = std::make_unique<detail::early_cpufj_t<i_t, f_t>>(
@@ -386,7 +394,7 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
         early_best_user_assignment = assignment;
         double elapsed =
           std::chrono::duration<double>(std::chrono::steady_clock::now() - early_fj_start).count();
-        CUOPT_LOG_INFO("New solution from early primal heuristics (%s). Objective %g. Time %.2f",
+        CUOPT_LOG_INFO("New solution from early primal heuristics (%s). Objective %+.6e. Time %.2f",
                        heuristic_name,
                        user_obj,
                        elapsed);

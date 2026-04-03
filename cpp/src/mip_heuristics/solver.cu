@@ -221,8 +221,8 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
   if (context.early_cpufj_ptr) {
     context.early_cpufj_ptr->stop();
     if (context.early_cpufj_ptr->solution_found()) {
-      CUOPT_LOG_INFO("Early CPUFJ found incumbent with user-space objective %g during presolve",
-                     context.early_cpufj_ptr->get_best_user_objective());
+      CUOPT_LOG_DEBUG("Early CPUFJ found incumbent with user-space objective %g during presolve",
+                      context.early_cpufj_ptr->get_best_user_objective());
     }
   }
 
