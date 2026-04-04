@@ -603,12 +603,14 @@ solution_t<i_t, f_t> diversity_manager_t<i_t, f_t>::run_solver()
 
   generate_solution(timer.remaining_time(), false);
   if (timer.check_time_limit()) {
+    dm.rins.stop_rins();
     population.add_external_solutions_to_population();
     return population.best_feasible();
   }
   if (check_b_b_preemption()) { return population.best_feasible(); }
 
   run_fp_alone();
+  dm.rins.stop_rins();
   population.add_external_solutions_to_population();
   return population.best_feasible();
 };

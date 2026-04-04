@@ -487,7 +487,6 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
   }
   context.stats.total_solve_time = timer_.elapsed_time();
   context.problem_ptr->post_process_solution(sol);
-  dm.rins.stop_rins();
   return sol;
 }
 
