@@ -14,6 +14,7 @@
 #include <dual_simplex/simplex_solver_settings.hpp>
 #include <dual_simplex/solve.hpp>
 #include <dual_simplex/tic_toc.hpp>
+#include <pdlp/initial_scaling_strategy/initial_scaling.cuh>
 
 namespace cuopt::linear_programming::detail {
 

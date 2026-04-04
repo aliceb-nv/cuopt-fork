@@ -42,14 +42,10 @@ static void init_handler(const raft::handle_t* handle_ptr)
 template <typename i_t, typename f_t>
 mip_solver_t<i_t, f_t>::mip_solver_t(const problem_t<i_t, f_t>& op_problem,
                                      const mip_solver_settings_t<i_t, f_t>& solver_settings,
-                                     pdlp_initial_scaling_strategy_t<i_t, f_t>& scaling,
                                      timer_t timer)
   : op_problem_(op_problem),
     solver_settings_(solver_settings),
-    context(op_problem.handle_ptr,
-            const_cast<problem_t<i_t, f_t>*>(&op_problem),
-            solver_settings,
-            &scaling),
+    context(op_problem.handle_ptr, const_cast<problem_t<i_t, f_t>*>(&op_problem), solver_settings),
     timer_(timer)
 {
   init_handler(op_problem.handle_ptr);
@@ -211,11 +207,14 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
   f_t time_limit             = context.settings.determinism_mode == CUOPT_MODE_DETERMINISTIC
                                  ? std::numeric_limits<f_t>::infinity()
                                  : timer_.remaining_time();
-  double presolve_time_limit = std::min(0.1 * time_limit, 60.0);
+  const auto& hp             = context.settings.heuristic_params;
+  double presolve_time_limit = std::min(hp.presolve_time_ratio * time_limit, hp.presolve_max_time);
   presolve_time_limit        = context.settings.determinism_mode == CUOPT_MODE_DETERMINISTIC
                                  ? std::numeric_limits<f_t>::infinity()
                                  : presolve_time_limit;
-  bool presolve_success      = run_presolve ? dm.run_presolve(presolve_time_limit, timer_) : true;
+  if (std::isfinite(presolve_time_limit))
+    CUOPT_LOG_DEBUG("Presolve time limit: %g", presolve_time_limit);
+  bool presolve_success = run_presolve ? dm.run_presolve(presolve_time_limit, timer_) : true;
 
   // Stop early CPUFJ after cuopt presolve (probing cache) but before main solve.
   if (context.early_cpufj_ptr) {
@@ -344,6 +343,8 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
     branch_and_bound_settings.cut_min_orthogonality = context.settings.cut_min_orthogonality;
     branch_and_bound_settings.mip_batch_pdlp_strong_branching =
       context.settings.mip_batch_pdlp_strong_branching;
+    branch_and_bound_settings.mip_batch_pdlp_reliability_branching =
+      context.settings.mip_batch_pdlp_reliability_branching;
 
     branch_and_bound_settings.strong_branching_simplex_iteration_limit =
       context.settings.strong_branching_simplex_iteration_limit < 0

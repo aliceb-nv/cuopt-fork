@@ -11,13 +11,13 @@
 #include <mip_heuristics/feasibility_jump/early_cpufj.cuh>
 #include <mip_heuristics/feasibility_jump/early_gpufj.cuh>
 #include <mip_heuristics/mip_constants.hpp>
+#include <mip_heuristics/mip_scaling_strategy.cuh>
 #include <mip_heuristics/presolve/third_party_presolve.hpp>
 #include <mip_heuristics/presolve/trivial_presolve.cuh>
 #include <mip_heuristics/solver.cuh>
 #include <mip_heuristics/utilities/sort_csr.cuh>
 #include <mip_heuristics/utils.cuh>
 
-#include <pdlp/initial_scaling_strategy/initial_scaling.cuh>
 #include <pdlp/pdlp.cuh>
 #include <pdlp/restart_strategy/pdlp_restart_strategy.cuh>
 #include <pdlp/step_size_strategy/adaptive_step_size_strategy.hpp>
@@ -88,12 +88,6 @@ mip_solution_t<i_t, f_t> run_mip(detail::problem_t<i_t, f_t>& problem,
 {
   try {
     raft::common::nvtx::range fun_scope("run_mip");
-    auto constexpr const running_mip = true;
-
-    // TODO ask Akif and Alice how was this passed down?
-    auto hyper_params                                     = settings.hyper_params;
-    hyper_params.update_primal_weight_on_initial_solution = false;
-    hyper_params.update_step_size_on_initial_solution     = true;
     if (settings.get_mip_callbacks().size() > 0) {
       auto callback_num_variables = problem.original_problem_ptr->get_n_variables();
       if (problem.has_papilo_presolve_data()) {
@@ -148,7 +142,7 @@ mip_solution_t<i_t, f_t> run_mip(detail::problem_t<i_t, f_t>& problem,
     }
     // problem contains unpreprocessed data
     detail::problem_t<i_t, f_t> scaled_problem(problem);
-
+    cuopt_func_call(auto saved_problem = scaled_problem);
     CUOPT_LOG_INFO("Objective offset %f scaling_factor %f",
                    problem.presolve_data.objective_offset,
                    problem.presolve_data.objective_scaling_factor);
@@ -157,33 +151,12 @@ mip_solution_t<i_t, f_t> run_mip(detail::problem_t<i_t, f_t>& problem,
                  "Size mismatch");
     cuopt_assert(problem.original_problem_ptr->get_n_constraints() == scaled_problem.n_constraints,
                  "Size mismatch");
-    detail::pdlp_initial_scaling_strategy_t<i_t, f_t> scaling(
-      scaled_problem.handle_ptr,
-      scaled_problem,
-      hyper_params.default_l_inf_ruiz_iterations,
-      (f_t)hyper_params.default_alpha_pock_chambolle_rescaling,
-      scaled_problem.reverse_coefficients,
-      scaled_problem.reverse_offsets,
-      scaled_problem.reverse_constraints,
-      nullptr,
-      hyper_params,
-      running_mip);
-
-    cuopt_func_call(auto saved_problem = scaled_problem);
-    if (settings.mip_scaling) {
-      scaling.scale_problem();
-      if (settings.initial_solutions.size() > 0) {
-        for (const auto& initial_solution : settings.initial_solutions) {
-          scaling.scale_primal(*initial_solution);
-        }
-      }
-    }
     // only call preprocess on scaled problem, so we can compute feasibility on the original problem
     scaled_problem.preprocess_problem();
-    // cuopt_func_call((check_scaled_problem<i_t, f_t>(scaled_problem, saved_problem)));
+    scaled_problem.related_vars_time_limit = settings.heuristic_params.related_vars_time_limit;
     detail::trivial_presolve(scaled_problem);
 
-    detail::mip_solver_t<i_t, f_t> solver(scaled_problem, settings, scaling, timer);
+    detail::mip_solver_t<i_t, f_t> solver(scaled_problem, settings, timer);
     // initial_upper_bound is in user-space (representation-invariant).
     // It will be converted to the target solver-space at each consumption point.
     solver.context.initial_upper_bound          = initial_upper_bound;
@@ -244,22 +217,25 @@ mip_solution_t<i_t, f_t> run_mip(detail::problem_t<i_t, f_t>& problem,
       CUOPT_LOG_DEBUG("Started early CPUFJ on papilo-presolved problem during cuOpt presolve");
     }
 
-    auto scaled_sol                 = solver.run_solver();
-    bool is_feasible_before_scaling = scaled_sol.get_feasible();
-    scaled_sol.problem_ptr          = &problem;
-
-    if (settings.mip_scaling) { scaling.unscale_solutions(scaled_sol); }
+    auto presolved_sol            = solver.run_solver();
+    bool is_feasible_on_presolved = presolved_sol.get_feasible();
+    presolved_sol.problem_ptr     = &problem;
     // at this point we need to compute the feasibility on the original problem not the presolved
     // one
-    bool is_feasible_after_unscaling = scaled_sol.compute_feasibility();
-    if (!scaled_problem.empty && is_feasible_before_scaling != is_feasible_after_unscaling) {
+    bool is_feasible_on_original = presolved_sol.compute_feasibility();
+    if (!scaled_problem.empty && is_feasible_on_presolved != is_feasible_on_original) {
       CUOPT_LOG_WARN(
-        "The feasibility does not match on scaled and unscaled problems. To overcome this issue, "
+        "The feasibility does not match on presolved and original problems. To overcome this "
+        "issue, "
         "please provide a more numerically stable problem.");
     }
 
-    auto sol = scaled_sol.get_solution(
-      is_feasible_before_scaling || is_feasible_after_unscaling, solver.get_solver_stats(), false);
+    auto sol = presolved_sol.get_solution(
+      is_feasible_on_presolved || is_feasible_on_original, solver.get_solver_stats(), false);
+
+    // Write back the (possibly updated) incumbent from the papilo-phase callback.
+    initial_upper_bound          = solver.context.initial_upper_bound;
+    initial_incumbent_assignment = solver.context.initial_incumbent_assignment;
 
     // Write back the (possibly updated) incumbent from the papilo-phase callback.
     initial_upper_bound          = solver.context.initial_upper_bound;
@@ -332,7 +308,10 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
     }
 
     auto timer = timer_t(time_limit);
-
+    if (settings.mip_scaling != CUOPT_MIP_SCALING_OFF) {
+      detail::mip_scaling_strategy_t<i_t, f_t> scaling(op_problem);
+      scaling.scale_problem(settings.mip_scaling != CUOPT_MIP_SCALING_NO_OBJECTIVE);
+    }
     double presolve_time = 0.0;
     std::unique_ptr<detail::third_party_presolve_t<i_t, f_t>> presolver;
     std::optional<detail::third_party_presolve_result_t<i_t, f_t>> presolve_result_opt;
@@ -420,7 +399,9 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
       detail::sort_csr(op_problem);
       // allocate not more than 10% of the time limit to presolve.
       // Note that this is not the presolve time, but the time limit for presolve.
-      double presolve_time_limit = std::min(0.1 * time_limit, 60.0);
+      const auto& hp = settings.heuristic_params;
+      double presolve_time_limit =
+        std::min(hp.presolve_time_ratio * time_limit, hp.presolve_max_time);
       if (settings.determinism_mode == CUOPT_MODE_DETERMINISTIC) {
         presolve_time_limit = std::numeric_limits<double>::infinity();
       }

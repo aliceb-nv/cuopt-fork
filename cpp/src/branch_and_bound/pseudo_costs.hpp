@@ -20,7 +20,10 @@
 
 #include <omp.h>
 #include <cmath>
+#include <rmm/device_uvector.hpp>
+
 #include <cstdint>
+#include <limits>
 
 namespace cuopt::linear_programming::dual_simplex {
 
@@ -411,6 +414,18 @@ struct reliability_branching_settings_t {
 };
 
 template <typename i_t, typename f_t>
+struct batch_pdlp_warm_cache_t {
+  const raft::handle_t batch_pdlp_handle{};
+  rmm::device_uvector<f_t> initial_primal{0, batch_pdlp_handle.get_stream()};
+  rmm::device_uvector<f_t> initial_dual{0, batch_pdlp_handle.get_stream()};
+  f_t step_size{std::numeric_limits<f_t>::signaling_NaN()};
+  f_t primal_weight{std::numeric_limits<f_t>::signaling_NaN()};
+  i_t pdlp_iteration{-1};
+  f_t percent_solved_by_batch_pdlp_at_root{f_t(0.0)};
+  bool populated{false};
+};
+
+template <typename i_t, typename f_t>
 class pseudo_costs_t {
  public:
   explicit pseudo_costs_t(i_t num_variables)
@@ -486,7 +501,9 @@ class pseudo_costs_t {
                                   const simplex_solver_settings_t<i_t, f_t>& settings,
                                   f_t upper_bound,
                                   int max_num_tasks,
-                                  logger_t& log);
+                                  logger_t& log,
+                                  const std::vector<i_t>& new_slacks,
+                                  const lp_problem_t<i_t, f_t>& original_lp);
 
   void update_pseudo_costs_from_strong_branching(const std::vector<i_t>& fractional,
                                                  const std::vector<f_t>& root_soln);
@@ -520,13 +537,15 @@ class pseudo_costs_t {
   std::vector<omp_mutex_t> pseudo_cost_mutex_down;
   omp_atomic_t<i_t> num_strong_branches_completed = 0;
   omp_atomic_t<int64_t> strong_branching_lp_iter  = 0;
+
+  batch_pdlp_warm_cache_t<i_t, f_t> pdlp_warm_cache;
 };
 
 template <typename i_t, typename f_t>
-void strong_branching(const user_problem_t<i_t, f_t>& original_problem,
-                      const lp_problem_t<i_t, f_t>& original_lp,
+void strong_branching(const lp_problem_t<i_t, f_t>& original_lp,
                       const simplex_solver_settings_t<i_t, f_t>& settings,
                       f_t start_time,
+                      const std::vector<i_t>& new_slacks,
                       const std::vector<variable_type_t>& var_types,
                       const lp_solution_t<i_t, f_t>& root_solution,
                       const std::vector<i_t>& fractional,

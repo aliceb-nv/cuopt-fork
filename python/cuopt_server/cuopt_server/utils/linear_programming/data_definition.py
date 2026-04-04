@@ -441,9 +441,15 @@ class SolverConfig(BaseModel):
         "<br>"
         "Note: Not supported for MILP. ",
     )
-    mip_scaling: Optional[bool] = Field(
-        default=True,
-        description="Set True to enable MIP scaling, False to disable.",
+    mip_scaling: Optional[int] = Field(
+        default=1,
+        description="MIP scaling mode:"
+        "<br>"
+        "- 0: No scaling"
+        "<br>"
+        "- 1: Full scaling (objective + row), default"
+        "<br>"
+        "- 2: Row scaling only (no objective scaling)",
     )
     mip_heuristics_only: Optional[bool] = Field(
         default=False,
@@ -452,8 +458,15 @@ class SolverConfig(BaseModel):
     )
     mip_batch_pdlp_strong_branching: Optional[int] = Field(
         default=0,
-        description="Set 1 to enable batch PDLP strong branching "
-        "in the MIP solver, 0 to disable.",
+        description="Strong branching mode: 0 = Dual Simplex only, "
+        "1 = cooperative work-stealing (DS + batch PDLP), "
+        "2 = batch PDLP only.",
+    )
+    mip_batch_pdlp_reliability_branching: Optional[int] = Field(
+        default=0,
+        description="Reliability branching mode: 0 = Dual Simplex only, "
+        "1 = cooperative work-stealing (DS + batch PDLP), "
+        "2 = batch PDLP only.",
     )
     num_cpu_threads: Optional[int] = Field(
         default=None,
