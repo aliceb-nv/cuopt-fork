@@ -475,10 +475,7 @@ void branch_and_bound_t<i_t, f_t>::set_new_solution(const std::vector<f_t>& solu
   mutex_original_lp_.unlock();
   bool is_feasible    = false;
   bool attempt_repair = false;
-  mutex_upper_.lock();
-  f_t current_upper_bound = upper_bound_;
-  mutex_upper_.unlock();
-  if (obj < current_upper_bound) {
+  if (!incumbent_.has_incumbent || obj < incumbent_.objective) {
     f_t primal_err;
     f_t bound_err;
     i_t num_fractional;
@@ -493,8 +490,8 @@ void branch_and_bound_t<i_t, f_t>::set_new_solution(const std::vector<f_t>& solu
       original_lp_, settings_, var_types_, crushed_solution, primal_err, bound_err, num_fractional);
     mutex_original_lp_.unlock();
     mutex_upper_.lock();
-    if (is_feasible && obj < upper_bound_) {
-      upper_bound_ = obj;
+    if (is_feasible && improves_incumbent(obj)) {
+      upper_bound_ = std::min(upper_bound_.load(), obj);
       incumbent_.set_incumbent_solution(obj, crushed_solution);
     } else {
       attempt_repair         = true;
@@ -654,8 +651,8 @@ void branch_and_bound_t<i_t, f_t>::repair_heuristic_solutions()
       if (is_feasible) {
         mutex_upper_.lock();
 
-        if (repaired_obj < upper_bound_) {
-          upper_bound_ = repaired_obj;
+        if (improves_incumbent(repaired_obj)) {
+          upper_bound_ = std::min(upper_bound_.load(), repaired_obj);
           incumbent_.set_incumbent_solution(repaired_obj, repaired_solution);
           report_heuristic(repaired_obj);
 
@@ -792,9 +789,9 @@ void branch_and_bound_t<i_t, f_t>::add_feasible_solution(f_t leaf_objective,
                       compute_user_objective(original_lp_, leaf_objective));
 
   mutex_upper_.lock();
-  if (leaf_objective < upper_bound_) {
+  if (improves_incumbent(leaf_objective)) {
     incumbent_.set_incumbent_solution(leaf_objective, leaf_solution);
-    upper_bound_ = leaf_objective;
+    upper_bound_ = std::min(upper_bound_.load(), leaf_objective);
     report(feasible_solution_symbol(thread_type), leaf_objective, get_lower_bound(), leaf_depth, 0);
     send_solution = true;
   }
@@ -802,7 +799,7 @@ void branch_and_bound_t<i_t, f_t>::add_feasible_solution(f_t leaf_objective,
   if (send_solution && settings_.solution_callback != nullptr) {
     std::vector<f_t> original_x;
     uncrush_primal_solution(original_problem_, original_lp_, incumbent_.x, original_x);
-    settings_.solution_callback(original_x, upper_bound_);
+    settings_.solution_callback(original_x, leaf_objective);
   }
   mutex_upper_.unlock();
 }
@@ -3286,8 +3283,8 @@ void branch_and_bound_t<i_t, f_t>::deterministic_process_worker_solutions(
              deterministic_current_horizon_);
 
       bool improved = false;
-      if (sol->objective < upper_bound_) {
-        upper_bound_ = sol->objective;
+      if (improves_incumbent(sol->objective)) {
+        upper_bound_ = std::min(upper_bound_.load(), sol->objective);
         incumbent_.set_incumbent_solution(sol->objective, sol->solution);
         current_upper = sol->objective;
         improved      = true;
@@ -3449,8 +3446,8 @@ void branch_and_bound_t<i_t, f_t>::deterministic_sort_replay_events(
       // Process heuristic solution at its correct work unit timestamp position
       f_t new_upper = std::numeric_limits<f_t>::infinity();
 
-      if (hsol.objective < upper_bound_) {
-        upper_bound_ = hsol.objective;
+      if (improves_incumbent(hsol.objective)) {
+        upper_bound_ = std::min(upper_bound_.load(), hsol.objective);
         incumbent_.set_incumbent_solution(hsol.objective, hsol.solution);
         new_upper = hsol.objective;
       }

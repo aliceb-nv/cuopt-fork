@@ -200,6 +200,15 @@ class branch_and_bound_t {
   // Solver-space incumbent tracked directly by B&B.
   mip_solution_t<i_t, f_t> incumbent_;
 
+  // Whether obj should replace the stored incumbent. Must be called under mutex_upper_.
+  // Compares against the stored incumbent's objective, NOT against upper_bound_, because
+  // set_initial_upper_bound can set a tighter bound from an OG-space solution that has no
+  // corresponding solver-space incumbent (e.g. papilo can't crush it back).
+  bool improves_incumbent(f_t obj) const
+  {
+    return !incumbent_.has_incumbent || obj < incumbent_.objective;
+  }
+
   // Structure with the general info of the solver.
   branch_and_bound_stats_t<i_t, f_t> exploration_stats_;
 
