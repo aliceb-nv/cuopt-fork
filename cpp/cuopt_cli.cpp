@@ -13,6 +13,7 @@
 #include <cuopt/linear_programming/solve.hpp>
 #include <mps_parser/parser.hpp>
 #include <utilities/logger.hpp>
+#include <utilities/timer.hpp>
 
 #include <raft/core/device_setter.hpp>
 #include <raft/core/handle.hpp>
@@ -92,11 +93,15 @@ int run_single_file(const std::string& file_path,
                     bool solve_relaxation,
                     cuopt::linear_programming::solver_settings_t<int, double>& settings)
 {
+  cuopt::init_logger_t log(settings.get_parameter<std::string>(CUOPT_LOG_FILE),
+                           settings.get_parameter<bool>(CUOPT_LOG_TO_CONSOLE));
+
   std::string base_filename = file_path.substr(file_path.find_last_of("/\\") + 1);
 
   constexpr bool input_mps_strict = false;
   cuopt::mps_parser::mps_data_model_t<int, double> mps_data_model;
   bool parsing_failed = false;
+  auto timer          = cuopt::timer_t(settings.get_parameter<double>(CUOPT_TIME_LIMIT));
   {
     CUOPT_LOG_INFO("Reading file %s", base_filename.c_str());
     try {
@@ -111,6 +116,7 @@ int run_single_file(const std::string& file_path,
     CUOPT_LOG_ERROR("Parsing MPS failed. Exiting!");
     return -1;
   }
+  CUOPT_LOG_INFO("Read file %s in %.2f seconds", base_filename.c_str(), timer.elapsed_time());
 
   // Determine memory backend and create problem using interface
   // Create handle only for GPU memory backend (avoid CUDA init on CPU-only hosts)
