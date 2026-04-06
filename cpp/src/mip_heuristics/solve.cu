@@ -237,10 +237,6 @@ mip_solution_t<i_t, f_t> run_mip(detail::problem_t<i_t, f_t>& problem,
     initial_upper_bound          = solver.context.initial_upper_bound;
     initial_incumbent_assignment = solver.context.initial_incumbent_assignment;
 
-    // Write back the (possibly updated) incumbent from the papilo-phase callback.
-    initial_upper_bound          = solver.context.initial_upper_bound;
-    initial_incumbent_assignment = solver.context.initial_incumbent_assignment;
-
     int hidesol =
       std::getenv("CUOPT_MIP_HIDE_SOLUTION") ? atoi(std::getenv("CUOPT_MIP_HIDE_SOLUTION")) : 0;
     if (!hidesol) { detail::print_solution(scaled_problem.handle_ptr, sol.get_solution()); }

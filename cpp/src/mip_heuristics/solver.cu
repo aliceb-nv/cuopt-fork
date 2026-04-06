@@ -216,7 +216,7 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
     CUOPT_LOG_DEBUG("Presolve time limit: %g", presolve_time_limit);
   bool presolve_success = run_presolve ? dm.run_presolve(presolve_time_limit, timer_) : true;
 
-  // Stop early CPUFJ after cuopt presolve (probing cache) but before main solve.
+  // Stop early CPUFJ after cuopt presolve (probing cache) but before main solve
   if (context.early_cpufj_ptr) {
     context.early_cpufj_ptr->stop();
     if (context.early_cpufj_ptr->solution_found()) {
@@ -478,6 +478,7 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
 
   rmm::device_scalar<i_t> is_feasible(sol.handle_ptr->get_stream());
   sol.test_variable_bounds(true, is_feasible.data());
+  // test_variable_bounds clears is_feasible if the test is failed
   if (!is_feasible.value(sol.handle_ptr->get_stream())) {
     CUOPT_LOG_ERROR(
       "Solution is not feasible due to variable bounds, returning infeasible solution!");
