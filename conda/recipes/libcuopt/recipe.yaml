@@ -93,7 +93,7 @@ cache:
       - bzip2
       - openssl
       - c-ares
-      - libgrpc
+      - libgrpc >=1.78.0,<1.80.0a0
       - libprotobuf
       - libabseil
       - re2
@@ -174,7 +174,7 @@ outputs:
         - openssl
         - c-ares
         - libuuid
-        - libgrpc
+        - libgrpc >=1.78.0,<1.80.0a0
         - libprotobuf
         - libabseil
         - re2
@@ -188,7 +188,7 @@ outputs:
         - openssl
         - c-ares
         - libuuid
-        - libgrpc
+        - libgrpc >=1.78.0,<1.80.0a0
         - libprotobuf
         - libabseil
       ignore_run_exports:
@@ -235,7 +235,7 @@ outputs:
         - libcusparse-dev
         - openssl
         - c-ares
-        - libgrpc
+        - libgrpc >=1.78.0,<1.80.0a0
         - libprotobuf
         - libabseil
       run:
