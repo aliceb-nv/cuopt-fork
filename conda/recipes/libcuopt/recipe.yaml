@@ -199,6 +199,7 @@ outputs:
         - libgrpc >=1.78.0,<1.80.0a0
         - libprotobuf
         - libabseil
+        - tbb
       ignore_run_exports:
         by_name:
           - cuda-nvtx
