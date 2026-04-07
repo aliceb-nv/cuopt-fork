@@ -609,6 +609,7 @@ solution_t<i_t, f_t> diversity_manager_t<i_t, f_t>::run_solver()
   }
   if (check_b_b_preemption()) {
     rins.stop_rins();
+    population.add_external_solutions_to_population();
     return population.best_feasible();
   }
 
