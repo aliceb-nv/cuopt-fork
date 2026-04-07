@@ -127,14 +127,22 @@ outputs:
         - bzip2
       ignore_run_exports:
         by_name:
+          - c-ares
           - cuda-nvtx
           - cuda-version
-          - libcurand
+          - libabseil
+          - libboost
           - libcudss
+          - libcurand
           - libcusparse
+          - libgrpc
+          - libprotobuf
           - librmm
-          - libzlib
           - libbz2
+          - libzlib
+          - openssl
+          - re2
+          - tbb
     tests:
     - package_contents:
         files:
