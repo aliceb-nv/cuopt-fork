@@ -76,9 +76,8 @@ typedef int64_t cuopt_int_t;
  *
  * Provides metadata about each incumbent solution reported during a MIP solve.
  *
- * ABI stability contract:
- * - Fields are append-only. Existing fields will never be reordered, removed,
- *   or change type across releases.
+ * Fields are append-only. Existing fields will never be reordered, removed,
+ * or change type across releases.
  */
 typedef struct {
   /** Which solver component found this solution (CUOPT_MIP_SOLUTION_ORIGIN_*). */
@@ -732,7 +731,7 @@ typedef void (*cuOptMIPGetSolutionCallback)(const cuopt_float_t* solution,
                                             void* user_data);
 
 /**
- * @brief Type of callback for receiving incumbent MIP solutions with extensible metadata.
+ * @brief Type of callback for receiving incumbent MIP solutions with extended metadata.
  *
  * @param[in] solution - Pointer to incumbent solution values.
  * @param[in] objective_value - Pointer to incumbent objective value.
@@ -785,7 +784,7 @@ cuopt_int_t cuOptSetMIPGetSolutionCallback(cuOptSolverSettings settings,
                                            void* user_data);
 
 /**
- * @brief Register an extended callback to receive incumbent MIP solutions with additional metadata.
+ * @brief Register an extended callback to receive incumbent MIP solutions with extended metadata.
  *
  * @param[in] settings - The solver settings object.
  * @param[in] callback - Callback function to receive incumbent solutions and callback metadata.

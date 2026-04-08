@@ -802,12 +802,15 @@ solution_t<i_t, f_t> diversity_manager_t<i_t, f_t>::run_solver()
     return best_sol;
   }
   if (timer.check_time_limit()) {
+    rins.stop_rins();
     population.add_external_solutions_to_population();
     auto& best_sol = population.best_feasible();
     log_return_solution("work_limit_reached", best_sol);
     return best_sol;
   }
   if (check_b_b_preemption()) {
+    rins.stop_rins();
+    population.add_external_solutions_to_population();
     auto& best_sol = population.best_feasible();
     log_return_solution("preempted_before_fp", best_sol);
     return best_sol;
@@ -820,6 +823,7 @@ solution_t<i_t, f_t> diversity_manager_t<i_t, f_t>::run_solver()
   CUOPT_LOG_DEBUG("post-run_fp_alone: gpu_work=%g gpu_prod=%g",
                   context.gpu_heur_loop.current_work(),
                   context.gpu_heur_loop.current_producer_work());
+  rins.stop_rins();
   population.add_external_solutions_to_population();
   auto& best_sol = population.best_feasible();
   CUOPT_LOG_DEBUG("post-fp handoff: feas=%d obj=%g hash=0x%x",

@@ -15,6 +15,7 @@
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
 
+#include <thrust/iterator/zip_iterator.h>
 #include <thrust/transform.h>
 #include <thrust/tuple.h>
 #include <thrust/universal_vector.h>

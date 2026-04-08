@@ -17,6 +17,8 @@
 #include <thrust/sort.h>
 #include <thrust/tuple.h>
 
+#include <thrust/iterator/transform_iterator.h>
+
 #include <cooperative_groups.h>
 
 #include "feasibility_jump_impl_common.cuh"

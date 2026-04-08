@@ -56,9 +56,11 @@ constexpr const char* mip_solution_origin_to_string(mip_solution_origin_t origin
     case mip_solution_origin_t::USER_INITIAL: return "user_initial";
     case mip_solution_origin_t::USER_INJECTED: return "user_injected";
     case mip_solution_origin_t::RINS: return "rins";
-    case mip_solution_origin_t::PRESOLVE: return "presolve";
-    default: return "unknown";
+    case mip_solution_origin_t::PRESOLVE:
+      return "presolve";
+      // no default to trigger compiler -Werror
   }
+  return "unknown";
 }
 
 using mip_solution_callback_info_t = cuOptMIPSolutionCallbackInfo;

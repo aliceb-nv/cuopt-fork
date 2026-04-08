@@ -104,6 +104,12 @@
 #define CUOPT_MIP_HYPER_HEURISTIC_RELAXED_LP_TIME_LIMIT "mip_hyper_heuristic_relaxed_lp_time_limit"
 #define CUOPT_MIP_HYPER_HEURISTIC_RELATED_VARS_TIME_LIMIT \
   "mip_hyper_heuristic_related_vars_time_limit"
+#define CUOPT_MIP_HYPER_HEURISTIC_CPUFJ_WORK_UNIT_SCALE "mip_hyper_heuristic_cpufj_work_unit_scale"
+#define CUOPT_MIP_HYPER_HEURISTIC_GPU_HEUR_WORK_UNIT_SCALE \
+  "mip_hyper_heuristic_gpu_heur_work_unit_scale"
+#define CUOPT_MIP_HYPER_HEURISTIC_BB_WORK_UNIT_SCALE "mip_hyper_heuristic_bb_work_unit_scale"
+#define CUOPT_MIP_HYPER_HEURISTIC_GPU_HEUR_WAIT_FOR_EXPLORATION \
+  "mip_hyper_heuristic_gpu_heur_wait_for_exploration"
 
 /* @brief MIP determinism mode flags (bitset) */
 #define CUOPT_DETERMINISM_NONE 0x0
