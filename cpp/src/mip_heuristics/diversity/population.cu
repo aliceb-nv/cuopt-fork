@@ -297,19 +297,16 @@ void population_t<i_t, f_t>::run_solution_callbacks(
 
       const double work_timestamp = context.gpu_heur_loop.current_work();
       const auto payload          = context.solution_publication.build_callback_payload(
-        context.problem_ptr, context.scaling, sol, callback_origin, work_timestamp);
+        context.problem_ptr, sol, callback_origin, work_timestamp);
       context.solution_publication.publish_new_best_feasible(payload, timer.elapsed_time());
     }
-    // save the best objective here, because we might not have been able to return the solution to
-    // the user because of the unscaling that causes infeasibility.
-    // This prevents an issue of repaired, or a fully feasible solution being reported in the call
-    // back in next run.
+    // Save the best objective here even if callback handling later exits early.
+    // This prevents older solutions from being reported as "new best" in subsequent callbacks.
     best_feasible_objective = sol.get_objective();
   }
 
   context.solution_injection.invoke_set_solution_callbacks(
     problem_ptr,
-    context.scaling,
     sol,
     [this](
       const std::vector<f_t>& assignment, f_t objective, internals::mip_solution_origin_t origin) {

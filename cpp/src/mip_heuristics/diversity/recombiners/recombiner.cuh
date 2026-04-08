@@ -224,7 +224,8 @@ class recombiner_t {
   }
 
   static void init_enabled_recombiners(mip_solver_context_t<i_t, f_t>& context,
-                                       const problem_t<i_t, f_t>& problem)
+                                       const problem_t<i_t, f_t>& problem,
+                                       int user_enabled_mask = -1)
   {
     std::unordered_set<recombiner_enum_t> enabled_recombiners;
     const bool disable_fp_and_submip_for_expensive_fix = problem.expensive_to_fix_vars;
@@ -234,6 +235,9 @@ class recombiner_t {
     const bool disable_submip_for_determinism =
       (context.settings.determinism_mode & CUOPT_DETERMINISM_GPU_HEURISTICS) != 0;
     for (auto recombiner : recombiner_types) {
+      if (user_enabled_mask >= 0 && !(user_enabled_mask & (1 << (uint32_t)recombiner))) {
+        continue;
+      }
       enabled_recombiners.insert(recombiner);
     }
     if (disable_fp_and_submip_for_expensive_fix) {

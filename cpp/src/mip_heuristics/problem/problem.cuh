@@ -18,6 +18,7 @@
 
 #include <cuopt/linear_programming/mip/solver_settings.hpp>
 #include <cuopt/linear_programming/optimization_problem.hpp>
+#include <cuopt/linear_programming/pdlp/solver_solution.hpp>
 #include <cuopt/linear_programming/utilities/internals.hpp>
 #include "host_helper.cuh"
 #include "problem_fixing.cuh"
@@ -98,8 +99,15 @@ class problem_t {
   void preprocess_problem();
   bool pre_process_assignment(rmm::device_uvector<f_t>& assignment);
   void post_process_assignment(rmm::device_uvector<f_t>& current_assignment,
+                               bool resize_to_original_problem,
+                               rmm::cuda_stream_view stream);
+  void post_process_assignment(rmm::device_uvector<f_t>& current_assignment,
                                bool resize_to_original_problem       = true,
-                               const raft::handle_t* handle_override = nullptr);
+                               const raft::handle_t* handle_override = nullptr)
+  {
+    auto stream = handle_override ? handle_override->get_stream() : handle_ptr->get_stream();
+    post_process_assignment(current_assignment, resize_to_original_problem, stream);
+  }
   void post_process_solution(solution_t<i_t, f_t>& solution);
   void set_papilo_presolve_data(const third_party_presolve_t<i_t, f_t>* presolver_ptr,
                                 std::vector<i_t> reduced_to_original,
@@ -245,8 +253,13 @@ class problem_t {
 
   std::function<void(const std::vector<f_t>&, cuopt::internals::mip_solution_origin_t)>
     branch_and_bound_callback;
-  std::function<void(
-    const std::vector<f_t>&, const std::vector<f_t>&, const std::vector<f_t>&, f_t, f_t, i_t)>
+  std::function<void(const std::vector<f_t>&,
+                     const std::vector<f_t>&,
+                     const std::vector<f_t>&,
+                     f_t,
+                     f_t,
+                     i_t,
+                     method_t)>
     set_root_relaxation_solution_callback;
 
   typename mip_solver_settings_t<i_t, f_t>::tolerances_t tolerances{};
@@ -324,6 +337,7 @@ class problem_t {
   bool cutting_plane_added{false};
   std::pair<std::vector<i_t>, std::vector<f_t>> vars_with_objective_coeffs;
   bool expensive_to_fix_vars{false};
+  double related_vars_time_limit{30.};
   std::vector<i_t> Q_offsets;
   std::vector<i_t> Q_indices;
   std::vector<f_t> Q_values;

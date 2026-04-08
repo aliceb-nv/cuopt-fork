@@ -11,7 +11,6 @@
 
 #include <mip_heuristics/problem/problem.cuh>
 #include <mip_heuristics/solution/solution.cuh>
-#include <pdlp/initial_scaling_strategy/initial_scaling.cuh>
 
 #include <limits>
 #include <mutex>
@@ -26,6 +25,40 @@ struct solution_callback_payload_t {
   f_t solver_objective{};
   internals::mip_solution_callback_info_t callback_info{};
 };
+
+template <typename f_t>
+void dispatch_get_solution_callbacks(
+  const std::vector<internals::base_solution_callback_t*>& user_callbacks,
+  const std::vector<f_t>& assignment,
+  f_t user_objective,
+  f_t solution_bound,
+  const internals::mip_solution_callback_info_t& callback_info)
+{
+  for (auto callback : user_callbacks) {
+    if (callback->get_type() != internals::base_solution_callback_type::GET_SOLUTION_EXT &&
+        callback->get_type() != internals::base_solution_callback_type::GET_SOLUTION) {
+      continue;
+    }
+
+    std::vector<f_t> user_assignment(assignment);
+    std::vector<f_t> user_objective_vec(1, user_objective);
+    std::vector<f_t> user_bound_vec(1, solution_bound);
+    if (callback->get_type() == internals::base_solution_callback_type::GET_SOLUTION_EXT) {
+      auto get_sol_callback_ext = static_cast<internals::get_solution_callback_ext_t*>(callback);
+      get_sol_callback_ext->get_solution(user_assignment.data(),
+                                         user_objective_vec.data(),
+                                         user_bound_vec.data(),
+                                         &callback_info,
+                                         get_sol_callback_ext->get_user_data());
+    } else if (callback->get_type() == internals::base_solution_callback_type::GET_SOLUTION) {
+      auto get_sol_callback = static_cast<internals::get_solution_callback_t*>(callback);
+      get_sol_callback->get_solution(user_assignment.data(),
+                                     user_objective_vec.data(),
+                                     user_bound_vec.data(),
+                                     get_sol_callback->get_user_data());
+    }
+  }
+}
 
 template <typename i_t, typename f_t>
 class solution_publication_t {
@@ -43,7 +76,6 @@ class solution_publication_t {
 
   solution_callback_payload_t<i_t, f_t> build_callback_payload(
     problem_t<i_t, f_t>* problem_ptr,
-    pdlp_initial_scaling_strategy_t<i_t, f_t>& scaling,
     solution_t<i_t, f_t>& sol,
     internals::mip_solution_origin_t origin,
     double work_timestamp)
@@ -63,12 +95,6 @@ class solution_publication_t {
     problem_ptr->post_process_assignment(temp_sol.assignment, true, sol.handle_ptr);
     CUOPT_LOG_DEBUG("build_callback_payload: post_postprocess size=%zu",
                     temp_sol.assignment.size());
-    if (settings.mip_scaling) {
-      rmm::device_uvector<f_t> dummy(0, temp_sol.handle_ptr->get_stream());
-      scaling.unscale_solutions(
-        temp_sol.assignment, dummy, temp_sol.handle_ptr->get_stream().value());
-      CUOPT_LOG_DEBUG("build_callback_payload: post_unscale size=%zu", temp_sol.assignment.size());
-    }
     if (problem_ptr->has_papilo_presolve_data()) {
       CUOPT_LOG_DEBUG("build_callback_payload: pre_papilo size=%zu papilo_reduced_size=%zu",
                       temp_sol.assignment.size(),
@@ -110,31 +136,11 @@ class solution_publication_t {
                     internals::mip_solution_origin_to_string(
                       (internals::mip_solution_origin_t)payload.callback_info.origin),
                     user_callbacks.size());
-
-    for (auto callback : user_callbacks) {
-      if (callback->get_type() != internals::base_solution_callback_type::GET_SOLUTION_EXT &&
-          callback->get_type() != internals::base_solution_callback_type::GET_SOLUTION) {
-        continue;
-      }
-
-      std::vector<f_t> user_assignment(payload.assignment);
-      std::vector<f_t> user_objective_vec(1, payload.user_objective);
-      std::vector<f_t> user_bound_vec(1, stats.get_solution_bound());
-      if (callback->get_type() == internals::base_solution_callback_type::GET_SOLUTION_EXT) {
-        auto get_sol_callback_ext = static_cast<internals::get_solution_callback_ext_t*>(callback);
-        get_sol_callback_ext->get_solution(user_assignment.data(),
-                                           user_objective_vec.data(),
-                                           user_bound_vec.data(),
-                                           &payload.callback_info,
-                                           get_sol_callback_ext->get_user_data());
-      } else if (callback->get_type() == internals::base_solution_callback_type::GET_SOLUTION) {
-        auto get_sol_callback = static_cast<internals::get_solution_callback_t*>(callback);
-        get_sol_callback->get_solution(user_assignment.data(),
-                                       user_objective_vec.data(),
-                                       user_bound_vec.data(),
-                                       get_sol_callback->get_user_data());
-      }
-    }
+    dispatch_get_solution_callbacks(user_callbacks,
+                                    payload.assignment,
+                                    payload.user_objective,
+                                    stats.get_solution_bound(),
+                                    payload.callback_info);
   }
 
   const mip_solver_settings_t<i_t, f_t>& settings;
@@ -156,7 +162,6 @@ class solution_injection_t {
 
   template <typename OnInjectedFn>
   void invoke_set_solution_callbacks(problem_t<i_t, f_t>* problem_ptr,
-                                     pdlp_initial_scaling_strategy_t<i_t, f_t>& scaling,
                                      solution_t<i_t, f_t>& current_incumbent,
                                      OnInjectedFn&& on_injected)
   {
@@ -188,7 +193,6 @@ class solution_injection_t {
                  current_incumbent.handle_ptr->get_stream());
       bool is_valid = problem_ptr->pre_process_assignment(incumbent_assignment);
       if (!is_valid) { continue; }
-      if (settings.mip_scaling) { scaling.scale_solutions(incumbent_assignment); }
 
       solution_t<i_t, f_t> outside_sol(current_incumbent);
       cuopt_assert(outside_sol.assignment.size() == incumbent_assignment.size(),

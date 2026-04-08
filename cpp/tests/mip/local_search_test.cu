@@ -98,21 +98,9 @@ static uint32_t run_fp(std::string test_instance, local_search_mode_t mode, doub
   problem.preprocess_problem();
 
   setup_device_symbols(op_problem.get_handle_ptr()->get_stream());
-
-  pdlp_hyper_params::pdlp_hyper_params_t hyper_params{};
-  detail::pdlp_initial_scaling_strategy_t<int, double> scaling(&handle_,
-                                                               problem,
-                                                               10,
-                                                               1.0,
-                                                               problem.reverse_coefficients,
-                                                               problem.reverse_offsets,
-                                                               problem.reverse_constraints,
-                                                               nullptr,
-                                                               hyper_params,
-                                                               true);
   auto timer =
     cuopt::termination_checker_t(settings.time_limit, cuopt::termination_checker_t::root_tag_t{});
-  detail::mip_solver_t<int, double> solver(problem, settings, scaling, timer);
+  detail::mip_solver_t<int, double> solver(problem, settings, timer);
   problem.tolerances = settings.get_tolerances();
 
   rmm::device_uvector<double> lp_optimal_solution(problem.n_variables,

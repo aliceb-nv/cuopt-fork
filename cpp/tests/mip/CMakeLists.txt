@@ -55,3 +55,6 @@ ConfigureTest(LOCAL_SEARCH_TEST
 ConfigureTest(DIVERSITY_TEST
     ${CMAKE_CURRENT_SOURCE_DIR}/diversity_test.cu
 )
+ConfigureTest(HEURISTICS_HYPER_PARAMS_TEST
+    ${CMAKE_CURRENT_SOURCE_DIR}/heuristics_hyper_params_test.cu
+)

@@ -89,8 +89,17 @@ class presolve_data_t {
   bool pre_process_assignment(problem_t<i_t, f_t>& problem, rmm::device_uvector<f_t>& assignment);
   void post_process_assignment(problem_t<i_t, f_t>& problem,
                                rmm::device_uvector<f_t>& current_assignment,
+                               bool resize_to_original_problem,
+                               rmm::cuda_stream_view stream);
+  void post_process_assignment(problem_t<i_t, f_t>& problem,
+                               rmm::device_uvector<f_t>& current_assignment,
                                bool resize_to_original_problem       = true,
-                               const raft::handle_t* handle_override = nullptr);
+                               const raft::handle_t* handle_override = nullptr)
+  {
+    auto stream =
+      handle_override ? handle_override->get_stream() : problem.handle_ptr->get_stream();
+    post_process_assignment(problem, current_assignment, resize_to_original_problem, stream);
+  }
   void post_process_solution(problem_t<i_t, f_t>& problem, solution_t<i_t, f_t>& solution);
 
   void set_papilo_presolve_data(const third_party_presolve_t<i_t, f_t>* presolver_ptr,

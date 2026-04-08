@@ -88,25 +88,13 @@ static uint32_t test_full_run_determinism(std::string path,
 
   setup_device_symbols(op_problem.get_handle_ptr()->get_stream());
 
-  pdlp_hyper_params::pdlp_hyper_params_t hyper_params{};
-  detail::pdlp_initial_scaling_strategy_t<int, double> scaling(&handle_,
-                                                               problem,
-                                                               10,
-                                                               1.0,
-                                                               problem.reverse_coefficients,
-                                                               problem.reverse_offsets,
-                                                               problem.reverse_constraints,
-                                                               nullptr,
-                                                               hyper_params,
-                                                               true);
-
   auto settings             = mip_solver_settings_t<int, double>{};
   settings.time_limit       = 3000.;
   settings.work_limit       = work_limit;
   settings.determinism_mode = CUOPT_MODE_DETERMINISTIC_GPU_HEURISTICS;
   settings.heuristics_only  = true;
   auto timer = cuopt::termination_checker_t(3000.0, cuopt::termination_checker_t::root_tag_t{});
-  detail::mip_solver_t<int, double> solver(problem, settings, scaling, timer);
+  detail::mip_solver_t<int, double> solver(problem, settings, timer);
   problem.tolerances = settings.get_tolerances();
 
   detail::diversity_manager_t<int, double> diversity_manager(solver.context);
@@ -148,24 +136,12 @@ static uint32_t test_initial_solution_determinism(std::string path,
 
   setup_device_symbols(op_problem.get_handle_ptr()->get_stream());
 
-  pdlp_hyper_params::pdlp_hyper_params_t hyper_params{};
-  detail::pdlp_initial_scaling_strategy_t<int, double> scaling(&handle_,
-                                                               problem,
-                                                               10,
-                                                               1.0,
-                                                               problem.reverse_coefficients,
-                                                               problem.reverse_offsets,
-                                                               problem.reverse_constraints,
-                                                               nullptr,
-                                                               hyper_params,
-                                                               true);
-
   auto settings             = mip_solver_settings_t<int, double>{};
   settings.time_limit       = 3000.;
   settings.determinism_mode = CUOPT_MODE_DETERMINISTIC_GPU_HEURISTICS;
   settings.heuristics_only  = true;
   auto timer = cuopt::termination_checker_t(3000.0, cuopt::termination_checker_t::root_tag_t{});
-  detail::mip_solver_t<int, double> solver(problem, settings, scaling, timer);
+  detail::mip_solver_t<int, double> solver(problem, settings, timer);
   problem.tolerances = settings.get_tolerances();
 
   detail::diversity_manager_t<int, double> diversity_manager(solver.context);
@@ -209,24 +185,12 @@ static uint32_t test_recombiners_determinism(std::string path,
 
   setup_device_symbols(op_problem.get_handle_ptr()->get_stream());
 
-  pdlp_hyper_params::pdlp_hyper_params_t hyper_params{};
-  detail::pdlp_initial_scaling_strategy_t<int, double> scaling(&handle_,
-                                                               problem,
-                                                               10,
-                                                               1.0,
-                                                               problem.reverse_coefficients,
-                                                               problem.reverse_offsets,
-                                                               problem.reverse_constraints,
-                                                               nullptr,
-                                                               hyper_params,
-                                                               true);
-
   auto settings             = mip_solver_settings_t<int, double>{};
   settings.time_limit       = 3000.;
   settings.determinism_mode = CUOPT_MODE_DETERMINISTIC_GPU_HEURISTICS;
   settings.heuristics_only  = true;
   auto timer = cuopt::termination_checker_t(3000.0, cuopt::termination_checker_t::root_tag_t{});
-  detail::mip_solver_t<int, double> solver(problem, settings, scaling, timer);
+  detail::mip_solver_t<int, double> solver(problem, settings, timer);
   problem.tolerances = settings.get_tolerances();
 
   detail::diversity_manager_t<int, double> diversity_manager(solver.context);

@@ -107,19 +107,8 @@ uint32_t test_probing_cache_determinism(std::string path,
   detail::problem_t<int, double> problem(op_problem);
   mip_solver_settings_t<int, double> default_settings{};
   default_settings.mip_scaling = false;  // we're not checking scaling determinism here
-  pdlp_hyper_params::pdlp_hyper_params_t hyper_params{};
-  detail::pdlp_initial_scaling_strategy_t<int, double> scaling(&handle_,
-                                                               problem,
-                                                               10,
-                                                               1.0,
-                                                               problem.reverse_coefficients,
-                                                               problem.reverse_offsets,
-                                                               problem.reverse_constraints,
-                                                               nullptr,
-                                                               hyper_params,
-                                                               true);
   auto timer = cuopt::termination_checker_t(0.0, cuopt::termination_checker_t::root_tag_t{});
-  detail::mip_solver_t<int, double> solver(problem, default_settings, scaling, timer);
+  detail::mip_solver_t<int, double> solver(problem, default_settings, timer);
   detail::bound_presolve_t<int, double> bnd_prb(solver.context);
 
   work_limit_context_t work_limit_context("ProbingCache");
@@ -231,11 +220,12 @@ TEST(problem, find_implied_integers)
                                  1e-12,
                                  20,
                                  1);
-  ASSERT_TRUE(result.has_value());
+  ASSERT_NE(result.status, detail::third_party_presolve_status_t::INFEASIBLE);
+  ASSERT_NE(result.status, detail::third_party_presolve_status_t::UNBNDORINFEAS);
 
-  auto problem = detail::problem_t<int, double>(result->reduced_problem);
-  problem.set_implied_integers(result->implied_integer_indices);
-  ASSERT_TRUE(result->implied_integer_indices.size() > 0);
+  auto problem = detail::problem_t<int, double>(result.reduced_problem);
+  problem.set_implied_integers(result.implied_integer_indices);
+  ASSERT_TRUE(result.implied_integer_indices.size() > 0);
   auto var_types = host_copy(problem.variable_types, handle_.get_stream());
   // Find the index of the one continuous variable
   auto it = std::find_if(var_types.begin(), var_types.end(), [](var_t var_type) {

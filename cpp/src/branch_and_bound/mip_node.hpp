@@ -36,27 +36,9 @@ bool inactive_status(node_status_t status);
 template <typename i_t, typename f_t>
 class mip_node_t {
  public:
-  mip_node_t()
-    : status(node_status_t::PENDING),
-      lower_bound(-std::numeric_limits<f_t>::infinity()),
-      depth(0),
-      parent(nullptr),
-      node_id(0),
-      branch_var(-1),
-      branch_dir(rounding_direction_t::NONE),
-      branch_var_lower(-std::numeric_limits<f_t>::infinity()),
-      branch_var_upper(std::numeric_limits<f_t>::infinity()),
-      fractional_val(std::numeric_limits<f_t>::infinity()),
-      objective_estimate(std::numeric_limits<f_t>::infinity()),
-      vstatus(0)
-  {
-    children[0] = nullptr;
-    children[1] = nullptr;
-  }
-
   ~mip_node_t()
   {
-    // Iterative tree teardown to avoid stack overflow on deep trees.
+    // Iterative teardown to avoid stack overflow on deep trees.
     // Detach all descendants breadth-first, then destroy them as leaves.
     std::vector<std::unique_ptr<mip_node_t>> nodes;
     for (auto& c : children) {
@@ -74,6 +56,24 @@ class mip_node_t {
 
   mip_node_t(mip_node_t&&)            = default;
   mip_node_t& operator=(mip_node_t&&) = default;
+
+  mip_node_t()
+    : status(node_status_t::PENDING),
+      lower_bound(-std::numeric_limits<f_t>::infinity()),
+      depth(0),
+      parent(nullptr),
+      node_id(0),
+      branch_var(-1),
+      branch_dir(rounding_direction_t::NONE),
+      branch_var_lower(-std::numeric_limits<f_t>::infinity()),
+      branch_var_upper(std::numeric_limits<f_t>::infinity()),
+      fractional_val(std::numeric_limits<f_t>::infinity()),
+      objective_estimate(std::numeric_limits<f_t>::infinity()),
+      vstatus(0)
+  {
+    children[0] = nullptr;
+    children[1] = nullptr;
+  }
 
   mip_node_t(f_t root_lower_bound, const std::vector<variable_status_t>& basis)
     : status(node_status_t::PENDING),

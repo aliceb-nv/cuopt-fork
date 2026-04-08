@@ -203,23 +203,11 @@ static fj_state_t run_fj(detail::problem_t<int, double>& problem,
                          std::vector<double> initial_solution = {},
                          int determinism_mode                 = CUOPT_MODE_OPPORTUNISTIC)
 {
-  pdlp_hyper_params::pdlp_hyper_params_t hyper_params{};
-  detail::pdlp_initial_scaling_strategy_t<int, double> scaling(problem.handle_ptr,
-                                                               problem,
-                                                               10,
-                                                               1.0,
-                                                               problem.reverse_coefficients,
-                                                               problem.reverse_offsets,
-                                                               problem.reverse_constraints,
-                                                               nullptr,
-                                                               hyper_params,
-                                                               true);
-
   auto settings             = mip_solver_settings_t<int, double>{};
   settings.time_limit       = 30.;
   settings.determinism_mode = determinism_mode;
   auto timer = cuopt::termination_checker_t(30.0, cuopt::termination_checker_t::root_tag_t{});
-  detail::mip_solver_t<int, double> solver(problem, settings, scaling, timer);
+  detail::mip_solver_t<int, double> solver(problem, settings, timer);
 
   detail::solution_t<int, double> solution(*solver.context.problem_ptr);
   if (initial_solution.size() > 0) {
