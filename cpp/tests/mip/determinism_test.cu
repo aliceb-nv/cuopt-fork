@@ -105,7 +105,6 @@ bool is_gpu_callback_origin(internals::mip_solution_origin_t origin)
   switch (origin) {
     case internals::mip_solution_origin_t::FEASIBILITY_JUMP:
     case internals::mip_solution_origin_t::LOCAL_SEARCH:
-    case internals::mip_solution_origin_t::QUICK_FEASIBLE:
     case internals::mip_solution_origin_t::LP_ROUNDING:
     case internals::mip_solution_origin_t::RECOMBINATION:
     case internals::mip_solution_origin_t::SUB_MIP: return true;

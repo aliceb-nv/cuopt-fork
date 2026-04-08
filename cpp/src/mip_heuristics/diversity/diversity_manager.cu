@@ -87,6 +87,7 @@ diversity_manager_t<i_t, f_t>::diversity_manager_t(mip_solver_context_t<i_t, f_t
     mab_ls(mab_ls_config_t<i_t, f_t>::n_of_arms, cuopt::seed_generator::get_seed(), ls_alpha, "ls"),
     ls_hash_map(*context.problem_ptr)
 {
+  // Necessary for tests that run sequentially - static globals aren't otherwise reset
   fp_recombiner_config_t::max_n_of_vars_from_other =
     fp_recombiner_config_t::initial_n_of_vars_from_other;
   ls_recombiner_config_t::max_n_of_vars_from_other =
@@ -481,6 +482,8 @@ solution_t<i_t, f_t> diversity_manager_t<i_t, f_t>::run_solver()
   const bool deterministic_bb_without_deterministic_heuristics =
     (context.settings.determinism_mode & CUOPT_DETERMINISM_BB) &&
     !(context.settings.determinism_mode & CUOPT_DETERMINISM_GPU_HEURISTICS);
+
+  // Debug: Allow disabling GPU heuristics to test B&B tree determinism in isolation
   const char* disable_heuristics_env = std::getenv("CUOPT_DISABLE_GPU_HEURISTICS");
   if (deterministic_bb_without_deterministic_heuristics ||
       (disable_heuristics_env != nullptr && std::string(disable_heuristics_env) == "1")) {
@@ -594,9 +597,6 @@ solution_t<i_t, f_t> diversity_manager_t<i_t, f_t>::run_solver()
     convert_greater_to_less(*problem_ptr);
 
     f_t absolute_tolerance = context.settings.tolerances.absolute_tolerance;
-    f_t tolerance_divisor =
-      problem_ptr->tolerances.absolute_tolerance / problem_ptr->tolerances.relative_tolerance;
-    if (tolerance_divisor == 0) { tolerance_divisor = 1; }
 
     auto lp_result = [&]() {
       // no concurrent root solve in determinism mode, reuse the work-accounted relaxed_lp machinery
@@ -624,16 +624,22 @@ solution_t<i_t, f_t> diversity_manager_t<i_t, f_t>::run_solver()
           *problem_ptr, lp_optimal_solution, lp_state, lp_settings);
       }
       pdlp_solver_settings_t<i_t, f_t> pdlp_settings{};
-      pdlp_settings.tolerances.relative_primal_tolerance = absolute_tolerance / tolerance_divisor;
-      pdlp_settings.tolerances.relative_dual_tolerance   = absolute_tolerance / tolerance_divisor;
-      pdlp_settings.time_limit                           = lp_time_limit;
-      pdlp_settings.first_primal_feasible                = false;
-      pdlp_settings.concurrent_halt                      = &global_concurrent_halt;
-      pdlp_settings.method                               = method_t::Concurrent;
-      pdlp_settings.inside_mip                           = true;
-      pdlp_settings.pdlp_solver_mode                     = pdlp_solver_mode_t::Stable2;
-      pdlp_settings.num_gpus                             = context.settings.num_gpus;
-      pdlp_settings.presolver                            = presolver_t::None;
+      pdlp_settings.tolerances.absolute_dual_tolerance = absolute_tolerance;
+      pdlp_settings.tolerances.relative_dual_tolerance =
+        context.settings.tolerances.relative_tolerance;
+      pdlp_settings.tolerances.absolute_primal_tolerance = absolute_tolerance;
+      pdlp_settings.tolerances.relative_primal_tolerance =
+        context.settings.tolerances.relative_tolerance;
+      pdlp_settings.time_limit              = lp_time_limit;
+      pdlp_settings.first_primal_feasible   = false;
+      pdlp_settings.concurrent_halt         = &global_concurrent_halt;
+      pdlp_settings.method                  = method_t::Concurrent;
+      pdlp_settings.inside_mip              = true;
+      pdlp_settings.pdlp_solver_mode        = pdlp_solver_mode_t::Stable2;
+      pdlp_settings.num_gpus                = context.settings.num_gpus;
+      pdlp_settings.presolver               = presolver_t::None;
+      pdlp_settings.per_constraint_residual = true;
+      set_pdlp_solver_mode(pdlp_settings);
       timer_t lp_timer(lp_time_limit);
       return solve_lp_with_method<i_t, f_t>(*problem_ptr, pdlp_settings, lp_timer);
     }();

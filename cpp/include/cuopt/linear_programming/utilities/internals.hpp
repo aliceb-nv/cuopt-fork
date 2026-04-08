@@ -30,7 +30,6 @@ enum class mip_solution_origin_t : uint32_t {
   FEASIBILITY_JUMP        = CUOPT_MIP_SOLUTION_ORIGIN_FEASIBILITY_JUMP,
   CPU_FEASIBILITY_JUMP    = CUOPT_MIP_SOLUTION_ORIGIN_CPU_FEASIBILITY_JUMP,
   LOCAL_SEARCH            = CUOPT_MIP_SOLUTION_ORIGIN_LOCAL_SEARCH,
-  QUICK_FEASIBLE          = CUOPT_MIP_SOLUTION_ORIGIN_QUICK_FEASIBLE,
   LP_ROUNDING             = CUOPT_MIP_SOLUTION_ORIGIN_LP_ROUNDING,
   RECOMBINATION           = CUOPT_MIP_SOLUTION_ORIGIN_RECOMBINATION,
   SUB_MIP                 = CUOPT_MIP_SOLUTION_ORIGIN_SUB_MIP,
@@ -49,7 +48,6 @@ constexpr const char* mip_solution_origin_to_string(mip_solution_origin_t origin
     case mip_solution_origin_t::FEASIBILITY_JUMP: return "feasibility_jump";
     case mip_solution_origin_t::CPU_FEASIBILITY_JUMP: return "cpu_feasibility_jump";
     case mip_solution_origin_t::LOCAL_SEARCH: return "local_search";
-    case mip_solution_origin_t::QUICK_FEASIBLE: return "quick_feasible";
     case mip_solution_origin_t::LP_ROUNDING: return "lp_rounding";
     case mip_solution_origin_t::RECOMBINATION: return "recombination";
     case mip_solution_origin_t::SUB_MIP: return "sub_mip";

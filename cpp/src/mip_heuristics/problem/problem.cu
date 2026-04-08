@@ -2214,8 +2214,7 @@ template <typename i_t, typename f_t>
 void problem_t<i_t, f_t>::papilo_uncrush_assignment(rmm::device_uvector<f_t>& assignment,
                                                     const raft::handle_t* handle_override) const
 {
-  presolve_data.papilo_uncrush_assignment(
-    const_cast<problem_t&>(*this), assignment, handle_override);
+  presolve_data.papilo_uncrush_assignment(*this, assignment, handle_override);
 }
 
 template <typename i_t, typename f_t>

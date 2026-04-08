@@ -223,7 +223,7 @@ void presolve_data_t<i_t, f_t>::set_papilo_presolve_data(
 
 template <typename i_t, typename f_t>
 void presolve_data_t<i_t, f_t>::papilo_uncrush_assignment(
-  problem_t<i_t, f_t>& problem,
+  const problem_t<i_t, f_t>& problem,
   rmm::device_uvector<f_t>& assignment,
   const raft::handle_t* handle_override) const
 {

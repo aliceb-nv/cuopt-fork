@@ -163,7 +163,6 @@ class bound_prop_recombiner_t : public recombiner_t<i_t, f_t> {
     CUOPT_LOG_DEBUG(
       "n_vars_from_guiding %d n_vars_from_other %d", n_vars_from_guiding, n_vars_from_other);
 
-    // DETERMINISM DEBUG: Log everything that could affect divergence
     CUOPT_DETERMINISM_LOG("BP_DET: sol_a_hash=0x%x sol_b_hash=0x%x offspring_hash=0x%x, seed %x",
                           a.get_hash(),
                           b.get_hash(),
