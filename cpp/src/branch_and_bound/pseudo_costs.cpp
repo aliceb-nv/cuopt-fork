@@ -1130,12 +1130,13 @@ void strong_branching(const lp_problem_t<i_t, f_t>& original_lp,
   std::vector<f_t> dual_simplex_obj_up(fractional.size(), std::numeric_limits<f_t>::quiet_NaN());
   f_t strong_branching_start_time = tic();
   i_t simplex_iteration_limit     = settings.strong_branching_simplex_iteration_limit;
-  std::vector<cuopt::work_limit_context_t> thread_work_contexts;
+  const i_t n_tasks               = std::min<i_t>(4 * settings.num_threads, fractional.size());
+  std::vector<cuopt::work_limit_context_t> task_work_contexts;
   if (deterministic_work_accounting) {
-    thread_work_contexts.reserve(settings.num_threads);
-    for (i_t t = 0; t < settings.num_threads; ++t) {
-      thread_work_contexts.emplace_back("sb_thread_" + std::to_string(t));
-      thread_work_contexts.back().deterministic = true;
+    task_work_contexts.reserve(n_tasks);
+    for (i_t k = 0; k < n_tasks; ++k) {
+      task_work_contexts.emplace_back("sb_task_" + std::to_string(k));
+      task_work_contexts.back().deterministic = true;
     }
   }
 
@@ -1172,13 +1173,12 @@ void strong_branching(const lp_problem_t<i_t, f_t>& original_lp,
         }
 
         if (effective_batch_pdlp != 2) {
-          i_t n = std::min<i_t>(4 * settings.num_threads, fractional.size());
 // Here we are creating more tasks than the number of threads
 // such that they can be scheduled dynamically to the threads.
-#pragma omp taskloop num_tasks(n)
-          for (i_t k = 0; k < n; k++) {
-            i_t start = std::floor(k * fractional.size() / n);
-            i_t end   = std::floor((k + 1) * fractional.size() / n);
+#pragma omp taskloop num_tasks(n_tasks)
+          for (i_t k = 0; k < n_tasks; k++) {
+            i_t start = std::floor(k * fractional.size() / n_tasks);
+            i_t end   = std::floor((k + 1) * fractional.size() / n_tasks);
 
             constexpr bool verbose = false;
             if (verbose) {
@@ -1209,9 +1209,7 @@ void strong_branching(const lp_problem_t<i_t, f_t>& original_lp,
                                  dual_simplex_status_down,
                                  dual_simplex_status_up,
                                  sb_view,
-                                 deterministic_work_accounting
-                                   ? &thread_work_contexts[omp_get_thread_num()]
-                                   : nullptr);
+                                 deterministic_work_accounting ? &task_work_contexts[k] : nullptr);
           }
           // DS done: signal PDLP to stop (time-limit or all work done) and wait
           if (effective_batch_pdlp == 1) { concurrent_halt.store(1); }
@@ -1220,7 +1218,7 @@ void strong_branching(const lp_problem_t<i_t, f_t>& original_lp,
     }
     if (deterministic_work_accounting) {
       double max_work = 0.0;
-      for (const auto& ctx : thread_work_contexts) {
+      for (const auto& ctx : task_work_contexts) {
         max_work = std::max(max_work, ctx.current_work());
       }
       work_unit_context->record_work_sync_on_horizon(max_work);
