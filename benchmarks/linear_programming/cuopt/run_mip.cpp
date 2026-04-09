@@ -118,7 +118,7 @@ void read_single_solution_from_path(const std::string& path,
   }
 }
 
-// reads a solution from an input file. The input file needs to be csv formatted
+// Reads a solution from an input file. The input file needs to be csv formatted
 // var_name,val
 std::vector<std::vector<double>> read_solution_from_dir(const std::string file_path,
                                                         const std::string& mps_file_name,
