@@ -185,7 +185,7 @@ class solution_injection_t {
                                      h_user_bound.data(),
                                      set_sol_callback->get_user_data());
       f_t outside_sol_objective = h_outside_sol_objective[0];
-      if (outside_sol_objective == inf) { continue; }
+      if (!std::isfinite(outside_sol_objective)) { continue; }
 
       raft::copy(incumbent_assignment.data(),
                  h_incumbent_assignment.data(),

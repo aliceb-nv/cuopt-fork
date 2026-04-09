@@ -274,7 +274,10 @@ bool feasibility_pump_t<i_t, f_t>::linear_project_onto_polytope(solution_t<i_t, 
   cuopt_func_call(solution.test_variable_bounds(false));
   relaxed_lp_settings_t lp_settings;
   lp_settings.time_limit = time_limit;
-  if (timer.deterministic) { lp_settings.work_limit = lp_settings.time_limit; }
+  if (timer.deterministic) {
+    lp_settings.work_limit = lp_settings.time_limit;
+    if (lp_settings.work_limit == 0.0) { return false; }
+  }
   lp_settings.work_context        = timer.work_context;
   lp_settings.tolerance           = lp_tolerance;
   lp_settings.check_infeasibility = false;

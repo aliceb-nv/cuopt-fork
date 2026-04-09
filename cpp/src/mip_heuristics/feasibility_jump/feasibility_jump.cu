@@ -1319,6 +1319,10 @@ i_t fj_t<i_t, f_t>::solve(solution_t<i_t, f_t>& solution)
   if (settings.mode == fj_mode_t::ROUNDING) {
     settings.time_limit =
       settings.time_limit * (1 - settings.parameters.rounding_second_stage_split);
+    if (deterministic) {
+      settings.work_limit =
+        settings.work_limit * (1 - settings.parameters.rounding_second_stage_split);
+    }
     settings.iteration_limit =
       settings.iteration_limit * (1 - settings.parameters.rounding_second_stage_split);
   }
@@ -1360,6 +1364,9 @@ i_t fj_t<i_t, f_t>::solve(solution_t<i_t, f_t>& solution)
   if (settings.mode == fj_mode_t::ROUNDING &&
       climbers[0]->fractional_variables.set_size.value(handle_ptr->get_stream()) > 0) {
     settings.time_limit = settings.time_limit * settings.parameters.rounding_second_stage_split;
+    if (deterministic) {
+      settings.work_limit = settings.work_limit * settings.parameters.rounding_second_stage_split;
+    }
     settings.iteration_limit =
       settings.iteration_limit * settings.parameters.rounding_second_stage_split;
 

@@ -295,8 +295,7 @@ TEST_P(DiversityTestParams, recombiners_deterministic)
   int seed =
     std::getenv("CUOPT_SEED") ? std::stoi(std::getenv("CUOPT_SEED")) : std::random_device{}();
   std::cerr << "Tested with seed " << seed << "\n";
-  auto path     = make_path_absolute(test_instance);
-  test_instance = std::getenv("CUOPT_INSTANCE") ? std::getenv("CUOPT_INSTANCE") : test_instance;
+  auto path          = make_path_absolute(test_instance);
   uint32_t gold_hash = 0;
   std::map<std::tuple<std::string, int, int, detail::recombiner_enum_t>, uint32_t> hash_map;
   for (int i = 0; i < 2; ++i) {
@@ -325,8 +324,7 @@ TEST_P(DiversityTestParams, initial_solution_deterministic)
   int seed =
     std::getenv("CUOPT_SEED") ? std::stoi(std::getenv("CUOPT_SEED")) : std::random_device{}();
   std::cerr << "Tested with seed " << seed << "\n";
-  auto path     = make_path_absolute(test_instance);
-  test_instance = std::getenv("CUOPT_INSTANCE") ? std::getenv("CUOPT_INSTANCE") : test_instance;
+  auto path          = make_path_absolute(test_instance);
   uint32_t gold_hash = 0;
   for (int i = 0; i < 2; ++i) {
     cuopt::seed_generator::set_seed(seed);

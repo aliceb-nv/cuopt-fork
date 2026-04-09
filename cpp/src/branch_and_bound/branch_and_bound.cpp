@@ -3782,7 +3782,7 @@ void branch_and_bound_t<i_t, f_t>::deterministic_sort_replay_events(
     {
       std::vector<queued_external_solution_t> future_solutions;
       for (auto& sol : heuristic_solution_queue_) {
-        if (sol.work_timestamp < deterministic_current_horizon_) {
+        if (sol.work_timestamp <= deterministic_current_horizon_) {
           due_solutions.push_back(std::move(sol));
         } else {
           future_solutions.push_back(std::move(sol));

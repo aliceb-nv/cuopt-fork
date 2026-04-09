@@ -194,7 +194,7 @@ static bool run_fj_check_determinism(std::string test_instance, int iter_limit)
   if (first_val_map.count(test_instance) == 0) {
     first_val_map[test_instance] = solution.get_user_objective();
   }
-  EXPECT_NEAR(solution.get_user_objective(), first_val_map[test_instance], 1.0)
+  EXPECT_EQ(solution.get_user_objective(), first_val_map[test_instance])
     << test_instance << " determinism objective mismatch";
 
   return true;
