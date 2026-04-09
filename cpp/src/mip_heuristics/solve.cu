@@ -8,6 +8,10 @@
 #include <cuopt/error.hpp>
 #include <cuopt/linear_programming/solve_remote.hpp>
 
+#include <omp.h>
+
+#include <utilities/scope_guard.hpp>
+
 #include <mip_heuristics/feasibility_jump/early_cpufj.cuh>
 #include <mip_heuristics/feasibility_jump/early_gpufj.cuh>
 #include <mip_heuristics/mip_constants.hpp>
@@ -236,6 +240,10 @@ template <typename i_t, typename f_t>
 mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
                                    mip_solver_settings_t<i_t, f_t> const& settings_const)
 {
+  // Release the OMP thread pool on exit so that consecutive solves from different
+  // std::async threads (e.g. in tests) don't deadlock on stale OMP master affinity.
+  auto omp_guard = cuopt::scope_guard([] { omp_pause_resource_all(omp_pause_hard); });
+
   try {
     mip_solver_settings_t<i_t, f_t> settings(settings_const);
     if (settings.presolver == presolver_t::Default || settings.presolver == presolver_t::PSLP) {
