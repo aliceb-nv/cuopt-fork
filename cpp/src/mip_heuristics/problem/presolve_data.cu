@@ -236,6 +236,7 @@ void presolve_data_t<i_t, f_t>::papilo_uncrush_assignment(
   const auto* h = handle_override ? handle_override : problem.handle_ptr;
   cuopt_assert(assignment.size() == papilo_reduced_to_original_map.size(),
                "Papilo uncrush assignment size mismatch");
+  problem.handle_ptr->sync_stream();
   auto h_assignment = cuopt::host_copy(assignment, h->get_stream());
   std::vector<f_t> full_assignment;
   papilo_presolve_ptr->uncrush_primal_solution(h_assignment, full_assignment);

@@ -366,11 +366,11 @@ bool local_search_t<i_t, f_t>::run_local_search(solution_t<i_t, f_t>& solution,
     } else {
       fj_settings.time_limit = 0.25;
     }
-    timer =
-      termination_checker_t(context.gpu_heur_loop, fj_settings.time_limit, *context.termination);
   } else {
     fj_settings.time_limit = std::min(1., timer.remaining_time());
   }
+  // Limit this nested local-search pass without discarding the caller's remaining budget.
+  termination_checker_t local_timer(context.gpu_heur_loop, fj_settings.time_limit, timer);
   fj_settings.update_weights  = false;
   fj_settings.feasibility_run = false;
   fj.set_fj_settings(fj_settings);
@@ -385,11 +385,11 @@ bool local_search_t<i_t, f_t>::run_local_search(solution_t<i_t, f_t>& solution,
   }
   if (rd == ls_method_t::FJ_LINE_SEGMENT && lp_optimal_exists) {
     fj.copy_weights(weights, solution.handle_ptr);
-    is_feas = run_fj_line_segment(solution, timer, ls_config);
+    is_feas = run_fj_line_segment(solution, local_timer, ls_config);
   } else {
     fj.copy_weights(weights, solution.handle_ptr);
-    is_feas = run_fj_annealing(solution, timer, ls_config);
-    if (lp_optimal_exists) { is_feas = run_fj_line_segment(solution, timer, ls_config); }
+    is_feas = run_fj_annealing(solution, local_timer, ls_config);
+    if (lp_optimal_exists) { is_feas = run_fj_line_segment(solution, local_timer, ls_config); }
   }
   return is_feas;
 }

@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include <raft/core/device_span.hpp>
 #include <raft/core/handle.hpp>
 #include <raft/util/cudart_utils.hpp>
@@ -23,6 +25,44 @@
 #include <cuda/std/functional>
 
 namespace cuopt {
+
+template <typename T>
+class copyable_atomic_t {
+ public:
+  copyable_atomic_t() = default;
+  copyable_atomic_t(T val) : val_(val) {}
+
+  copyable_atomic_t(const copyable_atomic_t& other)
+    : val_(other.val_.load(std::memory_order_relaxed))
+  {
+  }
+
+  copyable_atomic_t& operator=(const copyable_atomic_t& other)
+  {
+    if (this != &other) {
+      val_.store(other.val_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+    return *this;
+  }
+
+  T operator=(T new_val)
+  {
+    store(new_val);
+    return new_val;
+  }
+
+  operator T() const { return load(); }
+
+  T load(std::memory_order order = std::memory_order_relaxed) const { return val_.load(order); }
+
+  void store(T new_val, std::memory_order order = std::memory_order_relaxed)
+  {
+    val_.store(new_val, order);
+  }
+
+ private:
+  std::atomic<T> val_{};
+};
 
 template <typename T>
 struct type_2 {

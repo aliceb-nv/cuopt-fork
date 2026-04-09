@@ -112,7 +112,8 @@ mip_solution_t<i_t, f_t> run_mip(detail::problem_t<i_t, f_t>& problem,
         if (problem.has_papilo_presolve_data()) {
           problem.papilo_uncrush_assignment(temp_sol.assignment);
         }
-        payload.assignment = temp_sol.get_host_assignment();
+        payload.assignment =
+          cuopt::host_copy(temp_sol.assignment, temp_sol.handle_ptr->get_stream());
         detail::solution_publication_t<i_t, f_t> pub(settings, stats);
         pub.publish_new_best_feasible(payload);
       }

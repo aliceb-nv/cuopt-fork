@@ -11,6 +11,7 @@
 #include <mip_heuristics/local_search/line_segment_search/line_segment_search.cuh>
 #include <mip_heuristics/local_search/rounding/constraint_prop.cuh>
 #include <mip_heuristics/solution/solution.cuh>
+#include <utilities/termination_checker.hpp>
 #include <utilities/timer.hpp>
 
 #include <thrust/count.h>

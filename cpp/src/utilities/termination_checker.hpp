@@ -13,6 +13,7 @@
 
 #include <mip_heuristics/logger.hpp>
 
+#include "copy_helpers.hpp"
 #include "timer.hpp"
 #include "work_limit_context.hpp"
 
@@ -220,7 +221,7 @@ class termination_checker_t {
 
   timer_t timer;
   double work_limit{};
-  mutable bool finished{false};
+  mutable copyable_atomic_t<bool> finished{false};
   bool deterministic{false};
   work_limit_context_t* work_context{nullptr};
   double work_units_at_start{0};

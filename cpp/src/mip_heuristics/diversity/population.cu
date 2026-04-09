@@ -192,8 +192,12 @@ void population_t<i_t, f_t>::add_external_solution(const std::vector<f_t>& solut
 template <typename i_t, typename f_t>
 void population_t<i_t, f_t>::add_external_solutions_to_population()
 {
-  // GPU heuristics are producer-only in the current GPU determinism implementation
-  if ((context.settings.determinism_mode & CUOPT_DETERMINISM_GPU_HEURISTICS)) { return; }
+  const bool deterministic_bb = (context.settings.determinism_mode & CUOPT_DETERMINISM_BB) &&
+                                context.branch_and_bound_ptr != nullptr;
+  // Keep producer-only behavior only when deterministic B&B is draining the queue instead.
+  if ((context.settings.determinism_mode & CUOPT_DETERMINISM_GPU_HEURISTICS) && deterministic_bb) {
+    return;
+  }
   // don't do early exit checks here. mutex needs to be acquired to prevent race conditions
   auto new_sol_vector = get_external_solutions();
   for (auto& drained_sol : new_sol_vector) {
@@ -227,7 +231,7 @@ population_t<i_t, f_t>::get_external_solutions()
           h_entry.objective > new_best_feasible_objective) {
         continue;
       } else if (h_entry.origin != internals::mip_solution_origin_t::CPU_FEASIBILITY_JUMP &&
-                 h_entry.objective > new_best_feasible_objective) {
+                 h_entry.objective < new_best_feasible_objective) {
         new_best_feasible_objective = h_entry.objective;
       }
 
