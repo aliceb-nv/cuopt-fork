@@ -1041,7 +1041,7 @@ bool constraint_prop_t<i_t, f_t>::find_integer(
         !timeout_happened) {
       // timer_t repair_timer{std::min(timer.remaining_time() / 5, timer.elapsed_time() / 3)};
       termination_checker_t repair_timer(
-        context.gpu_heur_loop, timer.remaining_time() / 5, *context.termination);
+        context.gpu_heur_loop, max_timer.remaining_time() / 5, max_timer);
       save_bounds(sol);
       if (timer.deterministic) {
         CUOPT_DETERMINISM_LOG(

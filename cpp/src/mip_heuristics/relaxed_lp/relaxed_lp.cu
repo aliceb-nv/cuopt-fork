@@ -50,7 +50,7 @@ optimization_problem_solution_t<i_t, f_t> get_relaxed_lp_solution(
   const relaxed_lp_settings_t& settings)
 {
   raft::common::nvtx::range fun_scope("get_relaxed_lp_solution");
-  static uint64_t lp_call_counter{0};
+  static thread_local uint64_t lp_call_counter{0};
   const uint64_t lp_call_id = lp_call_counter++;
 
   pdlp_solver_settings_t<i_t, f_t> pdlp_settings{};
@@ -96,9 +96,11 @@ optimization_problem_solution_t<i_t, f_t> get_relaxed_lp_solution(
     pdlp_settings.presolver        = presolver_t::None;
   }
   CUOPT_DETERMINISM_LOG(
-    "LP call %lu config: det=%d work_limit=%.6f time_limit=%.6f iter_limit=%d method=%d mode=%d "
+    "LP call %lu[%d] config: det=%d work_limit=%.6f time_limit=%.6f iter_limit=%d method=%d "
+    "mode=%d "
     "presolver=%d save_state=%d has_initial=%d assignment_hash=0x%x",
     lp_call_id,
+    gettid(),
     (int)determinism_mode,
     settings.work_limit,
     pdlp_settings.time_limit,

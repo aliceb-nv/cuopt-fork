@@ -30,7 +30,8 @@ namespace {
 static bool is_dual_simplex_done(dual::status_t status)
 {
   return status == dual::status_t::DUAL_UNBOUNDED || status == dual::status_t::OPTIMAL ||
-         status == dual::status_t::ITERATION_LIMIT || status == dual::status_t::CUTOFF;
+         status == dual::status_t::ITERATION_LIMIT || status == dual::status_t::WORK_LIMIT ||
+         status == dual::status_t::CUTOFF;
 }
 
 template <typename f_t>
@@ -370,7 +371,7 @@ void strong_branch_helper(i_t start,
         // LP was infeasible
         obj = std::numeric_limits<f_t>::infinity();
       } else if (status == dual::status_t::OPTIMAL || status == dual::status_t::ITERATION_LIMIT ||
-                 status == dual::status_t::CUTOFF) {
+                 status == dual::status_t::WORK_LIMIT || status == dual::status_t::CUTOFF) {
         obj = compute_objective(child_problem, solution.x);
       } else {
         settings.log.debug("Thread id %2d remaining %d variable %d branch %d status %d\n",
@@ -519,7 +520,7 @@ std::pair<f_t, dual::status_t> trial_branching(const lp_problem_t<i_t, f_t>& ori
     // LP was infeasible
     return {std::numeric_limits<f_t>::infinity(), dual::status_t::DUAL_UNBOUNDED};
   } else if (status == dual::status_t::OPTIMAL || status == dual::status_t::ITERATION_LIMIT ||
-             status == dual::status_t::CUTOFF) {
+             status == dual::status_t::WORK_LIMIT || status == dual::status_t::CUTOFF) {
     return {compute_objective(child_problem, solution.x), status};
   } else {
     return {std::numeric_limits<f_t>::quiet_NaN(), dual::status_t::NUMERICAL};
@@ -1129,6 +1130,14 @@ void strong_branching(const lp_problem_t<i_t, f_t>& original_lp,
   std::vector<f_t> dual_simplex_obj_up(fractional.size(), std::numeric_limits<f_t>::quiet_NaN());
   f_t strong_branching_start_time = tic();
   i_t simplex_iteration_limit     = settings.strong_branching_simplex_iteration_limit;
+  std::vector<cuopt::work_limit_context_t> thread_work_contexts;
+  if (deterministic_work_accounting) {
+    thread_work_contexts.reserve(settings.num_threads);
+    for (i_t t = 0; t < settings.num_threads; ++t) {
+      thread_work_contexts.emplace_back("sb_thread_" + std::to_string(t));
+      thread_work_contexts.back().deterministic = true;
+    }
+  }
 
   if (simplex_iteration_limit < 1) {
     initialize_pseudo_costs_with_estimate(original_lp,
@@ -1199,12 +1208,22 @@ void strong_branching(const lp_problem_t<i_t, f_t>& original_lp,
                                  dual_simplex_obj_up,
                                  dual_simplex_status_down,
                                  dual_simplex_status_up,
-                                 sb_view);
+                                 sb_view,
+                                 deterministic_work_accounting
+                                   ? &thread_work_contexts[omp_get_thread_num()]
+                                   : nullptr);
           }
           // DS done: signal PDLP to stop (time-limit or all work done) and wait
           if (effective_batch_pdlp == 1) { concurrent_halt.store(1); }
         }
       }
+    }
+    if (deterministic_work_accounting) {
+      double max_work = 0.0;
+      for (const auto& ctx : thread_work_contexts) {
+        max_work = std::max(max_work, ctx.current_work());
+      }
+      work_unit_context->record_work_sync_on_horizon(max_work);
     }
   }
 

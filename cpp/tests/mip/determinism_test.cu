@@ -450,7 +450,7 @@ INSTANTIATE_TEST_SUITE_P(
   DeterministicBB,
   DeterministicBBInstanceTest,
   ::testing::Values(
-    // Instance, threads, time_limit, work limiy
+    // Instance, threads, time_limit, work limit
     std::make_tuple("/mip/gen-ip054.mps", 4, 60.0, 4),
     std::make_tuple("/mip/swath1.mps", 8, 60.0, 4),
     std::make_tuple("/mip/50v-10.mps", 8, 60.0, 4),

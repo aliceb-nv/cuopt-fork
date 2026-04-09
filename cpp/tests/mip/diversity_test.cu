@@ -166,8 +166,10 @@ static uint32_t test_initial_solution_determinism(std::string path,
   return final_hash;
 }
 
-static uint32_t test_recombiners_determinism(std::string path,
-                                             unsigned long seed = std::random_device{}())
+static uint32_t test_recombiners_determinism(
+  std::string path,
+  unsigned long seed,
+  std::map<std::tuple<std::string, int, int, detail::recombiner_enum_t>, uint32_t>& hash_map)
 {
   const raft::handle_t handle_{};
 
@@ -225,8 +227,6 @@ static uint32_t test_recombiners_determinism(std::string path,
   int pop_size    = std::min(6, (int)pop_vector.size());
 
   std::vector<uint32_t> hashes;
-
-  static std::map<std::tuple<std::string, int, int, detail::recombiner_enum_t>, uint32_t> hash_map;
 
   for (auto recombiner : {detail::recombiner_enum_t::LINE_SEGMENT,
                           detail::recombiner_enum_t::BOUND_PROP,
@@ -298,11 +298,12 @@ TEST_P(DiversityTestParams, recombiners_deterministic)
   auto path     = make_path_absolute(test_instance);
   test_instance = std::getenv("CUOPT_INSTANCE") ? std::getenv("CUOPT_INSTANCE") : test_instance;
   uint32_t gold_hash = 0;
+  std::map<std::tuple<std::string, int, int, detail::recombiner_enum_t>, uint32_t> hash_map;
   for (int i = 0; i < 2; ++i) {
     cuopt::seed_generator::set_seed(seed);
     std::cout << "Running " << test_instance << " " << i << std::endl;
     std::cout << "-------------------------------------------------------------\n";
-    auto hash = test_recombiners_determinism(path, seed);
+    auto hash = test_recombiners_determinism(path, seed, hash_map);
     if (i == 0) {
       gold_hash = hash;
       std::cout << "Gold hash: " << gold_hash << std::endl;
