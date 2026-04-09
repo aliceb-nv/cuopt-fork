@@ -121,9 +121,9 @@ class fp_recombiner_t : public recombiner_t<i_t, f_t> {
         detail::compute_hash(offspring.assignment, offspring.handle_ptr->get_stream()),
         fixed_problem.get_fingerprint(),
         fixed_problem.n_integer_vars);
-      work_limit_timer_t timer(this->context.gpu_heur_loop,
-                               fp_recombiner_config_t::fp_time_limit,
-                               *this->context.termination);
+      termination_checker_t timer(this->context.gpu_heur_loop,
+                                  fp_recombiner_config_t::fp_time_limit,
+                                  *this->context.termination);
       fp.timer = timer;
       fp.cycle_queue.reset(offspring);
       fp.reset();

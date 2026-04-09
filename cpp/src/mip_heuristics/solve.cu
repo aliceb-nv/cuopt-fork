@@ -30,8 +30,8 @@
 #include <pdlp/utils.cuh>
 #include <utilities/logger.hpp>
 #include <utilities/seed_generator.cuh>
+#include <utilities/termination_checker.hpp>
 #include <utilities/version_info.hpp>
-#include <utilities/work_limit_timer.hpp>
 
 #include <cuopt/linear_programming/backend_selection.hpp>
 #include <cuopt/linear_programming/cpu_optimization_problem.hpp>
@@ -73,14 +73,8 @@ mip_solution_t<i_t, f_t> run_mip(detail::problem_t<i_t, f_t>& problem,
                                  f_t& initial_upper_bound,
                                  std::vector<f_t>& initial_incumbent_assignment)
 {
-  raft::common::nvtx::range fun_scope("run_mip");
   try {
-    auto constexpr const running_mip = true;
-
-    // TODO ask Akif and Alice how was this passed down?
-    [[maybe_unused]] auto hyper_params                    = settings.hyper_params;
-    hyper_params.update_primal_weight_on_initial_solution = false;
-    hyper_params.update_step_size_on_initial_solution     = true;
+    raft::common::nvtx::range fun_scope("run_mip");
     if (settings.get_mip_callbacks().size() > 0) {
       auto callback_num_variables = problem.original_problem_ptr->get_n_variables();
       if (problem.has_papilo_presolve_data()) {
@@ -124,10 +118,9 @@ mip_solution_t<i_t, f_t> run_mip(detail::problem_t<i_t, f_t>& problem,
       }
       return solution.get_solution(true, stats, false);
     }
-
     // problem contains unpreprocessed data
     detail::problem_t<i_t, f_t> scaled_problem(problem);
-
+    cuopt_func_call(auto saved_problem = scaled_problem);
     CUOPT_LOG_INFO("Objective offset %f scaling_factor %f",
                    problem.presolve_data.objective_offset,
                    problem.presolve_data.objective_scaling_factor);
@@ -136,7 +129,6 @@ mip_solution_t<i_t, f_t> run_mip(detail::problem_t<i_t, f_t>& problem,
                  "Size mismatch");
     cuopt_assert(problem.original_problem_ptr->get_n_constraints() == scaled_problem.n_constraints,
                  "Size mismatch");
-
     // only call preprocess on scaled problem, so we can compute feasibility on the original problem
     scaled_problem.preprocess_problem();
     scaled_problem.related_vars_time_limit = settings.heuristic_params.related_vars_time_limit;

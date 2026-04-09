@@ -39,7 +39,6 @@ ConfigureTest(EMPTY_FIXED_PROBLEMS_TEST
 ConfigureTest(PRESOLVE_TEST
     ${CMAKE_CURRENT_SOURCE_DIR}/presolve_test.cu
 )
-# Disable for now
 ConfigureTest(FEASIBILITY_JUMP_TEST
    ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump_tests.cu
 )

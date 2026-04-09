@@ -189,7 +189,7 @@ void diversity_manager_t<i_t, f_t>::consume_staged_simplex_solution(lp_state_t<i
 template <typename i_t, typename f_t>
 bool diversity_manager_t<i_t, f_t>::run_local_search(solution_t<i_t, f_t>& solution,
                                                      const weight_t<i_t, f_t>& weights,
-                                                     work_limit_timer_t& timer,
+                                                     termination_checker_t& timer,
                                                      ls_config_t<i_t, f_t>& ls_config)
 {
   raft::common::nvtx::range fun_scope("run_local_search");
@@ -269,7 +269,7 @@ bool diversity_manager_t<i_t, f_t>::run_presolve(f_t time_limit,
   raft::common::nvtx::range fun_scope("run_presolve");
   CUOPT_LOG_INFO("Running presolve!");
   CUOPT_LOG_INFO("Problem fingerprint before DM presolve: 0x%x", problem_ptr->get_fingerprint());
-  work_limit_timer_t presolve_timer(context.gpu_heur_loop, time_limit, *context.termination);
+  termination_checker_t presolve_timer(context.gpu_heur_loop, time_limit, *context.termination);
 
   auto term_crit = ls.constraint_prop.bounds_update.solve(*problem_ptr);
   if (ls.constraint_prop.bounds_update.infeas_constraints_count > 0) {
@@ -288,7 +288,7 @@ bool diversity_manager_t<i_t, f_t>::run_presolve(f_t time_limit,
         ? std::numeric_limits<f_t>::infinity()
         : diversity_config.max_time_on_probing;
     f_t time_for_probing_cache = std::min(max_time_on_probing, time_limit);
-    work_limit_timer_t probing_timer(
+    termination_checker_t probing_timer(
       context.gpu_heur_loop, time_for_probing_cache, *context.termination);
     // this function computes probing cache, finds singletons, substitutions and changes the problem
     bool problem_is_infeasible =
@@ -366,7 +366,7 @@ void diversity_manager_t<i_t, f_t>::generate_quick_feasible_solution()
   // min 1 second, max 10 seconds
   const f_t generate_fast_solution_time =
     std::min(diversity_config.max_fast_sol_time, std::max(1., timer.remaining_time() / 20.));
-  work_limit_timer_t sol_timer(
+  termination_checker_t sol_timer(
     context.gpu_heur_loop, generate_fast_solution_time, *context.termination);
   // do very short LP run to get somewhere close to the optimal point
   ls.generate_fast_solution(solution, sol_timer);

@@ -25,8 +25,8 @@
 #include <mip_heuristics/local_search/local_search.cuh>
 #include <mip_heuristics/solution/solution.cuh>
 #include <mip_heuristics/solver.cuh>
+#include <utilities/termination_checker.hpp>
 #include <utilities/timer.hpp>
-#include <utilities/work_limit_timer.hpp>
 
 #include <cstdint>
 
@@ -67,7 +67,7 @@ class diversity_manager_t {
                               solution_t<i_t, f_t>& sol2);
   bool run_local_search(solution_t<i_t, f_t>& solution,
                         const weight_t<i_t, f_t>& weights,
-                        work_limit_timer_t& timer,
+                        termination_checker_t& timer,
                         ls_config_t<i_t, f_t>& ls_config);
 
   void consume_staged_simplex_solution(lp_state_t<i_t, f_t>& lp_state);
@@ -86,7 +86,7 @@ class diversity_manager_t {
   std::vector<f_t> staged_simplex_dual_solution;
   f_t staged_simplex_objective{std::numeric_limits<f_t>::infinity()};
   local_search_t<i_t, f_t> ls;
-  cuopt::work_limit_timer_t timer;
+  cuopt::termination_checker_t timer;
   bound_prop_recombiner_t<i_t, f_t> bound_prop_recombiner;
   fp_recombiner_t<i_t, f_t> fp_recombiner;
   line_segment_recombiner_t<i_t, f_t> line_segment_recombiner;

@@ -21,17 +21,8 @@
 #include <rmm/mr/limiting_resource_adaptor.hpp>
 #include <unordered_map>
 
-#if CUDART_VERSION >= 12080
-// TODO: investigate why this is necessary? dependency conflict? file NVBUG if necessary
-#include <nvtx3/nvtx3.hpp>
-#ifndef NVTX_NULLPTR
-#define NVTX_NULLPTR nullptr
-#endif
-#ifndef NVTX_REINTERPRET_CAST
-#define NVTX_REINTERPRET_CAST(type, value) (reinterpret_cast<type>(value))
-#endif
 #include <nvtx3/nvToolsExtMemCudaRt.h>
-#endif
+
 namespace cuopt {
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)

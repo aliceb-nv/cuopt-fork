@@ -50,8 +50,8 @@ optimization_problem_solution_t<i_t, f_t> get_relaxed_lp_solution(
   const relaxed_lp_settings_t& settings)
 {
   raft::common::nvtx::range fun_scope("get_relaxed_lp_solution");
-  static std::atomic<uint64_t> lp_call_counter{0};
-  const uint64_t lp_call_id = lp_call_counter.fetch_add(1, std::memory_order_relaxed);
+  static uint64_t lp_call_counter{0};
+  const uint64_t lp_call_id = lp_call_counter++;
 
   pdlp_solver_settings_t<i_t, f_t> pdlp_settings{};
   pdlp_settings.detect_infeasibility = settings.check_infeasibility;

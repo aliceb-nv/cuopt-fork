@@ -136,6 +136,8 @@ void presolve_data_t<i_t, f_t>::post_process_assignment(
     }
   }
 
+  // Apply variable substitutions from probing: x_substituted = offset + coefficient *
+  // x_substituting
   for (const auto& sub : variable_substitutions) {
     cuopt_assert(sub.substituted_var < (i_t)h_assignment.size(), "substituted_var out of bounds");
     cuopt_assert(sub.substituting_var < (i_t)h_assignment.size(), "substituting_var out of bounds");

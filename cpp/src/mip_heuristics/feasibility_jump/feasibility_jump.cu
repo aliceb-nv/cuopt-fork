@@ -1052,7 +1052,7 @@ i_t fj_t<i_t, f_t>::host_loop(solution_t<i_t, f_t>& solution, i_t climber_idx)
 
   data.incumbent_quality.set_value_async(obj, handle_ptr->get_stream());
 
-  work_limit_timer_t timer(context.gpu_heur_loop, settings.time_limit, *context.termination);
+  termination_checker_t timer(context.gpu_heur_loop, settings.time_limit, *context.termination);
   i_t steps;
   bool limit_reached = false;
   for (steps = 0; steps < std::numeric_limits<i_t>::max(); steps += iterations_per_batch) {

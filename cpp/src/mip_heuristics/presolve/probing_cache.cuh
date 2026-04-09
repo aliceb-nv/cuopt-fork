@@ -11,8 +11,8 @@
 
 #include <mip_heuristics/utils.cuh>
 
+#include <utilities/termination_checker.hpp>
 #include <utilities/timer.hpp>
-#include <utilities/work_limit_timer.hpp>
 
 namespace cuopt::linear_programming::detail {
 
@@ -120,6 +120,6 @@ class lb_probing_cache_t {
 template <typename i_t, typename f_t>
 bool compute_probing_cache(bound_presolve_t<i_t, f_t>& bound_presolve,
                            problem_t<i_t, f_t>& problem,
-                           work_limit_timer_t& timer);
+                           termination_checker_t& timer);
 
 }  // namespace cuopt::linear_programming::detail

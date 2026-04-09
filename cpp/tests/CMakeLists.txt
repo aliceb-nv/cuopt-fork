@@ -33,40 +33,6 @@ endif()
 
 set(CUOPT_TEST_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
-if (EXISTS "${CUDAToolkit_LIBRARY_ROOT}/extras/CUPTI/lib64")
-  # NVIDIA installer layout:
-  set(cuopt_cupti_root "${CUDAToolkit_LIBRARY_ROOT}/extras/CUPTI")
-else()
-  # Ubuntu package layout:
-  set(cuopt_cupti_root "${CUDAToolkit_LIBRARY_ROOT}")
-endif()
-message(STATUS "cuopt_cupti_root = ${cuopt_cupti_root}")
-
-# The CUPTI targets in FindCUDAToolkit are broken:
-# - The dll locations are not specified
-# - Dependent libraries nvperf_* are not linked.
-# So we create our own targets:
-function(cuopt_add_cupti_dep dep_name)
-  string(TOLOWER ${dep_name} dep_name_lower)
-  string(TOUPPER ${dep_name} dep_name_upper)
-
-  add_library(cuopt::${dep_name_lower} SHARED IMPORTED)
-
-  find_library(CUOPT_${dep_name_upper}_LIBRARY ${dep_name_lower} REQUIRED
-    DOC "The full path to lib${dep_name_lower}.so from the CUDA Toolkit."
-    HINTS "${cuopt_cupti_root}/lib64" "${cuopt_cupti_root}/lib"
-  )
-  mark_as_advanced(CUOPT_${dep_name_upper}_LIBRARY)
-
-  set_target_properties(cuopt::${dep_name_lower} PROPERTIES
-    IMPORTED_LOCATION "${CUOPT_${dep_name_upper}_LIBRARY}"
-  )
-endfunction()
-
-#cuopt_add_cupti_dep(nvperf_target)
-#cuopt_add_cupti_dep(nvperf_host)
-#cuopt_add_cupti_dep(cupti)
-
 # ################################################################ ------------------------------------------------------------------
 function(ConfigureTest CMAKE_TEST_NAME)
     add_executable(${CMAKE_TEST_NAME} ${ARGN})

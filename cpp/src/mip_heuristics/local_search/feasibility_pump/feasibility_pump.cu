@@ -320,7 +320,7 @@ bool feasibility_pump_t<i_t, f_t>::round(solution_t<i_t, f_t>& solution)
   } else {
     bounds_prop_time_limit = std::max((f_t)0.05, bounds_prop_time_limit);
   }
-  work_limit_timer_t bounds_prop_timer(
+  termination_checker_t bounds_prop_timer(
     context.gpu_heur_loop, bounds_prop_time_limit, *context.termination);
   const f_t lp_run_time_after_feasible     = 0.;
   bool old_var                             = constraint_prop.round_all_vars;

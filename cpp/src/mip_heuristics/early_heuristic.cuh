@@ -91,12 +91,8 @@ class early_heuristic_t {
     best_assignment_ = user_assignment;
     solution_found_  = true;
     f_t user_obj     = problem_ptr_->get_user_obj_from_solver_obj(solver_obj);
-    double elapsed =
-      std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time_).count();
-    CUOPT_LOG_INFO("Early heuristics (%s) lowered the primal bound. Objective %g. Time %.2f",
-                   Derived::name(),
-                   user_obj,
-                   elapsed);
+    // Log and callback are deferred to the shared incumbent_callback_ which enforces
+    // global monotonicity across all early heuristic instances.
     if (incumbent_callback_) {
       incumbent_callback_(solver_obj, user_obj, user_assignment, Derived::origin());
     }

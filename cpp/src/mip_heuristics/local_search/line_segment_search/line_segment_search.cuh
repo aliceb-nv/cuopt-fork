@@ -9,7 +9,7 @@
 
 #include <mip_heuristics/feasibility_jump/feasibility_jump.cuh>
 #include <mip_heuristics/local_search/rounding/constraint_prop.cuh>
-#include <utilities/work_limit_timer.hpp>
+#include <utilities/termination_checker.hpp>
 
 namespace cuopt::linear_programming::detail {
 
@@ -33,14 +33,14 @@ class line_segment_search_t {
                            const rmm::device_uvector<f_t>& point_1,
                            const rmm::device_uvector<f_t>& point_2,
                            bool is_feasibility_run,
-                           cuopt::work_limit_timer_t& timer);
+                           cuopt::termination_checker_t& timer);
 
   bool search_line_segment(solution_t<i_t, f_t>& solution,
                            const rmm::device_uvector<f_t>& point_1,
                            const rmm::device_uvector<f_t>& point_2,
                            const rmm::device_uvector<f_t>& delta_vector,
                            bool is_feasibility_run,
-                           cuopt::work_limit_timer_t& timer);
+                           cuopt::termination_checker_t& timer);
 
   void save_solution_if_better(solution_t<i_t, f_t>& solution,
                                const rmm::device_uvector<f_t>& point_1,

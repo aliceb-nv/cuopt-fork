@@ -14,7 +14,7 @@
 #include <utilities/work_limit_context.hpp>
 #include <utilities/work_unit_scheduler.hpp>
 
-#include <utilities/work_limit_timer.hpp>
+#include <utilities/termination_checker.hpp>
 
 // Forward declare
 namespace cuopt::linear_programming::dual_simplex {

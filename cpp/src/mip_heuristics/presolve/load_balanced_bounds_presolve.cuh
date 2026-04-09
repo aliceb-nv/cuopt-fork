@@ -15,8 +15,8 @@
 #include <mip_heuristics/solver_context.cuh>
 #include <mip_heuristics/utils.cuh>
 
+#include <utilities/termination_checker.hpp>
 #include <utilities/timer.hpp>
-#include <utilities/work_limit_timer.hpp>
 
 #include "load_balanced_partition_helpers.cuh"
 #include "utils.cuh"
@@ -161,7 +161,7 @@ class load_balanced_bounds_presolve_t {
   bool update_bounds_from_slack(const raft::handle_t* handle_ptr);
 
   termination_criterion_t bound_update_loop(const raft::handle_t* handle_ptr,
-                                            work_limit_timer_t& timer);
+                                            termination_checker_t& timer);
   bool calculate_infeasible_redundant_constraints(const raft::handle_t* handle_ptr);
 
   // void calculate_constraint_slack_on_problem_bounds();

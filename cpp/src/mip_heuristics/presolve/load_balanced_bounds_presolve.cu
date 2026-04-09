@@ -527,7 +527,7 @@ bool load_balanced_bounds_presolve_t<i_t, f_t>::update_bounds_from_slack(
 
 template <typename i_t, typename f_t>
 termination_criterion_t load_balanced_bounds_presolve_t<i_t, f_t>::bound_update_loop(
-  const raft::handle_t* handle_ptr, work_limit_timer_t& timer)
+  const raft::handle_t* handle_ptr, termination_checker_t& timer)
 {
   termination_criterion_t criteria = termination_criterion_t::ITERATION_LIMIT;
 
@@ -627,7 +627,7 @@ termination_criterion_t load_balanced_bounds_presolve_t<i_t, f_t>::solve(f_t var
                                                                          f_t var_ub,
                                                                          i_t var_idx)
 {
-  work_limit_timer_t timer(context.gpu_heur_loop, settings.time_limit, *context.termination);
+  termination_checker_t timer(context.gpu_heur_loop, settings.time_limit, *context.termination);
   auto& handle_ptr = pb->handle_ptr;
   copy_input_bounds(*pb);
   vars_bnd.set_element_async(2 * var_idx, var_lb, handle_ptr->get_stream());
@@ -639,7 +639,7 @@ template <typename i_t, typename f_t>
 termination_criterion_t load_balanced_bounds_presolve_t<i_t, f_t>::solve(
   raft::device_span<f_t> input_bounds)
 {
-  work_limit_timer_t timer(context.gpu_heur_loop, settings.time_limit, *context.termination);
+  termination_checker_t timer(context.gpu_heur_loop, settings.time_limit, *context.termination);
   auto& handle_ptr = pb->handle_ptr;
   if (input_bounds.size() != 0) {
     raft::copy(vars_bnd.data(), input_bounds.data(), input_bounds.size(), handle_ptr->get_stream());
@@ -668,7 +668,7 @@ template <typename i_t, typename f_t>
 termination_criterion_t load_balanced_bounds_presolve_t<i_t, f_t>::solve(
   const std::vector<thrust::pair<i_t, f_t>>& var_probe_val_pairs, bool use_host_bounds)
 {
-  work_limit_timer_t timer(context.gpu_heur_loop, settings.time_limit, *context.termination);
+  termination_checker_t timer(context.gpu_heur_loop, settings.time_limit, *context.termination);
   auto& handle_ptr = pb->handle_ptr;
   if (use_host_bounds) {
     update_device_bounds(handle_ptr);

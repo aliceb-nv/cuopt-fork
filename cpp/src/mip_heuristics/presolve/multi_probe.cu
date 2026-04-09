@@ -275,7 +275,7 @@ void multi_probe_t<i_t, f_t>::set_bounds(
 template <typename i_t, typename f_t>
 termination_criterion_t multi_probe_t<i_t, f_t>::bound_update_loop(problem_t<i_t, f_t>& pb,
                                                                    const raft::handle_t* handle_ptr,
-                                                                   work_limit_timer_t& timer)
+                                                                   termination_checker_t& timer)
 {
   termination_criterion_t criteria = termination_criterion_t::ITERATION_LIMIT;
   skip_0                           = false;
@@ -302,6 +302,7 @@ termination_criterion_t multi_probe_t<i_t, f_t>::bound_update_loop(problem_t<i_t
       criteria = termination_criterion_t::TIME_LIMIT;
       break;
     }
+    // calculate activity for both probes
     calculate_activity(pb, handle_ptr);
     if (!calculate_bounds_update(pb, handle_ptr)) {
       if (iter == 0) {
@@ -311,6 +312,8 @@ termination_criterion_t multi_probe_t<i_t, f_t>::bound_update_loop(problem_t<i_t
       }
       break;
     }
+    // next_changed are updated, fill current changed with zero and swap
+    // swap next and current changed constraints
     if (!skip_0) { upd_0.prepare_for_next_iteration(handle_ptr); }
     if (!skip_1) { upd_1.prepare_for_next_iteration(handle_ptr); }
     iter_0 += !skip_0;
@@ -407,7 +410,7 @@ termination_criterion_t multi_probe_t<i_t, f_t>::solve_for_interval(
   const std::tuple<i_t, std::pair<f_t, f_t>, std::pair<f_t, f_t>>& var_interval_vals,
   const raft::handle_t* handle_ptr)
 {
-  work_limit_timer_t timer(context.gpu_heur_loop, settings.time_limit, *context.termination);
+  termination_checker_t timer(context.gpu_heur_loop, settings.time_limit, *context.termination);
 
   copy_problem_into_probing_buffers(pb, handle_ptr);
   set_interval_bounds(var_interval_vals, pb, handle_ptr);
@@ -421,7 +424,7 @@ termination_criterion_t multi_probe_t<i_t, f_t>::solve(
   const std::tuple<std::vector<i_t>, std::vector<f_t>, std::vector<f_t>>& var_probe_vals,
   bool use_host_bounds)
 {
-  work_limit_timer_t timer(context.gpu_heur_loop, settings.time_limit, *context.termination);
+  termination_checker_t timer(context.gpu_heur_loop, settings.time_limit, *context.termination);
   auto& handle_ptr = pb.handle_ptr;
   if (use_host_bounds) {
     update_device_bounds(handle_ptr);

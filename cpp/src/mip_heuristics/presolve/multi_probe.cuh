@@ -12,8 +12,8 @@
 #include <mip_heuristics/solver.cuh>
 #include <mip_heuristics/utils.cuh>
 
+#include <utilities/termination_checker.hpp>
 #include <utilities/timer.hpp>
-#include <utilities/work_limit_timer.hpp>
 
 #include "bounds_update_data.cuh"
 #include "utils.cuh"
@@ -55,7 +55,7 @@ class multi_probe_t {
                           i_t select_update);
   termination_criterion_t bound_update_loop(problem_t<i_t, f_t>& pb,
                                             const raft::handle_t* handle_ptr,
-                                            work_limit_timer_t& timer);
+                                            termination_checker_t& timer);
   void set_interval_bounds(
     const std::tuple<i_t, std::pair<f_t, f_t>, std::pair<f_t, f_t>>& var_interval_vals,
     problem_t<i_t, f_t>& pb,

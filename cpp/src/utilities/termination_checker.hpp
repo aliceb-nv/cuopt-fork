@@ -19,13 +19,11 @@
 namespace cuopt {
 
 /**
- * Unified termination checker that subsumes timer_t and work_limit_timer_t.
+ * Unified termination checker that combines timer_t and termination_checker_t.
  *
  * In non-deterministic mode: checks wall-clock time.
  * In deterministic mode: checks work units via work_limit_context_t.
  * In BOTH modes: checks parent chain (inheriting root wall-clock limit) and user callbacks.
- *
- * This is the single timer type used throughout the solver. It replaces work_limit_timer_t.
  */
 class termination_checker_t {
  public:
@@ -112,7 +110,7 @@ class termination_checker_t {
     }
   }
 
-  // Aliases for compatibility with work_limit_timer_t and timer_t interfaces
+  // Aliases for compatibility with termination_checker_t and timer_t interfaces
   bool check_time_limit(const char* caller = __builtin_FUNCTION(),
                         const char* file   = __builtin_FILE(),
                         int line           = __builtin_LINE()) const noexcept
@@ -232,8 +230,5 @@ class termination_checker_t {
   bool (*termination_callback_)(void*) = nullptr;
   void* termination_callback_data_     = nullptr;
 };
-
-// Backward compatibility
-using work_limit_timer_t = termination_checker_t;
 
 }  // namespace cuopt

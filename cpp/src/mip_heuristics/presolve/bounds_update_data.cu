@@ -28,17 +28,6 @@ bounds_update_data_t<i_t, f_t>::bounds_update_data_t(problem_t<i_t, f_t>& proble
 template <typename i_t, typename f_t>
 void bounds_update_data_t<i_t, f_t>::resize(problem_t<i_t, f_t>& problem)
 {
-  CUOPT_LOG_DEBUG(
-    "bounds_update_data resize: nv=%d nc=%d min_act=%zu max_act=%zu lb=%zu ub=%zu "
-    "chg_c=%zu chg_v=%zu",
-    problem.n_variables,
-    problem.n_constraints,
-    min_activity.size(),
-    max_activity.size(),
-    lb.size(),
-    ub.size(),
-    changed_constraints.size(),
-    changed_variables.size());
   min_activity.resize(problem.n_constraints, problem.handle_ptr->get_stream());
   max_activity.resize(problem.n_constraints, problem.handle_ptr->get_stream());
   lb.resize(problem.n_variables, problem.handle_ptr->get_stream());

@@ -765,7 +765,7 @@ void constraint_prop_t<i_t, f_t>::restore_original_bounds_on_unfixed(
 template <typename i_t, typename f_t>
 bool constraint_prop_t<i_t, f_t>::run_repair_procedure(problem_t<i_t, f_t>& problem,
                                                        problem_t<i_t, f_t>& original_problem,
-                                                       work_limit_timer_t& timer,
+                                                       termination_checker_t& timer,
                                                        const raft::handle_t* handle_ptr)
 {
   // select the first probing value
@@ -872,7 +872,7 @@ bool constraint_prop_t<i_t, f_t>::find_integer(
   solution_t<i_t, f_t>& sol,
   solution_t<i_t, f_t>& orig_sol,
   f_t lp_run_time_after_feasible,
-  work_limit_timer_t& timer,
+  termination_checker_t& timer,
   std::optional<std::reference_wrapper<probing_config_t<i_t, f_t>>> probing_config)
 {
   using crit_t             = termination_criterion_t;
@@ -1040,7 +1040,7 @@ bool constraint_prop_t<i_t, f_t>::find_integer(
     if (!(n_failed_repair_iterations >= max_n_failed_repair_iterations) && rounding_ii &&
         !timeout_happened) {
       // timer_t repair_timer{std::min(timer.remaining_time() / 5, timer.elapsed_time() / 3)};
-      work_limit_timer_t repair_timer(
+      termination_checker_t repair_timer(
         context.gpu_heur_loop, timer.remaining_time() / 5, *context.termination);
       save_bounds(sol);
       if (timer.deterministic) {
@@ -1155,13 +1155,13 @@ template <typename i_t, typename f_t>
 bool constraint_prop_t<i_t, f_t>::apply_round(
   solution_t<i_t, f_t>& sol,
   f_t lp_run_time_after_feasible,
-  work_limit_timer_t& timer,
+  termination_checker_t& timer,
   std::optional<std::reference_wrapper<probing_config_t<i_t, f_t>>> probing_config)
 {
   raft::common::nvtx::range fun_scope("constraint prop round");
 
   sol.compute_feasibility();
-  max_timer = work_limit_timer_t{context.gpu_heur_loop, max_time_for_bounds_prop, timer};
+  max_timer = termination_checker_t{context.gpu_heur_loop, max_time_for_bounds_prop, timer};
   if (check_brute_force_rounding(sol)) { return true; }
   recovery_mode      = false;
   rounding_ii        = false;

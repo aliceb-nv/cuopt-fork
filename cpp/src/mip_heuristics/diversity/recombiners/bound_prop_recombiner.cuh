@@ -207,9 +207,9 @@ class bound_prop_recombiner_t : public recombiner_t<i_t, f_t> {
       CUOPT_DETERMINISM_LOG("BP_DET: fixed_problem_fingerprint=0x%x variable_map_size=%lu",
                             fixed_problem.get_fingerprint(),
                             variable_map.size());
-      work_limit_timer_t timer(this->context.gpu_heur_loop,
-                               bp_recombiner_config_t::bounds_prop_time_limit,
-                               *this->context.termination);
+      termination_checker_t timer(this->context.gpu_heur_loop,
+                                  bp_recombiner_config_t::bounds_prop_time_limit,
+                                  *this->context.termination);
       rmm::device_uvector<f_t> old_assignment(offspring.assignment,
                                               offspring.handle_ptr->get_stream());
       offspring.handle_ptr->sync_stream();
@@ -253,9 +253,9 @@ class bound_prop_recombiner_t : public recombiner_t<i_t, f_t> {
       a.handle_ptr->sync_stream();
     } else {
       CUOPT_DETERMINISM_LOG("BP_DET: Taking INFEASIBLE path (no variable fixing)");
-      work_limit_timer_t timer(this->context.gpu_heur_loop,
-                               bp_recombiner_config_t::bounds_prop_time_limit,
-                               *this->context.termination);
+      termination_checker_t timer(this->context.gpu_heur_loop,
+                                  bp_recombiner_config_t::bounds_prop_time_limit,
+                                  *this->context.termination);
       get_probing_values_for_infeasible(
         guiding_solution, other_solution, offspring, probing_values, n_vars_from_other);
       probing_config.probing_values = host_copy(probing_values, offspring.handle_ptr->get_stream());

@@ -17,7 +17,7 @@
 #include <mip_heuristics/utils.cuh>
 #include <utilities/determinism_log.hpp>
 #include <utilities/seed_generator.cuh>
-#include <utilities/work_limit_timer.hpp>
+#include <utilities/termination_checker.hpp>
 
 #include <mip_heuristics/feasibility_jump/fj_cpu.cuh>
 
@@ -210,7 +210,7 @@ bool local_search_t<i_t, f_t>::do_fj_solve(solution_t<i_t, f_t>& solution,
   if (time_limit == 0.) return solution.get_feasible();
   const bool deterministic = (context.settings.determinism_mode & CUOPT_DETERMINISM_GPU_HEURISTICS);
 
-  work_limit_timer_t timer(context.gpu_heur_loop, time_limit, *context.termination);
+  termination_checker_t timer(context.gpu_heur_loop, time_limit, *context.termination);
   const auto old_n_cstr_weights      = in_fj.cstr_weights.size();
   const auto expected_n_cstr_weights = static_cast<size_t>(solution.problem_ptr->n_constraints);
   // in case this is the first time run, resize
@@ -319,7 +319,7 @@ bool local_search_t<i_t, f_t>::do_fj_solve(solution_t<i_t, f_t>& solution,
 
 template <typename i_t, typename f_t>
 void local_search_t<i_t, f_t>::generate_fast_solution(solution_t<i_t, f_t>& solution,
-                                                      work_limit_timer_t& timer)
+                                                      termination_checker_t& timer)
 {
   CUOPT_LOG_DEBUG("Running FJ fast sol");
   thrust::fill(solution.handle_ptr->get_thrust_policy(),
@@ -335,7 +335,7 @@ void local_search_t<i_t, f_t>::generate_fast_solution(solution_t<i_t, f_t>& solu
   while ((context.diversity_manager_ptr == nullptr ||
           !context.diversity_manager_ptr->check_b_b_preemption()) &&
          !timer.check_time_limit()) {
-    work_limit_timer_t constr_prop_timer = work_limit_timer_t(
+    termination_checker_t constr_prop_timer = termination_checker_t(
       context.gpu_heur_loop, std::min(timer.remaining_time(), 2.), *context.termination);
     // do constraint prop on lp optimal solution
     constraint_prop.apply_round(solution, 1., constr_prop_timer);
@@ -353,7 +353,7 @@ void local_search_t<i_t, f_t>::generate_fast_solution(solution_t<i_t, f_t>& solu
 template <typename i_t, typename f_t>
 bool local_search_t<i_t, f_t>::run_local_search(solution_t<i_t, f_t>& solution,
                                                 const weight_t<i_t, f_t>& weights,
-                                                work_limit_timer_t& timer,
+                                                termination_checker_t& timer,
                                                 const ls_config_t<i_t, f_t>& ls_config)
 {
   raft::common::nvtx::range fun_scope("local search");
@@ -366,7 +366,8 @@ bool local_search_t<i_t, f_t>::run_local_search(solution_t<i_t, f_t>& solution,
     } else {
       fj_settings.time_limit = 0.25;
     }
-    timer = work_limit_timer_t(context.gpu_heur_loop, fj_settings.time_limit, *context.termination);
+    timer =
+      termination_checker_t(context.gpu_heur_loop, fj_settings.time_limit, *context.termination);
   } else {
     fj_settings.time_limit = std::min(1., timer.remaining_time());
   }
@@ -396,7 +397,7 @@ bool local_search_t<i_t, f_t>::run_local_search(solution_t<i_t, f_t>& solution,
 template <typename i_t, typename f_t>
 bool local_search_t<i_t, f_t>::run_fj_until_timer(solution_t<i_t, f_t>& solution,
                                                   const weight_t<i_t, f_t>& weights,
-                                                  work_limit_timer_t& timer)
+                                                  termination_checker_t& timer)
 {
   CUOPT_LOG_DEBUG("Running FJ until timer");
   bool is_feasible;
@@ -415,7 +416,7 @@ bool local_search_t<i_t, f_t>::run_fj_until_timer(solution_t<i_t, f_t>& solution
 
 template <typename i_t, typename f_t>
 bool local_search_t<i_t, f_t>::run_fj_annealing(solution_t<i_t, f_t>& solution,
-                                                work_limit_timer_t& timer,
+                                                termination_checker_t& timer,
                                                 const ls_config_t<i_t, f_t>& ls_config)
 {
   raft::common::nvtx::range fun_scope("run_fj_annealing");
@@ -445,7 +446,7 @@ bool local_search_t<i_t, f_t>::run_fj_annealing(solution_t<i_t, f_t>& solution,
 
 template <typename i_t, typename f_t>
 bool local_search_t<i_t, f_t>::run_fj_line_segment(solution_t<i_t, f_t>& solution,
-                                                   work_limit_timer_t& timer,
+                                                   termination_checker_t& timer,
                                                    const ls_config_t<i_t, f_t>& ls_config)
 {
   raft::common::nvtx::range fun_scope("run_fj_line_segment");
@@ -468,7 +469,7 @@ bool local_search_t<i_t, f_t>::run_fj_line_segment(solution_t<i_t, f_t>& solutio
 template <typename i_t, typename f_t>
 bool local_search_t<i_t, f_t>::check_fj_on_lp_optimal(solution_t<i_t, f_t>& solution,
                                                       bool perturb,
-                                                      work_limit_timer_t& timer)
+                                                      termination_checker_t& timer)
 {
   raft::common::nvtx::range fun_scope("check_fj_on_lp_optimal");
   if (lp_optimal_exists) {
@@ -484,8 +485,8 @@ bool local_search_t<i_t, f_t>::check_fj_on_lp_optimal(solution_t<i_t, f_t>& solu
     solution.assign_random_within_bounds(perturbation_ratio);
   }
   cuopt_func_call(solution.test_variable_bounds(false));
-  f_t lp_run_time_after_feasible       = std::min(1., timer.remaining_time());
-  work_limit_timer_t bounds_prop_timer = work_limit_timer_t(
+  f_t lp_run_time_after_feasible          = std::min(1., timer.remaining_time());
+  termination_checker_t bounds_prop_timer = termination_checker_t(
     context.gpu_heur_loop, std::min(timer.remaining_time(), 10.), *context.termination);
   bool is_feasible =
     constraint_prop.apply_round(solution, lp_run_time_after_feasible, bounds_prop_timer);
@@ -516,7 +517,7 @@ bool local_search_t<i_t, f_t>::check_fj_on_lp_optimal(solution_t<i_t, f_t>& solu
 
 template <typename i_t, typename f_t>
 bool local_search_t<i_t, f_t>::run_fj_on_zero(solution_t<i_t, f_t>& solution,
-                                              work_limit_timer_t& timer)
+                                              termination_checker_t& timer)
 {
   raft::common::nvtx::range fun_scope("run_fj_on_zero");
   thrust::fill(solution.handle_ptr->get_thrust_policy(),
@@ -535,7 +536,7 @@ bool local_search_t<i_t, f_t>::run_fj_on_zero(solution_t<i_t, f_t>& solution,
 
 template <typename i_t, typename f_t>
 bool local_search_t<i_t, f_t>::run_staged_fp(solution_t<i_t, f_t>& solution,
-                                             work_limit_timer_t& timer,
+                                             termination_checker_t& timer,
                                              population_t<i_t, f_t>* population_ptr)
 {
   raft::common::nvtx::range fun_scope("run_staged_fp");
@@ -563,7 +564,7 @@ bool local_search_t<i_t, f_t>::run_staged_fp(solution_t<i_t, f_t>& solution,
       }
       CUOPT_LOG_DEBUG("Running staged FP from beginning it %d", i);
       fp.relax_general_integers(solution);
-      work_limit_timer_t binary_timer(
+      termination_checker_t binary_timer(
         context.gpu_heur_loop, timer.remaining_time() / 3, *context.termination);
       i_t binary_it_counter = 0;
       for (; binary_it_counter < 100; ++binary_it_counter) {
@@ -644,9 +645,6 @@ void local_search_t<i_t, f_t>::save_solution_and_add_cutting_plane(
 template <typename i_t, typename f_t>
 void local_search_t<i_t, f_t>::resize_to_new_problem()
 {
-  CUOPT_LOG_DEBUG("resize_to_new_problem: nv=%d nc=%d",
-                  problem_with_objective_cut.n_variables,
-                  problem_with_objective_cut.n_constraints);
   resize_vectors(problem_with_objective_cut, problem_with_objective_cut.handle_ptr);
   // hint for next PR in case load balanced is reintroduced
   // lb_constraint_prop.temp_problem.setup(problem_with_objective_cut);
@@ -657,9 +655,6 @@ void local_search_t<i_t, f_t>::resize_to_new_problem()
 template <typename i_t, typename f_t>
 void local_search_t<i_t, f_t>::resize_to_old_problem(problem_t<i_t, f_t>* old_problem_ptr)
 {
-  CUOPT_LOG_DEBUG("resize_to_old_problem: nv=%d nc=%d",
-                  old_problem_ptr->n_variables,
-                  old_problem_ptr->n_constraints);
   resize_vectors(*old_problem_ptr, old_problem_ptr->handle_ptr);
   // hint for next PR in case load balanced is reintroduced
   // lb_constraint_prop.temp_problem.setup(*old_problem_ptr);
@@ -737,7 +732,7 @@ void local_search_t<i_t, f_t>::reset_alpha_and_run_recombiners(
 
 template <typename i_t, typename f_t>
 bool local_search_t<i_t, f_t>::run_fp(solution_t<i_t, f_t>& solution,
-                                      work_limit_timer_t& timer,
+                                      termination_checker_t& timer,
                                       population_t<i_t, f_t>* population_ptr,
                                       i_t n_fp_iterations)
 {
@@ -750,40 +745,41 @@ bool local_search_t<i_t, f_t>::run_fp(solution_t<i_t, f_t>& solution,
   rmm::device_uvector<f_t> best_solution(solution.assignment, solution.handle_ptr->get_stream());
   problem_t<i_t, f_t>* old_problem_ptr = solution.problem_ptr;
   fp.timer =
-    work_limit_timer_t(context.gpu_heur_loop, timer.remaining_time(), *context.termination);
+    termination_checker_t(context.gpu_heur_loop, timer.remaining_time(), *context.termination);
   // if it has not been initialized yet, create a new problem and move it to the cut problem
   if (!problem_with_objective_cut.cutting_plane_added) {
     problem_with_objective_cut = std::move(problem_t<i_t, f_t>(*old_problem_ptr));
-    CUOPT_LOG_DEBUG("FP cut-problem clone: old_nv=%d old_nc=%d cut_nv=%d cut_nc=%d",
-                    old_problem_ptr->n_variables,
-                    old_problem_ptr->n_constraints,
-                    problem_with_objective_cut.n_variables,
-                    problem_with_objective_cut.n_constraints);
+    CUOPT_DETERMINISM_LOG("FP cut-problem clone: old_nv=%d old_nc=%d cut_nv=%d cut_nc=%d",
+                          old_problem_ptr->n_variables,
+                          old_problem_ptr->n_constraints,
+                          problem_with_objective_cut.n_variables,
+                          problem_with_objective_cut.n_constraints);
   }
   if (is_feasible) {
     CUOPT_LOG_DEBUG("FP initial solution is feasible, adding cutting plane at obj");
     f_t objective_cut =
       best_objective - std::max(std::abs(0.001 * best_objective), OBJECTIVE_EPSILON);
-    CUOPT_LOG_DEBUG("FP cut-problem add: cut_obj=%g cut_nv=%d cut_nc=%d cut_added=%d fj_w=%zu",
-                    objective_cut,
-                    problem_with_objective_cut.n_variables,
-                    problem_with_objective_cut.n_constraints,
-                    (int)problem_with_objective_cut.cutting_plane_added,
-                    fj.cstr_weights.size());
+    CUOPT_DETERMINISM_LOG(
+      "FP cut-problem add: cut_obj=%g cut_nv=%d cut_nc=%d cut_added=%d fj_w=%zu",
+      objective_cut,
+      problem_with_objective_cut.n_variables,
+      problem_with_objective_cut.n_constraints,
+      (int)problem_with_objective_cut.cutting_plane_added,
+      fj.cstr_weights.size());
     problem_with_objective_cut.add_cutting_plane_at_objective(objective_cut);
-    CUOPT_LOG_DEBUG("FP cut-problem post-add: cut_nv=%d cut_nc=%d",
-                    problem_with_objective_cut.n_variables,
-                    problem_with_objective_cut.n_constraints);
+    CUOPT_DETERMINISM_LOG("FP cut-problem post-add: cut_nv=%d cut_nc=%d",
+                          problem_with_objective_cut.n_variables,
+                          problem_with_objective_cut.n_constraints);
     // Do the copy here for proper handling of the added constraints weight
     fj.copy_weights(
       population_ptr->weights, solution.handle_ptr, problem_with_objective_cut.n_constraints);
     solution.problem_ptr = &problem_with_objective_cut;
     solution.resize_to_problem();
     resize_to_new_problem();
-    CUOPT_LOG_DEBUG("FP cut-problem resize done: sol_assign=%zu sol_nv=%d sol_nc=%d",
-                    solution.assignment.size(),
-                    solution.problem_ptr->n_variables,
-                    solution.problem_ptr->n_constraints);
+    CUOPT_DETERMINISM_LOG("FP cut-problem resize done: sol_assign=%zu sol_nv=%d sol_nc=%d",
+                          solution.assignment.size(),
+                          solution.problem_ptr->n_variables,
+                          solution.problem_ptr->n_constraints);
   }
   i_t last_improved_iteration = 0;
   for (i_t i = 0; i < n_fp_iterations && !timer.check_time_limit(); ++i) {
@@ -850,7 +846,7 @@ bool local_search_t<i_t, f_t>::run_fp(solution_t<i_t, f_t>& solution,
       }
     }
   }
-  CUOPT_LOG_DEBUG(
+  CUOPT_DETERMINISM_LOG(
     "FP teardown start: assign=%zu best=%zu curr_pb=%p old_pb=%p curr_nv=%d curr_nc=%d "
     "old_nv=%d old_nc=%d prevp=%zu prevd=%zu fp_rem=%g parent_rem=%g gpu_work=%g "
     "gpu_prod=%g cut_added=%d",
@@ -873,21 +869,20 @@ bool local_search_t<i_t, f_t>::run_fp(solution_t<i_t, f_t>& solution,
              best_solution.data(),
              solution.assignment.size(),
              solution.handle_ptr->get_stream());
-  CUOPT_LOG_DEBUG("FP teardown post-copy: assign=%zu", solution.assignment.size());
+  CUOPT_DETERMINISM_LOG("FP teardown post-copy: assign=%zu", solution.assignment.size());
   solution.problem_ptr = old_problem_ptr;
-  CUOPT_LOG_DEBUG("FP teardown post-ptr: pb=%p nv=%d nc=%d",
-                  (void*)solution.problem_ptr,
-                  solution.problem_ptr->n_variables,
-                  solution.problem_ptr->n_constraints);
+  CUOPT_DETERMINISM_LOG("FP teardown post-ptr: pb=%p nv=%d nc=%d",
+                        (void*)solution.problem_ptr,
+                        solution.problem_ptr->n_variables,
+                        solution.problem_ptr->n_constraints);
   solution.resize_to_problem();
-  CUOPT_LOG_DEBUG("FP teardown post-resize: assign=%zu prevp=%zu prevd=%zu",
-                  solution.assignment.size(),
-                  solution.lp_state.prev_primal.size(),
-                  solution.lp_state.prev_dual.size());
+  CUOPT_DETERMINISM_LOG("FP teardown post-resize: assign=%zu prevp=%zu prevd=%zu",
+                        solution.assignment.size(),
+                        solution.lp_state.prev_primal.size(),
+                        solution.lp_state.prev_dual.size());
   resize_to_old_problem(old_problem_ptr);
-  CUOPT_LOG_DEBUG("FP teardown pre-sync");
   solution.handle_ptr->sync_stream();
-  CUOPT_LOG_DEBUG(
+  CUOPT_DETERMINISM_LOG(
     "FP teardown post-sync: hash=0x%x feas=%d", solution.get_hash(), (int)solution.get_feasible());
   return is_feasible;
 }
@@ -900,7 +895,7 @@ bool local_search_t<i_t, f_t>::generate_solution(solution_t<i_t, f_t>& solution,
 {
   raft::common::nvtx::range fun_scope("generate_solution");
   cuopt_assert(population_ptr != nullptr, "Population pointer must not be null");
-  work_limit_timer_t timer(context.gpu_heur_loop, time_limit, *context.termination);
+  termination_checker_t timer(context.gpu_heur_loop, time_limit, *context.termination);
   auto n_vars         = solution.problem_ptr->n_variables;
   auto n_binary_vars  = solution.problem_ptr->get_n_binary_variables();
   auto n_integer_vars = solution.problem_ptr->n_integer_vars;

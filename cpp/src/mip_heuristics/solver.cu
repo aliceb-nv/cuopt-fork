@@ -390,7 +390,7 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
       branch_and_bound_settings.num_threads = std::max(1, context.settings.num_cpu_threads);
     }
     CUOPT_LOG_INFO("Using %d CPU threads for B&B", branch_and_bound_settings.num_threads);
-
+    // Set the branch and bound -> primal heuristics callback
     branch_and_bound_settings.new_incumbent_callback =
       std::bind(&bb_callback_adapter_t<i_t, f_t>::new_incumbent_callback,
                 &solution_helper,
@@ -398,6 +398,7 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
                 std::placeholders::_2,
                 std::placeholders::_3,
                 std::placeholders::_4);
+    // heuristic_preemption_callback is needed in both modes to properly stop the heuristic thread
     branch_and_bound_settings.heuristic_preemption_callback =
       std::bind(&bb_callback_adapter_t<i_t, f_t>::preempt_heuristic_solver, &solution_helper);
     if (!(context.settings.determinism_mode & CUOPT_DETERMINISM_BB)) {
@@ -521,7 +522,7 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
       bb_sol.compute_feasibility();
       sol = std::move(bb_sol);
     } else if ((context.settings.determinism_mode & CUOPT_DETERMINISM_BB)) {
-      // In deterministic mode, only solutions formally retired by B&B are valid output.
+      // In deterministic mode, only solutions retired by B&B are valid output.
       // Discard the GPU heuristic incumbent that B&B never processed.
       sol = solution_t<i_t, f_t>(*context.problem_ptr);
     }

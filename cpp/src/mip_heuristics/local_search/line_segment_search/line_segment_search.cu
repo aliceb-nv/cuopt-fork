@@ -130,7 +130,7 @@ bool line_segment_search_t<i_t, f_t>::search_line_segment(
   const rmm::device_uvector<f_t>& point_2,
   const rmm::device_uvector<f_t>& delta_vector,
   bool is_feasibility_run,
-  cuopt::work_limit_timer_t& timer)
+  cuopt::termination_checker_t& timer)
 {
   CUOPT_LOG_DEBUG("Running line segment search with a given delta vector");
   cuopt_assert(point_1.size() == point_2.size(), "size mismatch");
@@ -265,7 +265,7 @@ bool line_segment_search_t<i_t, f_t>::search_line_segment(solution_t<i_t, f_t>& 
                                                           const rmm::device_uvector<f_t>& point_1,
                                                           const rmm::device_uvector<f_t>& point_2,
                                                           bool is_feasibility_run,
-                                                          cuopt::work_limit_timer_t& timer)
+                                                          cuopt::termination_checker_t& timer)
 {
   CUOPT_LOG_DEBUG("Running line segment search");
   cuopt_assert(point_1.size() == point_2.size(), "size mismatch");

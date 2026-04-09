@@ -76,7 +76,7 @@ class line_segment_recombiner_t : public recombiner_t<i_t, f_t> {
     auto& other_solution   = a.get_feasible() ? b : a;
     // copy the solution from A
     solution_t<i_t, f_t> offspring(guiding_solution);
-    work_limit_timer_t line_segment_timer{
+    termination_checker_t line_segment_timer{
       this->context.gpu_heur_loop, ls_recombiner_config_t::time_limit, *this->context.termination};
     // TODO after we have the conic combination, detect the lambda change
     // (i.e. the integral variables flip on line segment)

@@ -409,7 +409,7 @@ bool lb_bounds_repair_t<i_t, f_t>::repair_problem(
   load_balanced_problem_t<i_t, f_t>* problem,
   load_balanced_bounds_presolve_t<i_t, f_t>& lb_bound_presolve,
   problem_t<i_t, f_t>& original_problem,
-  work_limit_timer_t& timer_,
+  termination_checker_t& timer_,
   const raft::handle_t* handle_ptr_)
 {
   nvtx::range fun_scope("LB repair_problem");

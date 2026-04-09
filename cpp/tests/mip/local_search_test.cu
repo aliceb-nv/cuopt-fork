@@ -138,7 +138,7 @@ static uint32_t run_fp(std::string test_instance, local_search_mode_t mode, doub
 
   work_limit_context_t work_limit_context("LocalSearch");
   work_limit_context.deterministic = true;
-  local_search.fp.timer            = work_limit_timer_t(work_limit_context, work_limit, timer);
+  local_search.fp.timer            = termination_checker_t(work_limit_context, work_limit, timer);
 
   detail::ls_config_t<int, double> ls_config{};
 
@@ -157,13 +157,13 @@ static uint32_t run_fp(std::string test_instance, local_search_mode_t mode, doub
       iterations++;
     }
   } else if (mode == local_search_mode_t::FJ_LINE_SEGMENT) {
-    work_limit_timer_t wlt(work_limit_context, work_limit, timer);
+    termination_checker_t wlt(work_limit_context, work_limit, timer);
     local_search.run_fj_line_segment(solution, wlt, ls_config);
   } else if (mode == local_search_mode_t::FJ_ON_ZERO) {
-    work_limit_timer_t wlt(work_limit_context, work_limit, timer);
+    termination_checker_t wlt(work_limit_context, work_limit, timer);
     local_search.run_fj_on_zero(solution, wlt);
   } else if (mode == local_search_mode_t::FJ_ANNEALING) {
-    work_limit_timer_t wlt(work_limit_context, work_limit, timer);
+    termination_checker_t wlt(work_limit_context, work_limit, timer);
     local_search.run_fj_annealing(solution, wlt, ls_config);
   }
 

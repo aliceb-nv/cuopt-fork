@@ -300,7 +300,7 @@ These utilities already exist in the codebase. Use them instead of writing ad-ho
 | `CUOPT_LOG_*` | `<utilities/logger.hpp>` | Logging macros: `CUOPT_LOG_INFO`, `CUOPT_LOG_DEBUG`, `CUOPT_LOG_WARN`, `CUOPT_LOG_ERROR` |
 | `CUOPT_DETERMINISM_LOG` | `<utilities/determinism_log.hpp>` | Determinism-specific debug logging (compiled out when not needed) |
 | `omp_atomic_t<T>` | `<utilities/omp_helpers.hpp>` | OpenMP-compatible atomic with `.load()`, `.store()`, operators |
-| `work_limit_timer_t` | `<utilities/work_limit_timer.hpp>` | Timer that respects deterministic work-unit budgets |
+| `termination_checker_t` | `<utilities/termination_checker.hpp>` | Timer that respects deterministic work-unit budgets |
 | `cuopt::host_copy` | `<utilities/copy_helpers.hpp>` | D2H copy returning `std::vector`: `auto h_vec = cuopt::host_copy(d_vec, stream)` |
 
 ## Common Pitfalls
