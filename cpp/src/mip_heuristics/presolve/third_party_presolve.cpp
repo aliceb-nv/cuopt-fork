@@ -876,6 +876,89 @@ void third_party_presolve_t<i_t, f_t>::uncrush_primal_solution(
   full_primal = std::move(full_sol.primal);
 }
 
+/**
+ * Crush an original-space primal solution into the presolved (reduced) space.
+ *
+ * This is the forward version of Papilo's Postsolve::undo(). It replays
+ * each presolve reduction in forward order to transform variable values,
+ * then projects onto the surviving variables via origcol_mapping.
+ *
+ * The crushing process is remarkably straightforward since we only need to support primal crushing.
+ * We're essentially just projecting
+ */
+template <typename f_t>
+static void crush_primal_impl(const papilo::PostsolveStorage<f_t>& storage,
+                              const std::vector<f_t>& original_primal,
+                              std::vector<f_t>& reduced_primal)
+{
+  const auto& types   = storage.types;
+  const auto& indices = storage.indices;
+  const auto& values  = storage.values;
+  const auto& start   = storage.start;
+
+  const int n_cols_original = (int)storage.nColsOriginal;
+  cuopt_assert((int)original_primal.size() == n_cols_original,
+               "original_primal size must match nColsOriginal");
+
+  std::vector<f_t> assignment(original_primal.begin(), original_primal.end());
+
+  // Go through the postsolve reduction stack in forward order
+  for (int i = 0; i < (int)types.size(); ++i) {
+    int first = start[i];
+
+    switch (types[i]) {
+      // The one tricky reduction - Parallel column merging
+      case ReductionType::kParallelCol: {
+        // Storage layout: [orig_col1, flags1, orig_col2, flags2, -1]
+        //                 [col1lb,    col1ub, col2lb,    col2ub, col2scale]
+        int col1         = indices[first];
+        int col2         = indices[first + 2];
+        const f_t& scale = values[first + 4];
+        assignment[col2] += scale * assignment[col1];
+        break;
+      }
+
+      // All other reductions are either no-ops for primal crushing
+      // or simply metadata
+      case ReductionType::kFixedCol:                            // Handled via projection
+      case ReductionType::kSubstitutedCol:                      // Col is dropped
+      case ReductionType::kSubstitutedColWithDual:              // Col is dropped
+      case ReductionType::kFixedInfCol:                         // Col is dropped
+      case ReductionType::kVarBoundChange:                      // Noop
+      case ReductionType::kRedundantRow:                        // Noop
+      case ReductionType::kRowBoundChange:                      // Noop
+      case ReductionType::kRowBoundChangeForcedByRow:           // Noop
+      case ReductionType::kReasonForRowBoundChangeForcedByRow:  // Noop
+      case ReductionType::kSaveRow:                             // Noop
+      case ReductionType::kReducedBoundsCost:                   // Noop
+      case ReductionType::kColumnDualValue:                     // Dual only
+      case ReductionType::kRowDualValue:                        // Dual only
+      case ReductionType::kCoefficientChange:
+        break;  // Noop
+        // no default: case to let the compiler scream at us if a new reduction is later introduced
+    }
+  }
+
+  // Project the surviving variables into the presolved-space via
+  // the mapping provided by Papilo
+  const auto& col_map = storage.origcol_mapping;
+  reduced_primal.resize(col_map.size());
+  for (size_t k = 0; k < col_map.size(); ++k) {
+    reduced_primal[k] = assignment[col_map[k]];
+  }
+}
+
+template <typename i_t, typename f_t>
+void third_party_presolve_t<i_t, f_t>::crush_primal_solution(
+  const std::vector<f_t>& original_primal, std::vector<f_t>& reduced_primal) const
+{
+  cuopt_expects(presolver_ == cuopt::linear_programming::presolver_t::Papilo,
+                error_type_t::RuntimeError,
+                "Primal crushing is only supported for PaPILO presolve");
+  cuopt_assert(papilo_post_solve_storage_ != nullptr, "No postsolve storage available");
+  crush_primal_impl<f_t>(*papilo_post_solve_storage_, original_primal, reduced_primal);
+}
+
 template <typename i_t, typename f_t>
 third_party_presolve_t<i_t, f_t>::~third_party_presolve_t()
 {
