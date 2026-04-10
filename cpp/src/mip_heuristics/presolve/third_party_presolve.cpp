@@ -541,6 +541,29 @@ void check_postsolve_status(const papilo::PostsolveStatus& status)
   }
 }
 
+// Wrapper to run papilo presolvers in TBB sequential mode
+// This is necessary due to a bug in commit <> in Probing
+// that causes nondeterminism. Disable it when running in deterministic mode.
+template <template <typename> class Presolver, typename REAL>
+class SequentialPresolveWrapper : public Presolver<REAL> {
+ protected:
+  papilo::PresolveStatus execute(const papilo::Problem<REAL>& problem,
+                                 const papilo::ProblemUpdate<REAL>& problemUpdate,
+                                 const papilo::Num<REAL>& num,
+                                 papilo::Reductions<REAL>& reductions,
+                                 const papilo::Timer& timer,
+                                 int& reason_of_infeasibility) override
+  {
+    tbb::task_arena serial_arena(1);
+    papilo::PresolveStatus status;
+    serial_arena.execute([&] {
+      status = Presolver<REAL>::execute(
+        problem, problemUpdate, num, reductions, timer, reason_of_infeasibility);
+    });
+    return status;
+  }
+};
+
 template <typename f_t>
 void set_presolve_methods(papilo::Presolve<f_t>& presolver,
                           problem_category_t category,
@@ -573,8 +596,12 @@ void set_presolve_methods(papilo::Presolve<f_t>& presolver,
   presolver.addPresolveMethod(uptr(new papilo::ImplIntDetection<f_t>()));
   presolver.addPresolveMethod(uptr(new papilo::DominatedCols<f_t>()));
   // Papilo's Probing presolver is nondeterministic.
-  // TODO: push an upstream PR
-  if (!deterministic) { presolver.addPresolveMethod(uptr(new papilo::Probing<f_t>())); }
+  // TODO: push an upstream PR to Papilo to fix the nondeterminism bug
+  if (!deterministic) {
+    presolver.addPresolveMethod(uptr(new papilo::Probing<f_t>()));
+  } else {
+    presolver.addPresolveMethod(uptr(new SequentialPresolveWrapper<papilo::Probing, f_t>()));
+  }
 
   if (!dual_postsolve) {
     presolver.addPresolveMethod(uptr(new papilo::DualInfer<f_t>()));

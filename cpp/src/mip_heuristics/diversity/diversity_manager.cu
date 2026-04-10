@@ -497,6 +497,10 @@ solution_t<i_t, f_t> diversity_manager_t<i_t, f_t>::run_solver()
     }
     population.initialize_population();
     population.allocate_solutions();
+    std::vector<solution_t<i_t, f_t>> initial_sol_vector;
+    add_user_given_solutions(initial_sol_vector);
+    population.add_solutions_from_vec(std::move(initial_sol_vector),
+                                      internals::mip_solution_origin_t::USER_INITIAL);
 
     // Start CPUFJ in deterministic mode with B&B integration
     if (context.branch_and_bound_ptr != nullptr) {
