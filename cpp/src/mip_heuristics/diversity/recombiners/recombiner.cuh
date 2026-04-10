@@ -232,8 +232,6 @@ class recombiner_t {
     const i_t n_continuous_vars = problem.n_variables - problem.n_integer_vars;
     const bool disable_submip_for_continuous_limit =
       n_continuous_vars > (i_t)sub_mip_recombiner_config_t::max_continuous_vars;
-    const bool disable_submip_for_determinism =
-      (context.settings.determinism_mode & CUOPT_DETERMINISM_GPU_HEURISTICS) != 0;
     for (auto recombiner : recombiner_types) {
       if (user_enabled_mask >= 0 && !(user_enabled_mask & (1 << (uint32_t)recombiner))) {
         continue;
@@ -248,8 +246,6 @@ class recombiner_t {
     if (disable_submip_for_continuous_limit) {
       enabled_recombiners.erase(recombiner_enum_t::SUB_MIP);
     }
-    // submip not supported in deterministic mode yet
-    if (disable_submip_for_determinism) { enabled_recombiners.erase(recombiner_enum_t::SUB_MIP); }
     recombiner_t::enabled_recombiners =
       std::vector<recombiner_enum_t>(enabled_recombiners.begin(), enabled_recombiners.end());
     cuopt_assert(!recombiner_t::enabled_recombiners.empty(), "No recombiners enabled after init");

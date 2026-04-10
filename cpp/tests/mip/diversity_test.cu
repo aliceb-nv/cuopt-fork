@@ -230,7 +230,8 @@ static uint32_t test_recombiners_determinism(
 
   for (auto recombiner : {detail::recombiner_enum_t::LINE_SEGMENT,
                           detail::recombiner_enum_t::BOUND_PROP,
-                          detail::recombiner_enum_t::FP}) {
+                          detail::recombiner_enum_t::FP,
+                          detail::recombiner_enum_t::SUB_MIP}) {
     for (int i = 1; i < pop_size; i++) {
       for (int j = i + 1; j < pop_size; j++) {
         printf("recombining %d and %d w/ recombiner %s\n",

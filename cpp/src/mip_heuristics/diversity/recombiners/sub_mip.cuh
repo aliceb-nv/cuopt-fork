@@ -104,6 +104,10 @@ class sub_mip_recombiner_t : public recombiner_t<i_t, f_t> {
       branch_and_bound_solution.resize(branch_and_bound_problem.num_cols);
       // Fill in the settings for branch and bound
       branch_and_bound_settings.time_limit = sub_mip_recombiner_config_t::sub_mip_time_limit;
+      if (context.settings.determinism_mode & CUOPT_DETERMINISM_GPU_HEURISTICS) {
+        branch_and_bound_settings.deterministic = true;
+        branch_and_bound_settings.work_limit    = sub_mip_recombiner_config_t::sub_mip_time_limit;
+      }
       branch_and_bound_settings.print_presolve_stats = false;
       branch_and_bound_settings.absolute_mip_gap_tol = context.settings.tolerances.absolute_mip_gap;
       branch_and_bound_settings.relative_mip_gap_tol = context.settings.tolerances.relative_mip_gap;
@@ -127,6 +131,10 @@ class sub_mip_recombiner_t : public recombiner_t<i_t, f_t> {
       dual_simplex::branch_and_bound_t<i_t, f_t> branch_and_bound(
         branch_and_bound_problem, branch_and_bound_settings, dual_simplex::tic(), empty_probing);
       branch_and_bound_status = branch_and_bound.solve(branch_and_bound_solution);
+      if (context.settings.determinism_mode & CUOPT_DETERMINISM_GPU_HEURISTICS) {
+        double sub_mip_work = branch_and_bound.get_work_unit_context().current_work();
+        context.gpu_heur_loop.record_work_sync_on_horizon(sub_mip_work);
+      }
       if (solution_vector.size() > 0) {
         cuopt_assert(fixed_assignment.size() == branch_and_bound_solution.x.size(),
                      "Assignment size mismatch");

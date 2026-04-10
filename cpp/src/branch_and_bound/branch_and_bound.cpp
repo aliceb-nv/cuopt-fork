@@ -3434,7 +3434,7 @@ void branch_and_bound_t<i_t, f_t>::deterministic_sync_callback()
   double horizon_end = deterministic_current_horizon_;
 
   double wait_start = tic();
-  producer_sync_.wait_for_producers(horizon_end);
+  if (!settings_.sub_mip) { producer_sync_.wait_for_producers(horizon_end); }
   double wait_time = toc(wait_start);
   total_producer_wait_time_ += wait_time;
   max_producer_wait_time_ = std::max(max_producer_wait_time_, wait_time);
