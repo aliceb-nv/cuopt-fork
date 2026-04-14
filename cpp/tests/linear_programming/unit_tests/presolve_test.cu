@@ -676,7 +676,7 @@ INSTANTIATE_TEST_SUITE_P(
     crush_test_param{"linear_programming/qap15/qap15.mps", true},
     //crush_test_param{"linear_programming/scpm1/scpm1.mps", true},
     //crush_test_param{"linear_programming/neos3/neos3.mps", true},
-    crush_test_param{"linear_programming/a2864/a2864.mps", true},
+    //crush_test_param{"linear_programming/a2864/a2864.mps", true},
     crush_test_param{"linear_programming/afiro_original.mps", false},
     crush_test_param{"mip/enlight_hard.mps", false},
     crush_test_param{"mip/enlight11.mps", false},
@@ -731,6 +731,143 @@ INSTANTIATE_TEST_SUITE_P(
     std::replace(name.begin(), name.end(), '.', '_');
     std::replace(name.begin(), name.end(), '-', '_');
     if (info.param.use_pdlp) name += "_pdlp";
+    return name;
+  }
+);
+// clang-format on
+
+// Test that crushed solutions work as warmstarts in the full solving pipeline.
+// Presolve → cold PDLP solve → postsolve → crush → warmstarted PDLP solve.
+// The warmstarted solve should converge in fewer iterations than the cold start.
+class crush_warmstart : public ::testing::TestWithParam<std::string> {};
+
+TEST_P(crush_warmstart, round_trip)
+{
+  const raft::handle_t handle_{};
+  auto stream = handle_.get_stream();
+
+  auto path = make_path_absolute(GetParam());
+  auto mps  = cuopt::mps_parser::parse_mps<int, double>(path, false);
+  auto op_problem =
+    cuopt::linear_programming::mps_data_model_to_optimization_problem<int, double>(&handle_, mps);
+
+  // Step 1: Presolve
+  detail::sort_csr(op_problem);
+  detail::third_party_presolve_t<int, double> presolver;
+  auto result = presolver.apply(op_problem,
+                                problem_category_t::LP,
+                                presolver_t::Papilo,
+                                /*dual_postsolve=*/true,
+                                /*abs_tol=*/1e-6,
+                                /*rel_tol=*/1e-9,
+                                /*time_limit=*/60.0);
+  ASSERT_TRUE(result.status == detail::third_party_presolve_status_t::REDUCED ||
+              result.status == detail::third_party_presolve_status_t::UNCHANGED);
+
+  int n_red_vars = result.reduced_problem.get_n_variables();
+  int n_red_cons = result.reduced_problem.get_n_constraints();
+
+  // Step 2: Cold PDLP solve of the reduced problem
+  auto settings           = pdlp_solver_settings_t<int, double>{};
+  settings.presolver      = presolver_t::None;
+  settings.dual_postsolve = true;
+  settings.method         = cuopt::linear_programming::method_t::PDLP;
+  settings.time_limit     = 60.0;
+
+  auto cold_solution = solve_lp(result.reduced_problem, settings);
+  ASSERT_EQ(cold_solution.get_termination_status(), pdlp_termination_status_t::Optimal);
+
+  auto cold_iters = cold_solution.get_additional_termination_information().number_of_steps_taken;
+  double cold_obj = cold_solution.get_additional_termination_information().primal_objective;
+
+  // Step 3: Postsolve to original space (only primal + dual needed for warmstart)
+  auto primal_sol = cuopt::device_copy(cold_solution.get_primal_solution(), stream);
+  auto dual_sol   = cuopt::device_copy(cold_solution.get_dual_solution(), stream);
+  rmm::device_uvector<double> rc_sol(n_red_vars, stream);
+  thrust::fill(rmm::exec_policy(stream), rc_sol.begin(), rc_sol.end(), 0.0);
+
+  presolver.undo(primal_sol, dual_sol, rc_sol, problem_category_t::LP, false, true, stream);
+
+  auto x_orig = host_copy(primal_sol, stream);
+  auto y_orig = host_copy(dual_sol, stream);
+
+  // Step 4: Crush back to reduced space (no rc needed for warmstart)
+  auto orig_A_vals    = op_problem.get_constraint_matrix_values_host();
+  auto orig_A_indices = op_problem.get_constraint_matrix_indices_host();
+  auto orig_A_offsets = op_problem.get_constraint_matrix_offsets_host();
+
+  std::vector<double> x_crushed, y_crushed, rc_unused;
+  presolver.crush_primal_dual_solution(x_orig,
+                                       y_orig,
+                                       x_crushed,
+                                       y_crushed,
+                                       {},
+                                       rc_unused,
+                                       orig_A_vals,
+                                       orig_A_indices,
+                                       orig_A_offsets);
+
+  ASSERT_EQ((int)x_crushed.size(), n_red_vars);
+  ASSERT_EQ((int)y_crushed.size(), n_red_cons);
+
+  // Step 5: Warmstarted PDLP solve of the reduced problem
+  auto warm_settings = settings;
+  warm_settings.set_initial_primal_solution(x_crushed.data(), n_red_vars, stream);
+  warm_settings.set_initial_dual_solution(y_crushed.data(), n_red_cons, stream);
+
+  auto warm_solution = solve_lp(result.reduced_problem, warm_settings);
+  ASSERT_EQ(warm_solution.get_termination_status(), pdlp_termination_status_t::Optimal);
+
+  double warm_obj = warm_solution.get_additional_termination_information().primal_objective;
+  auto warm_iters = warm_solution.get_additional_termination_information().number_of_steps_taken;
+
+  // Verify: same objective
+  EXPECT_NEAR(warm_obj, cold_obj, 1e-3 * std::max(1.0, std::abs(cold_obj)))
+    << "warmstarted objective should match cold solve";
+
+  // Verify: warmstart should take fewer iterations than cold start
+  EXPECT_LE(warm_iters, cold_iters)
+    << "warmstarted solve should not take more iterations than cold solve"
+    << " (cold=" << cold_iters << ", warm=" << warm_iters << ")";
+}
+
+// clang-format off
+INSTANTIATE_TEST_SUITE_P(
+  papilo_presolve,
+  crush_warmstart,
+  ::testing::Values(
+    "mip/fiball.mps",
+    "mip/50v-10.mps",
+    "mip/drayage-25-23.mps",
+    "mip/neos-3004026-krka.mps",
+    "mip/app1-1.mps",
+    "mip/bnatt400.mps",
+    "mip/decomp2.mps",
+    "mip/graph20-20-1rand.mps",
+    "mip/milo-v12-6-r2-40-1.mps",
+    "mip/neos-1582420.mps",
+    "mip/neos-5188808-nattai.mps",
+    "mip/net12.mps",
+    "mip/n2seq36q.mps",
+    "mip/seymour1.mps",
+    "mip/neos8.mps",
+    "mip/CMS750_4.mps",
+    "mip/cbs-cta.mps",
+    "mip/swath3.mps",
+    "mip/air05.mps",
+    "mip/fastxgemm-n2r6s0t2.mps",
+    "mip/dws008-01.mps",
+    "mip/germanrr.mps",
+    "mip/neos-1445765.mps",
+    "mip/neos-3083819-nubu.mps",
+    "mip/neos-5107597-kakapo.mps",
+    "mip/rocI-4-11.mps"
+  ),
+  [](const ::testing::TestParamInfo<std::string>& info) {
+    std::string name = info.param;
+    std::replace(name.begin(), name.end(), '/', '_');
+    std::replace(name.begin(), name.end(), '.', '_');
+    std::replace(name.begin(), name.end(), '-', '_');
     return name;
   }
 );

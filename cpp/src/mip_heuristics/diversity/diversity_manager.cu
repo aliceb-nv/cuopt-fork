@@ -196,6 +196,7 @@ void diversity_manager_t<i_t, f_t>::add_user_given_solutions(
                  init_sol_assignment.data(),
                  h_original.size(),
                  sol.handle_ptr->get_stream());
+      sol.handle_ptr->sync_stream();
       std::vector<f_t> h_crushed;
       problem_ptr->presolve_data.papilo_presolve_ptr->crush_primal_solution(h_original, h_crushed);
       init_sol_assignment.resize(h_crushed.size(), sol.handle_ptr->get_stream());
