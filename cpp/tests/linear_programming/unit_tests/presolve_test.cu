@@ -10,6 +10,7 @@
 #include <cuopt/linear_programming/pdlp/solver_settings.hpp>
 #include <cuopt/linear_programming/solve.hpp>
 #include <mip_heuristics/presolve/third_party_presolve.hpp>
+#include <mip_heuristics/utilities/sort_csr.cuh>
 #include <mps_parser/mps_data_model.hpp>
 #include <mps_parser/parser.hpp>
 #include <pdlp/utils.cuh>
@@ -23,6 +24,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <string>
@@ -96,6 +98,82 @@ static void check_variable_bounds(const std::vector<double>& solution,
     }
     if (ub != std::numeric_limits<double>::infinity()) {
       EXPECT_LE(solution[i], ub + tolerance) << "Variable " << i << " violates upper bound";
+    }
+  }
+}
+
+// A^T * y from CSR matrix A (m x n)
+static void compute_transpose_matvec(const std::vector<double>& values,
+                                     const std::vector<int>& indices,
+                                     const std::vector<int>& offsets,
+                                     const std::vector<double>& y,
+                                     int n_cols,
+                                     std::vector<double>& result)
+{
+  size_t n_rows = offsets.size() - 1;
+  assert(y.size() == n_rows);
+  result.assign(n_cols, 0.0);
+  for (size_t i = 0; i < n_rows; ++i) {
+    for (int j = offsets[i]; j < offsets[i + 1]; ++j) {
+      result[indices[j]] += values[j] * y[i];
+    }
+  }
+}
+
+// KKT complementary slackness on variable bounds:
+// reduced cost z_j = c_j - (A^T y)_j must be >= 0 at lower bound,
+// <= 0 at upper bound, and ~0 for interior variables.
+static void check_reduced_cost_consistency(const std::vector<double>& objective,
+                                           const std::vector<double>& ATy,
+                                           const std::vector<double>& primal,
+                                           const std::vector<double>& var_lb,
+                                           const std::vector<double>& var_ub,
+                                           double bound_tol,
+                                           double cs_tol)
+{
+  constexpr double inf = std::numeric_limits<double>::infinity();
+  assert(objective.size() == primal.size());
+  assert(ATy.size() == primal.size());
+  for (size_t j = 0; j < primal.size(); ++j) {
+    double z_j = objective[j] - ATy[j];
+    bool at_lb = (var_lb[j] > -inf && std::abs(primal[j] - var_lb[j]) <= bound_tol);
+    bool at_ub = (var_ub[j] < inf && std::abs(primal[j] - var_ub[j]) <= bound_tol);
+    if (at_lb && at_ub) continue;  // fixed variable — reduced cost unconstrained
+
+    if (at_lb) {
+      ASSERT_GE(z_j, -cs_tol) << "reduced cost violation at variable " << j << " (at lower bound)";
+    } else if (at_ub) {
+      ASSERT_LE(z_j, cs_tol) << "reduced cost violation at variable " << j << " (at upper bound)";
+    } else {
+      ASSERT_NEAR(z_j, 0.0, cs_tol) << "reduced cost should be ~0 for interior variable " << j;
+    }
+  }
+}
+
+// KKT complementary slackness on constraint bounds:
+// y_i >= 0 when constraint at lower bound, <= 0 at upper bound, ~0 when inactive.
+static void check_dual_sign_consistency(const std::vector<double>& Ax,
+                                        const std::vector<double>& dual,
+                                        const std::vector<double>& con_lb,
+                                        const std::vector<double>& con_ub,
+                                        double bound_tol,
+                                        double cs_tol)
+{
+  constexpr double inf = std::numeric_limits<double>::infinity();
+  assert(Ax.size() == dual.size());
+  for (size_t i = 0; i < dual.size(); ++i) {
+    bool at_lb = (con_lb[i] > -inf && std::abs(Ax[i] - con_lb[i]) <= bound_tol);
+    bool at_ub = (con_ub[i] < inf && std::abs(Ax[i] - con_ub[i]) <= bound_tol);
+    if (at_lb && at_ub) continue;  // equality constraint — dual unconstrained
+
+    if (at_lb) {
+      ASSERT_GE(dual[i], -cs_tol) << "dual sign violation at constraint " << i
+                                  << " (at lower bound)";
+    } else if (at_ub) {
+      ASSERT_LE(dual[i], cs_tol) << "dual sign violation at constraint " << i
+                                 << " (at upper bound)";
+    } else {
+      ASSERT_NEAR(dual[i], 0.0, cs_tol) << "dual should be ~0 for non-active constraint " << i;
     }
   }
 }
@@ -382,6 +460,281 @@ TEST(pslp_presolve, postsolve_multiple_problems)
     EXPECT_LT(rel_error, 0.01) << "Problem " << name << " objective mismatch";
   }
 }
+
+// Crush an optimal original-space (x, y) into reduced space and verify that
+// the result satisfies the KKT conditions of the reduced problem: primal
+// feasibility, dual feasibility (reduced cost definition), and complementary
+// slackness on both variable and constraint bounds.
+struct crush_test_param {
+  std::string mps_path;
+  bool use_pdlp;
+};
+
+class dual_crush_round_trip : public ::testing::TestWithParam<crush_test_param> {};
+
+TEST_P(dual_crush_round_trip, kkt_check)
+{
+  const raft::handle_t handle_{};
+  auto stream = handle_.get_stream();
+
+  constexpr double bound_tol = 1e-5;
+  constexpr double kkt_tol   = 9e-2;
+
+  const auto& param = GetParam();
+  auto path         = make_path_absolute(param.mps_path);
+  auto mps          = cuopt::mps_parser::parse_mps<int, double>(path, false);
+  auto op_problem =
+    cuopt::linear_programming::mps_data_model_to_optimization_problem<int, double>(&handle_, mps);
+
+  // Step 1: Presolve with a single presolver instance (same one used for crush later)
+  detail::sort_csr(op_problem);
+  detail::third_party_presolve_t<int, double> presolver;
+  auto result = presolver.apply(op_problem,
+                                problem_category_t::LP,
+                                presolver_t::Papilo,
+                                /*dual_postsolve=*/true,
+                                /*abs_tol=*/1e-6,
+                                /*rel_tol=*/1e-9,
+                                /*time_limit=*/60.0);
+  ASSERT_TRUE(result.status == detail::third_party_presolve_status_t::REDUCED ||
+              result.status == detail::third_party_presolve_status_t::UNCHANGED);
+
+  // Step 2: Solve the reduced problem (no presolve — we already did it)
+  auto settings           = pdlp_solver_settings_t<int, double>{};
+  settings.presolver      = presolver_t::None;
+  settings.dual_postsolve = true;
+  settings.time_limit     = 60.0;
+  if (param.use_pdlp) {
+    settings.method                               = cuopt::linear_programming::method_t::PDLP;
+    settings.tolerances.absolute_dual_tolerance   = 1e-7;
+    settings.tolerances.relative_dual_tolerance   = 0;
+    settings.tolerances.absolute_primal_tolerance = 1e-7;
+    settings.tolerances.relative_primal_tolerance = 0;
+  } else {
+    settings.method = cuopt::linear_programming::method_t::DualSimplex;
+  }
+
+  auto reduced_solution = solve_lp(result.reduced_problem, settings);
+  ASSERT_EQ(reduced_solution.get_termination_status(), pdlp_termination_status_t::Optimal);
+
+  // Step 3: Postsolve to get original-space (x, y, z) using the same presolver.
+  // For PDLP, derive z = c_red - A_red^T y_red instead of using get_reduced_cost(),
+  // since PDLP's approximate solution may have inconsistent reduced costs.
+  auto primal_sol = cuopt::device_copy(reduced_solution.get_primal_solution(), stream);
+  auto dual_sol   = cuopt::device_copy(reduced_solution.get_dual_solution(), stream);
+  rmm::device_uvector<double> rc_sol(0, stream);
+  if (param.use_pdlp) {
+    auto red_A_vals    = result.reduced_problem.get_constraint_matrix_values_host();
+    auto red_A_indices = result.reduced_problem.get_constraint_matrix_indices_host();
+    auto red_A_offsets = result.reduced_problem.get_constraint_matrix_offsets_host();
+    auto red_c         = result.reduced_problem.get_objective_coefficients_host();
+    auto h_y_red       = host_copy(dual_sol, stream);
+    int red_n_vars     = result.reduced_problem.get_n_variables();
+
+    std::vector<double> ATy_red;
+    compute_transpose_matvec(
+      red_A_vals, red_A_indices, red_A_offsets, h_y_red, red_n_vars, ATy_red);
+    std::vector<double> z_red(red_n_vars);
+    for (int j = 0; j < red_n_vars; ++j) {
+      z_red[j] = red_c[j] - ATy_red[j];
+    }
+    rc_sol = cuopt::device_copy(z_red, stream);
+  } else {
+    rc_sol = cuopt::device_copy(reduced_solution.get_reduced_cost(), stream);
+  }
+
+  presolver.undo(primal_sol, dual_sol, rc_sol, problem_category_t::LP, false, true, stream);
+
+  auto x_orig  = host_copy(primal_sol, stream);
+  auto y_orig  = host_copy(dual_sol, stream);
+  auto rc_orig = host_copy(rc_sol, stream);
+
+  ASSERT_EQ((int)x_orig.size(), op_problem.get_n_variables());
+  ASSERT_EQ((int)y_orig.size(), op_problem.get_n_constraints());
+
+  // Step 4: Sanity-check the postsolve output in original space before crushing.
+  auto orig_A_vals    = op_problem.get_constraint_matrix_values_host();
+  auto orig_A_indices = op_problem.get_constraint_matrix_indices_host();
+  auto orig_A_offsets = op_problem.get_constraint_matrix_offsets_host();
+  auto orig_c         = op_problem.get_objective_coefficients_host();
+  auto orig_var_lb    = op_problem.get_variable_lower_bounds_host();
+  auto orig_var_ub    = op_problem.get_variable_upper_bounds_host();
+  auto orig_con_lb    = op_problem.get_constraint_lower_bounds_host();
+  auto orig_con_ub    = op_problem.get_constraint_upper_bounds_host();
+  {
+    int orig_n_vars = op_problem.get_n_variables();
+
+    // Stationarity: z == c - A^T y
+    std::vector<double> ATy_orig;
+    compute_transpose_matvec(
+      orig_A_vals, orig_A_indices, orig_A_offsets, y_orig, orig_n_vars, ATy_orig);
+    for (size_t j = 0; j < rc_orig.size(); ++j) {
+      double z_derived = orig_c[j] - ATy_orig[j];
+      EXPECT_NEAR(rc_orig[j], z_derived, kkt_tol)
+        << "postsolve stationarity violation at original variable " << j;
+    }
+
+    // Primal feasibility
+    check_variable_bounds(x_orig, orig_var_lb, orig_var_ub, bound_tol);
+    std::vector<double> Ax_orig;
+    compute_constraint_residuals(orig_A_vals, orig_A_indices, orig_A_offsets, x_orig, Ax_orig);
+    check_constraint_satisfaction(Ax_orig, orig_con_lb, orig_con_ub, bound_tol);
+
+    // Complementary slackness
+    check_reduced_cost_consistency(
+      orig_c, ATy_orig, x_orig, orig_var_lb, orig_var_ub, bound_tol, kkt_tol);
+    check_dual_sign_consistency(Ax_orig, y_orig, orig_con_lb, orig_con_ub, bound_tol, kkt_tol);
+  }
+
+  // Step 5: Crush using the SAME presolver that produced the postsolve storage
+  std::vector<double> x_crushed, y_crushed, rc_crushed;
+  presolver.crush_primal_dual_solution(x_orig,
+                                       y_orig,
+                                       x_crushed,
+                                       y_crushed,
+                                       rc_orig,
+                                       rc_crushed,
+                                       orig_A_vals,
+                                       orig_A_indices,
+                                       orig_A_offsets);
+
+  int n_vars = result.reduced_problem.get_n_variables();
+  int n_cons = result.reduced_problem.get_n_constraints();
+  ASSERT_EQ((int)x_crushed.size(), n_vars);
+  ASSERT_EQ((int)y_crushed.size(), n_cons);
+  ASSERT_EQ((int)rc_crushed.size(), n_vars);
+
+  // Extract reduced problem data on host
+  auto A_vals    = result.reduced_problem.get_constraint_matrix_values_host();
+  auto A_indices = result.reduced_problem.get_constraint_matrix_indices_host();
+  auto A_offsets = result.reduced_problem.get_constraint_matrix_offsets_host();
+  auto c_red     = result.reduced_problem.get_objective_coefficients_host();
+  auto var_lb    = result.reduced_problem.get_variable_lower_bounds_host();
+  auto var_ub    = result.reduced_problem.get_variable_upper_bounds_host();
+  auto con_lb    = result.reduced_problem.get_constraint_lower_bounds_host();
+  auto con_ub    = result.reduced_problem.get_constraint_upper_bounds_host();
+
+  // Primal feasibility: variable bounds
+  check_variable_bounds(x_crushed, var_lb, var_ub, bound_tol);
+
+  // Primal feasibility: constraint satisfaction (l_c <= Ax <= u_c)
+  std::vector<double> Ax;
+  compute_constraint_residuals(A_vals, A_indices, A_offsets, x_crushed, Ax);
+  check_constraint_satisfaction(Ax, con_lb, con_ub, bound_tol);
+
+  // Dual feasibility: compute implied reduced costs z = c - A^T y
+  std::vector<double> ATy;
+  compute_transpose_matvec(A_vals, A_indices, A_offsets, y_crushed, n_vars, ATy);
+
+  // Complementary slackness on variable bounds (reduced cost signs)
+  check_reduced_cost_consistency(c_red, ATy, x_crushed, var_lb, var_ub, bound_tol, kkt_tol);
+
+  // Complementary slackness on constraint bounds (dual variable signs)
+  check_dual_sign_consistency(Ax, y_crushed, con_lb, con_ub, bound_tol, kkt_tol);
+
+  // Crushed reduced costs: consistency with derived z = c - A^T y
+  for (size_t j = 0; j < rc_crushed.size(); ++j) {
+    double z_derived = c_red[j] - ATy[j];
+    ASSERT_NEAR(rc_crushed[j], z_derived, kkt_tol)
+      << "crushed reduced cost vs derived mismatch at variable " << j;
+  }
+
+  // Cross-check: crushed primal should match the solver's primal (unique at optimality)
+  auto x_ref = host_copy(reduced_solution.get_primal_solution(), stream);
+  ASSERT_EQ(x_crushed.size(), x_ref.size());
+  for (size_t i = 0; i < x_crushed.size(); ++i) {
+    EXPECT_NEAR(x_crushed[i], x_ref[i], kkt_tol) << "primal mismatch at reduced variable " << i;
+  }
+
+  // Cross-check: crushed objective should match the solver's objective
+  auto obj_ref       = reduced_solution.get_additional_termination_information().primal_objective;
+  double obj_crushed = 0.0;
+  for (size_t i = 0; i < x_crushed.size(); ++i) {
+    obj_crushed += c_red[i] * x_crushed[i];
+  }
+  obj_crushed += result.reduced_problem.get_objective_offset();
+  EXPECT_NEAR(obj_crushed, obj_ref, kkt_tol * std::max(1.0, std::abs(obj_ref)))
+    << "crushed objective mismatch";
+
+  // Note: y_crushed and rc_crushed are NOT required to match the solver's y_ref/rc_ref.
+  // Dual degeneracy means multiple optimal duals exist. The crush may land on a different
+  // one due to Papilo's postsolve performing dual pivots (kVarBoundChange). Both are valid
+  // as long as KKT conditions hold, which is already verified above.
+}
+
+// clang-format off
+INSTANTIATE_TEST_SUITE_P(
+  papilo_presolve,
+  dual_crush_round_trip,
+  ::testing::Values(
+    crush_test_param{"linear_programming/graph40-40/graph40-40.mps", true},
+    //crush_test_param{"linear_programming/ex10/ex10.mps", true},
+    //crush_test_param{"linear_programming/datt256_lp/datt256_lp.mps", true},
+    //crush_test_param{"linear_programming/woodlands09/woodlands09.mps", false},
+    //crush_test_param{"linear_programming/savsched1/savsched1.mps", false},
+    crush_test_param{"linear_programming/nug08-3rd/nug08-3rd.mps", true},
+    crush_test_param{"linear_programming/qap15/qap15.mps", true},
+    //crush_test_param{"linear_programming/scpm1/scpm1.mps", true},
+    //crush_test_param{"linear_programming/neos3/neos3.mps", true},
+    crush_test_param{"linear_programming/a2864/a2864.mps", true},
+    crush_test_param{"linear_programming/afiro_original.mps", false},
+    crush_test_param{"mip/enlight_hard.mps", false},
+    crush_test_param{"mip/enlight11.mps", false},
+    crush_test_param{"mip/50v-10.mps", false},
+    crush_test_param{"mip/fiball.mps", false},
+    crush_test_param{"mip/gen-ip054.mps", false},
+    crush_test_param{"mip/sct2.mps", false},
+    crush_test_param{"mip/drayage-25-23.mps", false},
+    crush_test_param{"mip/tr12-30.mps", false},
+    crush_test_param{"mip/neos-3004026-krka.mps", false},
+    crush_test_param{"mip/ns1208400.mps", false},
+    crush_test_param{"mip/gmu-35-50.mps", true},
+    crush_test_param{"mip/n2seq36q.mps", false},
+    crush_test_param{"mip/seymour1.mps", false},
+    //crush_test_param{"mip/thor50dday.mps", false},
+    crush_test_param{"mip/neos8.mps", false},
+    crush_test_param{"mip/app1-1.mps", false},
+    crush_test_param{"mip/bnatt400.mps", false},
+    crush_test_param{"mip/bnatt500.mps", false},
+    //crush_test_param{"mip/brazil3.mps", false},
+    crush_test_param{"mip/cbs-cta.mps", false},
+    crush_test_param{"mip/CMS750_4.mps", false},
+    crush_test_param{"mip/decomp2.mps", false},
+    crush_test_param{"mip/dws008-01.mps", false},
+    crush_test_param{"mip/germanrr.mps", false},
+    crush_test_param{"mip/graph20-20-1rand.mps", false},
+    crush_test_param{"mip/milo-v12-6-r2-40-1.mps", false},
+    crush_test_param{"mip/neos-1445765.mps", false},
+    crush_test_param{"mip/neos-1582420.mps", false},
+    crush_test_param{"mip/neos-3083819-nubu.mps", false},
+    crush_test_param{"mip/neos-5107597-kakapo.mps", false},
+    crush_test_param{"mip/neos-5188808-nattai.mps", false},
+    crush_test_param{"mip/net12.mps", false},
+    crush_test_param{"mip/rocI-4-11.mps", false},
+    crush_test_param{"mip/traininstance2.mps", false},
+    crush_test_param{"mip/traininstance6.mps", false},
+    crush_test_param{"mip/neos-787933.mps", false},
+    crush_test_param{"mip/radiationm18-12-05.mps", false},
+    crush_test_param{"mip/momentum1.mps", false},
+    crush_test_param{"mip/rococoB10-011000.mps", false},
+    crush_test_param{"mip/b1c1s1.mps", false},
+    crush_test_param{"mip/nu25-pr12.mps", false},
+    crush_test_param{"mip/air05.mps", false},
+    crush_test_param{"mip/seymour.mps", false},
+    crush_test_param{"mip/swath3.mps", false},
+    crush_test_param{"mip/neos-950242.mps", false},
+    crush_test_param{"mip/fastxgemm-n2r6s0t2.mps", false}
+  ),
+  [](const ::testing::TestParamInfo<crush_test_param>& info) {
+    std::string name = info.param.mps_path;
+    std::replace(name.begin(), name.end(), '/', '_');
+    std::replace(name.begin(), name.end(), '.', '_');
+    std::replace(name.begin(), name.end(), '-', '_');
+    if (info.param.use_pdlp) name += "_pdlp";
+    return name;
+  }
+);
+// clang-format on
 
 }  // namespace cuopt::linear_programming::test
 

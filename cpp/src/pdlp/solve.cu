@@ -1551,6 +1551,18 @@ optimization_problem_solution_t<i_t, f_t> solve_lp(
         cuopt::device_copy(solution.get_reduced_cost(), op_problem.get_handle_ptr()->get_stream());
       bool status_to_skip = false;
 
+      CUOPT_LOG_DEBUG(
+        "Pre-undo: original problem n_vars=%d n_cons=%d, "
+        "reduced solution primal=%zu dual=%zu reduced_costs=%zu, "
+        "solver termination=%d dual_postsolve=%d",
+        op_problem.get_n_variables(),
+        op_problem.get_n_constraints(),
+        primal_solution.size(),
+        dual_solution.size(),
+        reduced_costs.size(),
+        (int)solution.get_termination_status(),
+        (int)settings.dual_postsolve);
+
       presolver->undo(primal_solution,
                       dual_solution,
                       reduced_costs,

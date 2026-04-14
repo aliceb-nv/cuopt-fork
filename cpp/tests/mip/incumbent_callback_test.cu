@@ -210,7 +210,7 @@ TEST(mip_solve, initial_solution_survives_papilo_crush)
 
   // Step 1: solve to get a reference feasible solution
   auto settings1       = mip_solver_settings_t<int, double>{};
-  settings1.time_limit = 30.;
+  settings1.time_limit = 5.;
   settings1.presolver  = presolver_t::Papilo;
   auto result1         = solve_mip(op_problem, settings1);
   auto status1         = result1.get_termination_status();
@@ -226,7 +226,7 @@ TEST(mip_solve, initial_solution_survives_papilo_crush)
   // immediately. The only way we get a good objective is if the MIP start
   // was crushed through PaPILO and accepted by add_user_given_solutions.
   auto settings2       = mip_solver_settings_t<int, double>{};
-  settings2.time_limit = 10.;
+  settings2.time_limit = 5.;
   settings2.presolver  = presolver_t::Papilo;
   settings2.node_limit = 0;
   settings2.add_initial_solution(reference_solution.data(), reference_solution.size(), stream);
