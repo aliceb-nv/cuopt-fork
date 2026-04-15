@@ -913,7 +913,6 @@ void third_party_presolve_t<i_t, f_t>::crush_primal_solution(
  * Only two reductions actually transform survivor coordinates:
  *   kParallelCol             — merges x[col1] into x[col2]
  *   kRowBoundChangeForcedByRow — conditionally transfers y[deleted_row] → y[kept_row]
- * Everything else is either projection-only or metadata.
  */
 template <typename i_t, typename f_t>
 void third_party_presolve_t<i_t, f_t>::crush_primal_dual_solution(
@@ -944,7 +943,7 @@ void third_party_presolve_t<i_t, f_t>::crush_primal_dual_solution(
   const bool crush_dual = !y_original.empty();
   if (crush_dual) { cuopt_assert((int)y_original.size() == (int)storage.nRowsOriginal, ""); }
 
-  const bool crush_rc = !z_original.empty();
+  const bool crush_rc = !z_original.empty() && crush_dual;
   if (crush_rc) { cuopt_assert((int)z_original.size() == (int)storage.nColsOriginal, ""); }
 
   std::vector<f_t> x(x_original.begin(), x_original.end());

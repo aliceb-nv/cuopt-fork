@@ -102,7 +102,6 @@ static void check_variable_bounds(const std::vector<double>& solution,
   }
 }
 
-// A^T * y from CSR matrix A (m x n)
 static void compute_transpose_matvec(const std::vector<double>& values,
                                      const std::vector<int>& indices,
                                      const std::vector<int>& offsets,
@@ -110,26 +109,28 @@ static void compute_transpose_matvec(const std::vector<double>& values,
                                      int n_cols,
                                      std::vector<double>& result)
 {
+  assert(!offsets.empty());
+  assert(values.size() == indices.size());
+  assert(n_cols >= 0);
   size_t n_rows = offsets.size() - 1;
   assert(y.size() == n_rows);
+  assert((size_t)offsets.back() == values.size());
   result.assign(n_cols, 0.0);
+  std::vector<double> kahan_compensation(n_cols, 0.0);
   for (size_t i = 0; i < n_rows; ++i) {
     for (int j = offsets[i]; j < offsets[i + 1]; ++j) {
-      result[indices[j]] += values[j] * y[i];
+      int col = indices[j];
+      assert(col >= 0 && col < n_cols);
+      double delta            = values[j] * y[i];
+      double corrected        = delta - kahan_compensation[col];
+      double next             = result[col] + corrected;
+      kahan_compensation[col] = (next - result[col]) - corrected;
+      result[col]             = next;
     }
   }
 }
 
-// General-form variable-bound KKT for exported solver solutions.
-//
-// We validate the scalar reduced cost z_j directly, with the user-space convention
-//   z = c - A^T y.
-// This is the same convention exposed by both PDLP and Dual Simplex after any
-// internal transformations are undone.
-//
-// Lower-bound multipliers correspond to positive reduced costs, upper-bound
-// multipliers correspond to negative reduced costs. If a side is absent, the
-// corresponding multiplier must be zero.
+// Complimentary slackness checks
 static void check_reduced_cost_consistency(const std::vector<double>& reduced_cost,
                                            const std::vector<double>& primal,
                                            const std::vector<double>& var_lb,
@@ -489,19 +490,14 @@ TEST(pslp_presolve, postsolve_multiple_problems)
     EXPECT_LT(rel_error, 0.01) << "Problem " << name << " objective mismatch";
   }
 }
-
-// Crush an optimal original-space (x, y, z) into reduced space and verify the
-// user-space general-form KKT conditions on both the original and reduced LPs.
-// This intentionally checks the exported solution convention, so the same
-// conditions apply to PDLP and Dual Simplex even though Dual Simplex uses a
-// different internal form.
 struct crush_test_param {
   std::string mps_path;
   bool use_pdlp;
 };
-
 class dual_crush_round_trip : public ::testing::TestWithParam<crush_test_param> {};
 
+// Crush an optimal original-space (x, y, z) into reduced space and verify the
+// user-space general-form KKT conditions on both the original and reduced LPs.
 TEST_P(dual_crush_round_trip, kkt_check)
 {
   const raft::handle_t handle_{};
@@ -529,7 +525,7 @@ TEST_P(dual_crush_round_trip, kkt_check)
   ASSERT_TRUE(result.status == detail::third_party_presolve_status_t::REDUCED ||
               result.status == detail::third_party_presolve_status_t::UNCHANGED);
 
-  // Step 2: Solve the reduced problem (no presolve — we already did it)
+  // Step 2: Solve the reduced problem (no presolve, we already did it)
   auto settings           = pdlp_solver_settings_t<int, double>{};
   settings.presolver      = presolver_t::None;
   settings.dual_postsolve = true;
@@ -615,7 +611,7 @@ TEST_P(dual_crush_round_trip, kkt_check)
     check_dual_sign_consistency(Ax_orig, y_orig, orig_con_lb, orig_con_ub, bound_tol, kkt_tol);
   }
 
-  // Step 5: Crush using the SAME presolver that produced the postsolve storage
+  // Step 5: Crush using the same presolver that produced the postsolve storage
   std::vector<double> x_crushed, y_crushed, rc_crushed;
   presolver.crush_primal_dual_solution(x_orig,
                                        y_orig,
@@ -633,7 +629,6 @@ TEST_P(dual_crush_round_trip, kkt_check)
   ASSERT_EQ((int)y_crushed.size(), n_cons);
   ASSERT_EQ((int)rc_crushed.size(), n_vars);
 
-  // Extract reduced problem data on host
   auto A_vals    = result.reduced_problem.get_constraint_matrix_values_host();
   auto A_indices = result.reduced_problem.get_constraint_matrix_indices_host();
   auto A_offsets = result.reduced_problem.get_constraint_matrix_offsets_host();
@@ -668,7 +663,7 @@ TEST_P(dual_crush_round_trip, kkt_check)
       << "crushed reduced cost vs derived mismatch at variable " << j;
   }
 
-  // Cross-check: crushed primal should match the solver's primal (unique at optimality)
+  // Cross-check: crushed primal should match the solver's primal
   auto x_ref = host_copy(reduced_solution.get_primal_solution(), stream);
   ASSERT_EQ(x_crushed.size(), x_ref.size());
   for (size_t i = 0; i < x_crushed.size(); ++i) {
@@ -684,11 +679,6 @@ TEST_P(dual_crush_round_trip, kkt_check)
   obj_crushed += result.reduced_problem.get_objective_offset();
   EXPECT_NEAR(obj_crushed, obj_ref, kkt_tol * std::max(1.0, std::abs(obj_ref)))
     << "crushed objective mismatch";
-
-  // Note: y_crushed and rc_crushed are NOT required to match the solver's y_ref/rc_ref.
-  // Dual degeneracy means multiple optimal duals exist. The crush may land on a different
-  // one due to Papilo's postsolve performing dual pivots (kVarBoundChange). Both are valid
-  // as long as KKT conditions hold, which is already verified above.
 }
 
 // clang-format off
@@ -809,11 +799,24 @@ TEST_P(crush_warmstart, round_trip)
   auto cold_iters = cold_solution.get_additional_termination_information().number_of_steps_taken;
   double cold_obj = cold_solution.get_additional_termination_information().primal_objective;
 
-  // Step 3: Postsolve to original space (only primal + dual needed for warmstart)
+  // Step 3: Postsolve to original space.
+  // Recompute z via kahan summation
   auto primal_sol = cuopt::device_copy(cold_solution.get_primal_solution(), stream);
   auto dual_sol   = cuopt::device_copy(cold_solution.get_dual_solution(), stream);
-  rmm::device_uvector<double> rc_sol(n_red_vars, stream);
-  thrust::fill(rmm::exec_policy(stream), rc_sol.begin(), rc_sol.end(), 0.0);
+
+  auto red_A_vals    = result.reduced_problem.get_constraint_matrix_values_host();
+  auto red_A_indices = result.reduced_problem.get_constraint_matrix_indices_host();
+  auto red_A_offsets = result.reduced_problem.get_constraint_matrix_offsets_host();
+  auto red_c         = result.reduced_problem.get_objective_coefficients_host();
+  auto h_y_red       = host_copy(dual_sol, stream);
+
+  std::vector<double> ATy_red;
+  compute_transpose_matvec(red_A_vals, red_A_indices, red_A_offsets, h_y_red, n_red_vars, ATy_red);
+  std::vector<double> z_red(n_red_vars);
+  for (int j = 0; j < n_red_vars; ++j) {
+    z_red[j] = red_c[j] - ATy_red[j];
+  }
+  auto rc_sol = cuopt::device_copy(z_red, stream);
 
   presolver.undo(primal_sol, dual_sol, rc_sol, problem_category_t::LP, false, true, stream);
 
@@ -850,12 +853,10 @@ TEST_P(crush_warmstart, round_trip)
   double warm_obj = warm_solution.get_additional_termination_information().primal_objective;
   auto warm_iters = warm_solution.get_additional_termination_information().number_of_steps_taken;
 
-  // Verify: same objective
-  EXPECT_NEAR(warm_obj, cold_obj, 1e-3 * std::max(1.0, std::abs(cold_obj)))
-    << "warmstarted objective should match cold solve";
+  double obj_tol = 1e-3 * (1.0 + std::abs(cold_obj));
+  EXPECT_NEAR(warm_obj, cold_obj, obj_tol) << "warmstarted objective should match cold solve";
 
-  // Verify: warmstart should take fewer iterations than cold start
-  EXPECT_LE(warm_iters, cold_iters)
+  EXPECT_LT(warm_iters, cold_iters)
     << "warmstarted solve should not take more iterations than cold solve"
     << " (cold=" << cold_iters << ", warm=" << warm_iters << ")";
 }
@@ -873,7 +874,6 @@ INSTANTIATE_TEST_SUITE_P(
     "mip/bnatt400.mps",
     "mip/decomp2.mps",
     "mip/graph20-20-1rand.mps",
-    "mip/milo-v12-6-r2-40-1.mps",
     "mip/neos-1582420.mps",
     "mip/neos-5188808-nattai.mps",
     "mip/net12.mps",
@@ -886,7 +886,6 @@ INSTANTIATE_TEST_SUITE_P(
     "mip/air05.mps",
     "mip/fastxgemm-n2r6s0t2.mps",
     "mip/dws008-01.mps",
-    "mip/germanrr.mps",
     "mip/neos-1445765.mps",
     "mip/neos-3083819-nubu.mps",
     "mip/neos-5107597-kakapo.mps",

@@ -190,20 +190,13 @@ void diversity_manager_t<i_t, f_t>::add_user_given_solutions(
     solution_t<i_t, f_t> sol(*problem_ptr);
     rmm::device_uvector<f_t> init_sol_assignment(*init_sol, sol.handle_ptr->get_stream());
 
-    if (has_papilo && (i_t)init_sol_assignment.size() == papilo_orig_n) {
-      std::vector<f_t> h_original(init_sol_assignment.size());
-      raft::copy(h_original.data(),
-                 init_sol_assignment.data(),
-                 h_original.size(),
-                 sol.handle_ptr->get_stream());
-      sol.handle_ptr->sync_stream();
+    if (has_papilo) {
+      cuopt_assert((i_t)init_sol_assignment.size() == papilo_orig_n,
+                   "Initial solution size mismatch");
+      std::vector<f_t> h_original = host_copy(init_sol_assignment, sol.handle_ptr->get_stream());
       std::vector<f_t> h_crushed;
       problem_ptr->presolve_data.papilo_presolve_ptr->crush_primal_solution(h_original, h_crushed);
-      init_sol_assignment.resize(h_crushed.size(), sol.handle_ptr->get_stream());
-      raft::copy(init_sol_assignment.data(),
-                 h_crushed.data(),
-                 h_crushed.size(),
-                 sol.handle_ptr->get_stream());
+      expand_device_copy(init_sol_assignment, h_crushed, sol.handle_ptr->get_stream());
       CUOPT_LOG_DEBUG("Crushed initial solution %d through Papilo (%d -> %d vars)",
                       sol_idx,
                       papilo_orig_n,

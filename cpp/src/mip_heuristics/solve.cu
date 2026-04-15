@@ -359,7 +359,7 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
     // This may fail if some dual reductions cut off parts of the polytope that the
     // solutions lie in. We thus may hit scenarios where an excellent incumbent is found
     // but is dropped due to these dual reductions, and we lose a good solution.
-    // This is why we still keep the solution around in OG-space
+    // This is why we still keep the solution around in original-space
     // and later extract it at the end of the solve.
     std::atomic<f_t> early_best_objective{std::numeric_limits<f_t>::infinity()};
     f_t early_best_user_obj{std::numeric_limits<f_t>::infinity()};

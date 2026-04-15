@@ -26,7 +26,6 @@ INSTANCES=(
     "enlight11"
     "supportcase22"
     "pk1"
-    # Instances with significant presolve reductions (dual crush round-trip tests)
     "app1-1"
     "bnatt400"
     "bnatt500"
@@ -47,7 +46,6 @@ INSTANCES=(
     "rocI-4-11"
     "traininstance2"
     "traininstance6"
-    # Medium-big instances with significant presolve reductions
     "neos-787933"
     "radiationm18-12-05"
     "momentum1"
