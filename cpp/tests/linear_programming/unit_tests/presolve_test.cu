@@ -120,60 +120,89 @@ static void compute_transpose_matvec(const std::vector<double>& values,
   }
 }
 
-// KKT complementary slackness on variable bounds:
-// reduced cost z_j = c_j - (A^T y)_j must be >= 0 at lower bound,
-// <= 0 at upper bound, and ~0 for interior variables.
-static void check_reduced_cost_consistency(const std::vector<double>& objective,
-                                           const std::vector<double>& ATy,
+// General-form variable-bound KKT for exported solver solutions.
+//
+// We validate the scalar reduced cost z_j directly, with the user-space convention
+//   z = c - A^T y.
+// This is the same convention exposed by both PDLP and Dual Simplex after any
+// internal transformations are undone.
+//
+// Lower-bound multipliers correspond to positive reduced costs, upper-bound
+// multipliers correspond to negative reduced costs. If a side is absent, the
+// corresponding multiplier must be zero.
+static void check_reduced_cost_consistency(const std::vector<double>& reduced_cost,
                                            const std::vector<double>& primal,
                                            const std::vector<double>& var_lb,
                                            const std::vector<double>& var_ub,
                                            double bound_tol,
-                                           double cs_tol)
+                                           double dual_tol)
 {
   constexpr double inf = std::numeric_limits<double>::infinity();
-  assert(objective.size() == primal.size());
-  assert(ATy.size() == primal.size());
+  assert(reduced_cost.size() == primal.size());
+  assert(var_lb.size() == primal.size());
+  assert(var_ub.size() == primal.size());
   for (size_t j = 0; j < primal.size(); ++j) {
-    double z_j = objective[j] - ATy[j];
-    bool at_lb = (var_lb[j] > -inf && std::abs(primal[j] - var_lb[j]) <= bound_tol);
-    bool at_ub = (var_ub[j] < inf && std::abs(primal[j] - var_ub[j]) <= bound_tol);
-    if (at_lb && at_ub) continue;  // fixed variable — reduced cost unconstrained
+    const bool has_lb = var_lb[j] > -inf;
+    const bool has_ub = var_ub[j] < inf;
+    const double z_j  = reduced_cost[j];
 
-    if (at_lb) {
-      ASSERT_GE(z_j, -cs_tol) << "reduced cost violation at variable " << j << " (at lower bound)";
-    } else if (at_ub) {
-      ASSERT_LE(z_j, cs_tol) << "reduced cost violation at variable " << j << " (at upper bound)";
-    } else {
-      ASSERT_NEAR(z_j, 0.0, cs_tol) << "reduced cost should be ~0 for interior variable " << j;
+    // If a side is missing, its multiplier cannot exist.
+    if (!has_lb) {
+      ASSERT_LE(z_j, dual_tol) << "positive reduced cost requires a finite lower bound at variable "
+                               << j;
+    }
+    if (!has_ub) {
+      ASSERT_GE(z_j, -dual_tol)
+        << "negative reduced cost requires a finite upper bound at variable " << j;
+    }
+
+    // If we are strictly away from a bound, the multiplier for that side must vanish.
+    if (has_lb && primal[j] - var_lb[j] > bound_tol) {
+      ASSERT_LE(z_j, dual_tol)
+        << "positive reduced cost requires an active lower bound at variable " << j;
+    }
+    if (has_ub && var_ub[j] - primal[j] > bound_tol) {
+      ASSERT_GE(z_j, -dual_tol)
+        << "negative reduced cost requires an active upper bound at variable " << j;
     }
   }
 }
 
-// KKT complementary slackness on constraint bounds:
-// y_i >= 0 when constraint at lower bound, <= 0 at upper bound, ~0 when inactive.
+// General-form row-bound KKT for exported solver duals.
+//
+// Positive y_i corresponds to the lower row bound, negative y_i to the upper
+// row bound. If a side is absent, the corresponding multiplier must be zero.
 static void check_dual_sign_consistency(const std::vector<double>& Ax,
                                         const std::vector<double>& dual,
                                         const std::vector<double>& con_lb,
                                         const std::vector<double>& con_ub,
                                         double bound_tol,
-                                        double cs_tol)
+                                        double dual_tol)
 {
   constexpr double inf = std::numeric_limits<double>::infinity();
   assert(Ax.size() == dual.size());
+  assert(con_lb.size() == dual.size());
+  assert(con_ub.size() == dual.size());
   for (size_t i = 0; i < dual.size(); ++i) {
-    bool at_lb = (con_lb[i] > -inf && std::abs(Ax[i] - con_lb[i]) <= bound_tol);
-    bool at_ub = (con_ub[i] < inf && std::abs(Ax[i] - con_ub[i]) <= bound_tol);
-    if (at_lb && at_ub) continue;  // equality constraint — dual unconstrained
+    const bool has_lb = con_lb[i] > -inf;
+    const bool has_ub = con_ub[i] < inf;
 
-    if (at_lb) {
-      ASSERT_GE(dual[i], -cs_tol) << "dual sign violation at constraint " << i
-                                  << " (at lower bound)";
-    } else if (at_ub) {
-      ASSERT_LE(dual[i], cs_tol) << "dual sign violation at constraint " << i
-                                 << " (at upper bound)";
-    } else {
-      ASSERT_NEAR(dual[i], 0.0, cs_tol) << "dual should be ~0 for non-active constraint " << i;
+    if (!has_lb) {
+      ASSERT_LE(dual[i], dual_tol)
+        << "positive row dual requires a finite lower bound at constraint " << i;
+    }
+    if (!has_ub) {
+      ASSERT_GE(dual[i], -dual_tol)
+        << "negative row dual requires a finite upper bound at constraint " << i;
+    }
+
+    if (has_lb && Ax[i] - con_lb[i] > bound_tol) {
+      ASSERT_LE(dual[i], dual_tol)
+        << "positive row dual requires an active lower bound at constraint " << i;
+    }
+    if (has_ub && con_ub[i] - Ax[i] > bound_tol) {
+      ASSERT_GE(dual[i], -dual_tol)
+        << "negative row dual requires an active upper bound at constraint " << i;
     }
   }
 }
@@ -461,10 +490,11 @@ TEST(pslp_presolve, postsolve_multiple_problems)
   }
 }
 
-// Crush an optimal original-space (x, y) into reduced space and verify that
-// the result satisfies the KKT conditions of the reduced problem: primal
-// feasibility, dual feasibility (reduced cost definition), and complementary
-// slackness on both variable and constraint bounds.
+// Crush an optimal original-space (x, y, z) into reduced space and verify the
+// user-space general-form KKT conditions on both the original and reduced LPs.
+// This intentionally checks the exported solution convention, so the same
+// conditions apply to PDLP and Dual Simplex even though Dual Simplex uses a
+// different internal form.
 struct crush_test_param {
   std::string mps_path;
   bool use_pdlp;
@@ -580,9 +610,8 @@ TEST_P(dual_crush_round_trip, kkt_check)
     compute_constraint_residuals(orig_A_vals, orig_A_indices, orig_A_offsets, x_orig, Ax_orig);
     check_constraint_satisfaction(Ax_orig, orig_con_lb, orig_con_ub, bound_tol);
 
-    // Complementary slackness
-    check_reduced_cost_consistency(
-      orig_c, ATy_orig, x_orig, orig_var_lb, orig_var_ub, bound_tol, kkt_tol);
+    // Variable- and row-bound KKT in original space
+    check_reduced_cost_consistency(rc_orig, x_orig, orig_var_lb, orig_var_ub, bound_tol, kkt_tol);
     check_dual_sign_consistency(Ax_orig, y_orig, orig_con_lb, orig_con_ub, bound_tol, kkt_tol);
   }
 
@@ -626,10 +655,10 @@ TEST_P(dual_crush_round_trip, kkt_check)
   std::vector<double> ATy;
   compute_transpose_matvec(A_vals, A_indices, A_offsets, y_crushed, n_vars, ATy);
 
-  // Complementary slackness on variable bounds (reduced cost signs)
-  check_reduced_cost_consistency(c_red, ATy, x_crushed, var_lb, var_ub, bound_tol, kkt_tol);
+  // Variable-bound KKT in reduced space
+  check_reduced_cost_consistency(rc_crushed, x_crushed, var_lb, var_ub, bound_tol, kkt_tol);
 
-  // Complementary slackness on constraint bounds (dual variable signs)
+  // Row-bound KKT in reduced space
   check_dual_sign_consistency(Ax, y_crushed, con_lb, con_ub, bound_tol, kkt_tol);
 
   // Crushed reduced costs: consistency with derived z = c - A^T y
