@@ -191,8 +191,15 @@ void diversity_manager_t<i_t, f_t>::add_user_given_solutions(
     rmm::device_uvector<f_t> init_sol_assignment(*init_sol, sol.handle_ptr->get_stream());
 
     if (has_papilo) {
-      cuopt_assert((i_t)init_sol_assignment.size() == papilo_orig_n,
-                   "Initial solution size mismatch");
+      if ((i_t)init_sol_assignment.size() != papilo_orig_n) {
+        CUOPT_LOG_ERROR(
+          "Error cannot add the provided initial solution! Initial solution %zu has %zu vars, "
+          "expected %d; skipping",
+          sol_idx,
+          init_sol_assignment.size(),
+          papilo_orig_n);
+        continue;
+      }
       std::vector<f_t> h_original = host_copy(init_sol_assignment, sol.handle_ptr->get_stream());
       std::vector<f_t> h_crushed;
       problem_ptr->presolve_data.papilo_presolve_ptr->crush_primal_solution(h_original, h_crushed);
@@ -436,9 +443,9 @@ solution_t<i_t, f_t> diversity_manager_t<i_t, f_t>::run_solver()
     CUOPT_LOG_INFO("GPU heuristics disabled via CUOPT_DISABLE_GPU_HEURISTICS=1");
     population.initialize_population();
     population.allocate_solutions();
-    if (check_b_b_preemption()) { return population.best_feasible(); }
     add_user_given_solutions(initial_sol_vector);
     population.add_solutions_from_vec(std::move(initial_sol_vector));
+    if (check_b_b_preemption()) { return population.best_feasible(); }
 
     while (!check_b_b_preemption()) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -469,8 +476,8 @@ solution_t<i_t, f_t> diversity_manager_t<i_t, f_t>::run_solver()
     "The problem must not be ii");
   population.initialize_population();
   population.allocate_solutions();
-  if (check_b_b_preemption()) { return population.best_feasible(); }
   add_user_given_solutions(initial_sol_vector);
+  if (check_b_b_preemption()) { return population.best_feasible(); }
   // Run CPUFJ early to find quick initial solutions
   ls_cpufj_raii_guard_t ls_cpufj_raii_guard(ls);  // RAII to stop cpufj threads on solve stop
   ls.start_cpufj_scratch_threads(population);
