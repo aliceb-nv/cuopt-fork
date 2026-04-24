@@ -196,7 +196,7 @@ void diversity_manager_t<i_t, f_t>::add_user_given_solutions(
       std::vector<f_t> h_original = host_copy(init_sol_assignment, sol.handle_ptr->get_stream());
       std::vector<f_t> h_crushed;
       problem_ptr->presolve_data.papilo_presolve_ptr->crush_primal_solution(h_original, h_crushed);
-      expand_device_copy(init_sol_assignment, h_crushed, sol.handle_ptr->get_stream());
+      init_sol_assignment = cuopt::device_copy(h_crushed, sol.handle_ptr->get_stream());
       CUOPT_LOG_DEBUG("Crushed initial solution %d through Papilo (%d -> %d vars)",
                       sol_idx,
                       papilo_orig_n,
