@@ -1349,6 +1349,8 @@ void problem_t<i_t, f_t>::set_implied_integers(const std::vector<i_t>& implied_i
 template <typename i_t, typename f_t>
 void problem_t<i_t, f_t>::recompute_objective_integrality()
 {
+  using cuopt::linear_programming::detail::is_integer;
+
   objective_is_integral =
     thrust::all_of(handle_ptr->get_thrust_policy(),
                    thrust::make_counting_iterator(0),
@@ -1357,8 +1359,7 @@ void problem_t<i_t, f_t>::recompute_objective_integrality()
                      if (v.objective_coefficients[var_idx] == 0) return true;
                      // Need a tight tolerance for integrality to weed out instances like
                      // neos-827175 with very small objective coefficients
-                     return raft::abs(round(v.objective_coefficients[var_idx]) -
-                                      v.objective_coefficients[var_idx]) <= 1e-9 &&
+                     return is_integer<f_t>(v.objective_coefficients[var_idx], 1e-9) &&
                             ((v.variable_types[var_idx] == var_t::INTEGER) ||
                              (v.var_flags[var_idx] & (i_t)VAR_IMPLIED_INTEGER));
                    });
