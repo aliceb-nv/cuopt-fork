@@ -10,6 +10,7 @@
 #include <branch_and_bound/pseudo_costs.hpp>
 
 #include <cuts/cuts.hpp>
+#include <mip_heuristics/feasibility_jump/cpu_fj_thread.cuh>
 #include <mip_heuristics/presolve/conflict_graph/clique_table.cuh>
 
 #include <dual_simplex/basis_solves.hpp>
@@ -29,6 +30,7 @@
 #include <omp.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -2224,6 +2226,9 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
   f_t last_objective       = root_objective_;
   f_t root_relax_objective = root_objective_;
 
+  constexpr bool enable_root_cut_cpufj       = true;
+  constexpr double root_cut_cpufj_work_units = 0.1;
+
   f_t cut_generation_start_time = tic();
   i_t cut_pool_size             = 0;
   for (i_t cut_pass = 0; cut_pass < settings_.max_cut_passes; cut_pass++) {
@@ -2502,6 +2507,25 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
                          original_lp_.num_rows,
                          original_lp_.num_cols,
                          original_lp_.A.col_start[original_lp_.A.n]);
+  }
+
+  if (enable_root_cut_cpufj && original_lp_.num_rows > original_rows) {
+    std::atomic<bool> root_cut_cpufj_preemption{false};
+    detail::run_fj_cpu_from_host_lp<i_t, f_t>(
+      original_lp_,
+      var_types_,
+      root_relax_soln_.x,
+      settings_,
+      root_cut_cpufj_preemption,
+      f_t{1},
+      1,
+      [this](f_t, const std::vector<f_t>& assignment, double obj) {
+        std::vector<f_t> user_assignment(assignment.begin(),
+                                         assignment.begin() + original_problem_.num_cols);
+        CUOPT_LOG_INFO("Root cut CPUFJ found solution with objective %.16e\n", obj);
+        set_new_solution(user_assignment);
+      },
+      "[RootCut CPUFJ] ");
   }
 
   set_uninitialized_steepest_edge_norms(original_lp_, basic_list, edge_norms_);
