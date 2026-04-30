@@ -158,33 +158,6 @@ class branch_and_bound_t {
   producer_sync_t& get_producer_sync() { return producer_sync_; }
 
  private:
-  enum class root_cut_pass_action_t { CONTINUE, BREAK, RETURN };
-
-  struct root_cut_pass_result_t {
-    root_cut_pass_action_t action{root_cut_pass_action_t::CONTINUE};
-    mip_status_t status{mip_status_t::UNSET};
-  };
-
-  root_cut_pass_result_t run_root_cut_pass(i_t cut_pass,
-                                           mip_solution_t<i_t, f_t>& solution,
-                                           cut_generation_t<i_t, f_t>& cut_generation,
-                                           cut_pool_t<i_t, f_t>& cut_pool,
-                                           variable_bounds_t<i_t, f_t>& variable_bounds,
-                                           basis_update_mpf_t<i_t, f_t>& basis_update,
-                                           simplex_solver_settings_t<i_t, f_t>& lp_settings,
-                                           std::vector<i_t>& basic_list,
-                                           std::vector<i_t>& nonbasic_list,
-                                           std::vector<f_t>& edge_norms,
-                                           std::vector<i_t>& fractional,
-                                           i_t& num_fractional,
-                                           cut_info_t<i_t, f_t>& cut_info,
-                                           const std::vector<f_t>& saved_solution,
-                                           f_t& last_upper_bound,
-                                           f_t& last_objective,
-                                           f_t root_relax_objective,
-                                           i_t original_rows,
-                                           i_t& cut_pool_size);
-
   const user_problem_t<i_t, f_t>& original_problem_;
   const simplex_solver_settings_t<i_t, f_t> settings_;
   const probing_implied_bound_t<i_t, f_t>& probing_implied_bound_;

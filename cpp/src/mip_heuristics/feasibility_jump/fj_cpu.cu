@@ -1770,7 +1770,7 @@ static bool cpufj_solve_loop(fj_cpu_climber_t<i_t, f_t>& fj_cpu,
       fj_cpu.work_units_elapsed += biased_work;
 
       if (fj_cpu.producer_sync != nullptr) { fj_cpu.producer_sync->notify_progress(); }
-      if (fj_cpu.work_units_elapsed.load(std::memory_order_acquire) >= work_unit_limit) { break; }
+      if (fj_cpu.work_units_elapsed >= work_unit_limit) { break; }
     }
 
     cuopt_func_call(sanity_checks(fj_cpu));
@@ -1863,13 +1863,12 @@ std::unique_ptr<fj_cpu_task_t<i_t, f_t>> make_fj_cpu_task_from_host_lp(
   const std::vector<dual_simplex::variable_type_t>& variable_types,
   const std::vector<f_t>& seed_assignment,
   const dual_simplex::simplex_solver_settings_t<i_t, f_t>& settings,
-  std::atomic<bool>& preemption_flag,
   std::function<void(f_t, const std::vector<f_t>&, double)> improvement_callback,
   std::string log_prefix)
 {
-  auto task = std::make_unique<fj_cpu_task_t<i_t, f_t>>();
-  auto fj_cpu =
-    init_fj_cpu_from_host_lp(problem, variable_types, seed_assignment, settings, preemption_flag);
+  auto task   = std::make_unique<fj_cpu_task_t<i_t, f_t>>();
+  auto fj_cpu = init_fj_cpu_from_host_lp(
+    problem, variable_types, seed_assignment, settings, task->preemption_flag);
   fj_cpu->log_prefix           = std::move(log_prefix);
   fj_cpu->improvement_callback = std::move(improvement_callback);
   task->fj_cpu.reset(fj_cpu.release());
@@ -1909,7 +1908,6 @@ template std::unique_ptr<fj_cpu_task_t<int, float>> make_fj_cpu_task_from_host_l
   const std::vector<dual_simplex::variable_type_t>& variable_types,
   const std::vector<float>& seed_assignment,
   const dual_simplex::simplex_solver_settings_t<int, float>& settings,
-  std::atomic<bool>& preemption_flag,
   std::function<void(float, const std::vector<float>&, double)> improvement_callback,
   std::string log_prefix);
 template void run_fj_cpu_task(fj_cpu_task_t<int, float>& task,
@@ -1939,7 +1937,6 @@ template std::unique_ptr<fj_cpu_task_t<int, double>> make_fj_cpu_task_from_host_
   const std::vector<dual_simplex::variable_type_t>& variable_types,
   const std::vector<double>& seed_assignment,
   const dual_simplex::simplex_solver_settings_t<int, double>& settings,
-  std::atomic<bool>& preemption_flag,
   std::function<void(double, const std::vector<double>&, double)> improvement_callback,
   std::string log_prefix);
 template void run_fj_cpu_task(fj_cpu_task_t<int, double>& task,

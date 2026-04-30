@@ -11,7 +11,6 @@
 #include <condition_variable>
 #include <functional>
 #include <limits>
-#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
