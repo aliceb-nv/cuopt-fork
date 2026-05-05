@@ -2230,8 +2230,8 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
   std::unique_ptr<detail::fj_cpu_task_t<i_t, f_t>> root_cut_cpufj_task;
   auto root_cut_cpufj_improvement_callback =
     [this](f_t obj, const std::vector<f_t>& assignment, double) {
-      std::vector<f_t> user_assignment(assignment.begin(),
-                                       assignment.begin() + original_problem_.num_cols);
+      std::vector<f_t> user_assignment;
+      uncrush_primal_solution(original_problem_, original_lp_, assignment, user_assignment);
       settings_.log.debug("Root cut CPUFJ found solution with objective %.16e\n", obj);
       set_new_solution(user_assignment);
     };

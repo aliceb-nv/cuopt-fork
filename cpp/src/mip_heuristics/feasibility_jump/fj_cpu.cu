@@ -1455,6 +1455,7 @@ static std::unique_ptr<fj_cpu_climber_t<i_t, f_t>> init_fj_cpu_from_host_lp(
 
   typename mip_solver_settings_t<i_t, f_t>::tolerances_t tolerances{};
   tolerances.absolute_tolerance    = settings.primal_tol;
+  tolerances.relative_tolerance    = settings.zero_tol;
   tolerances.integrality_tolerance = settings.integer_tol;
   tolerances.absolute_mip_gap      = settings.absolute_mip_gap_tol;
   tolerances.relative_mip_gap      = settings.relative_mip_gap_tol;
