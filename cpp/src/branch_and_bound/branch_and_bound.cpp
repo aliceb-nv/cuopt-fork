@@ -2232,7 +2232,7 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
     [this](f_t obj, const std::vector<f_t>& assignment, double) {
       std::vector<f_t> user_assignment(assignment.begin(),
                                        assignment.begin() + original_problem_.num_cols);
-      CUOPT_LOG_DEBUG("Root cut CPUFJ found solution with objective %.16e\n", obj);
+      settings_.log.debug("Root cut CPUFJ found solution with objective %.16e\n", obj);
       set_new_solution(user_assignment);
     };
   auto stop_root_cut_cpufj = [&]() {
@@ -2294,12 +2294,12 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
       if (cut_generation_time > 1.0) {
         settings_.log.debug("Cut generation time %.2f seconds\n", cut_generation_time);
       }
-
+      // Score the cuts
       f_t score_start_time = tic();
       cut_pool.score_cuts(root_relax_soln_.x);
       f_t score_time = toc(score_start_time);
       if (score_time > 1.0) { settings_.log.debug("Cut scoring time %.2f seconds\n", score_time); }
-
+      // Get the best cuts from the cut pool
       csr_matrix_t<i_t, f_t> cuts_to_add(0, original_lp_.num_cols, 0);
       std::vector<f_t> cut_rhs;
       std::vector<cut_type_t> cut_types;

@@ -1419,6 +1419,7 @@ void finalize_fj_cpu_host_initialization(
   // nnz count
   fj_cpu.cached_mtm_moves.resize(fj_cpu.h_coefficients.size(),
                                  std::make_pair(0, fj_staged_score_t::zero()));
+
   fj_cpu.cached_cstr_bounds.resize(fj_cpu.h_reverse_coefficients.size());
   for (i_t var_idx = 0; var_idx < n_variables; ++var_idx) {
     auto [offset_begin, offset_end] = reverse_range_for_var<i_t, f_t>(fj_cpu, var_idx);
@@ -1888,9 +1889,9 @@ template <typename i_t, typename f_t>
 void stop_fj_cpu_task(fj_cpu_task_t<i_t, f_t>& task)
 {
   if (task.fj_cpu) {
-    auto& fj_cpu = *task.fj_cpu;
-    fj_cpu.preemption_flag.store(true, std::memory_order_release);
-    fj_cpu.halted = true;
+    auto& fj_cpu           = *task.fj_cpu;
+    fj_cpu.preemption_flag = true;
+    fj_cpu.halted          = true;
   }
 }
 
