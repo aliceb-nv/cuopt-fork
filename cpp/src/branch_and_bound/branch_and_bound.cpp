@@ -2235,7 +2235,9 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
   auto root_cut_cpufj_improvement_callback =
     [this](f_t obj, const std::vector<f_t>& assignment, double) {
       std::vector<f_t> user_assignment;
+      mutex_original_lp_.lock();
       uncrush_primal_solution(original_problem_, original_lp_, assignment, user_assignment);
+      mutex_original_lp_.unlock();
       settings_.log.debug("Root cut CPUFJ found solution with objective %.16e\n", obj);
       set_new_solution(user_assignment);
     };
@@ -2257,6 +2259,7 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
   for (i_t cut_pass = 0; cut_pass < settings_.max_cut_passes; cut_pass++) {
     if (num_fractional == 0) {
       set_solution_at_root(solution, cut_info);
+      finish_clique_thread();
       return mip_status_t::OPTIMAL;
     }
 
@@ -2504,6 +2507,7 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
       if (rel_gap < settings_.relative_mip_gap_tol || abs_gap < settings_.absolute_mip_gap_tol) {
         if (num_fractional == 0) { set_solution_at_root(solution, cut_info); }
         set_final_solution(solution, root_objective_);
+        finish_clique_thread();
         return {cut_pass_action_t::RETURN, mip_status_t::OPTIMAL};
       }
 
