@@ -2586,9 +2586,8 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
                                                       "[RootCut CPUFJ] ");
     settings_.log.debug("Root cut CPUFJ final problem build time: %.6f seconds\n",
                         toc(root_cut_cpufj_build_start_time));
-    f_t fj_time_limit = settings_.deterministic
-                          ? f_t(settings_.time_limit - toc(exploration_stats_.start_time))
-                          : f_t{1};
+    f_t remaining_time = f_t(settings_.time_limit - toc(exploration_stats_.start_time));
+    f_t fj_time_limit = settings_.deterministic ? remaining_time : std::min(remaining_time, f_t{1});
     detail::run_fj_cpu_task(*root_cut_cpufj_task, fj_time_limit, 0.5);
     root_cut_cpufj_task.reset();
   }
