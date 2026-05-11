@@ -8,11 +8,8 @@
 #pragma once
 
 #include <atomic>
-#include <condition_variable>
 #include <functional>
 #include <limits>
-#include <mutex>
-#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -126,7 +123,7 @@ struct fj_cpu_climber_t {
 
   // vector<bool> is actually likely beneficial here since we're memory bound
   std::vector<bool> flip_move_computed;
-  ;
+
   // CSR nnz offset -> (delta, score)
   std::vector<std::pair<f_t, fj_staged_score_t>> cached_mtm_moves;
 
@@ -192,6 +189,11 @@ struct fj_cpu_climber_t {
   // TODO atomic ref? c++20
   std::atomic<bool>& preemption_flag;
 };
+
+template <typename i_t, typename f_t>
+void cpufj_solve(fj_cpu_climber_t<i_t, f_t>* fj_cpu,
+                 f_t in_time_limit      = std::numeric_limits<f_t>::infinity(),
+                 double work_unit_limit = std::numeric_limits<double>::infinity());
 
 // Standalone CPUFJ init for running without full fj_t infrastructure (avoids GPU allocations).
 // Used for early CPUFJ during presolve.
