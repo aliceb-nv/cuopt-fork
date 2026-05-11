@@ -1793,10 +1793,7 @@ template <typename i_t, typename f_t>
 void run_fj_cpu_task(fj_cpu_task_t<i_t, f_t>& task, f_t time_limit, double work_unit_limit)
 {
   cuopt_assert(task.fj_cpu != nullptr, "CPUFJ task has no climber");
-  auto& fj_cpu           = *task.fj_cpu;
-  fj_cpu.halted          = false;
-  fj_cpu.preemption_flag = false;
-  cpufj_solve(&fj_cpu, time_limit, work_unit_limit);
+  cpufj_solve(task.fj_cpu.get(), time_limit, work_unit_limit);
 }
 
 template <typename i_t, typename f_t>
