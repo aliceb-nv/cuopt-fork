@@ -1698,7 +1698,7 @@ void cpufj_solve(fj_cpu_climber_t<i_t, f_t>* fj_cpu, f_t in_time_limit, double w
           ? fj_cpu->settings.iteration_limit
           : -1,
         local_mins,
-        fj_cpu->pb_ptr->get_user_obj_from_solver_obj(fj_cpu->h_best_objective),
+        fj_cpu->h_best_objective,
         fj_cpu->violated_constraints.size(),
         fj_cpu->h_objective_weight,
         fj_cpu->max_weight);
