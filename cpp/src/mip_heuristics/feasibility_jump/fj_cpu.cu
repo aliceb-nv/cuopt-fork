@@ -27,7 +27,6 @@
 #include <cmath>
 #include <iomanip>
 #include <mutex>
-#include <numeric>
 #include <random>
 #include <sstream>
 #include <thread>
@@ -47,44 +46,6 @@
 #endif
 
 namespace cuopt::linear_programming::detail {
-
-template <typename f_t>
-static f_t clamp_value(f_t value, f_t lower, f_t upper)
-{
-  return std::min(std::max(value, lower), upper);
-}
-
-template <typename i_t, typename f_t>
-static void rebuild_reverse_matrix(i_t n_variables,
-                                   i_t n_constraints,
-                                   i_t nnz,
-                                   const std::vector<f_t>& coefficients,
-                                   const std::vector<i_t>& variables,
-                                   const std::vector<i_t>& offsets,
-                                   std::vector<f_t>& reverse_coefficients,
-                                   std::vector<i_t>& reverse_constraints,
-                                   std::vector<i_t>& reverse_offsets)
-{
-  reverse_offsets.assign(n_variables + 1, 0);
-  for (i_t row = 0; row < n_constraints; ++row) {
-    for (i_t p = offsets[row]; p < offsets[row + 1]; ++p) {
-      ++reverse_offsets[variables[p] + 1];
-    }
-  }
-  std::partial_sum(reverse_offsets.begin(), reverse_offsets.end(), reverse_offsets.begin());
-
-  reverse_constraints.resize(nnz);
-  reverse_coefficients.resize(nnz);
-  std::vector<i_t> next = reverse_offsets;
-  for (i_t row = 0; row < n_constraints; ++row) {
-    for (i_t p = offsets[row]; p < offsets[row + 1]; ++p) {
-      const i_t col             = variables[p];
-      const i_t dst             = next[col]++;
-      reverse_constraints[dst]  = row;
-      reverse_coefficients[dst] = coefficients[p];
-    }
-  }
-}
 
 template <typename i_t, typename f_t>
 void finalize_fj_cpu_host_initialization(
@@ -1490,25 +1451,18 @@ static std::unique_ptr<fj_cpu_climber_t<i_t, f_t>> init_fj_cpu_from_host_lp(
   }
 
   const i_t nnz = static_cast<i_t>(variables.size());
-  std::vector<f_t> reverse_coefficients;
-  std::vector<i_t> reverse_constraints;
-  std::vector<i_t> reverse_offsets;
-  rebuild_reverse_matrix(n_variables,
-                         n_constraints,
-                         nnz,
-                         coefficients,
-                         variables,
-                         offsets,
-                         reverse_coefficients,
-                         reverse_constraints,
-                         reverse_offsets);
+  dual_simplex::csc_matrix_t<i_t, f_t> reverse_csc(n_constraints, n_variables, nnz);
+  csr_A.to_compressed_col(reverse_csc);
+  std::vector<f_t> reverse_coefficients = std::move(reverse_csc.x);
+  std::vector<i_t> reverse_constraints  = std::move(reverse_csc.i);
+  std::vector<i_t> reverse_offsets      = std::move(reverse_csc.col_start);
 
   std::vector<f_t> projected_seed(n_variables, f_t{0});
   for (i_t j = 0; j < n_variables; ++j) {
     f_t value = j < static_cast<i_t>(seed_assignment.size()) ? seed_assignment[j] : f_t{0};
-    value     = clamp_value(value, problem.lower[j], problem.upper[j]);
+    value     = std::clamp(value, problem.lower[j], problem.upper[j]);
     if (variable_types[j] != dual_simplex::variable_type_t::CONTINUOUS) {
-      value = clamp_value(std::round(value), problem.lower[j], problem.upper[j]);
+      value = std::clamp(std::round(value), problem.lower[j], problem.upper[j]);
     }
     projected_seed[j] = value;
   }
@@ -1634,9 +1588,7 @@ std::unique_ptr<fj_cpu_climber_t<i_t, f_t>> fj_t<i_t, f_t>::create_cpu_climber(
 }
 
 template <typename i_t, typename f_t>
-static bool cpufj_solve(fj_cpu_climber_t<i_t, f_t>& fj_cpu,
-                        f_t in_time_limit,
-                        double work_unit_limit = std::numeric_limits<double>::infinity())
+void cpufj_solve(fj_cpu_climber_t<i_t, f_t>* fj_cpu, f_t in_time_limit, double work_unit_limit)
 {
   i_t local_mins  = 0;
   auto loop_start = std::chrono::high_resolution_clock::now();
@@ -1736,7 +1688,7 @@ static bool cpufj_solve(fj_cpu_climber_t<i_t, f_t>& fj_cpu,
     for (auto cstr_idx : fj_cpu->violated_constraints) {
       fj_cpu->total_violations += fj_cpu->view.excess_score(cstr_idx, fj_cpu->h_lhs[cstr_idx]);
     }
-    if (fj_cpu.iterations % fj_cpu.log_interval == 0) {
+    if (fj_cpu->iterations % fj_cpu->log_interval == 0) {
       CUOPT_LOG_DEBUG(
         "%sCPUFJ iteration: %d/%d, local mins: %d, best_objective: %g, viol: %zu, obj weight %g, "
         "maxw %g",
@@ -1747,9 +1699,9 @@ static bool cpufj_solve(fj_cpu_climber_t<i_t, f_t>& fj_cpu,
           : -1,
         local_mins,
         fj_cpu->pb_ptr->get_user_obj_from_solver_obj(fj_cpu->h_best_objective),
-        fj_cpu.violated_constraints.size(),
-        fj_cpu.h_objective_weight,
-        fj_cpu.max_weight);
+        fj_cpu->violated_constraints.size(),
+        fj_cpu->h_objective_weight,
+        fj_cpu->max_weight);
     }
     // send current solution to callback every 3000 steps for diversity
     if (fj_cpu->iterations % fj_cpu->diversity_callback_interval == 0) {
@@ -1771,8 +1723,8 @@ static bool cpufj_solve(fj_cpu_climber_t<i_t, f_t>& fj_cpu,
       double biased_work   = (loads + stores) * fj_cpu->work_unit_bias / 1e10;
       fj_cpu->work_units_elapsed += biased_work;
 
-      if (fj_cpu.producer_sync != nullptr) { fj_cpu.producer_sync->notify_progress(); }
-      if (fj_cpu.work_units_elapsed >= work_unit_limit) { break; }
+      if (fj_cpu->producer_sync != nullptr) { fj_cpu->producer_sync->notify_progress(); }
+      if (fj_cpu->work_units_elapsed >= work_unit_limit) { break; }
     }
 
     cuopt_func_call(sanity_checks(*fj_cpu));
@@ -1844,7 +1796,7 @@ void run_fj_cpu_task(fj_cpu_task_t<i_t, f_t>& task, f_t time_limit, double work_
   auto& fj_cpu           = *task.fj_cpu;
   fj_cpu.halted          = false;
   fj_cpu.preemption_flag = false;
-  cpufj_solve_loop(fj_cpu, time_limit, work_unit_limit);
+  cpufj_solve(&fj_cpu, time_limit, work_unit_limit);
 }
 
 template <typename i_t, typename f_t>
@@ -1860,7 +1812,9 @@ void stop_fj_cpu_task(fj_cpu_task_t<i_t, f_t>& task)
 #if MIP_INSTANTIATE_FLOAT
 template class fj_t<int, float>;
 template struct fj_cpu_task_t<int, float>;
-template void cpufj_solve(fj_cpu_climber_t<int, float>* fj_cpu, float in_time_limit);
+template void cpufj_solve(fj_cpu_climber_t<int, float>* fj_cpu,
+                          float in_time_limit,
+                          double work_unit_limit);
 template std::unique_ptr<fj_cpu_climber_t<int, float>> init_fj_cpu_standalone(
   problem_t<int, float>& problem,
   solution_t<int, float>& solution,
@@ -1889,7 +1843,9 @@ template void finalize_fj_cpu_host_initialization(
 #if MIP_INSTANTIATE_DOUBLE
 template class fj_t<int, double>;
 template struct fj_cpu_task_t<int, double>;
-template void cpufj_solve(fj_cpu_climber_t<int, double>* fj_cpu, double in_time_limit);
+template void cpufj_solve(fj_cpu_climber_t<int, double>* fj_cpu,
+                          double in_time_limit,
+                          double work_unit_limit);
 template std::unique_ptr<fj_cpu_climber_t<int, double>> init_fj_cpu_standalone(
   problem_t<int, double>& problem,
   solution_t<int, double>& solution,

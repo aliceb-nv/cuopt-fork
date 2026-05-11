@@ -2259,7 +2259,8 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
   for (i_t cut_pass = 0; cut_pass < settings_.max_cut_passes; cut_pass++) {
     if (num_fractional == 0) {
       set_solution_at_root(solution, cut_info);
-      finish_clique_thread();
+      signal_extend_cliques_.store(true, std::memory_order_release);
+#pragma omp taskwait depend(in : *clique_signal)
       return mip_status_t::OPTIMAL;
     }
 
@@ -2294,9 +2295,7 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
         if (settings_.heuristic_preemption_callback != nullptr) {
           settings_.heuristic_preemption_callback();
         }
-        signal_extend_cliques_.store(true, std::memory_order_release);
-#pragma omp taskwait depend(in : *clique_signal)
-        return mip_status_t::INFEASIBLE;
+        return {cut_pass_action_t::RETURN, mip_status_t::INFEASIBLE};
       }
       f_t cut_generation_time = toc(cut_start_time);
       if (cut_generation_time > 1.0) {
@@ -2508,7 +2507,6 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
       if (rel_gap < settings_.relative_mip_gap_tol || abs_gap < settings_.absolute_mip_gap_tol) {
         if (num_fractional == 0) { set_solution_at_root(solution, cut_info); }
         set_final_solution(solution, root_objective_);
-        finish_clique_thread();
         return {cut_pass_action_t::RETURN, mip_status_t::OPTIMAL};
       }
 
@@ -2546,7 +2544,11 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
       }
     }
 
-    if (cut_pass_result.action == cut_pass_action_t::RETURN) { return cut_pass_result.status; }
+    if (cut_pass_result.action == cut_pass_action_t::RETURN) {
+      signal_extend_cliques_.store(true, std::memory_order_release);
+#pragma omp taskwait depend(in : *clique_signal)
+      return cut_pass_result.status;
+    }
     if (cut_pass_result.action == cut_pass_action_t::BREAK) { break; }
 
     if (enable_root_cut_cpufj && !settings_.deterministic && settings_.num_threads >= 2 &&

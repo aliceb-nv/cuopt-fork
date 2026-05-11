@@ -9,7 +9,6 @@
 
 #include <dual_simplex/presolve.hpp>
 #include <dual_simplex/simplex_solver_settings.hpp>
-#include <mip_heuristics/utilities/cpu_worker_thread.cuh>
 
 #include <atomic>
 #include <functional>
@@ -22,27 +21,6 @@ namespace cuopt::linear_programming::detail {
 
 template <typename i_t, typename f_t>
 struct fj_cpu_climber_t;
-
-template <typename i_t, typename f_t>
-class fj_t;
-
-template <typename i_t, typename f_t>
-struct cpu_fj_thread_t : public cpu_worker_thread_base_t<cpu_fj_thread_t<i_t, f_t>> {
-  ~cpu_fj_thread_t();
-
-  void run_worker();
-  void on_terminate();
-  void on_start();
-  bool get_result() { return cpu_fj_solution_found; }
-
-  void stop_cpu_solver();
-
-  std::atomic<bool> cpu_fj_solution_found{false};
-  f_t time_limit{+std::numeric_limits<f_t>::infinity()};
-  double work_unit_limit{std::numeric_limits<double>::infinity()};
-  std::unique_ptr<fj_cpu_climber_t<i_t, f_t>> fj_cpu;
-  fj_t<i_t, f_t>* fj_ptr{nullptr};
-};
 
 template <typename i_t, typename f_t>
 struct fj_cpu_task_t {
