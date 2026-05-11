@@ -2526,22 +2526,18 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
     };
 
     cut_pass_result_t cut_pass_result;
-#pragma omp parallel num_threads(root_cut_cpufj_task ? 2 : 1)
-    {
-#pragma omp single
-      {
-        if (root_cut_cpufj_task) {
+    if (root_cut_cpufj_task) {
 #pragma omp task shared(root_cut_cpufj_task) default(none)
-          detail::run_fj_cpu_task(*root_cut_cpufj_task,
-                                  std::numeric_limits<f_t>::infinity(),
-                                  std::numeric_limits<f_t>::infinity());
-        }
+      detail::run_fj_cpu_task(*root_cut_cpufj_task,
+                              std::numeric_limits<f_t>::infinity(),
+                              std::numeric_limits<f_t>::infinity());
+    }
 
-        cut_pass_result = do_cut_pass();
+    cut_pass_result = do_cut_pass();
 
-        if (root_cut_cpufj_task) { detail::stop_fj_cpu_task(*root_cut_cpufj_task); }
+    if (root_cut_cpufj_task) {
+      detail::stop_fj_cpu_task(*root_cut_cpufj_task);
 #pragma omp taskwait
-      }
     }
 
     if (cut_pass_result.action == cut_pass_action_t::RETURN) {
