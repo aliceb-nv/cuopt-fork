@@ -2543,7 +2543,7 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
 
     cut_pass_result_t cut_pass_result;
     if (root_cut_cpufj_task) {
-#pragma omp task shared(root_cut_cpufj_task) default(none)
+#pragma omp task shared(root_cut_cpufj_task) default(none) depend(out : *root_cut_cpufj_task)
       detail::run_fj_cpu_task(*root_cut_cpufj_task,
                               std::numeric_limits<f_t>::infinity(),
                               std::numeric_limits<f_t>::infinity());
@@ -2570,7 +2570,7 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
 
     if (root_cut_cpufj_task) {
       detail::stop_fj_cpu_task(*root_cut_cpufj_task);
-#pragma omp taskwait
+#pragma omp taskwait depend(in : *root_cut_cpufj_task)
     }
 
     if (cut_pass_result.action == cut_pass_action_t::RETURN) {
