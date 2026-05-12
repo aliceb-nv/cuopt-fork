@@ -269,17 +269,12 @@ class branch_and_bound_t {
               i_t node_int_infeas,
               double work_time = -1);
 
-  // Action requested by a single cut-pass iteration of the root-cut loop.
   enum class cut_pass_action_t { CONTINUE, BREAK, RETURN };
   struct cut_pass_result_t {
     cut_pass_action_t action{cut_pass_action_t::CONTINUE};
     mip_status_t status{mip_status_t::UNSET};
   };
 
-  // Body of one root-cut-loop iteration. Generates cuts, resolves the LP, runs bound
-  // strengthening, and reports back to the caller via cut_pass_result_t. Mutating outputs
-  // (num_fractional, fractional, last_*, cut_pool_size, lp_settings, *_list, etc.) are
-  // passed by reference; read-only inputs are passed by value or const-ref.
   cut_pass_result_t do_cut_pass(i_t cut_pass,
                                 mip_solution_t<i_t, f_t>& solution,
                                 i_t& num_fractional,

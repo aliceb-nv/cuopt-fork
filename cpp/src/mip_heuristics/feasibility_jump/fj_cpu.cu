@@ -1718,8 +1718,9 @@ void cpufj_solve(fj_cpu_climber_t<i_t, f_t>* fj_cpu, f_t in_time_limit, double w
 #endif
 
     if (fj_cpu->iterations % 100 == 0 && fj_cpu->iterations > 0) {
-      // Collect memory statistics
-      auto [loads, stores] = fj_cpu->memory_aggregator.collect();
+      // Collect memory statistics for this window only (collect+flush gives a delta,
+      // not a cumulative total) so work_units grows linearly in algorithm progress.
+      auto [loads, stores] = fj_cpu->memory_aggregator.collect_and_flush();
       double biased_work   = (loads + stores) * fj_cpu->work_unit_bias / 1e10;
       fj_cpu->work_units_elapsed += biased_work;
 

@@ -2510,13 +2510,19 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
   constexpr bool enable_root_cut_cpufj = true;
   std::unique_ptr<detail::fj_cpu_task_t<i_t, f_t>> root_cut_cpufj_task;
   auto root_cut_cpufj_improvement_callback =
-    [this](f_t obj, const std::vector<f_t>& assignment, double) {
+    [this](f_t obj, const std::vector<f_t>& assignment, double work_units) {
       std::vector<f_t> user_assignment;
       mutex_original_lp_.lock();
       uncrush_primal_solution(original_problem_, original_lp_, assignment, user_assignment);
       mutex_original_lp_.unlock();
       settings_.log.debug("Root cut CPUFJ found solution with objective %.16e\n", obj);
-      set_new_solution(user_assignment);
+      // In deterministic mode the solution must be ordered by its work-unit timestamp so
+      // B&B sees incumbents in a reproducible sequence; otherwise apply it immediately.
+      if (settings_.deterministic) {
+        queue_external_solution_deterministic(user_assignment, work_units);
+      } else {
+        set_new_solution(user_assignment);
+      }
     };
   auto stop_root_cut_cpufj = [&]() {
     if (!root_cut_cpufj_task) { return; }
