@@ -3209,6 +3209,19 @@ void branch_and_bound_t<i_t, f_t>::deterministic_sync_callback()
   f_t abs_gap     = compute_user_abs_gap(original_lp_, upper_bound, lower_bound);
   f_t rel_gap     = user_relative_gap(original_lp_, upper_bound, lower_bound);
 
+  // Apply limit-based statuses first so a definitive answer (gap closure or tree exhaustion)
+  // detected in the same callback can override them. Otherwise a long producer wait that
+  // pushes the wall clock past time_limit would clobber a true INFEASIBLE/OPTIMAL conclusion
+  // and the solver would report TIME_LIMIT for an already-solved instance.
+  if (toc(exploration_stats_.start_time) > settings_.time_limit) {
+    deterministic_global_termination_status_ = mip_status_t::TIME_LIMIT;
+  }
+
+  // Stop early if next horizon exceeds work limit
+  if (deterministic_current_horizon_ > settings_.work_limit) {
+    deterministic_global_termination_status_ = mip_status_t::WORK_LIMIT;
+  }
+
   if (abs_gap <= settings_.absolute_mip_gap_tol || rel_gap <= settings_.relative_mip_gap_tol) {
     deterministic_global_termination_status_ = mip_status_t::OPTIMAL;
   }
@@ -3220,15 +3233,6 @@ void branch_and_bound_t<i_t, f_t>::deterministic_sync_callback()
     } else {
       deterministic_global_termination_status_ = mip_status_t::OPTIMAL;
     }
-  }
-
-  if (toc(exploration_stats_.start_time) > settings_.time_limit) {
-    deterministic_global_termination_status_ = mip_status_t::TIME_LIMIT;
-  }
-
-  // Stop early if next horizon exceeds work limit
-  if (deterministic_current_horizon_ > settings_.work_limit) {
-    deterministic_global_termination_status_ = mip_status_t::WORK_LIMIT;
   }
 
   // Signal shutdown to prevent threads from entering barriers after termination
