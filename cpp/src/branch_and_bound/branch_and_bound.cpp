@@ -2609,13 +2609,20 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
 
   if (enable_root_cut_cpufj && cut_info.has_cuts()) {
     f_t root_cut_cpufj_build_start_time = tic();
+    // In deterministic mode this CPUFJ is built on the B&B task while the LS deterministic
+    // CPUFJ is being built on the main thread; both would otherwise race on the global
+    // seed_generator and pick non-reproducible seeds. Pin a stable seed here so this
+    // climber's behavior depends only on settings_.random_seed.
+    int64_t root_cut_cpufj_seed =
+      settings_.deterministic ? static_cast<int64_t>(settings_.random_seed) : -1;
     root_cut_cpufj_task =
       detail::make_fj_cpu_task_from_host_lp<i_t, f_t>(original_lp_,
                                                       var_types_,
                                                       root_relax_soln_.x,
                                                       settings_,
                                                       root_cut_cpufj_improvement_callback,
-                                                      "[RootCut CPUFJ] ");
+                                                      "[RootCut CPUFJ] ",
+                                                      root_cut_cpufj_seed);
     settings_.log.debug("Root cut CPUFJ final problem build time: %.6f seconds\n",
                         toc(root_cut_cpufj_build_start_time));
     f_t remaining_time = f_t(settings_.time_limit - toc(exploration_stats_.start_time));

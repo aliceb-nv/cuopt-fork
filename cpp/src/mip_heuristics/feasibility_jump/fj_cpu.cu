@@ -1407,7 +1407,8 @@ static std::unique_ptr<fj_cpu_climber_t<i_t, f_t>> init_fj_cpu_from_host_lp(
   const std::vector<dual_simplex::variable_type_t>& variable_types,
   const std::vector<f_t>& seed_assignment,
   const dual_simplex::simplex_solver_settings_t<i_t, f_t>& settings,
-  std::atomic<bool>& preemption_flag)
+  std::atomic<bool>& preemption_flag,
+  int64_t seed)
 {
   using f_t2 = typename type_2<f_t>::type;
 
@@ -1474,7 +1475,7 @@ static std::unique_ptr<fj_cpu_climber_t<i_t, f_t>> init_fj_cpu_from_host_lp(
   fj_settings.iteration_limit        = std::numeric_limits<int>::max();
   fj_settings.update_weights         = true;
   fj_settings.feasibility_run        = false;
-  fj_settings.seed                   = cuopt::seed_generator::get_seed();
+  fj_settings.seed                   = seed >= 0 ? seed : cuopt::seed_generator::get_seed();
 
   auto fj_cpu      = std::make_unique<fj_cpu_climber_t<i_t, f_t>>(preemption_flag);
   fj_cpu->view     = typename fj_t<i_t, f_t>::climber_data_t::view_t{};
@@ -1779,11 +1780,12 @@ std::unique_ptr<fj_cpu_task_t<i_t, f_t>> make_fj_cpu_task_from_host_lp(
   const std::vector<f_t>& seed_assignment,
   const dual_simplex::simplex_solver_settings_t<i_t, f_t>& settings,
   std::function<void(f_t, const std::vector<f_t>&, double)> improvement_callback,
-  std::string log_prefix)
+  std::string log_prefix,
+  int64_t seed)
 {
   auto task   = std::make_unique<fj_cpu_task_t<i_t, f_t>>();
   auto fj_cpu = init_fj_cpu_from_host_lp(
-    problem, variable_types, seed_assignment, settings, task->preemption_flag);
+    problem, variable_types, seed_assignment, settings, task->preemption_flag, seed);
   fj_cpu->log_prefix           = std::move(log_prefix);
   fj_cpu->improvement_callback = std::move(improvement_callback);
   task->fj_cpu.reset(fj_cpu.release());
@@ -1824,7 +1826,8 @@ template std::unique_ptr<fj_cpu_task_t<int, float>> make_fj_cpu_task_from_host_l
   const std::vector<float>& seed_assignment,
   const dual_simplex::simplex_solver_settings_t<int, float>& settings,
   std::function<void(float, const std::vector<float>&, double)> improvement_callback,
-  std::string log_prefix);
+  std::string log_prefix,
+  int64_t seed);
 template void run_fj_cpu_task(fj_cpu_task_t<int, float>& task,
                               float time_limit,
                               double work_unit_limit);
@@ -1855,7 +1858,8 @@ template std::unique_ptr<fj_cpu_task_t<int, double>> make_fj_cpu_task_from_host_
   const std::vector<double>& seed_assignment,
   const dual_simplex::simplex_solver_settings_t<int, double>& settings,
   std::function<void(double, const std::vector<double>&, double)> improvement_callback,
-  std::string log_prefix);
+  std::string log_prefix,
+  int64_t seed);
 template void run_fj_cpu_task(fj_cpu_task_t<int, double>& task,
                               double time_limit,
                               double work_unit_limit);
