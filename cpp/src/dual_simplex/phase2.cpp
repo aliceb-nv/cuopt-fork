@@ -39,8 +39,10 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <map>
+#include <string>
 
 namespace cuopt::linear_programming::dual_simplex {
 
@@ -3769,6 +3771,15 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
   // settings.time_limit.
   const f_t start_time = tic();
 
+  // Basis refactorization is optional, gated on an environment variable, so the
+  // driver can run in its most minimal form. Default OFF (env unset or "0"):
+  // behave like the original minimal driver and stop with NUMERICAL once the basis
+  // can no longer be updated safely. Set CUOPT_SIMPLIFIED_REFACTOR=1 to enable it.
+  static const bool refactor_enabled = [] {
+    const char* e = std::getenv("CUOPT_SIMPLIFIED_REFACTOR");
+    return e != nullptr && std::string(e) != "0";
+  }();
+
   std::vector<f_t>& x = sol.x;
   std::vector<f_t>& y = sol.y;
   std::vector<f_t>& z = sol.z;
@@ -3831,6 +3842,16 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
                         iter_limit);
   }
   for (i_t iter = 0; iter < iter_limit; ++iter) {
+    // Wall-clock guard: unbounded MPF stacking makes each solve O(num_updates), so
+    // a non-converging instance can crawl. Respect settings.time_limit (inf by
+    // default, so this is a no-op unless the caller sets a finite limit).
+    if (toc(start_time) > settings.time_limit) {
+      sol.objective      = compute_objective(lp, x);
+      sol.user_objective = compute_user_objective(lp, sol.objective);
+      sol.iterations     = iter;
+      return dual::status_t::TIME_LIMIT;
+    }
+
     // 1. Steepest-edge pricing — picks leaving variable.
     i_t direction     = 0;
     i_t basic_leaving = -1;
@@ -3962,26 +3983,35 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
     basic_mark[leaving]              = -1;
     basic_mark[entering]             = basic_leaving;
 
-    // Middle-product-form rank-1 update. Refactor the basis from scratch when
-    // it has reached the safe number of updates or the update recommends it,
-    // then resynchronize the bookkeeping and primal point and keep iterating
-    // (mirrors dual_phase2_with_advanced_basis).
-    bool should_refactor = ft.num_updates() >= settings.refactor_frequency;
-    if (!should_refactor) {
-      should_refactor = ft.update(utilde_sparse, UTsol_sparse, basic_leaving) == 1;
-    }
-    if (should_refactor) {
-      if (settings.log.log) { settings.log.printf("[MIN]   refactor at iter=%d\n", iter); }
-      const i_t refactor_status = ft.refactor_basis(
-        lp.A, settings, lp.lower, lp.upper, start_time, basic_list, nonbasic_list, vstatus);
-      if (refactor_status != 0) { return dual::status_t::NUMERICAL; }
-      // Basis repair may have changed the lists; rebuild basic_mark and recompute
-      // the primal point from the fresh factorization. Reduced costs y/z stay as
-      // maintained (the basis is unchanged for a healthy refactorization).
-      std::fill(basic_mark.begin(), basic_mark.end(), -1);
-      for (i_t k = 0; k < m; ++k) { basic_mark[basic_list[k]] = k; }
-      phase2::compute_primal_solution_from_basis(
-        lp, ft, basic_list, nonbasic_list, vstatus, x, xB_workspace, work);
+    // Middle-product-form rank-1 update.
+    if (refactor_enabled) {
+      // Refactor the basis from scratch when it has reached the safe number of
+      // updates or the update recommends it, then resynchronize the bookkeeping and
+      // primal point and keep iterating (mirrors dual_phase2_with_advanced_basis).
+      bool should_refactor = ft.num_updates() >= settings.refactor_frequency;
+      if (!should_refactor) {
+        should_refactor = ft.update(utilde_sparse, UTsol_sparse, basic_leaving) == 1;
+      }
+      if (should_refactor) {
+        if (settings.log.log) { settings.log.printf("[MIN]   refactor at iter=%d\n", iter); }
+        const i_t refactor_status = ft.refactor_basis(
+          lp.A, settings, lp.lower, lp.upper, start_time, basic_list, nonbasic_list, vstatus);
+        if (refactor_status != 0) { return dual::status_t::NUMERICAL; }
+        // Basis repair may have changed the lists; rebuild basic_mark and recompute
+        // the primal point from the fresh factorization. Reduced costs y/z stay as
+        // maintained (the basis is unchanged for a healthy refactorization).
+        std::fill(basic_mark.begin(), basic_mark.end(), -1);
+        for (i_t k = 0; k < m; ++k) { basic_mark[basic_list[k]] = k; }
+        phase2::compute_primal_solution_from_basis(
+          lp, ft, basic_list, nonbasic_list, vstatus, x, xB_workspace, work);
+      }
+    } else {
+      // Refactorization disabled (default): stack MPF rank-1 updates with NO
+      // update-count limit. The MPF store grows dynamically; stop only if the
+      // update is numerically unsafe (mu = 1 + vᵀu drifts out of [1e-8, 1e8]).
+      if (ft.update(utilde_sparse, UTsol_sparse, basic_leaving) == 1) {
+        return dual::status_t::NUMERICAL;
+      }
     }
 
     // Rebuild infeasibility tracking from the new basis for next pricing.
