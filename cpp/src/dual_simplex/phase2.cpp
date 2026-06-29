@@ -3746,6 +3746,269 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
   return status;
 }
 
+// Minimal dual simplex driver. Five steps only — sparse triangular solves,
+// simple ratio test, MPF rank-1 basis updates, steepest-edge pricing, SpMv
+// reduced-cost computation. No perturbation, work limits, or recovery. Uses the
+// caller-provided settings (tolerances, refactor_frequency); emits an optional
+// per-iteration trace when settings.log is enabled.
+template <typename i_t, typename f_t>
+dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         // Problem
+                                      const simplex_solver_settings_t<i_t, f_t>& settings,  // Settings
+                                      std::vector<variable_status_t>& vstatus,  // Variable status (basic/nonbasic)
+                                      basis_update_mpf_t<i_t, f_t>& ft, // LU factorization object
+                                      std::vector<i_t>& basic_list, // Basic variables indices
+                                      std::vector<i_t>& nonbasic_list, // Nonbasic variables indices
+                                      lp_solution_t<i_t, f_t>& sol, // Solution
+                                      std::vector<f_t>& delta_y_steepest_edge) // Steepest-edge weights
+{
+  const i_t m = lp.num_rows;
+  const i_t n = lp.num_cols;
+
+  // Reference time for the refactor's internal time-limit check. Passing 0.0
+  // would make toc() measure time since the epoch and spuriously trip a finite
+  // settings.time_limit.
+  const f_t start_time = tic();
+
+  std::vector<f_t>& x = sol.x;
+  std::vector<f_t>& y = sol.y;
+  std::vector<f_t>& z = sol.z;
+
+  f_t work = 0.0;  // sink for helpers that report work; unused.
+  std::vector<f_t> xB_workspace(m);
+
+  // Recompute x for current basis under (possibly new) bounds.
+  phase2::set_primal_variables_on_bounds(lp, settings, z, vstatus, x);
+  phase2::compute_primal_variables(
+    ft, lp.rhs, lp.A, basic_list, nonbasic_list, settings.tight_tol, x, xB_workspace, work);
+
+  // Steepest-edge weights: cold-start from slack basis or accept warm input.
+  if (delta_y_steepest_edge.empty()) {
+    delta_y_steepest_edge.assign(n, 0.0);
+    phase2::initialize_steepest_edge_norms_from_slack_basis(
+      basic_list, nonbasic_list, delta_y_steepest_edge);
+  } else {
+    for (i_t k = 0; k < m; ++k) {
+      const i_t j = basic_list[k];
+      if (delta_y_steepest_edge[j] <= 0.0) { delta_y_steepest_edge[j] = 1e-4; }
+    }
+  }
+
+  // Iteration workspace.
+  std::vector<f_t> delta_y(m, 0.0);
+  std::vector<f_t> delta_z(n, 0.0);
+  std::vector<f_t> delta_x(n, 0.0);
+  std::vector<f_t> v(m, 0.0);
+  const std::vector<f_t> delta_x_flip;  // compute_delta_x takes it but never reads it.
+  std::vector<i_t> basic_mark(n, -1);
+  for (i_t k = 0; k < m; ++k) { basic_mark[basic_list[k]] = k; }
+  std::vector<i_t> delta_z_mark(n, 0);
+  std::vector<i_t> delta_z_indices;
+  delta_z_indices.reserve(n);
+
+  std::vector<f_t> squared_infeas;
+  std::vector<i_t> infeas_idx;
+  f_t primal_inf = 0.0;
+  phase2::compute_initial_primal_infeasibilities(
+    lp, settings, basic_list, x, squared_infeas, infeas_idx, primal_inf);
+
+  sparse_vector_t<i_t, f_t> delta_y_sparse(m, 0);
+  sparse_vector_t<i_t, f_t> UTsol_sparse(m, 0);
+  sparse_vector_t<i_t, f_t> utilde_sparse(m, 0);
+  sparse_vector_t<i_t, f_t> scaled_dxB_sparse(m, 0);
+  sparse_vector_t<i_t, f_t> rhs_sparse(m, 0);
+  sparse_vector_t<i_t, f_t> v_sparse(m, 0);
+
+  // Allow enough iterations for large NETLIB models; the simple ratio test can
+  // need several times the pivots of the advanced driver. Bounded to avoid
+  // runaway looping on degenerate models (no anti-cycling here yet).
+  const i_t iter_limit = std::min<i_t>(500000, std::max<i_t>(20000, 20 * (m + n)));
+  if (settings.log.log) {
+    settings.log.printf("[MIN] start m=%d n=%d p_inf=%.6e refactor_freq=%d iter_limit=%d\n",
+                        m,
+                        n,
+                        primal_inf,
+                        settings.refactor_frequency,
+                        iter_limit);
+  }
+  for (i_t iter = 0; iter < iter_limit; ++iter) {
+    // 1. Steepest-edge pricing — picks leaving variable.
+    i_t direction     = 0;
+    i_t basic_leaving = -1;
+    f_t max_val;
+    const i_t leaving = phase2::steepest_edge_pricing_with_infeasibilities(lp,
+                                                                           settings,
+                                                                           x,
+                                                                           delta_y_steepest_edge,
+                                                                           basic_mark,
+                                                                           squared_infeas,
+                                                                           infeas_idx,
+                                                                           direction,
+                                                                           basic_leaving,
+                                                                           max_val,
+                                                                           work);
+    if (leaving == -1) {
+      sol.objective      = compute_objective(lp, x);
+      sol.user_objective = compute_user_objective(lp, sol.objective);
+      sol.iterations     = iter;
+      if (settings.log.log) {
+        settings.log.printf("[MIN] OPTIMAL iter=%d obj=%.10e\n", iter, sol.objective);
+      }
+      return dual::status_t::OPTIMAL;
+    }
+
+    // 2. BTran (sparse upper/lower triangular solve): B' delta_y = -direction * e_basic_leaving.
+    delta_y_sparse.clear();
+    UTsol_sparse.clear();
+    phase2::compute_delta_y(ft, basic_leaving, direction, delta_y_sparse, UTsol_sparse);
+    const f_t dy_norm_sq = delta_y_sparse.norm2_squared();
+
+    // 3. Reduced-cost SpMv: delta_z_N = -A_N' delta_y.
+    delta_y_sparse.to_dense(delta_y);
+    compute_reduced_cost_update(lp,
+                                basic_list,
+                                nonbasic_list,
+                                delta_y,
+                                leaving,
+                                direction,
+                                delta_z_mark,
+                                delta_z_indices,
+                                delta_z,
+                                work);
+
+    // 4. Simple ratio test — picks entering variable + step length.
+    // TODO(long-step): replace with bound_flipping_ratio_test for fewer iterations.
+    f_t step_length;
+    i_t nonbasic_entering = -1;
+    const i_t entering    = phase2::phase2_ratio_test(
+      lp, settings, vstatus, nonbasic_list, z, delta_z, step_length, nonbasic_entering);
+    if (entering == -1) {
+      if (settings.log.log) {
+        // Diagnose: was the pivot row numerically null (degenerate trap) or a
+        // genuine unbounded ray (real infeasibility)? Scan the reduced-cost
+        // changes over the nonbasic set.
+        f_t max_abs_dz   = 0.0;
+        i_t dz_above_tol = 0;
+        for (i_t kk = 0; kk < static_cast<i_t>(nonbasic_list.size()); ++kk) {
+          const f_t adz = std::abs(delta_z[nonbasic_list[kk]]);
+          if (adz > max_abs_dz) { max_abs_dz = adz; }
+          if (adz > settings.dual_tol) { dz_above_tol++; }
+        }
+        settings.log.printf(
+          "[MIN] DUAL_UNBOUNDED iter=%d leave=%d basic_leave=%d dir=%d leave_x=%.6e "
+          "max|dz|=%.3e dz>dual_tol=%d p_inf=%.6e\n",
+          iter,
+          leaving,
+          basic_leaving,
+          direction,
+          x[leaving],
+          max_abs_dz,
+          dz_above_tol,
+          primal_inf);
+      }
+      return dual::status_t::DUAL_UNBOUNDED;
+    }
+
+    // Update duals: y += step * delta_y; z += step * delta_z.
+    phase2::update_dual_variables(
+      delta_y_sparse, delta_z_indices, delta_z, step_length, leaving, y, z, work);
+
+    // FTran (sparse triangular solve): B delta_x = -A(:, entering).
+    utilde_sparse.clear();
+    scaled_dxB_sparse.clear();
+    rhs_sparse.from_csc_column(lp.A, entering);
+    if (phase2::compute_delta_x(lp,
+                                ft,
+                                entering,
+                                leaving,
+                                basic_leaving,
+                                direction,
+                                basic_list,
+                                delta_x_flip,
+                                rhs_sparse,
+                                delta_z,
+                                x,
+                                utilde_sparse,
+                                scaled_dxB_sparse,
+                                delta_x,
+                                work) == -1) {
+      return dual::status_t::NUMERICAL;
+    }
+
+    // Update steepest-edge weights (rank-1).
+    phase2::update_steepest_edge_norms(settings,
+                                       basic_list,
+                                       ft,
+                                       direction,
+                                       delta_y_sparse,
+                                       dy_norm_sq,
+                                       scaled_dxB_sparse,
+                                       basic_leaving,
+                                       entering,
+                                       v,
+                                       v_sparse,
+                                       delta_y_steepest_edge,
+                                       work);
+
+    // Update primal: x += delta_x.
+    phase2::update_primal_variables(scaled_dxB_sparse, basic_list, delta_x, entering, x, work);
+
+    // 5. Basis swap + MPF rank-1 LU update.
+    vstatus[entering] = variable_status_t::BASIC;
+    vstatus[leaving]  = (lp.lower[leaving] == lp.upper[leaving])
+                         ? variable_status_t::NONBASIC_FIXED
+                         : static_cast<variable_status_t>(-direction);
+    basic_list[basic_leaving]        = entering;
+    nonbasic_list[nonbasic_entering] = leaving;
+    basic_mark[leaving]              = -1;
+    basic_mark[entering]             = basic_leaving;
+
+    // Middle-product-form rank-1 update. Refactor the basis from scratch when
+    // it has reached the safe number of updates or the update recommends it,
+    // then resynchronize the bookkeeping and primal point and keep iterating
+    // (mirrors dual_phase2_with_advanced_basis).
+    bool should_refactor = ft.num_updates() >= settings.refactor_frequency;
+    if (!should_refactor) {
+      should_refactor = ft.update(utilde_sparse, UTsol_sparse, basic_leaving) == 1;
+    }
+    if (should_refactor) {
+      if (settings.log.log) { settings.log.printf("[MIN]   refactor at iter=%d\n", iter); }
+      const i_t refactor_status = ft.refactor_basis(
+        lp.A, settings, lp.lower, lp.upper, start_time, basic_list, nonbasic_list, vstatus);
+      if (refactor_status != 0) { return dual::status_t::NUMERICAL; }
+      // Basis repair may have changed the lists; rebuild basic_mark and recompute
+      // the primal point from the fresh factorization. Reduced costs y/z stay as
+      // maintained (the basis is unchanged for a healthy refactorization).
+      std::fill(basic_mark.begin(), basic_mark.end(), -1);
+      for (i_t k = 0; k < m; ++k) { basic_mark[basic_list[k]] = k; }
+      phase2::compute_primal_solution_from_basis(
+        lp, ft, basic_list, nonbasic_list, vstatus, x, xB_workspace, work);
+    }
+
+    // Rebuild infeasibility tracking from the new basis for next pricing.
+    phase2::compute_initial_primal_infeasibilities(
+      lp, settings, basic_list, x, squared_infeas, infeas_idx, primal_inf);
+    phase2::clear_delta_z(entering, leaving, delta_z_mark, delta_z_indices, delta_z);
+
+    if (settings.log.log) {
+      settings.log.printf(
+        "[MIN] iter=%d leave=%d dir=%d enter=%d step=%.3e obj=%.10e p_inf=%.6e nInf=%d nupd=%d\n",
+        iter,
+        leaving,
+        direction,
+        entering,
+        step_length,
+        compute_objective(lp, x),
+        primal_inf,
+        static_cast<int>(infeas_idx.size()),
+        ft.num_updates());
+    }
+  }
+  sol.objective      = compute_objective(lp, x);
+  sol.user_objective = compute_user_objective(lp, sol.objective);
+  sol.iterations     = iter_limit;
+  return dual::status_t::ITERATION_LIMIT;
+}
+
 #ifdef DUAL_SIMPLEX_INSTANTIATE_DOUBLE
 
 template dual::status_t dual_phase2<int, double>(
@@ -3775,6 +4038,16 @@ template dual::status_t dual_phase2_with_advanced_basis<int, double>(
   int& iter,
   std::vector<double>& steepest_edge_norms,
   work_limit_context_t* work_unit_context);
+
+template dual::status_t simplified_dual_phase2<int, double>(
+  const lp_problem_t<int, double>& lp,
+  const simplex_solver_settings_t<int, double>& settings,
+  std::vector<variable_status_t>& vstatus,
+  basis_update_mpf_t<int, double>& ft,
+  std::vector<int>& basic_list,
+  std::vector<int>& nonbasic_list,
+  lp_solution_t<int, double>& sol,
+  std::vector<double>& delta_y_steepest_edge);
 
 template void compute_reduced_cost_update<int, double>(const lp_problem_t<int, double>& lp,
                                                        const std::vector<int>& basic_list,

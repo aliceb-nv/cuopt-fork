@@ -81,6 +81,21 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
                                                std::vector<f_t>& delta_y_steepest_edge,
                                                work_limit_context_t* work_unit_context = nullptr);
 
+// Minimal dual simplex driver. Assumes the caller provides an LU factorization
+// `ft` matching the basis described by `vstatus`, `basic_list`, `nonbasic_list`.
+// Implements only the 5 essential pieces: sparse triangular solves (BTran/FTran),
+// simple ratio test, middle-product-form rank-1 basis updates, steepest-edge
+// pricing with weight updates, and SpMv-based reduced-cost computation.
+template <typename i_t, typename f_t>
+dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
+                                      const simplex_solver_settings_t<i_t, f_t>& settings,
+                                      std::vector<variable_status_t>& vstatus,
+                                      basis_update_mpf_t<i_t, f_t>& ft,
+                                      std::vector<i_t>& basic_list,
+                                      std::vector<i_t>& nonbasic_list,
+                                      lp_solution_t<i_t, f_t>& sol,
+                                      std::vector<f_t>& delta_y_steepest_edge);
+
 template <typename i_t, typename f_t>
 void compute_reduced_cost_update(const lp_problem_t<i_t, f_t>& lp,
                                  const std::vector<i_t>& basic_list,

@@ -19,6 +19,13 @@
 
 namespace cuopt::linear_programming {
 
+namespace detail {
+
+template <typename i_t, typename f_t>
+class problem_t;
+
+}  // namespace detail
+
 template <typename i_t, typename f_t>
 static dual_simplex::user_problem_t<i_t, f_t> cuopt_problem_to_user_problem(
   raft::handle_t const* handle_ptr, const optimization_problem_interface_t<i_t, f_t>& problem)
