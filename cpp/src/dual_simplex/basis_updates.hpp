@@ -368,6 +368,14 @@ class basis_update_mpf_t {
   const std::vector<i_t>& row_permutation() const { return row_permutation_; }
   const std::vector<i_t>& inverse_row_permutation() const { return inverse_row_permutation_; }
 
+  // Read-only accessors to the initial LU factors and their transposes. Added so
+  // an external GPU port can marshal a freshly-refactored factorization to the
+  // device. Behavior-preserving (no mutation).
+  const csc_matrix_t<i_t, f_t>& L0() const { return L0_; }
+  const csc_matrix_t<i_t, f_t>& U0() const { return U0_; }
+  const csc_matrix_t<i_t, f_t>& L0_transpose() const { return L0_transpose_; }
+  const csc_matrix_t<i_t, f_t>& U0_transpose() const { return U0_transpose_; }
+
   void compute_transposes()
   {
     L0_.transpose(L0_transpose_);

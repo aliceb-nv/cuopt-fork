@@ -40,6 +40,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <map>
 #include <string>
@@ -3780,11 +3781,55 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
     return e != nullptr && std::string(e) != "0";
   }();
 
+  // Optional bound-flipping (long-step) ratio test, gated on CUOPT_SIMPLIFIED_BOUND_FLIP.
+  // Default OFF -> simple ratio test. Reuses the production bound_flipping_ratio_test_t +
+  // flip_bounds + adjust_for_flips; adds one extra FTran per iteration when flips occur.
+  static const bool bound_flip_enabled = [] {
+    const char* e = std::getenv("CUOPT_SIMPLIFIED_BOUND_FLIP");
+    return e != nullptr && std::string(e) != "0";
+  }();
+
+  // Optional cost perturbation, gated on CUOPT_SIMPLIFIED_PERTURB. Default OFF.
+  // Mirrors the full driver: a working objective is shifted so wrong-sign reduced
+  // costs of one-sided variables snap to dual-feasible; the perturbation is removed
+  // (true z recomputed + adopted) once it is no longer needed. Reuses the production
+  // compute_perturbation / amount_of_perturbation / compute_dual_solution_from_basis.
+  static const bool perturb_enabled = [] {
+    const char* e = std::getenv("CUOPT_SIMPLIFIED_PERTURB");
+    return e != nullptr && std::string(e) != "0";
+  }();
+
+  // Optional steepest-edge norm drift safeguard, gated on CUOPT_SIMPLIFIED_SE_RESET.
+  // Default OFF. When a leaving variable is priced using a maintained steepest-edge
+  // norm that has drifted below settings.steepest_edge_ratio of the true norm (the
+  // BTran result), reset the norm and re-price (mirrors the full driver, phase2.cpp).
+  static const bool se_reset_enabled = [] {
+    const char* e = std::getenv("CUOPT_SIMPLIFIED_SE_RESET");
+    return e != nullptr && std::string(e) != "0";
+  }();
+
+  // The following three alignments with the full driver are ALWAYS ON (no longer
+  // env-gated): they are required for the minimal driver to match the full dual-simplex
+  // phase 2 on the degenerate NETLIB instances (woodw, pilot, pilot87).
+  //   (1) Transpose delta_z: compute delta_z_N = -A_N' delta_y row-wise on a CSR copy
+  //       (Arow) + maintained per-row nonbasic partition (nonbasic_end), falling back to
+  //       the dense column-wise path when delta_y is dense (>30%). Mirrors the full driver.
+  //   (2) Work-amortized refactor trigger: (num_updates > freq && solve_work > refactor_work)
+  //       || (num_updates > 10*freq), instead of the count-based num_updates >= freq.
+  //   (3) Exact steepest-edge init: initialize_steepest_edge_norms (m B^-T solves on ft)
+  //       on a cold start, instead of the crude slack-basis init — also aligns the ft
+  //       solve-statistics that drive the hypersparse-vs-dense path.
+
   std::vector<f_t>& x = sol.x;
   std::vector<f_t>& y = sol.y;
   std::vector<f_t>& z = sol.z;
 
   f_t work = 0.0;  // sink for helpers that report work; unused.
+  // Work-amortized refactor accounting (alignment 2). Mirrors the full driver: solve_work
+  // accumulates ft solve work since the last refactor; refactor_work is the ft work of the
+  // last refactor. Both reset/refresh at each refactor.
+  f_t solve_work    = 0.0;
+  f_t refactor_work = 0.0;
   std::vector<f_t> xB_workspace(m);
 
   // Recompute x for current basis under (possibly new) bounds.
@@ -3792,11 +3837,14 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
   phase2::compute_primal_variables(
     ft, lp.rhs, lp.A, basic_list, nonbasic_list, settings.tight_tol, x, xB_workspace, work);
 
-  // Steepest-edge weights: cold-start from slack basis or accept warm input.
+  // Steepest-edge weights (alignment 3): on a cold start, use the full driver's exact
+  // mechanism — exact norms via m B^-T solves on ft, which also seeds the ft
+  // solve-statistics identically (so the hypersparse-vs-dense path matches). Accept warm
+  // input if provided.
   if (delta_y_steepest_edge.empty()) {
-    delta_y_steepest_edge.assign(n, 0.0);
-    phase2::initialize_steepest_edge_norms_from_slack_basis(
-      basic_list, nonbasic_list, delta_y_steepest_edge);
+    delta_y_steepest_edge.assign(n, -1.0);
+    phase2::initialize_steepest_edge_norms(
+      lp, settings, start_time, basic_list, ft, delta_y_steepest_edge, work);
   } else {
     for (i_t k = 0; k < m; ++k) {
       const i_t j = basic_list[k];
@@ -3809,12 +3857,38 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
   std::vector<f_t> delta_z(n, 0.0);
   std::vector<f_t> delta_x(n, 0.0);
   std::vector<f_t> v(m, 0.0);
-  const std::vector<f_t> delta_x_flip;  // compute_delta_x takes it but never reads it.
+  std::vector<f_t> delta_x_flip(n, 0.0);  // bound-flip primal deltas (read by compute_delta_x only nominally)
   std::vector<i_t> basic_mark(n, -1);
   for (i_t k = 0; k < m; ++k) { basic_mark[basic_list[k]] = k; }
   std::vector<i_t> delta_z_mark(n, 0);
   std::vector<i_t> delta_z_indices;
   delta_z_indices.reserve(n);
+
+  // Transpose delta_z state (alignment 1): Arow is a CSR copy of A; nonbasic_end[i]
+  // partitions row i so the nonbasic-variable coefficients occupy
+  // Arow.row_start[i] .. nonbasic_end[i]; row_mark is scratch for the per-pivot partition
+  // update (update_Arow). compute_initial_nonbasic_end needs basic_mark, built above.
+  csr_matrix_t<i_t, f_t> Arow(1, 1, 0);
+  std::vector<i_t> nonbasic_end(m);
+  std::vector<i_t> row_mark;
+  lp.A.to_compressed_row(Arow);
+  row_mark.reserve(m);
+  compute_initial_nonbasic_end(basic_mark, Arow, nonbasic_end);
+
+  // Bound-flipping ratio test state (used only when bound_flip_enabled).
+  std::vector<uint8_t> bounded_variables(n, 0);
+  phase2::compute_bounded_info(lp.lower, lp.upper, bounded_variables);
+  std::vector<i_t> nonbasic_mark(n, -1);
+  for (i_t k = 0; k < n - m; ++k) { nonbasic_mark[nonbasic_list[k]] = k; }
+  std::vector<f_t> atilde(m, 0.0);
+  std::vector<i_t> atilde_mark(m, 0);
+  std::vector<i_t> atilde_index;
+  sparse_vector_t<i_t, f_t> atilde_sparse(m, 0);
+  sparse_vector_t<i_t, f_t> delta_xB_0_sparse(m, 0);
+
+  // Perturbation working objective (shifted copy of lp.objective; used only when
+  // perturb_enabled). amount_of_perturbation(lp, objective) measures the shift.
+  std::vector<f_t> objective = lp.objective;
 
   std::vector<f_t> squared_infeas;
   std::vector<i_t> infeas_idx;
@@ -3832,7 +3906,21 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
   // Allow enough iterations for large NETLIB models; the simple ratio test can
   // need several times the pivots of the advanced driver. Bounded to avoid
   // runaway looping on degenerate models (no anti-cycling here yet).
-  const i_t iter_limit = std::min<i_t>(500000, std::max<i_t>(20000, 20 * (m + n)));
+  i_t iter_limit = std::min<i_t>(500000, std::max<i_t>(20000, 20 * (m + n)));
+  // Optional fixed iteration cap (CUOPT_SIMPLIFIED_ITER_LIMIT) so the CPU and GPU
+  // drivers run the same number of steps from the same basis for bitwise comparison.
+  static const i_t iter_limit_override = [] {
+    const char* e = std::getenv("CUOPT_SIMPLIFIED_ITER_LIMIT");
+    return (e != nullptr) ? std::atoi(e) : 0;
+  }();
+  if (iter_limit_override > 0) { iter_limit = iter_limit_override; }
+  // Reinterpret a double as its raw 64-bit pattern, so per-step traces can be
+  // diffed bitwise against the GPU port without float-formatting ambiguity.
+  auto dbits = [](f_t v) {
+    unsigned long long u;
+    std::memcpy(&u, &v, sizeof(u));
+    return u;
+  };
   if (settings.log.log) {
     settings.log.printf("[MIN] start m=%d n=%d p_inf=%.6e refactor_freq=%d iter_limit=%d\n",
                         m,
@@ -3840,6 +3928,8 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
                         primal_inf,
                         settings.refactor_frequency,
                         iter_limit);
+    std::printf(
+      "[CMP] start m=%d n=%d p_inf=%016llx iter_limit=%d\n", m, n, dbits(primal_inf), iter_limit);
   }
   for (i_t iter = 0; iter < iter_limit; ++iter) {
     // Wall-clock guard: unbounded MPF stacking makes each solve O(num_updates), so
@@ -3850,6 +3940,29 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
       sol.user_objective = compute_user_objective(lp, sol.objective);
       sol.iterations     = iter;
       return dual::status_t::TIME_LIMIT;
+    }
+
+    // Objective cutoff (dual bound). With a dual-feasible basis the current
+    // objective c'x is a valid lower bound on the primal optimum and is
+    // monotonically non-decreasing across dual-simplex iterations, so once it
+    // reaches settings.cut_off this node can no longer beat the incumbent and we
+    // stop early (mirrors the advanced driver at phase2.cpp, `obj >= cut_off`).
+    // Gated on a finite cutoff so the common no-cutoff path (cut_off = +inf, the
+    // default) skips the O(n) objective evaluation entirely.
+    if (std::isfinite(settings.cut_off)) {
+      const f_t cutoff_obj = compute_objective(lp, x);
+      if (cutoff_obj >= settings.cut_off) {
+        sol.objective      = cutoff_obj;
+        sol.user_objective = compute_user_objective(lp, cutoff_obj);
+        sol.iterations     = iter;
+        if (settings.log.log) {
+          settings.log.printf("[MIN] CUTOFF iter=%d obj=%.10e cut_off=%.10e\n",
+                              iter,
+                              cutoff_obj,
+                              settings.cut_off);
+        }
+        return dual::status_t::CUTOFF;
+      }
     }
 
     // 1. Steepest-edge pricing — picks leaving variable.
@@ -3868,6 +3981,23 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
                                                                            max_val,
                                                                            work);
     if (leaving == -1) {
+      // Primal feasible -> optimal for the (possibly perturbed) objective. If we
+      // perturbed, recompute the true reduced costs; adopt them if they are dual
+      // feasible (so sol.z is the unperturbed optimum).
+      if (perturb_enabled && phase2::amount_of_perturbation(lp, objective) > 0.0) {
+        std::vector<f_t> uy(m), uz(n);
+        phase2::compute_dual_solution_from_basis(lp, ft, basic_list, nonbasic_list, uy, uz, work);
+        if (phase2::dual_infeasibility(
+              lp, settings, vstatus, uz, settings.tight_tol, settings.dual_tol) <=
+            settings.dual_tol) {
+          z         = uz;
+          y         = uy;
+          objective = lp.objective;
+          if (settings.log.log) {
+            settings.log.printf("[MIN] removed perturbation at OPTIMAL iter=%d\n", iter);
+          }
+        }
+      }
       sol.objective      = compute_objective(lp, x);
       sol.user_objective = compute_user_objective(lp, sol.objective);
       sol.iterations     = iter;
@@ -3880,29 +4010,123 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
     // 2. BTran (sparse upper/lower triangular solve): B' delta_y = -direction * e_basic_leaving.
     delta_y_sparse.clear();
     UTsol_sparse.clear();
+    const f_t btran_start_work = ft.work_estimate();
     phase2::compute_delta_y(ft, basic_leaving, direction, delta_y_sparse, UTsol_sparse);
+    solve_work += ft.work_estimate() - btran_start_work;
     const f_t dy_norm_sq = delta_y_sparse.norm2_squared();
 
-    // 3. Reduced-cost SpMv: delta_z_N = -A_N' delta_y.
-    delta_y_sparse.to_dense(delta_y);
-    compute_reduced_cost_update(lp,
-                                basic_list,
-                                nonbasic_list,
-                                delta_y,
-                                leaving,
-                                direction,
-                                delta_z_mark,
-                                delta_z_indices,
-                                delta_z,
-                                work);
+    // Steepest-edge norm drift safeguard: dy_norm_sq is the true norm of the leaving
+    // row. If the maintained norm used for pricing has drifted below
+    // settings.steepest_edge_ratio of it, the leaving choice was made on a stale
+    // norm -- reset it and re-price (mirrors the full driver, phase2.cpp:3020).
+    if (se_reset_enabled &&
+        delta_y_steepest_edge[leaving] < settings.steepest_edge_ratio * dy_norm_sq) {
+      delta_y_steepest_edge[leaving] = dy_norm_sq;
+      continue;
+    }
 
-    // 4. Simple ratio test — picks entering variable + step length.
-    // TODO(long-step): replace with bound_flipping_ratio_test for fewer iterations.
-    f_t step_length;
+    // 3. Reduced-cost SpMv: delta_z_N = -A_N' delta_y. When delta_y is sparse (<=30%
+    //    dense), compute it row-wise on the CSR copy, iterating only the nonzero delta_y
+    //    rows (cheap when delta_y is sparse); otherwise dense column-wise. Mirrors the
+    //    full driver (phase2.cpp:~3045).
+    i_t delta_y_nz0            = 0;
+    const i_t nz_delta_y       = static_cast<i_t>(delta_y_sparse.i.size());
+    for (i_t k = 0; k < nz_delta_y; ++k) {
+      if (std::abs(delta_y_sparse.x[k]) > 1e-12) { delta_y_nz0++; }
+    }
+    const f_t delta_y_nz_percentage = delta_y_nz0 / static_cast<f_t>(m) * 100.0;
+    const bool used_transpose_dz    = delta_y_nz_percentage <= 30.0;
+    if (used_transpose_dz) {
+      compute_delta_z(Arow,
+                      delta_y_sparse,
+                      leaving,
+                      direction,
+                      nonbasic_end,
+                      delta_z_mark,
+                      delta_z_indices,
+                      delta_z,
+                      work);
+    } else {
+      delta_y_sparse.to_dense(delta_y);
+      compute_reduced_cost_update(lp,
+                                  basic_list,
+                                  nonbasic_list,
+                                  delta_y,
+                                  leaving,
+                                  direction,
+                                  delta_z_mark,
+                                  delta_z_indices,
+                                  delta_z,
+                                  work);
+    }
+
+    // 4. Ratio test — picks entering variable + step length. Simple by default;
+    //    bound-flipping (long-step) when CUOPT_SIMPLIFIED_BOUND_FLIP=1.
+    f_t step_length       = 0.0;
     i_t nonbasic_entering = -1;
-    const i_t entering    = phase2::phase2_ratio_test(
-      lp, settings, vstatus, nonbasic_list, z, delta_z, step_length, nonbasic_entering);
+    i_t entering;
+    if (bound_flip_enabled) {
+      const f_t slope = direction == 1 ? (lp.lower[leaving] - x[leaving])
+                                       : (x[leaving] - lp.upper[leaving]);
+      bound_flipping_ratio_test_t<i_t, f_t> bfrt(settings,
+                                                 start_time,
+                                                 m,
+                                                 n,
+                                                 slope,
+                                                 lp.lower,
+                                                 lp.upper,
+                                                 bounded_variables,
+                                                 vstatus,
+                                                 nonbasic_list,
+                                                 z,
+                                                 delta_z,
+                                                 delta_z_indices,
+                                                 nonbasic_mark);
+      entering = bfrt.compute_step_length(step_length, nonbasic_entering);
+      if (entering == RATIO_TEST_TIME_LIMIT) {
+        sol.objective      = compute_objective(lp, x);
+        sol.user_objective = compute_user_objective(lp, sol.objective);
+        sol.iterations     = iter;
+        return dual::status_t::TIME_LIMIT;
+      }
+      if (entering == RATIO_TEST_NUMERICAL_ISSUES || entering == RATIO_TEST_CONCURRENT_LIMIT) {
+        return dual::status_t::NUMERICAL;
+      }
+    } else {
+      entering = phase2::phase2_ratio_test(
+        lp, settings, vstatus, nonbasic_list, z, delta_z, step_length, nonbasic_entering);
+    }
     if (entering == -1) {
+      // Would-be DUAL_UNBOUNDED. If we perturbed, the unboundedness may be an
+      // artifact of the perturbed objective: recompute the true reduced costs and,
+      // if they are dual feasible, drop the perturbation and keep iterating on the
+      // true objective (mirrors the full driver's remove-and-continue).
+      if (perturb_enabled) {
+        const f_t perturbation = phase2::amount_of_perturbation(lp, objective);
+        if (perturbation > 0.0) {
+          std::vector<f_t> uy(m), uz(n);
+          phase2::compute_dual_solution_from_basis(lp, ft, basic_list, nonbasic_list, uy, uz, work);
+          const f_t dinf = phase2::dual_infeasibility(
+            lp, settings, vstatus, uz, settings.tight_tol, settings.dual_tol);
+          if (dinf <= settings.dual_tol) {
+            if (settings.log.log) {
+              settings.log.printf(
+                "[MIN] removed perturbation %.3e at iter=%d (was DUAL_UNBOUNDED)\n",
+                perturbation,
+                iter);
+            }
+            z         = uz;
+            y         = uy;
+            objective = lp.objective;
+            phase2::compute_primal_solution_from_basis(
+              lp, ft, basic_list, nonbasic_list, vstatus, x, xB_workspace, work);
+            phase2::compute_initial_primal_infeasibilities(
+              lp, settings, basic_list, x, squared_infeas, infeas_idx, primal_inf);
+            phase2::clear_delta_z(entering, leaving, delta_z_mark, delta_z_indices, delta_z);
+            continue;
+          }
+        }
+      }
       if (settings.log.log) {
         // Diagnose: was the pivot row numerically null (degenerate trap) or a
         // genuine unbounded ray (real infeasibility)? Scan the reduced-cost
@@ -3933,29 +4157,65 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
     phase2::update_dual_variables(
       delta_y_sparse, delta_z_indices, delta_z, step_length, leaving, y, z, work);
 
+    // Bound-flipping: flip the boxed nonbasic variables the long step stepped over
+    // (their z is now infeasible) to their other bound, then correct the basic primal
+    // with one extra FTran. No-op when bound_flip_enabled is false.
+    if (bound_flip_enabled) {
+      const i_t num_flipped = phase2::flip_bounds(lp,
+                                                  settings,
+                                                  bounded_variables,
+                                                  lp.objective,
+                                                  z,
+                                                  delta_z_indices,
+                                                  nonbasic_list,
+                                                  entering,
+                                                  vstatus,
+                                                  delta_x_flip,
+                                                  atilde_mark,
+                                                  atilde,
+                                                  atilde_index,
+                                                  work);
+      delta_xB_0_sparse.clear();
+      if (num_flipped > 0) {
+        phase2::adjust_for_flips(ft,
+                                 basic_list,
+                                 delta_z_indices,
+                                 atilde_index,
+                                 atilde,
+                                 atilde_mark,
+                                 atilde_sparse,
+                                 delta_xB_0_sparse,
+                                 delta_x_flip,
+                                 x,
+                                 work);
+      }
+    }
+
     // FTran (sparse triangular solve): B delta_x = -A(:, entering).
     utilde_sparse.clear();
     scaled_dxB_sparse.clear();
     rhs_sparse.from_csc_column(lp.A, entering);
-    if (phase2::compute_delta_x(lp,
-                                ft,
-                                entering,
-                                leaving,
-                                basic_leaving,
-                                direction,
-                                basic_list,
-                                delta_x_flip,
-                                rhs_sparse,
-                                delta_z,
-                                x,
-                                utilde_sparse,
-                                scaled_dxB_sparse,
-                                delta_x,
-                                work) == -1) {
-      return dual::status_t::NUMERICAL;
-    }
+    const f_t ftran_start_work = ft.work_estimate();
+    const i_t delta_x_status   = phase2::compute_delta_x(lp,
+                                                       ft,
+                                                       entering,
+                                                       leaving,
+                                                       basic_leaving,
+                                                       direction,
+                                                       basic_list,
+                                                       delta_x_flip,
+                                                       rhs_sparse,
+                                                       delta_z,
+                                                       x,
+                                                       utilde_sparse,
+                                                       scaled_dxB_sparse,
+                                                       delta_x,
+                                                       work);
+    solve_work += ft.work_estimate() - ftran_start_work;
+    if (delta_x_status == -1) { return dual::status_t::NUMERICAL; }
 
     // Update steepest-edge weights (rank-1).
+    const f_t se_norms_start_work = ft.work_estimate();
     phase2::update_steepest_edge_norms(settings,
                                        basic_list,
                                        ft,
@@ -3969,6 +4229,7 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
                                        v_sparse,
                                        delta_y_steepest_edge,
                                        work);
+    solve_work += ft.work_estimate() - se_norms_start_work;
 
     // Update primal: x += delta_x.
     phase2::update_primal_variables(scaled_dxB_sparse, basic_list, delta_x, entering, x, work);
@@ -3982,26 +4243,47 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
     nonbasic_list[nonbasic_entering] = leaving;
     basic_mark[leaving]              = -1;
     basic_mark[entering]             = basic_leaving;
+    if (bound_flip_enabled) {
+      nonbasic_mark[entering] = -1;                 // entering leaves the nonbasic set
+      nonbasic_mark[leaving]  = nonbasic_entering;  // leaving takes its slot in nonbasic_list
+    }
+
+    // Keep the CSR nonbasic partition in sync with the new basis (entering became
+    // basic, leaving became nonbasic) for the next iteration's transpose delta_z.
+    // (A subsequent refactor rebuilds it.)
+    update_Arow(leaving, entering, lp.A, row_mark, nonbasic_end, Arow, work);
 
     // Middle-product-form rank-1 update.
     if (refactor_enabled) {
-      // Refactor the basis from scratch when it has reached the safe number of
-      // updates or the update recommends it, then resynchronize the bookkeeping and
-      // primal point and keep iterating (mirrors dual_phase2_with_advanced_basis).
-      bool should_refactor = ft.num_updates() >= settings.refactor_frequency;
+      // Refactor the basis from scratch when the work-amortized trigger fires (matching
+      // the full driver) or the update recommends it, then resynchronize the bookkeeping
+      // and primal point and keep iterating (mirrors dual_phase2_with_advanced_basis).
+      bool should_refactor =
+        (ft.num_updates() > settings.refactor_frequency && solve_work > refactor_work) ||
+        (ft.num_updates() > 10 * settings.refactor_frequency);
       if (!should_refactor) {
         should_refactor = ft.update(utilde_sparse, UTsol_sparse, basic_leaving) == 1;
       }
       if (should_refactor) {
         if (settings.log.log) { settings.log.printf("[MIN]   refactor at iter=%d\n", iter); }
-        const i_t refactor_status = ft.refactor_basis(
+        const f_t refactor_start_work = ft.work_estimate();
+        const i_t refactor_status     = ft.refactor_basis(
           lp.A, settings, lp.lower, lp.upper, start_time, basic_list, nonbasic_list, vstatus);
+        refactor_work = ft.work_estimate() - refactor_start_work;
+        solve_work    = 0.0;
         if (refactor_status != 0) { return dual::status_t::NUMERICAL; }
         // Basis repair may have changed the lists; rebuild basic_mark and recompute
         // the primal point from the fresh factorization. Reduced costs y/z stay as
         // maintained (the basis is unchanged for a healthy refactorization).
         std::fill(basic_mark.begin(), basic_mark.end(), -1);
         for (i_t k = 0; k < m; ++k) { basic_mark[basic_list[k]] = k; }
+        if (bound_flip_enabled) {
+          std::fill(nonbasic_mark.begin(), nonbasic_mark.end(), -1);
+          for (i_t k = 0; k < n - m; ++k) { nonbasic_mark[nonbasic_list[k]] = k; }
+        }
+        // Basis repair may have reordered the lists; rebuild the CSR nonbasic
+        // partition from scratch for the new basis.
+        compute_initial_nonbasic_end(basic_mark, Arow, nonbasic_end);
         phase2::compute_primal_solution_from_basis(
           lp, ft, basic_list, nonbasic_list, vstatus, x, xB_workspace, work);
       }
@@ -4011,6 +4293,17 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
       // update is numerically unsafe (mu = 1 + vᵀu drifts out of [1e-8, 1e8]).
       if (ft.update(utilde_sparse, UTsol_sparse, basic_leaving) == 1) {
         return dual::status_t::NUMERICAL;
+      }
+    }
+
+    // Perturbation: snap wrong-sign reduced costs of one-sided nonbasic variables to
+    // dual feasibility, accumulating the shift in the working objective. (Boxed
+    // variables are handled by bound flipping; these two are complementary.)
+    if (perturb_enabled) {
+      f_t sum_perturb = 0.0;
+      phase2::compute_perturbation(lp, settings, delta_z_indices, z, objective, sum_perturb, work);
+      if (settings.log.log && sum_perturb > 0.0) {
+        settings.log.printf("[MIN] perturbed %.3e at iter=%d\n", sum_perturb, iter);
       }
     }
 
@@ -4029,6 +4322,18 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
         step_length,
         compute_objective(lp, x),
         primal_inf,
+        static_cast<int>(infeas_idx.size()),
+        ft.num_updates());
+      std::printf(
+        "[CMP] iter=%d leave=%d dir=%d enter=%d step=%016llx obj=%016llx p_inf=%016llx nInf=%d "
+        "nupd=%d\n",
+        iter,
+        leaving,
+        direction,
+        entering,
+        dbits(step_length),
+        dbits(compute_objective(lp, x)),
+        dbits(primal_inf),
         static_cast<int>(infeas_idx.size()),
         ft.num_updates());
     }
