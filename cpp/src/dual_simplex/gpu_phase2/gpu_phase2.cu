@@ -1156,7 +1156,8 @@ struct gpu_lp {
 };
 
 struct gpu_settings {
-  f_t primal_tol, dual_tol, pivot_tol, tight_tol, fixed_tol, zero_tol, time_limit;
+  f_t primal_tol, dual_tol, pivot_tol, tight_tol, fixed_tol, zero_tol, time_limit, cut_off,
+    steepest_edge_ratio;
   i_t refactor_frequency;
 };
 
@@ -1183,6 +1184,27 @@ __device__ f_t compute_objective(const gpu_lp& problem, const f_t* x)
 __device__ f_t compute_user_objective(const gpu_lp& lp, f_t obj)
 {
   return lp.obj_scale * (obj + lp.obj_constant);
+}
+
+// Incremental objective update (strict port of phase2::update_objective, phase2.cpp:1864):
+// obj += delta_x·objective over the changed basics + the entering variable. Called with the
+// OLD basic_list (before the basis swap) and — like the advanced/CPU-simplified driver —
+// WITHOUT the bound-flip contribution. changed_basic_indices == scaled_dxB_sparse (its .i are
+// the changed positions in basic_list). O(nnz), not O(n).
+__device__ void update_objective(const i_t* basic_list,
+                                 const gpu_sparse_vector& changed_basic_indices,
+                                 const gpu_span<f_t>& objective,
+                                 const f_t* delta_x,
+                                 i_t entering_index,
+                                 f_t& obj)
+{
+  const i_t changed_basic_nz = (i_t)changed_basic_indices.i.size();
+  for (i_t k = 0; k < changed_basic_nz; ++k) {
+    const i_t j = basic_list[changed_basic_indices.i[k]];
+    obj += delta_x[j] * objective[j];
+  }
+  // Leaving index already included above
+  obj += delta_x[entering_index] * objective[entering_index];
 }
 
 __device__ void compute_reduced_cost_update(const gpu_lp& lp,
@@ -1889,8 +1911,12 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
            (unsigned long long)__double_as_longlong(primal_inf),
            iter_limit);
   }
+  // Incrementally-tracked objective for the cutoff, mirroring the CPU simplified (and
+  // advanced) driver: init fresh once, then update_objective per pivot. Using the true
+  // costs lp.objective (the GPU has no perturbation) is a valid dual bound.
+  f_t obj  = compute_objective(lp, x);
   i_t iter = 0;
-  for (iter = 0; iter < iter_limit; ++iter) {
+  while (iter < iter_limit) {
     if (g_gpu_alloc_failed) {
       sol.objective      = compute_objective(lp, x);
       sol.user_objective = compute_user_objective(lp, sol.objective);
@@ -1923,6 +1949,15 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     UTsol_sparse.clear();
     compute_delta_y(ft, basic_leaving, direction, delta_y_sparse, UTsol_sparse);
     const f_t dy_norm_sq = delta_y_sparse.norm2_squared();
+
+    // Steepest-edge norm drift safeguard: dy_norm_sq is the true norm of the leaving
+    // row. If the maintained norm used for pricing has drifted below
+    // settings.steepest_edge_ratio of it, the leaving choice was made on a stale norm --
+    // reset it and re-price (strict port of the CPU simplified, phase2.cpp:4037).
+    if (delta_y_steepest_edge[leaving] < settings.steepest_edge_ratio * dy_norm_sq) {
+      delta_y_steepest_edge[leaving] = dy_norm_sq;
+      continue;
+    }
 
     // 3. Reduced-cost SpMv: transpose (CSR) when delta_y is sparse (<=30% dense), else
     //    dense CSC. Mirrors the CPU driver.
@@ -1976,6 +2011,11 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
 
     update_primal_variables(scaled_dxB_sparse, basic_list, delta_x.data(), entering, x, work);
 
+    // Incrementally update the objective the SAME way the CPU driver does (phase2.cpp:4259):
+    // obj += delta_x·objective over the changed basics + entering, true costs, called with the
+    // OLD basic_list (before the swap below), WITHOUT the bound-flip contribution.
+    update_objective(basic_list, scaled_dxB_sparse, lp.objective, delta_x.data(), entering, obj);
+
     // 5. Basis swap + MPF rank-1 stacking update.
     vstatus[entering] = variable_status_t::BASIC;
     vstatus[leaving]  = (lp.lower[leaving] == lp.upper[leaving])
@@ -2012,6 +2052,31 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
              (unsigned long long)__double_as_longlong(primal_inf),
              (int)infeas_idx.size(),
              ft.num_updates());
+    }
+
+    // Increment only on a COMPLETED iteration, at the end of the body — matching the CPU
+    // simplified driver's iter++ (phase2.cpp:4370). The SE-reset `continue` above jumps
+    // back to `while` without counting, so `iter` counts pivots, not loop passes.
+    iter++;
+
+    // Objective cutoff (dual bound), checked AFTER the pivot/iter++ — mirrors the CPU
+    // simplified driver's placement + comparand (phase2.cpp:4377): the incrementally
+    // tracked objective `obj` (true costs, omits bound flips — a valid, conservative lower
+    // bound). Gated on a finite cutoff (default +inf skips it).
+    if (isfinite(settings.cut_off)) {
+      const f_t cutoff_obj = obj;
+      if (cutoff_obj >= settings.cut_off) {
+        sol.objective      = compute_objective(lp, x);
+        sol.user_objective = compute_user_objective(lp, sol.objective);
+        sol.iterations     = iter;
+        if (gpu_log) {
+          printf("[GMP] cutoff iter=%d obj=%016llx cut_off=%016llx\n",
+                 iter,
+                 (unsigned long long)__double_as_longlong(cutoff_obj),
+                 (unsigned long long)__double_as_longlong(settings.cut_off));
+        }
+        return dual::status_t::CUTOFF;
+      }
     }
   }
   sol.objective      = compute_objective(lp, x);
@@ -2057,7 +2122,8 @@ struct kernel_args {
   f_t* dy_se;
   i_t dy_se_empty;
   // settings
-  f_t primal_tol, dual_tol, pivot_tol, tight_tol, fixed_tol, zero_tol, time_limit;
+  f_t primal_tol, dual_tol, pivot_tol, tight_tol, fixed_tol, zero_tol, time_limit, cut_off,
+    steepest_edge_ratio;
   f_t start_time;
   i_t iter_limit_override;  // >0 forces a fixed iteration cap (for bitwise CPU comparison)
   i_t gpu_log;              // emit the per-step [CMP] trace
@@ -2108,7 +2174,9 @@ __global__ void gpu_phase2_kernel(kernel_args a)
   settings.fixed_tol          = a.fixed_tol;
   settings.zero_tol           = a.zero_tol;
   settings.time_limit         = a.time_limit;
-  settings.refactor_frequency = a.refactor_frequency;
+  settings.cut_off             = a.cut_off;
+  settings.steepest_edge_ratio = a.steepest_edge_ratio;
+  settings.refactor_frequency  = a.refactor_frequency;
 
   gpu_basis_update_mpf ft;
   ft.num_updates_           = a.num_updates;
@@ -2305,7 +2373,9 @@ dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
   a.fixed_tol  = settings.fixed_tol;
   a.zero_tol   = settings.zero_tol;
   a.time_limit = settings.time_limit;
-  a.start_time = tic();
+  a.cut_off             = settings.cut_off;
+  a.steepest_edge_ratio = settings.steepest_edge_ratio;
+  a.start_time          = tic();
   // Optional fixed iteration cap (must match the CPU's CUOPT_SIMPLIFIED_ITER_LIMIT).
   {
     const char* e         = std::getenv("CUOPT_SIMPLIFIED_ITER_LIMIT");

@@ -2829,6 +2829,16 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
   }
   i_t iterations_since_refactor = 0;
 
+  // Reinterpret a double as its raw 64-bit pattern, for a per-iteration [ADV] trace
+  // that can be diffed bitwise against the simplified driver's [CMP] trace (to locate
+  // exactly where/why the two pivot sequences first diverge). Active only when logging.
+  auto dbits = [](f_t v) {
+    unsigned long long u;
+    std::memcpy(&u, &v, sizeof(u));
+    return u;
+  };
+
+  // Phase 2 main loop
   while (iter < iter_limit) {
     PHASE2_NVTX_RANGE("DualSimplex::phase2_main_loop");
 
@@ -3676,6 +3686,25 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
 
     iter++;
 
+    // Per-iteration bit trace (matches the simplified driver's [CMP], iter-1 so the
+    // pivot numbering aligns): logs this iteration's leaving/entering choice, step,
+    // and resulting objective as raw uint64 so an [ADV] vs [CMP] diff pinpoints the
+    // exact iteration + quantity where the two drivers first diverge.
+    if (settings.log.log) {
+      std::printf(
+        "[ADV] iter=%d leave=%d dir=%d enter=%d step=%016llx obj_inc=%016llx cobj=%016llx nInf=%d "
+        "nupd=%d\n",
+        iter - 1,
+        leaving_index,
+        direction,
+        entering_index,
+        dbits(step_length),
+        dbits(obj),                        // the ADVANCED's incremental cutoff comparand (update_objective)
+        dbits(compute_objective(lp, x)),   // fresh recompute (what the simplified compares)
+        static_cast<int>(infeasibility_indices.size()),
+        ft.num_updates());
+    }
+
     // Clear delta_z
     phase2_work_estimate += 3 * delta_z_indices.size();
     phase2::clear_delta_z(entering_index, leaving_index, delta_z_mark, delta_z_indices, delta_z);
@@ -3799,14 +3828,12 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
     return e != nullptr && std::string(e) != "0";
   }();
 
-  // Optional steepest-edge norm drift safeguard, gated on CUOPT_SIMPLIFIED_SE_RESET.
-  // Default OFF. When a leaving variable is priced using a maintained steepest-edge
-  // norm that has drifted below settings.steepest_edge_ratio of the true norm (the
-  // BTran result), reset the norm and re-price (mirrors the full driver, phase2.cpp).
-  static const bool se_reset_enabled = [] {
-    const char* e = std::getenv("CUOPT_SIMPLIFIED_SE_RESET");
-    return e != nullptr && std::string(e) != "0";
-  }();
+  // Steepest-edge norm drift safeguard — now ALWAYS ON (no longer env-gated). When a
+  // leaving variable is priced using a maintained steepest-edge norm that has drifted
+  // below settings.steepest_edge_ratio of the true norm (the BTran result), reset the
+  // norm and re-price (mirrors the full driver, phase2.cpp). This is the anti-stall
+  // safeguard that eliminates the undetectable TIME_LIMIT stall (e.g. the wachplan B&B
+  // node); on NETLIB it does not regress the minimal solve count (see DS_STATUS.md).
 
   // The following three alignments with the full driver are ALWAYS ON (no longer
   // env-gated): they are required for the minimal driver to match the full dual-simplex
@@ -3931,7 +3958,13 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
     std::printf(
       "[CMP] start m=%d n=%d p_inf=%016llx iter_limit=%d\n", m, n, dbits(primal_inf), iter_limit);
   }
-  for (i_t iter = 0; iter < iter_limit; ++iter) {
+  // Incrementally-tracked objective for the cutoff, mirroring the advanced driver:
+  // init fresh once, then update_objective per pivot (phase2.cpp:3484). Avoids the
+  // O(n) fresh recompute every iteration, and — using the true costs lp.objective —
+  // is a valid dual bound whether or not perturbation is opted in.
+  f_t obj = compute_objective(lp, x);
+  i_t iter = 0;
+  while (iter < iter_limit) {
     // Wall-clock guard: unbounded MPF stacking makes each solve O(num_updates), so
     // a non-converging instance can crawl. Respect settings.time_limit (inf by
     // default, so this is a no-op unless the caller sets a finite limit).
@@ -3942,28 +3975,10 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
       return dual::status_t::TIME_LIMIT;
     }
 
-    // Objective cutoff (dual bound). With a dual-feasible basis the current
-    // objective c'x is a valid lower bound on the primal optimum and is
-    // monotonically non-decreasing across dual-simplex iterations, so once it
-    // reaches settings.cut_off this node can no longer beat the incumbent and we
-    // stop early (mirrors the advanced driver at phase2.cpp, `obj >= cut_off`).
-    // Gated on a finite cutoff so the common no-cutoff path (cut_off = +inf, the
-    // default) skips the O(n) objective evaluation entirely.
-    if (std::isfinite(settings.cut_off)) {
-      const f_t cutoff_obj = compute_objective(lp, x);
-      if (cutoff_obj >= settings.cut_off) {
-        sol.objective      = cutoff_obj;
-        sol.user_objective = compute_user_objective(lp, cutoff_obj);
-        sol.iterations     = iter;
-        if (settings.log.log) {
-          settings.log.printf("[MIN] CUTOFF iter=%d obj=%.10e cut_off=%.10e\n",
-                              iter,
-                              cutoff_obj,
-                              settings.cut_off);
-        }
-        return dual::status_t::CUTOFF;
-      }
-    }
+    // (Objective cutoff moved to the END of the loop body, after iter++/the pivot,
+    // to mirror the advanced driver's placement (phase2.cpp:~3742). This isolates
+    // whether the top-vs-end cutoff-check placement is the residual iteration-count
+    // difference between the two drivers on degenerate cutoff plateaus.)
 
     // 1. Steepest-edge pricing — picks leaving variable.
     i_t direction     = 0;
@@ -4019,8 +4034,7 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
     // row. If the maintained norm used for pricing has drifted below
     // settings.steepest_edge_ratio of it, the leaving choice was made on a stale
     // norm -- reset it and re-price (mirrors the full driver, phase2.cpp:3020).
-    if (se_reset_enabled &&
-        delta_y_steepest_edge[leaving] < settings.steepest_edge_ratio * dy_norm_sq) {
+    if (delta_y_steepest_edge[leaving] < settings.steepest_edge_ratio * dy_norm_sq) {
       delta_y_steepest_edge[leaving] = dy_norm_sq;
       continue;
     }
@@ -4123,6 +4137,9 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
             phase2::compute_initial_primal_infeasibilities(
               lp, settings, basic_list, x, squared_infeas, infeas_idx, primal_inf);
             phase2::clear_delta_z(entering, leaving, delta_z_mark, delta_z_indices, delta_z);
+            // x was recomputed and perturbation removed (objective == lp.objective):
+            // resync the incrementally-tracked objective to the fresh value.
+            obj = compute_objective(lp, x);
             continue;
           }
         }
@@ -4234,6 +4251,14 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
     // Update primal: x += delta_x.
     phase2::update_primal_variables(scaled_dxB_sparse, basic_list, delta_x, entering, x, work);
 
+    // Incrementally update the objective the SAME way the advanced driver does
+    // (phase2.cpp:3484): obj += delta_x·objective over the changed basics + the
+    // entering variable, using the true costs. Called with the OLD basic_list (before
+    // the swap below) and — like the advanced — WITHOUT the bound-flip contribution,
+    // so the cutoff comparand matches the advanced's exactly (O(nnz) not O(n)).
+    phase2::update_objective(
+      basic_list, scaled_dxB_sparse.i, lp.objective, delta_x, entering, obj, work);
+
     // 5. Basis swap + MPF rank-1 LU update.
     vstatus[entering] = variable_status_t::BASIC;
     vstatus[leaving]  = (lp.lower[leaving] == lp.upper[leaving])
@@ -4336,6 +4361,35 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
         dbits(primal_inf),
         static_cast<int>(infeas_idx.size()),
         ft.num_updates());
+    }
+
+    // Increment only on a COMPLETED iteration, at the end of the body — matching the
+    // advanced driver's iter++ (phase2.cpp:3686). The re-price `continue`s above
+    // (SE-reset line ~4057, perturbation-removal line ~4158) jump back to `while`
+    // without counting, so `iter` counts pivots, not every loop pass.
+    iter++;
+
+    // Objective cutoff (dual bound), checked AFTER the pivot/iter++ — mirrors the
+    // advanced driver's placement (phase2.cpp:~3742) AND its comparand: the
+    // incrementally-tracked objective `obj` (update_objective, true costs, omits bound
+    // flips — a valid, conservative lower bound). No O(n) recompute here. Gated on a
+    // finite cutoff (default +inf skips it).
+    if (std::isfinite(settings.cut_off)) {
+      const f_t cutoff_obj = obj;
+      if (cutoff_obj >= settings.cut_off) {
+        sol.objective      = compute_objective(lp, x);
+        sol.user_objective = compute_user_objective(lp, sol.objective);
+        sol.iterations     = iter;
+        if (settings.log.log) {
+          settings.log.printf(
+            "[MIN] CUTOFF iter=%d obj=%.10e cut_off=%.10e\n", iter, cutoff_obj, settings.cut_off);
+          std::printf("[CMP] cutoff iter=%d obj=%016llx cut_off=%016llx\n",
+                      iter,
+                      dbits(cutoff_obj),
+                      dbits(settings.cut_off));
+        }
+        return dual::status_t::CUTOFF;
+      }
     }
   }
   sol.objective      = compute_objective(lp, x);
