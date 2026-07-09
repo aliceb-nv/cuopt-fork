@@ -50,7 +50,19 @@ template <typename T>
 using gpu_span = cuda::std::span<T>;
 
 // Set if any device-side allocation fails; the driver bails with NUMERICAL.
+// Shared across all blocks in a batch launch (a single failing block poisons the
+// whole batch by design → surfaces as a loud verification mismatch). Reset from
+// the host before each launch; set with atomicOr so concurrent blocks don't tear.
 __device__ int g_gpu_alloc_failed;
+
+// Master switch for the [SEPROF]/[SESTAT] profiling globals (g_bsolve/g_se).
+// Those are single __device__ accumulators written on the hot b_solve/SE path;
+// with one block (<<<1,1>>>) that is fine, but in a multi-block batch launch
+// every block would hammer the same global → cross-block races + L2 contention
+// that pollute the measured kernel time. The batch wrapper sets this to 0 so the
+// profiling writes are skipped entirely; the single-problem wrapper sets it to
+// the CUOPT_GPU_PROFILE value. Read-only on the hot path (cheap, no contention).
+__device__ int g_seprof_on;
 
 __device__ __forceinline__ f_t dev_inf() { return cuda::std::numeric_limits<f_t>::infinity(); }
 __device__ __forceinline__ f_t dev_nan() { return cuda::std::numeric_limits<f_t>::quiet_NaN(); }
@@ -136,7 +148,7 @@ struct gpu_vector {
              (unsigned long long)(newcap * sizeof(T)),
              (unsigned long long)cap_,
              (unsigned long long)newcap);
-      g_gpu_alloc_failed = 1;
+      atomicOr(&g_gpu_alloc_failed, 1);
       return;
     }
     for (size_t k = 0; k < size_; ++k) { p[k] = data_[k]; }
@@ -670,6 +682,44 @@ __device__ i_t sparse_triangle_solve(
 }
 
 // ---------------------------------------------------------------------------
+// clock64 profiler focused on the b_solve inside update_steepest_edge_norms (the "se" section,
+// the largest slice of the GPU pivot loop). Single-thread <<<1,1>>> kernel => these device
+// globals are race-free. Timing-only: clock64 reads + integer accumulation, no effect on the LP
+// computation (CPU<->GPU bit-parity is unchanged). Emitted as [SEPROF] at kernel exit when
+// CUOPT_GPU_PROFILE=1. The sparse b_solve overwrites g_bsolve on every call; update_steepest_edge_norms
+// harvests it right after ITS b_solve (so only the se-context solve is attributed).
+// ---------------------------------------------------------------------------
+struct bsolve_bd_t {
+  long long permute, lsolve, usolve, hyper_l, hyper_u, nz_in, nz_l, nz_u;
+  long long l0, lrank1, u0;  // base L0 triangular solve, rank-1 T-loop (in l_solve), base U0 solve
+};
+__device__ bsolve_bd_t g_bsolve;
+struct se_prof_t {
+  long long total, bsolve, permute, lsolve, usolve, rest, calls, hyper_l, hyper_u, nz_in, nz_l, nz_u;
+  long long l0, lrank1, u0;
+  // Whole-pivot section timers (accumulated over the loop): steepest-edge pricing, BTran
+  // (compute_delta_y), reduced-cost delta_z (compute_delta_z / dense fallback), ratio test
+  // (phase2_ratio_test), FTran (compute_delta_x). se_total above covers update_steepest_edge_norms.
+  long long pricing, btran, dz, rt, ftran;
+  __device__ void reset()
+  {
+    total = bsolve = permute = lsolve = usolve = rest = calls = hyper_l = hyper_u = nz_in = nz_l =
+      nz_u = l0 = lrank1 = u0 = 0;
+    pricing = btran = dz = rt = ftran = 0;
+  }
+  __device__ void emit(long long kernel_total, int iters) const
+  {
+    printf("[SEPROF] iters=%d kernel_total=%lld se_total=%lld se_bsolve=%lld permute=%lld "
+           "lsolve=%lld usolve=%lld rest=%lld se_calls=%lld hyper_l=%lld hyper_u=%lld "
+           "nz_in=%lld nz_l=%lld nz_u=%lld l0=%lld lrank1=%lld u0=%lld "
+           "pricing=%lld btran=%lld dz=%lld rt=%lld ftran=%lld\n",
+           iters, kernel_total, total, bsolve, permute, lsolve, usolve, rest, calls, hyper_l,
+           hyper_u, nz_in, nz_l, nz_u, l0, lrank1, u0, pricing, btran, dz, rt, ftran);
+  }
+};
+__device__ se_prof_t g_se;
+
+// ---------------------------------------------------------------------------
 // gpu_basis_update_mpf : the MPF LU factorization object. The initial factors
 // L0_/U0_ (+ transposes) and permutations are fixed views uploaded from the
 // host; S_/mu_values_ grow in-kernel as rank-1 updates are stacked.
@@ -936,20 +986,27 @@ struct gpu_basis_update_mpf {
 
   __device__ i_t u_solve(f_t* rhs) const
   {
+    long long _t0 = clock64();
     upper_triangular_solve(U0_, rhs, work_estimate_);
+    if (g_seprof_on) g_bsolve.u0 = clock64() - _t0;  // [SEPROF] base U0 solve (no rank-1 on U)
     return 0;
   }
   __device__ i_t u_solve(gpu_sparse_vector& rhs) const
   {
+    long long _t0 = clock64();
     i_t top = sparse_triangle_solve<false>(
       rhs, nullptr, xi_workspace_.data(), U0_, x_workspace_.data(), work_estimate_);
     solve_to_sparse_vector(top, rhs);
+    if (g_seprof_on) g_bsolve.u0 = clock64() - _t0;
     return 0;
   }
 
   __device__ i_t l_solve(f_t* rhs) const
   {
+    long long _t0 = clock64();
     lower_triangular_solve(L0_, rhs, work_estimate_);
+    if (g_seprof_on) g_bsolve.l0 = clock64() - _t0;  // [SEPROF] base L0 triangular solve
+    long long _t1 = clock64();
     const f_t zero_tol = 1e-16;  // Any higher and pilot_ja fails
     for (i_t k = 0; k < num_updates_; ++k) {
       const f_t mu    = mu_values_[k];
@@ -960,15 +1017,19 @@ struct gpu_basis_update_mpf {
       if (fabs(theta) > zero_tol) { add_sparse_column(S_, u_col, -theta, rhs); }
     }
     work_estimate_ += 2 * num_updates_;
+    if (g_seprof_on) g_bsolve.lrank1 = clock64() - _t1;  // [SEPROF] rank-1 MPF T-loop (grows with num_updates)
     return 0;
   }
   __device__ i_t l_solve(gpu_sparse_vector& rhs) const
   {
     const i_t m = L0_.m;
+    long long _t0 = clock64();
     i_t top     = sparse_triangle_solve<true>(
       rhs, nullptr, xi_workspace_.data(), L0_, x_workspace_.data(), work_estimate_);
     solve_to_workspace(top);
     i_t nz             = m - top;
+    if (g_seprof_on) g_bsolve.l0 = clock64() - _t0;
+    long long _t1      = clock64();
     const f_t zero_tol = 1e-13;
     for (i_t k = 0; k < num_updates_; ++k) {
       const f_t mu    = mu_values_[k];
@@ -982,6 +1043,7 @@ struct gpu_basis_update_mpf {
     }
     work_estimate_ += 2 * num_updates_;
     gather_into_sparse_vector(nz, rhs);
+    if (g_seprof_on) g_bsolve.lrank1 = clock64() - _t1;
     return 0;
   }
 
@@ -1000,14 +1062,20 @@ struct gpu_basis_update_mpf {
                          gpu_sparse_vector& Lsol,
                          bool need_Lsol = true) const
   {
+    long long _bp0 = clock64();  // [SEPROF] b_solve internal timers (fill g_bsolve, harvested by se)
     solution = rhs;
     work_estimate_ += 2 * rhs.i.size();
     solution.inverse_permute_vector(inverse_row_permutation_.data());
     work_estimate_ += 3 * rhs.i.size();
+    if (g_seprof_on) {
+      g_bsolve.permute = clock64() - _bp0;
+      g_bsolve.nz_in   = rhs.i.size();
+    }
 
     bool use_hypersparse;
     const f_t input_size = static_cast<f_t>(rhs.i.size());
     estimate_solution_density(input_size, sum_L_, num_calls_L_, use_hypersparse);
+    long long _bl0 = clock64();
     if (use_hypersparse) {
       l_solve(solution);
     } else {
@@ -1018,6 +1086,11 @@ struct gpu_basis_update_mpf {
       solution.from_dense(solution_dense);
       work_estimate_ += solution_dense.size();
     }
+    if (g_seprof_on) {
+      g_bsolve.lsolve  = clock64() - _bl0;
+      g_bsolve.hyper_l = use_hypersparse ? 1 : 0;
+      g_bsolve.nz_l    = solution.i.size();
+    }
     if (need_Lsol) {
       Lsol = solution;
       work_estimate_ += 2 * solution.i.size();
@@ -1026,6 +1099,7 @@ struct gpu_basis_update_mpf {
 
     const f_t rhs_size = static_cast<f_t>(solution.i.size());
     estimate_solution_density(rhs_size, sum_U_, num_calls_U_, use_hypersparse);
+    long long _bu0 = clock64();
     if (use_hypersparse) {
       u_solve(solution);
     } else {
@@ -1035,6 +1109,11 @@ struct gpu_basis_update_mpf {
       u_solve(solution_dense.data());
       solution.from_dense(solution_dense);
       work_estimate_ += solution_dense.size();
+    }
+    if (g_seprof_on) {
+      g_bsolve.usolve  = clock64() - _bu0;
+      g_bsolve.hyper_u = use_hypersparse ? 1 : 0;
+      g_bsolve.nz_u    = solution.i.size();
     }
     sum_U_ += static_cast<f_t>(solution.i.size()) / rhs_size;
     return 0;
@@ -1730,8 +1809,25 @@ __device__ i_t update_steepest_edge_norms(const gpu_settings& settings,
                                           f_t* delta_y_steepest_edge,
                                           f_t& work_estimate)
 {
+  long long _se0 = clock64();  // [SEPROF] se-section timing (b_solve vs rest)
   v_sparse.clear();
-  ft.b_solve(delta_y_sparse, v_sparse);
+  ft.b_solve(delta_y_sparse, v_sparse);  // fills g_bsolve (permute/lsolve/usolve + hypersparse + nnz)
+  long long _se1 = clock64();
+  if (g_seprof_on) {
+    g_se.calls++;
+    g_se.bsolve += _se1 - _se0;
+    g_se.permute += g_bsolve.permute;
+    g_se.lsolve += g_bsolve.lsolve;
+    g_se.usolve += g_bsolve.usolve;
+    g_se.hyper_l += g_bsolve.hyper_l;   // +1 if the L-solve took the hypersparse path this call
+    g_se.hyper_u += g_bsolve.hyper_u;   // +1 if the U-solve took the hypersparse path this call
+    g_se.nz_in += g_bsolve.nz_in;       // nnz of the RHS (delta_y)
+    g_se.nz_l += g_bsolve.nz_l;         // nnz after the L-solve
+    g_se.nz_u += g_bsolve.nz_u;         // nnz after the U-solve (final v)
+    g_se.l0 += g_bsolve.l0;             // base L0 triangular solve
+    g_se.lrank1 += g_bsolve.lrank1;     // rank-1 MPF updates (T-loop in l_solve)
+    g_se.u0 += g_bsolve.u0;             // base U0 triangular solve
+  }
   if (direction == -1) {
     v_sparse.negate();
     work_estimate += 2 * v_sparse.i.size();
@@ -1741,7 +1837,13 @@ __device__ i_t update_steepest_edge_norms(const gpu_settings& settings,
 
   const f_t wr = -scaled_delta_xB.find_coefficient(basic_leaving_index);
   work_estimate += scaled_delta_xB.i.size();
-  if (wr == 0) { return -1; }
+  if (wr == 0) {
+    if (g_seprof_on) {
+      g_se.rest += clock64() - _se1;
+      g_se.total += clock64() - _se0;
+    }
+    return -1;
+  }
   const f_t omegar             = dy_norm_squared / (wr * wr);
   const i_t scaled_delta_xB_nz = scaled_delta_xB.i.size();
 
@@ -1766,6 +1868,10 @@ __device__ i_t update_steepest_edge_norms(const gpu_settings& settings,
     v[v_sparse.i[k]] = 0.0;
   }
   work_estimate += 2 * v_nz;
+  if (g_seprof_on) {
+    g_se.rest += clock64() - _se1;
+    g_se.total += clock64() - _se0;
+  }
   return 0;
 }
 
@@ -1839,13 +1945,24 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
                                                             f_t* delta_y_steepest_edge,
                                                             bool dy_se_empty,
                                                             i_t iter_limit_override,
-                                                            bool gpu_log)
+                                                            bool gpu_log,
+                                                            bool gpu_prof)
 {
   const i_t m = lp.num_rows;
   const i_t n = lp.num_cols;
 
   // Device wall-clock reference for the time-limit guard.
   const unsigned long long start_ns = dev_globaltimer();
+
+  // [SEPROF] clock64 profiler (emitted at exit when gpu_prof). Reset the accumulators for THIS
+  // solve; prof_t0 = whole-kernel start so se_total can be shown as a share of the total.
+  // g_seprof_on gates every profiling write on the hot path; with gpu_prof off (always the case
+  // in a multi-block batch) the shared g_se/g_bsolve globals are never touched (no cross-block race).
+  g_seprof_on = gpu_prof ? 1 : 0;
+  if (g_seprof_on) g_se.reset();
+  const long long prof_t0 = clock64();
+#define SEPROF_EMIT() \
+  do { if (gpu_prof) g_se.emit(clock64() - prof_t0, iter); } while (0)
 
   f_t* x = sol.x.data();
   f_t* y = sol.y.data();
@@ -1921,33 +2038,40 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
       sol.objective      = compute_objective(lp, x);
       sol.user_objective = compute_user_objective(lp, sol.objective);
       sol.iterations     = iter;
+      SEPROF_EMIT();
       return dual::status_t::NUMERICAL;
     }
     if (static_cast<f_t>(dev_globaltimer() - start_ns) * 1e-9 > settings.time_limit) {
       sol.objective      = compute_objective(lp, x);
       sol.user_objective = compute_user_objective(lp, sol.objective);
       sol.iterations     = iter;
+      SEPROF_EMIT();
       return dual::status_t::TIME_LIMIT;
     }
 
     // 1. Steepest-edge pricing.
-    i_t direction     = 0;
-    i_t basic_leaving = -1;
+    i_t direction        = 0;
+    i_t basic_leaving    = -1;
     f_t max_val;
+    const long long _t_pr = clock64();  // [SEPROF]
     const i_t leaving = steepest_edge_pricing_with_infeasibilities(
       lp, settings, x, delta_y_steepest_edge, basic_mark.data(), squared_infeas, infeas_idx,
       direction, basic_leaving, max_val, work);
+    if (g_seprof_on) g_se.pricing += clock64() - _t_pr;  // [SEPROF]
     if (leaving == -1) {
       sol.objective      = compute_objective(lp, x);
       sol.user_objective = compute_user_objective(lp, sol.objective);
       sol.iterations     = iter;
+      SEPROF_EMIT();
       return dual::status_t::OPTIMAL;
     }
 
     // 2. BTran.
     delta_y_sparse.clear();
     UTsol_sparse.clear();
+    const long long _t_bt = clock64();  // [SEPROF]
     compute_delta_y(ft, basic_leaving, direction, delta_y_sparse, UTsol_sparse);
+    if (g_seprof_on) g_se.btran += clock64() - _t_bt;  // [SEPROF]
     const f_t dy_norm_sq = delta_y_sparse.norm2_squared();
 
     // Steepest-edge norm drift safeguard: dy_norm_sq is the true norm of the leaving
@@ -1968,6 +2092,7 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     }
     const f_t delta_y_nz_percentage = delta_y_nz0 / static_cast<f_t>(m) * 100.0;
     const bool used_transpose_dz    = delta_y_nz_percentage <= 30.0;
+    const long long _t_dz = clock64();  // [SEPROF]
     if (used_transpose_dz) {
       compute_delta_z(Arow, delta_y_sparse, leaving, direction, nonbasic_end.data(),
                       delta_z_mark.data(), delta_z_indices, delta_z.data(), work);
@@ -1976,16 +2101,20 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
       compute_reduced_cost_update(lp, basic_list, nonbasic_list, delta_y.data(), leaving, direction,
                                   delta_z_mark.data(), delta_z_indices, delta_z.data(), work);
     }
+    if (g_seprof_on) g_se.dz += clock64() - _t_dz;  // [SEPROF]
 
     // 4. Simple ratio test.
     f_t step_length;
     i_t nonbasic_entering = -1;
+    const long long _t_rt = clock64();  // [SEPROF]
     const i_t entering    = phase2_ratio_test(
       lp, settings, vstatus, nonbasic_list, z, delta_z.data(), step_length, nonbasic_entering);
+    if (g_seprof_on) g_se.rt += clock64() - _t_rt;  // [SEPROF]
     if (entering == -1) {
       sol.objective      = compute_objective(lp, x);
       sol.user_objective = compute_user_objective(lp, sol.objective);
       sol.iterations     = iter;
+      SEPROF_EMIT();
       return dual::status_t::DUAL_UNBOUNDED;
     }
 
@@ -1996,12 +2125,16 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     utilde_sparse.clear();
     scaled_dxB_sparse.clear();
     rhs_sparse.from_csc_column(lp.A, entering);
-    if (compute_delta_x(lp, ft, entering, leaving, basic_leaving, direction, basic_list, rhs_sparse,
-                        delta_z.data(), x, utilde_sparse, scaled_dxB_sparse, delta_x.data(),
-                        work) == -1) {
+    const long long _t_ft = clock64();  // [SEPROF]
+    const i_t dx_status =
+      compute_delta_x(lp, ft, entering, leaving, basic_leaving, direction, basic_list, rhs_sparse,
+                      delta_z.data(), x, utilde_sparse, scaled_dxB_sparse, delta_x.data(), work);
+    if (g_seprof_on) g_se.ftran += clock64() - _t_ft;  // [SEPROF]
+    if (dx_status == -1) {
       sol.objective      = compute_objective(lp, x);
       sol.user_objective = compute_user_objective(lp, sol.objective);
       sol.iterations     = iter;
+      SEPROF_EMIT();
       return dual::status_t::NUMERICAL;
     }
 
@@ -2033,6 +2166,7 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
       sol.objective      = compute_objective(lp, x);
       sol.user_objective = compute_user_objective(lp, sol.objective);
       sol.iterations     = iter;
+      SEPROF_EMIT();
       return dual::status_t::NUMERICAL;
     }
 
@@ -2075,6 +2209,7 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
                  (unsigned long long)__double_as_longlong(cutoff_obj),
                  (unsigned long long)__double_as_longlong(settings.cut_off));
         }
+        SEPROF_EMIT();
         return dual::status_t::CUTOFF;
       }
     }
@@ -2082,8 +2217,10 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
   sol.objective      = compute_objective(lp, x);
   sol.user_objective = compute_user_objective(lp, sol.objective);
   sol.iterations     = iter_limit;
+  SEPROF_EMIT();
   return dual::status_t::ITERATION_LIMIT;
 }
+#undef SEPROF_EMIT
 
 // ---------------------------------------------------------------------------
 // Kernel argument bundle (all raw device pointers + scalars, passed by value).
@@ -2127,6 +2264,7 @@ struct kernel_args {
   f_t start_time;
   i_t iter_limit_override;  // >0 forces a fixed iteration cap (for bitwise CPU comparison)
   i_t gpu_log;              // emit the per-step [CMP] trace
+  i_t gpu_prof;             // emit the [SEPROF] se-b_solve clock64 breakdown at exit
   // outputs
   i_t* out_status;
   f_t* out_objective;
@@ -2147,10 +2285,22 @@ __device__ gpu_csc_view make_view(
   return v;
 }
 
-__global__ void gpu_phase2_kernel(kernel_args a)
+
+// One block == one problem. args points to an N-entry device array; block b solves
+// args[blockIdx.x] entirely on its own device buffers. Launched <<<1,1>>> for the
+// single-problem wrapper (N=1) and <<<N,1>>> for the batch wrapper. g_gpu_alloc_failed
+// is reset by the HOST before launch (not here) so a late block can't clear a failure
+// flag an earlier block already set.
+__global__ void
+__launch_bounds__(1, 8)
+gpu_phase2_kernel(kernel_args* args)
 {
-  if (threadIdx.x != 0 || blockIdx.x != 0) { return; }
-  g_gpu_alloc_failed = 0;
+  if (blockDim.x > 1) {
+    // For now this should never happen, only single thread blocks
+    assert(false);
+    return;
+  }
+  kernel_args& a = args[blockIdx.x];
 
   const i_t m = a.m;
   const i_t n = a.n;
@@ -2207,7 +2357,8 @@ __global__ void gpu_phase2_kernel(kernel_args a)
                                                             a.dy_se,
                                                             a.dy_se_empty != 0,
                                                             a.iter_limit_override,
-                                                            a.gpu_log != 0);
+                                                            a.gpu_log != 0,
+                                                            a.gpu_prof != 0);
 
   *a.out_status         = static_cast<i_t>(status);
   *a.out_objective      = sol.objective;
@@ -2246,67 +2397,48 @@ static T* alloc_zeroed(size_t count)
   return d;
 }
 
-}  // namespace gpu_phase2_detail
-
-// ---------------------------------------------------------------------------
-// Host wrapper. Same signature as simplified_dual_phase2.
-// ---------------------------------------------------------------------------
-template <typename i_t, typename f_t>
-dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
-                                          const simplex_solver_settings_t<i_t, f_t>& settings,
-                                          std::vector<variable_status_t>& vstatus,
-                                          basis_update_mpf_t<i_t, f_t>& ft,
-                                          std::vector<i_t>& basic_list,
-                                          std::vector<i_t>& nonbasic_list,
-                                          lp_solution_t<i_t, f_t>& sol,
-                                          std::vector<f_t>& delta_y_steepest_edge)
+// Device heap (in-kernel gpu_vector malloc arena) + stack are per-CONTEXT limits and the heap
+// can ONLY be set before the first malloc-using kernel launch, so set them exactly once per
+// process. First caller wins: the batch wrapper (the only/first GPU kernel in the throughput
+// benchmark) sizes the heap for N concurrent S_ stacks; the single-problem wrapper uses a
+// generous default. heap_bytes is the requested malloc-arena size (NOT counting the static
+// per-problem buffers, which are separate cudaMallocs).
+static bool g_device_limits_set = false;
+static void ensure_device_limits(size_t heap_bytes)
 {
-  using namespace gpu_phase2_detail;
-  static_assert(sizeof(i_t) == sizeof(int) && sizeof(f_t) == sizeof(double),
-                "gpu_simplified_dual_phase2 is only instantiated for <int, double>");
+  if (g_device_limits_set) return;
+  g_device_limits_set = true;
+  if (heap_bytes < (static_cast<size_t>(256) << 20)) { heap_bytes = static_cast<size_t>(256) << 20; }
+  cudaError_t hp = cudaDeviceSetLimit(cudaLimitMallocHeapSize, heap_bytes);
+  if (hp != cudaSuccess) {
+    cudaGetLastError();
+    std::fprintf(stderr, "[gpu_phase2] warning: could not set device heap size: %s\n",
+                 cudaGetErrorString(hp));
+  }
+  // The deep (non-recursive) call chain wants more than the ~1 KB default stack.
+  cudaError_t stk = cudaDeviceSetLimit(cudaLimitStackSize, static_cast<size_t>(32) << 10);
+  if (stk != cudaSuccess) {
+    cudaGetLastError();
+    std::fprintf(stderr, "[gpu_phase2] warning: could not raise device stack size: %s\n",
+                 cudaGetErrorString(stk));
+  }
+}
 
+// Marshal one prepared problem into a kernel_args with fresh device buffers. Both the
+// single-problem wrapper and the batch wrapper build kernel_args through here, so the device
+// sees byte-identical inputs either way. `ft` must be a fresh factorization (num_updates == 0).
+// Free the buffers afterwards with free_kernel_args.
+static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
+                                   const simplex_solver_settings_t<i_t, f_t>& settings,
+                                   std::vector<variable_status_t>& vstatus,
+                                   basis_update_mpf_t<i_t, f_t>& ft,
+                                   std::vector<i_t>& basic_list,
+                                   std::vector<i_t>& nonbasic_list,
+                                   lp_solution_t<i_t, f_t>& sol,
+                                   std::vector<f_t>& delta_y_steepest_edge)
+{
   const int m = lp.num_rows;
   const int n = lp.num_cols;
-
-  // Pure-stacking GPU port: the supplied factorization must be fresh (no stacked
-  // updates yet), matching the harness which refactors immediately before the call.
-  if (ft.num_updates() != 0) {
-    std::fprintf(stderr,
-                 "[gpu_phase2] ERROR: ft has %d stacked updates; the GPU port expects a fresh "
-                 "factorization.\n",
-                 ft.num_updates());
-    return dual::status_t::NUMERICAL;
-  }
-
-  // Raise device heap (for in-kernel gpu_vector malloc) and stack (deep call
-  // chain). These are per-context limits and the heap size can ONLY be set before
-  // the first malloc-using kernel launch, so set both exactly once per process.
-  static bool device_limits_set = false;
-  if (!device_limits_set) {
-    device_limits_set = true;
-    size_t free_b = 0, total_b = 0;
-    RAFT_CUDA_TRY(cudaMemGetInfo(&free_b, &total_b));
-    size_t heap = static_cast<size_t>(0.7 * static_cast<double>(free_b));
-    const size_t cap = static_cast<size_t>(8) << 30;  // 8 GiB cap
-    if (heap > cap) { heap = cap; }
-    if (heap < (static_cast<size_t>(256) << 20)) { heap = static_cast<size_t>(256) << 20; }
-    cudaError_t hp = cudaDeviceSetLimit(cudaLimitMallocHeapSize, heap);
-    if (hp != cudaSuccess) {
-      cudaGetLastError();
-      std::fprintf(stderr,
-                   "[gpu_phase2] warning: could not set device heap size: %s\n",
-                   cudaGetErrorString(hp));
-    }
-    // The deep (non-recursive) call chain wants more than the ~1 KB default stack.
-    cudaError_t stk = cudaDeviceSetLimit(cudaLimitStackSize, static_cast<size_t>(32) << 10);
-    if (stk != cudaSuccess) {
-      cudaGetLastError();
-      std::fprintf(stderr,
-                   "[gpu_phase2] warning: could not raise device stack size: %s\n",
-                   cudaGetErrorString(stk));
-    }
-  }
-
   const auto& A   = lp.A;
   const auto& L0  = ft.L0();
   const auto& U0  = ft.U0();
@@ -2382,15 +2514,123 @@ dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
     a.iter_limit_override = (e != nullptr) ? std::atoi(e) : 0;
   }
   a.gpu_log = settings.log.log ? 1 : 0;
+  {
+    const char* e = std::getenv("CUOPT_GPU_PROFILE");
+    a.gpu_prof    = (e != nullptr && std::string(e) != "0") ? 1 : 0;
+  }
 
   a.out_status         = alloc_zeroed<int>(1);
   a.out_objective      = alloc_zeroed<double>(1);
   a.out_user_objective = alloc_zeroed<double>(1);
   a.out_iterations     = alloc_zeroed<int>(1);
+  return a;
+}
 
-  gpu_phase2_kernel<<<1, 1>>>(a);
+static void free_kernel_args(const kernel_args& a)
+{
+  for (void* p : {(void*)a.A_col_start, (void*)a.A_i, (void*)a.A_x, (void*)a.rhs, (void*)a.lower,
+                  (void*)a.upper, (void*)a.objective, (void*)a.L0_col_start, (void*)a.L0_i,
+                  (void*)a.L0_x, (void*)a.U0_col_start, (void*)a.U0_i, (void*)a.U0_x,
+                  (void*)a.L0t_col_start, (void*)a.L0t_i, (void*)a.L0t_x, (void*)a.U0t_col_start,
+                  (void*)a.U0t_i, (void*)a.U0t_x, (void*)a.row_perm, (void*)a.inv_row_perm,
+                  (void*)a.xi_workspace, (void*)a.x_workspace, (void*)a.vstatus,
+                  (void*)a.basic_list, (void*)a.nonbasic_list, (void*)a.x, (void*)a.y, (void*)a.z,
+                  (void*)a.dy_se, (void*)a.out_status, (void*)a.out_objective,
+                  (void*)a.out_user_objective, (void*)a.out_iterations}) {
+    if (p) { cudaFree(p); }
+  }
+}
+
+// Exact device bytes marshal_problem cudaMallocs for one problem's STATIC buffers (read-only
+// factors/matrix + mutable state), EXCLUDING the in-kernel gpu_vector heap (S_ growth). Used by
+// the batch pre-flight VRAM estimate; mirrors the upload/alloc sizes 1:1 (empty vectors still
+// take 1 element, matching upload/alloc_zeroed). Slightly conservative on the small state vectors.
+static size_t problem_static_bytes(const lp_problem_t<i_t, f_t>& lp,
+                                   const basis_update_mpf_t<i_t, f_t>& ft)
+{
+  const size_t m = lp.num_rows;
+  const size_t n = lp.num_cols;
+  const auto& L0  = ft.L0();
+  const auto& U0  = ft.U0();
+  const auto& L0t = ft.L0_transpose();
+  const auto& U0t = ft.U0_transpose();
+  auto bi = [](size_t c) { return (c == 0 ? 1 : c) * sizeof(i_t); };
+  auto bd = [](size_t c) { return (c == 0 ? 1 : c) * sizeof(f_t); };
+  size_t b = 0;
+  // A (col_start, i, x) + rhs/lower/upper/objective
+  b += bi(lp.A.col_start.size()) + bi(lp.A.nnz()) + bd(lp.A.nnz());
+  b += bd(m) + 3 * bd(n);
+  // Four factors, each col_start + i + x
+  b += bi(L0.col_start.size())  + bi(L0.nnz())  + bd(L0.nnz());
+  b += bi(U0.col_start.size())  + bi(U0.nnz())  + bd(U0.nnz());
+  b += bi(L0t.col_start.size()) + bi(L0t.nnz()) + bd(L0t.nnz());
+  b += bi(U0t.col_start.size()) + bi(U0t.nnz()) + bd(U0t.nnz());
+  // perms + workspaces
+  b += bi(m) + bi(m) + bi(2 * m) + bd(m);
+  // state: vstatus(n) + basic(m) + nonbasic(<=n) + x(n)+y(m)+z(n) + dy_se(n) + 4 out scalars
+  b += n * sizeof(variable_status_t) + bi(m) + bi(n) + bd(n) + bd(m) + bd(n) + bd(n);
+  b += 2 * bi(1) + 2 * bd(1);
+  return b;
+}
+
+}  // namespace gpu_phase2_detail
+
+// ---------------------------------------------------------------------------
+// Host wrapper. Same signature as simplified_dual_phase2.
+// ---------------------------------------------------------------------------
+template <typename i_t, typename f_t>
+dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
+                                          const simplex_solver_settings_t<i_t, f_t>& settings,
+                                          std::vector<variable_status_t>& vstatus,
+                                          basis_update_mpf_t<i_t, f_t>& ft,
+                                          std::vector<i_t>& basic_list,
+                                          std::vector<i_t>& nonbasic_list,
+                                          lp_solution_t<i_t, f_t>& sol,
+                                          std::vector<f_t>& delta_y_steepest_edge)
+{
+  using namespace gpu_phase2_detail;
+  static_assert(sizeof(i_t) == sizeof(int) && sizeof(f_t) == sizeof(double),
+                "gpu_simplified_dual_phase2 is only instantiated for <int, double>");
+
+  const int m = lp.num_rows;
+  const int n = lp.num_cols;
+
+  // Pure-stacking GPU port: the supplied factorization must be fresh (no stacked
+  // updates yet), matching the harness which refactors immediately before the call.
+  if (ft.num_updates() != 0) {
+    std::fprintf(stderr,
+                 "[gpu_phase2] ERROR: ft has %d stacked updates; the GPU port expects a fresh "
+                 "factorization.\n",
+                 ft.num_updates());
+    return dual::status_t::NUMERICAL;
+  }
+
+  // Size the per-context device heap/stack once (generous default for a single solve).
+  {
+    size_t free_b = 0, total_b = 0;
+    RAFT_CUDA_TRY(cudaMemGetInfo(&free_b, &total_b));
+    size_t heap = static_cast<size_t>(0.7 * static_cast<double>(free_b));
+    const size_t cap = static_cast<size_t>(8) << 30;  // 8 GiB cap
+    if (heap > cap) { heap = cap; }
+    ensure_device_limits(heap);
+  }
+
+  kernel_args a = marshal_problem(lp, settings, vstatus, ft, basic_list, nonbasic_list, sol,
+                                  delta_y_steepest_edge);
+
+  // Reset the shared alloc-failed flag from the host (the kernel no longer does it).
+  const int zero_flag = 0;
+  RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_gpu_alloc_failed, &zero_flag, sizeof(int)));
+
+  // The kernel takes a device pointer to an array of kernel_args (one per block);
+  // the single-problem path is just N == 1.
+  kernel_args* d_args = nullptr;
+  RAFT_CUDA_TRY(cudaMalloc(&d_args, sizeof(kernel_args)));
+  RAFT_CUDA_TRY(cudaMemcpy(d_args, &a, sizeof(kernel_args), cudaMemcpyHostToDevice));
+  gpu_phase2_kernel<<<1, 1>>>(d_args);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
   RAFT_CUDA_TRY(cudaDeviceSynchronize());
+  cudaFree(d_args);
 
   // Marshal outputs back.
   int h_status = 0;
@@ -2414,20 +2654,143 @@ dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
     std::fprintf(stderr, "[gpu_phase2] device allocation failed during solve.\n");
   }
 
-  // Free device buffers.
-  for (void* p : {(void*)a.A_col_start, (void*)a.A_i, (void*)a.A_x, (void*)a.rhs, (void*)a.lower,
-                  (void*)a.upper, (void*)a.objective, (void*)a.L0_col_start, (void*)a.L0_i,
-                  (void*)a.L0_x, (void*)a.U0_col_start, (void*)a.U0_i, (void*)a.U0_x,
-                  (void*)a.L0t_col_start, (void*)a.L0t_i, (void*)a.L0t_x, (void*)a.U0t_col_start,
-                  (void*)a.U0t_i, (void*)a.U0t_x, (void*)a.row_perm, (void*)a.inv_row_perm,
-                  (void*)a.xi_workspace, (void*)a.x_workspace, (void*)a.vstatus,
-                  (void*)a.basic_list, (void*)a.nonbasic_list, (void*)a.x, (void*)a.y, (void*)a.z,
-                  (void*)a.dy_se, (void*)a.out_status, (void*)a.out_objective,
-                  (void*)a.out_user_objective, (void*)a.out_iterations}) {
-    if (p) { cudaFree(p); }
-  }
+  free_kernel_args(a);
 
   return static_cast<dual::status_t>(h_status);
+}
+
+// ---------------------------------------------------------------------------
+// Batch wrapper: solve N independent problems in ONE launch, one block each.
+// Each item must already be set up exactly as a single solve is (fresh factorized
+// ft, basis lists, duals in sol.y/z) — i.e. the same steps run_phase2_from_basis
+// does before the driver call. Fails LOUD (never a silent OOM): a pre-flight VRAM
+// check rejects the whole batch if it will not fit. On success, fills out_status[i]
+// and each item->sol (x, objective, user_objective, iterations).
+// ---------------------------------------------------------------------------
+template <typename i_t, typename f_t>
+void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>>& items,
+                                      size_t heap_estimate_bytes,
+                                      std::vector<dual::status_t>& out_status,
+                                      gpu_batch_timing& timing)
+{
+  using namespace gpu_phase2_detail;
+  static_assert(sizeof(i_t) == sizeof(int) && sizeof(f_t) == sizeof(double),
+                "gpu_simplified_dual_phase2_batch is only instantiated for <int, double>");
+
+  const size_t N = items.size();
+  out_status.assign(N, dual::status_t::UNSET);
+  timing = gpu_batch_timing{};
+  if (N == 0) return;
+
+  // Every ft must be a fresh factorization (pure MPF stacking port, no on-device refactor).
+  for (size_t b = 0; b < N; ++b) {
+    if (items[b].ft->num_updates() != 0) {
+      timing.rejected = true;
+      timing.message  = "item " + std::to_string(b) + " has a non-fresh factorization (num_updates=" +
+                        std::to_string(items[b].ft->num_updates()) + ")";
+      std::fprintf(stderr, "[gpu_phase2] batch ERROR: %s\n", timing.message.c_str());
+      return;
+    }
+  }
+
+  // ---- Pre-flight VRAM check (fail loud, before any device allocation) ----
+  size_t static_bytes = 0;
+  for (size_t b = 0; b < N; ++b) {
+    static_bytes += problem_static_bytes(*items[b].lp, *items[b].ft);
+  }
+  const size_t args_bytes = N * sizeof(kernel_args);
+  const size_t need = static_bytes + heap_estimate_bytes + args_bytes;
+  size_t free_b = 0, total_b = 0;
+  RAFT_CUDA_TRY(cudaMemGetInfo(&free_b, &total_b));
+  timing.vram_needed_bytes = need;
+  timing.vram_free_bytes   = free_b;
+  // Keep an 8% safety margin for CUDA context/allocator overhead + fragmentation.
+  const size_t budget = static_cast<size_t>(0.92 * static_cast<double>(free_b));
+  const double GB = 1.0 / (1024.0 * 1024.0 * 1024.0);
+  if (need > budget) {
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+                  "batch needs ~%.2f GB VRAM (static %.2f + heap %.2f + args %.2f), only %.2f GB "
+                  "free (usable budget %.2f GB) for %zu problems — reduce --replicas or use a larger GPU",
+                  need * GB, static_bytes * GB, heap_estimate_bytes * GB, args_bytes * GB,
+                  free_b * GB, budget * GB, N);
+    timing.rejected = true;
+    timing.message  = buf;
+    std::fprintf(stderr, "[gpu_phase2] batch REJECTED: %s\n", buf);
+    return;
+  }
+
+  // Size the malloc heap for all N concurrent S_ stacks (first GPU kernel this process).
+  ensure_device_limits(heap_estimate_bytes);
+
+  // ---- Marshal every problem + upload (host-timed) ----
+  const double up_t0 = tic();
+  std::vector<kernel_args> h_args(N);
+  for (size_t b = 0; b < N; ++b) {
+    const auto& it = items[b];
+    h_args[b] = marshal_problem(*it.lp, *it.settings, *it.vstatus, *it.ft, *it.basic_list,
+                                *it.nonbasic_list, *it.sol, *it.dy_se);
+    // Force profiling + per-step logging OFF for every block: the [SEPROF]/[CMP] globals are
+    // shared across blocks, so writing them from a multi-block launch races and pollutes timing.
+    h_args[b].gpu_prof = 0;
+    h_args[b].gpu_log  = 0;
+  }
+  kernel_args* d_args = nullptr;
+  RAFT_CUDA_TRY(cudaMalloc(&d_args, N * sizeof(kernel_args)));
+  RAFT_CUDA_TRY(cudaMemcpy(d_args, h_args.data(), N * sizeof(kernel_args), cudaMemcpyHostToDevice));
+  const int zero_flag = 0;
+  RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_gpu_alloc_failed, &zero_flag, sizeof(int)));
+  RAFT_CUDA_TRY(cudaDeviceSynchronize());
+  timing.upload_s = toc(up_t0);
+
+  // ---- Launch one block per problem, timed with CUDA events (device compute only) ----
+  cudaEvent_t ev_start, ev_stop;
+  RAFT_CUDA_TRY(cudaEventCreate(&ev_start));
+  RAFT_CUDA_TRY(cudaEventCreate(&ev_stop));
+  RAFT_CUDA_TRY(cudaEventRecord(ev_start));
+  gpu_phase2_kernel<<<static_cast<unsigned>(N), 1>>>(d_args);
+  RAFT_CUDA_TRY(cudaEventRecord(ev_stop));
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+  RAFT_CUDA_TRY(cudaEventSynchronize(ev_stop));
+  float kernel_ms = 0.0f;
+  RAFT_CUDA_TRY(cudaEventElapsedTime(&kernel_ms, ev_start, ev_stop));
+  timing.kernel_s = kernel_ms / 1000.0;
+  cudaEventDestroy(ev_start);
+  cudaEventDestroy(ev_stop);
+
+  // ---- Copy each problem's result back (host-timed) ----
+  const double cb_t0 = tic();
+  for (size_t b = 0; b < N; ++b) {
+    const auto& a  = h_args[b];
+    auto& sol      = *items[b].sol;
+    const int n    = a.n;
+    const int m    = a.m;
+    int h_status = 0, h_iters = 0;
+    double h_obj = 0.0, h_uobj = 0.0;
+    RAFT_CUDA_TRY(cudaMemcpy(&h_status, a.out_status, sizeof(int), cudaMemcpyDeviceToHost));
+    RAFT_CUDA_TRY(cudaMemcpy(&h_obj, a.out_objective, sizeof(double), cudaMemcpyDeviceToHost));
+    RAFT_CUDA_TRY(cudaMemcpy(&h_uobj, a.out_user_objective, sizeof(double), cudaMemcpyDeviceToHost));
+    RAFT_CUDA_TRY(cudaMemcpy(&h_iters, a.out_iterations, sizeof(int), cudaMemcpyDeviceToHost));
+    RAFT_CUDA_TRY(cudaMemcpy(sol.x.data(), a.x, n * sizeof(double), cudaMemcpyDeviceToHost));
+    RAFT_CUDA_TRY(cudaMemcpy(sol.y.data(), a.y, m * sizeof(double), cudaMemcpyDeviceToHost));
+    RAFT_CUDA_TRY(cudaMemcpy(sol.z.data(), a.z, n * sizeof(double), cudaMemcpyDeviceToHost));
+    sol.objective      = h_obj;
+    sol.user_objective = h_uobj;
+    sol.iterations     = h_iters;
+    out_status[b]      = static_cast<dual::status_t>(h_status);
+  }
+  timing.copyback_s = toc(cb_t0);
+
+  int alloc_failed = 0;
+  RAFT_CUDA_TRY(cudaMemcpyFromSymbol(&alloc_failed, g_gpu_alloc_failed, sizeof(int)));
+  if (alloc_failed) {
+    timing.message = "a device allocation failed during the batch solve (heap too small) — results "
+                     "are unreliable and will show up as verification mismatches";
+    std::fprintf(stderr, "[gpu_phase2] batch WARNING: %s\n", timing.message.c_str());
+  }
+
+  for (size_t b = 0; b < N; ++b) { free_kernel_args(h_args[b]); }
+  cudaFree(d_args);
 }
 
 template dual::status_t gpu_simplified_dual_phase2<int, double>(
@@ -2439,5 +2802,11 @@ template dual::status_t gpu_simplified_dual_phase2<int, double>(
   std::vector<int>&,
   lp_solution_t<int, double>&,
   std::vector<double>&);
+
+template void gpu_simplified_dual_phase2_batch<int, double>(
+  const std::vector<gpu_batch_item<int, double>>&,
+  size_t,
+  std::vector<dual::status_t>&,
+  gpu_batch_timing&);
 
 }  // namespace cuopt::linear_programming::dual_simplex
