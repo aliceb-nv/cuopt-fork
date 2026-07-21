@@ -27,6 +27,8 @@
 
 #include "gpu_phase2.cuh"
 
+#include "dense_triangle_solve.cuh"
+
 #include <dual_simplex/sparse_matrix.hpp>
 #include <dual_simplex/sparse_vector.hpp>
 #include <dual_simplex/tic_toc.hpp>
@@ -36,6 +38,7 @@
 #include <cuda/std/limits>
 #include <cuda/std/span>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -45,6 +48,7 @@ namespace gpu_phase2_detail {
 
 using i_t = int;
 using f_t = double;
+namespace dts = dense_triangle_solve;  // shared dense-solve cores
 
 template <typename T>
 using gpu_span = cuda::std::span<T>;
@@ -55,14 +59,10 @@ using gpu_span = cuda::std::span<T>;
 // the host before each launch; set with atomicOr so concurrent blocks don't tear.
 __device__ int g_gpu_alloc_failed;
 
-// Master switch for the [SEPROF]/[SESTAT] profiling globals (g_bsolve/g_se).
-// Those are single __device__ accumulators written on the hot b_solve/SE path;
-// with one block (<<<1,1>>>) that is fine, but in a multi-block batch launch
-// every block would hammer the same global → cross-block races + L2 contention
-// that pollute the measured kernel time. The batch wrapper sets this to 0 so the
-// profiling writes are skipped entirely; the single-problem wrapper sets it to
-// the CUOPT_GPU_PROFILE value. Read-only on the hot path (cheap, no contention).
-__device__ int g_seprof_on;
+// Warp dense-solve mode (host sets via cudaMemcpyToSymbol from CUOPT_GPU_WARP): 0 = plain wavefront
+// (bit-exact, one lane per column), 1 = big≥32 (whole-warp cooperation on large columns).
+__device__ int g_warp_solve_mode;
+static constexpr int kBigThreshold = 32;  // "large column" cutoff for the big path
 
 __device__ __forceinline__ f_t dev_inf() { return cuda::std::numeric_limits<f_t>::infinity(); }
 __device__ __forceinline__ f_t dev_nan() { return cuda::std::numeric_limits<f_t>::quiet_NaN(); }
@@ -96,7 +96,8 @@ struct gpu_vector {
     for (size_t k = 0; k < o.size_; ++k) { data_[k] = o.data_[k]; }
     size_ = o.size_;
   }
-  __device__ gpu_vector(gpu_vector&& o) : data_(o.data_), size_(o.size_), cap_(o.cap_)
+  __device__ gpu_vector(gpu_vector&& o)
+    : data_(o.data_), size_(o.size_), cap_(o.cap_)
   {
     o.data_ = nullptr;
     o.size_ = 0;
@@ -138,6 +139,17 @@ struct gpu_vector {
   __device__ T* begin() { return data_; }
   __device__ T* end() { return data_ + size_; }
   __device__ void clear() { size_ = 0; }
+  // Set the logical size directly after a raw write through data() (warp collective ops that fill
+  // [0, n) in-place). Caller must ensure capacity >= n (reserve first).
+  __device__ void set_size(size_t n) { size_ = n; }
+  // Swap buffers with another gpu_vector (preserves both allocations — used by sort() to
+  // reuse scratch without move-stealing its buffer).
+  __device__ void swap(gpu_vector& o)
+  {
+    T* d = data_; data_ = o.data_; o.data_ = d;
+    size_t s = size_; size_ = o.size_; o.size_ = s;
+    size_t c = cap_; cap_ = o.cap_; o.cap_ = c;
+  }
 
   __device__ void grow_to(size_t newcap)
   {
@@ -385,24 +397,23 @@ struct gpu_sparse_vector {
 
   __device__ void inverse_permute_vector(const i_t* p)
   {
-    i_t nz = i.size();
-    gpu_vector<i_t> i_perm(nz);
-    for (i_t k = 0; k < nz; ++k) {
-      i_perm[k] = p[i[k]];
-    }
-    i = static_cast<gpu_vector<i_t>&&>(i_perm);
+    // In-place: each index is remapped independently (i[k] <- p[i[k]]), so no temp buffer is needed.
+    const i_t nz = i.size();
+    for (i_t k = 0; k < nz; ++k) { i[k] = p[i[k]]; }
   }
 
-  __device__ void sort()
+  // Sort the sparse vector by index using caller-provided reused scratch (no per-call device malloc):
+  // an O(n) bucket sort when dense (>30% nnz), else an n·log·n sort of a permutation then a gather.
+  // The reused bucket is re-zeroed via assign (owning buffer, no realloc); the n·log·n path gathers
+  // into scratch and swaps (preserving both buffers).
+  __device__ void sort(gpu_vector<f_t>& bucket, gpu_vector<i_t>& i_scr,
+                       gpu_vector<f_t>& x_scr, gpu_vector<i_t>& perm)
   {
     if (i.size() == 1) { return; }
-    // If the number of nonzeros is large, use an O(n) bucket sort.
+    const i_t nz = i.size();
     if (i.size() > 0.3 * n) {
-      gpu_vector<f_t> bucket(n, 0.0);
-      const i_t nz = i.size();
-      for (i_t k = 0; k < nz; ++k) {
-        bucket[i[k]] = x[k];
-      }
+      bucket.assign(n, 0.0);  // reused (was gpu_vector<f_t> bucket(n,0.0)); O(n) re-zero, no malloc
+      for (i_t k = 0; k < nz; ++k) { bucket[i[k]] = x[k]; }
       i.clear();
       i.reserve(nz);
       x.clear();
@@ -414,24 +425,23 @@ struct gpu_sparse_vector {
         }
       }
     } else {
-      // n log n sort: sort a permutation by index, then gather.
-      const i_t nz = i.size();
-      gpu_vector<i_t> i_sorted(nz);
-      gpu_vector<f_t> x_sorted(nz);
-      gpu_vector<i_t> perm(nz);
-      for (i_t k = 0; k < nz; ++k) {
-        perm[k] = k;
-      }
+      perm.clear();
+      perm.reserve(nz);
+      for (i_t k = 0; k < nz; ++k) { perm.push_back(k); }
       i_t* iunsorted = i.data();
       gpu_sort(perm.begin(), perm.end(), [iunsorted] __device__(i_t a, i_t b) {
         return iunsorted[a] < iunsorted[b];
       });
+      i_scr.clear();
+      i_scr.reserve(nz);
+      x_scr.clear();
+      x_scr.reserve(nz);
       for (i_t k = 0; k < nz; ++k) {
-        i_sorted[k] = i[perm[k]];
-        x_sorted[k] = x[perm[k]];
+        i_scr.push_back(i[perm[k]]);
+        x_scr.push_back(x[perm[k]]);
       }
-      i = static_cast<gpu_vector<i_t>&&>(i_sorted);
-      x = static_cast<gpu_vector<f_t>&&>(x_sorted);
+      i.swap(i_scr);  // i/x get the sorted buffers; scratch keeps the old ones (capacity reused)
+      x.swap(x_scr);
     }
   }
 
@@ -507,71 +517,448 @@ __device__ f_t sparse_dot(const i_t* xind, const f_t* xval, i_t nx, const i_t* y
 
 // ---- dense triangular solves (triangle_solve.hpp) -------------------------
 
-__device__ i_t lower_triangular_solve(const gpu_csc_view& L, f_t* x, f_t& work_estimate)
+__device__ void lower_triangular_solve(const gpu_csc_view& L, f_t* x, f_t& work_estimate)
 {
-  i_t n = L.n;
-  for (i_t j = 0; j < n; ++j) {
-    i_t col_start = L.col_start[j];
-    i_t col_end   = L.col_start[j + 1];
-    if (x[j] != 0.0) {
-      x[j] /= L.x[col_start];
-      const f_t x_j = x[j];
-      for (i_t p = col_start + 1; p < col_end; ++p) {
-        x[L.i[p]] -= L.x[p] * x_j;
-      }
-    }
-  }
-  work_estimate += 3 * n + 3 * L.col_start[n];
-  return 0;
+  dts::lower_solve(L.col_start.data(), L.i.data(), L.x.data(), x, L.n, &work_estimate);
 }
 
-__device__ i_t lower_triangular_transpose_solve(const gpu_csc_view& L, f_t* x, f_t& work_estimate)
+__device__ void lower_triangular_transpose_solve(const gpu_csc_view& L, f_t* x, f_t& work_estimate)
 {
-  const i_t n = L.n;
-  for (i_t j = n - 1; j >= 0; --j) {
-    const i_t col_start = L.col_start[j] + 1;
-    const i_t col_end   = L.col_start[j + 1];
-    for (i_t p = col_start; p < col_end; ++p) {
-      x[j] -= L.x[p] * x[L.i[p]];
-    }
-    x[j] /= L.x[L.col_start[j]];
-  }
-  work_estimate += 6 * n + 4 * L.col_start[n];
-  return 0;
+  dts::lower_transpose_solve(L.col_start.data(), L.i.data(), L.x.data(), x, L.n, &work_estimate);
 }
 
 __device__ i_t upper_triangular_solve(const gpu_csc_view& U, f_t* x, f_t& work_estimate)
 {
-  const i_t n = U.n;
-  for (i_t j = n - 1; j >= 0; --j) {
-    const i_t col_start = U.col_start[j];
-    const i_t col_end   = U.col_start[j + 1] - 1;
-    if (x[j] != 0.0) {
-      x[j] /= U.x[col_end];
-      const f_t x_j = x[j];
-      for (i_t p = col_start; p < col_end; ++p) {
-        x[U.i[p]] -= U.x[p] * x_j;
-      }
-      work_estimate += 3 * (col_end - col_start) + 3;
-    }
-  }
-  work_estimate += 3 * n;
+  dts::upper_solve(U.col_start.data(), U.i.data(), U.x.data(), x, U.n, &work_estimate);
   return 0;
 }
 
 __device__ i_t upper_triangular_transpose_solve(const gpu_csc_view& U, f_t* x, f_t& work_estimate)
 {
-  const i_t n = U.n;
-  for (i_t j = 0; j < n; ++j) {
-    const i_t col_start = U.col_start[j];
-    const i_t col_end   = U.col_start[j + 1] - 1;
-    for (i_t p = col_start; p < col_end; ++p) {
-      x[j] -= U.x[p] * x[U.i[p]];
-    }
-    x[j] /= U.x[col_end];
-  }
-  work_estimate += 4 * n + 4 * U.col_start[n];
+  dts::upper_transpose_solve(U.col_start.data(), U.i.data(), U.x.data(), x, U.n, &work_estimate);
   return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Warp-parallel wavefront (level-scheduled) dense triangular solves.
+//
+// The fixed L0/U0 factors never change (no refactor), so a solve's dependency
+// structure is computed ONCE (warp_build_config) into an elimination-level
+// schedule: every column is bucketed into a level; all columns in one level are
+// mutually independent and are processed concurrently -- ONE LANE PER COLUMN --
+// with a __syncwarp() between levels. Each column's own accumulation runs
+// serially in a single lane in the SAME order as the <<<1,1>>> solve, so the
+// warp result is bit-for-bit equal to the single-thread reference.
+//
+// All four solves are expressed in race-free GATHER form  x[j]=(rhs[j]-sum)/diag,
+// cross-wiring the non-transpose L/U solves to the transpose CSC so every output
+// x[j] is written by exactly one lane (no atomics):
+//   op          gather matrix     diag   inner-order   dep / level order
+//   L-solve  -> L0_transpose_     last   ascending     deps<j, process asc
+//   U-solve  -> U0_transpose_     first  descending    deps>j, process desc
+//   Lᵀ-solve -> L0_              first  ascending     deps>j, process desc
+//   Uᵀ-solve -> U0_              last   ascending     deps<j, process asc
+// ---------------------------------------------------------------------------
+// The four dense triangular-solve operators the warp path parallelizes. Their values
+// are the indices into every per-operator array in warp_solve_config (and the order in
+// which warp_build_config fills them). WARP_TLOOP is a non-solve collective (the MPF
+// rank-1 replay) handled via the tl_* fields, so it never indexes a per-operator array.
+// WARP_DONE is the "no work left" sentinel, placed one past every real op.
+static constexpr int kNumWarpSolveOps = 4;  // L, U, Lᵀ, Uᵀ
+enum warp_solve_op {
+  WARP_L_SOLVE = 0, WARP_U_SOLVE = 1, WARP_LT_SOLVE = 2, WARP_UT_SOLVE = 3,
+  WARP_TLOOP     = kNumWarpSolveOps,     // 4: MPF rank-1 T-loop (uses tl_* fields, not cs[op]/nlev[op])
+  WARP_DZ        = kNumWarpSolveOps + 1, // 5: reduced-cost SpMv δz = -A_N'·δy (uses dz_* fields)
+  WARP_TODENSE   = kNumWarpSolveOps + 2, // 6: sparse→dense scatter (td_* fields)
+  WARP_FROMDENSE = kNumWarpSolveOps + 3, // 7: dense→sparse compaction (fd_* fields)
+  WARP_RT        = kNumWarpSolveOps + 4, // 8: dual ratio test min-argmin (rt_* fields)
+  WARP_DONE      = kNumWarpSolveOps + 5  // 9: sentinel — never indexes a per-op array
+};
+
+// Trivially constructible (no member initializers) so it can be a __shared__
+// variable. Lane 0 fills every field (warp_build_config + warp_dispatch) before
+// any lane reads it, ordered by the first __syncwarp.
+struct warp_solve_config {
+  // Per-operator (indexed by warp_solve_op); filled once by warp_build_config.
+  const i_t* cs[kNumWarpSolveOps];      // gather CSC col_start
+  const i_t* ridx[kNumWarpSolveOps];    // gather CSC row indices
+  const f_t* val[kNumWarpSolveOps];     // gather CSC values
+  const i_t* lstart[kNumWarpSolveOps];  // level offsets [nlev+1]
+  const i_t* corder[kNumWarpSolveOps];  // columns by level [m] (sorted large-first when mode==big)
+  i_t  nlev[kNumWarpSolveOps];
+  bool diag_first[kNumWarpSolveOps];
+  bool descending[kNumWarpSolveOps];
+  bool incremental[kNumWarpSolveOps];   // L/U-solve subtract incrementally (match scatter); LᵀUᵀ sum
+  // mode 1 (big): per-level base word into bits[] + the large-column bitmask.
+  const i_t*      lword[kNumWarpSolveOps];
+  const unsigned* bits[kNumWarpSolveOps];
+  int  mode;                            // 0 plain / 1 big (= g_warp_solve_mode)
+  i_t  m;
+  // Per-dispatch request: written by lane 0, read by all lanes after __syncwarp.
+  f_t* x;
+  int  op;
+  // T-loop request (op == WARP_TLOOP): the MPF rank-1 replay over S_. Set fresh each
+  // dispatch (S_ pointers can move on resize). dot col = 2k+tl_dotoff, axpy col = 2k+tl_axpyoff.
+  const i_t* tl_cs;      // S_.col_start
+  const i_t* tl_ri;      // S_.i
+  const f_t* tl_val;     // S_.x
+  const f_t* tl_mu;      // mu_values_
+  f_t*       tl_work;    // &work_estimate_ (lane-0 accumulation only)
+  i_t        tl_num;     // num_updates_
+  i_t        tl_dotoff;  // 0 (u_col) or 1 (v_col)
+  i_t        tl_axpyoff; // 0 (u_col) or 1 (v_col)
+  bool       tl_asc;     // ascending k (l_solve) vs descending (l_transpose)
+  f_t        tl_tol;     // theta zero-tolerance
+  // δz SpMv request (op == WARP_DZ): dense CSC gather δz[j] = -A(:,j)'·δy over nonbasic columns.
+  const i_t* dz_Acs;      // A.col_start
+  const i_t* dz_Ari;      // A.i
+  const f_t* dz_Aval;     // A.x
+  const f_t* dz_dy;       // delta_y (dense)
+  const i_t* dz_basic;    // basic_list
+  const i_t* dz_nonbasic; // nonbasic_list
+  f_t*       dz_out;      // delta_z (dense output)
+  i_t*       dz_indices;  // raw index buffer, filled [0,count) in nonbasic order
+  i_t*       dz_mark;     // delta_z_mark
+  i_t*       dz_count;    // out: number of nonzeros appended (lane 0)
+  f_t*       dz_work;     // out: work_estimate accumulation (lane 0), or nullptr
+  i_t        dz_m;
+  i_t        dz_n;
+  i_t        dz_leaving;
+  i_t        dz_dir;
+  // sparse→dense scatter (op == WARP_TODENSE): dense[0,td_n)=0 then dense[td_i[k]]=td_x[k].
+  const i_t* td_i;
+  const f_t* td_x;
+  f_t*       td_dense;
+  i_t        td_nz;
+  i_t        td_n;
+  // dense→sparse compaction (op == WARP_FROMDENSE): append (k, fd_in[k]) for nonzero fd_in[k].
+  const f_t* fd_in;
+  i_t*       fd_i;
+  f_t*       fd_x;
+  i_t*       fd_count;
+  i_t        fd_n;
+  // dual ratio test (op == WARP_RT): min eligible ratio over nonbasic cols, then argmax |z| within tol.
+  const i_t*                rt_nonbasic;
+  const variable_status_t*  rt_vstatus;
+  const f_t*                rt_z;
+  const f_t*                rt_dz;
+  i_t*                      rt_entering;   // out: entering column j (or -1)
+  i_t*                      rt_k;          // out: its nonbasic_list index
+  f_t*                      rt_step;       // out: step_length (chosen ratio)
+  i_t                       rt_m;
+  i_t                       rt_n;
+  f_t                       rt_pivot_tol;
+  f_t                       rt_dual_tol;
+  f_t                       rt_zero_tol;
+};
+
+// Collective (all-32-lane) dense solve of operator cfg.op on x = cfg.x. Both modes do exactly
+// cfg.nlev[op] internal __syncwarps, so the persistent-helper dispatch count is mode-independent.
+__device__ void warp_collective_solve(const warp_solve_config& cfg)
+{
+  const int op = cfg.op;
+  if (cfg.mode == 1) {  // big≥32: whole-warp cooperation on large columns
+    dts::wavefront_big_solve(cfg.cs[op], cfg.ridx[op], cfg.val[op], cfg.x, cfg.lstart[op],
+                             cfg.corder[op], cfg.lword[op], cfg.bits[op], cfg.nlev[op],
+                             cfg.diag_first[op], cfg.descending[op], cfg.incremental[op]);
+  } else {              // plain wavefront: one lane per column
+    dts::wavefront_gather_solve(cfg.cs[op], cfg.ridx[op], cfg.val[op], cfg.x, cfg.lstart[op],
+                                cfg.corder[op], cfg.nlev[op], cfg.diag_first[op], cfg.descending[op],
+                                cfg.incremental[op]);
+  }
+}
+
+// All-lane butterfly sum: every lane returns the full 32-lane total, so all lanes then compute the
+// same theta and take the same branch (branch-uniform => matched __syncwarp counts). NOT bit-exact vs
+// the serial left-to-right sum (reordered adds) -> warp path only; the <<<1,1>>> ref never uses it.
+__device__ __forceinline__ f_t warp_reduce_add(f_t v)
+{
+  for (int o = 16; o > 0; o >>= 1) { v += __shfl_xor_sync(0xffffffffu, v, o); }
+  return v;
+}
+
+// All-lane butterfly min: every lane returns the full 32-lane minimum (used by the ratio test to
+// broadcast the global min ratio before the tie-break pass). min is associative/commutative → bit-exact.
+__device__ __forceinline__ f_t warp_reduce_min(f_t v)
+{
+  for (int o = 16; o > 0; o >>= 1) { v = fmin(v, __shfl_xor_sync(0xffffffffu, v, o)); }
+  return v;
+}
+
+// Collective (all-32-lane) MPF rank-1 T-loop replay: for each update k, dot = S(:,dcol)'·x
+// (lane-strided partial + all-reduce), theta = dot/mu, then x += -theta·S(:,acol) (lane-strided
+// distinct writes). One __syncwarp per update (uniform), so the internal barrier count = tl_num
+// on both lane 0 and the helpers. Only the dot reduction is non-bit-exact (relaxed); the axpy
+// writes are distinct rows within a column -> race-free and bit-exact. work_estimate is
+// accumulated on lane 0 only (mirrors the serial dot_product / add_sparse_column accounting).
+__device__ void warp_collective_tloop(const warp_solve_config& cfg)
+{
+  const int lane = static_cast<int>(threadIdx.x);
+  const i_t num  = cfg.tl_num;
+  f_t* x         = cfg.x;
+  f_t work       = 0.0;
+  for (i_t s = 0; s < num; ++s) {
+    const i_t k    = cfg.tl_asc ? s : (num - 1 - s);
+    const i_t dcol = 2 * k + cfg.tl_dotoff;
+    const i_t acol = 2 * k + cfg.tl_axpyoff;
+    const f_t mu   = cfg.tl_mu[k];
+    const i_t dc0  = cfg.tl_cs[dcol];
+    const i_t dc1  = cfg.tl_cs[dcol + 1];
+    f_t partial    = 0.0;
+    for (i_t p = dc0 + lane; p < dc1; p += 32) { partial += cfg.tl_val[p] * x[cfg.tl_ri[p]]; }
+    const f_t dot   = warp_reduce_add(partial);   // every lane gets the full sum
+    const f_t theta = dot / mu;
+    if (lane == 0) { work += 3 * (dc1 - dc0); }
+    if (fabs(theta) > cfg.tl_tol) {
+      const i_t ac0 = cfg.tl_cs[acol];
+      const i_t ac1 = cfg.tl_cs[acol + 1];
+      for (i_t p = ac0 + lane; p < ac1; p += 32) { x[cfg.tl_ri[p]] += (-theta) * cfg.tl_val[p]; }
+      if (lane == 0) { work += 3 * (ac1 - ac0); }
+    }
+    __syncwarp(0xffffffffu);   // x writes visible before the next update's dot reads them
+  }
+  if (lane == 0 && cfg.tl_work != nullptr) { *cfg.tl_work += work; }
+}
+
+// Collective (all-32-lane) reduced-cost SpMv: δz[j] = -A(:,j)'·δy for each nonbasic column j
+// (one lane per column, gather form → distinct outputs, no atomics, per-column dot in a single lane
+// → BIT-EXACT vs the serial dense path). Clears basic δz, sets the leaving entry, then computes the
+// nonbasic dots and appends the nonzero columns to dz_indices via an ordered ballot/popc compaction
+// that preserves the exact nonbasic_list order (so the index list matches the serial push_back order).
+// Exactly ONE internal __syncwarp (after the clear, before the leaving overwrite).
+__device__ void warp_collective_dz(const warp_solve_config& cfg)
+{
+  const int lane = static_cast<int>(threadIdx.x);
+  const i_t m = cfg.dz_m, n = cfg.dz_n;
+  f_t* dz = cfg.dz_out;
+  for (i_t k = lane; k < m; k += 32) { dz[cfg.dz_basic[k]] = 0.0; }  // clear basic entries
+  __syncwarp(0xffffffffu);                                           // clears done before leaving set
+  if (lane == 0) { dz[cfg.dz_leaving] = static_cast<f_t>(cfg.dz_dir); }
+  const i_t num_nb = n - m;
+  i_t count      = 0;    // running #appended (identical on all lanes)
+  f_t nnz_local  = 0.0;
+  for (i_t base = 0; base < num_nb; base += 32) {
+    const i_t k = base + lane;
+    i_t j = -1; f_t dzj = 0.0; bool active = false;
+    if (k < num_nb) {
+      j            = cfg.dz_nonbasic[k];
+      const i_t c0 = cfg.dz_Acs[j], c1 = cfg.dz_Acs[j + 1];
+      f_t dot      = 0.0;
+      for (i_t p = c0; p < c1; ++p) { dot += cfg.dz_Aval[p] * cfg.dz_dy[cfg.dz_Ari[p]]; }
+      dzj = -dot; dz[j] = dzj;
+      nnz_local += static_cast<f_t>(c1 - c0);
+      active = (dzj != 0.0);
+    }
+    const unsigned ball = __ballot_sync(0xffffffffu, active);
+    const int prefix    = __popc(ball & ((1u << lane) - 1u));
+    if (active) { cfg.dz_indices[count + prefix] = j; cfg.dz_mark[j] = 1; }  // distinct offsets/rows
+    count += __popc(ball);
+  }
+  if (lane == 0) { *cfg.dz_count = count; }
+  if (cfg.dz_work != nullptr) {
+    const f_t nnz_total = warp_reduce_add(nnz_local);
+    if (lane == 0) {
+      *cfg.dz_work += 2.0 * m + 3.0 * static_cast<f_t>(num_nb) + 3.0 * nnz_total
+                    + 2.0 * static_cast<f_t>(count);
+    }
+  }
+}
+
+// Collective sparse→dense scatter: dense[0,n)=0 then dense[i[k]]=x[k]. One internal __syncwarp
+// (zero all before scattering, since scatter targets overlap the zeroed range). Distinct sparse
+// indices → distinct writes → bit-exact.
+__device__ void warp_collective_todense(const warp_solve_config& cfg)
+{
+  const int lane = static_cast<int>(threadIdx.x);
+  const i_t n = cfg.td_n;
+  for (i_t k = lane; k < n; k += 32) { cfg.td_dense[k] = 0.0; }
+  __syncwarp(0xffffffffu);
+  const i_t nz = cfg.td_nz;
+  for (i_t k = lane; k < nz; k += 32) { cfg.td_dense[cfg.td_i[k]] = cfg.td_x[k]; }
+}
+
+// Collective dense→sparse compaction: append (k, in[k]) for every nonzero in[k], in increasing k
+// (ordered ballot/popc → matches the serial scan order). Distinct offsets → no internal barrier.
+__device__ void warp_collective_fromdense(const warp_solve_config& cfg)
+{
+  const int lane = static_cast<int>(threadIdx.x);
+  const i_t n = cfg.fd_n;
+  i_t count = 0;
+  for (i_t base = 0; base < n; base += 32) {
+    const i_t k = base + lane;
+    bool active = false; f_t v = 0.0;
+    if (k < n) { v = cfg.fd_in[k]; active = (v != 0.0); }
+    const unsigned ball = __ballot_sync(0xffffffffu, active);
+    const int prefix    = __popc(ball & ((1u << lane) - 1u));
+    if (active) { cfg.fd_i[count + prefix] = k; cfg.fd_x[count + prefix] = v; }
+    count += __popc(ball);
+  }
+  if (lane == 0) { *cfg.fd_count = count; }
+}
+
+// Collective dual ratio test: min eligible ratio over nonbasic columns, then argmax |z[j]| among the
+// candidates within zero_tol of that min (ties → smaller nonbasic index). Two lane-strided passes +
+// two warp reductions (no `__syncwarp` — all via registers/shfl). Bit-exact vs the serial greedy scan
+// EXCEPT a rare window-drift cascade (needs many ratios within zero_tol of each other; zero_tol is
+// tiny) → relaxed. Eligibility mirrors the serial exactly.
+__device__ void warp_collective_rt(const warp_solve_config& cfg)
+{
+  const int lane   = static_cast<int>(threadIdx.x);
+  const i_t num_nb = cfg.rt_n - cfg.rt_m;
+  const f_t ptol = cfg.rt_pivot_tol, dtol = cfg.rt_dual_tol, ztol = cfg.rt_zero_tol;
+  const f_t INF  = dev_inf();
+
+  // Pass 1: global minimum eligible ratio (all lanes get it).
+  f_t lmin = INF;
+  for (i_t k = lane; k < num_nb; k += 32) {
+    const i_t j             = cfg.rt_nonbasic[k];
+    const variable_status_t s = cfg.rt_vstatus[j];
+    f_t ratio = INF;
+    if (s == variable_status_t::NONBASIC_LOWER && cfg.rt_dz[j] < -ptol) {
+      ratio = (-dtol - cfg.rt_z[j]) / cfg.rt_dz[j];
+    } else if (s == variable_status_t::NONBASIC_UPPER && cfg.rt_dz[j] > ptol) {
+      ratio = (dtol - cfg.rt_z[j]) / cfg.rt_dz[j];
+    }
+    if (ratio < lmin) { lmin = ratio; }
+  }
+  const f_t gmin = warp_reduce_min(lmin);
+
+  // Pass 2: among ratio < gmin+ztol, pick max |z[j]| (tie → smaller k).
+  f_t best_absz = -1.0; i_t best_k = 0x7fffffff; i_t best_j = -1; f_t best_r = INF;
+  for (i_t k = lane; k < num_nb; k += 32) {
+    const i_t j             = cfg.rt_nonbasic[k];
+    const variable_status_t s = cfg.rt_vstatus[j];
+    f_t ratio = INF;
+    if (s == variable_status_t::NONBASIC_LOWER && cfg.rt_dz[j] < -ptol) {
+      ratio = (-dtol - cfg.rt_z[j]) / cfg.rt_dz[j];
+    } else if (s == variable_status_t::NONBASIC_UPPER && cfg.rt_dz[j] > ptol) {
+      ratio = (dtol - cfg.rt_z[j]) / cfg.rt_dz[j];
+    }
+    // Candidate = the argmin (always, so entering can't be spuriously -1) plus near-ties within
+    // zero_tol. Use the difference (ratio - gmin) not (ratio < gmin + ztol): the latter drops the
+    // argmin when gmin is large (gmin+ztol rounds back to gmin) or zero_tol == 0 → false DUAL_UNBOUNDED.
+    if (ratio <= gmin || ratio - gmin < ztol) {
+      const f_t az = fabs(cfg.rt_z[j]);
+      if (az > best_absz || (az == best_absz && k < best_k)) {
+        best_absz = az; best_k = k; best_j = j; best_r = ratio;
+      }
+    }
+  }
+  // Reduce (best_absz, best_k, best_j, best_r) to lane 0: max |z|, tie → smaller k.
+  for (int off = 16; off > 0; off >>= 1) {
+    const f_t o_absz = __shfl_down_sync(0xffffffffu, best_absz, off);
+    const i_t o_k    = __shfl_down_sync(0xffffffffu, best_k, off);
+    const i_t o_j    = __shfl_down_sync(0xffffffffu, best_j, off);
+    const f_t o_r    = __shfl_down_sync(0xffffffffu, best_r, off);
+    if (o_absz > best_absz || (o_absz == best_absz && o_k < best_k)) {
+      best_absz = o_absz; best_k = o_k; best_j = o_j; best_r = o_r;
+    }
+  }
+  if (lane == 0) { *cfg.rt_entering = best_j; *cfg.rt_k = best_j < 0 ? -1 : best_k; *cfg.rt_step = best_r; }
+}
+
+// Route a posted request to the right collective body: op < kNumWarpSolveOps is a dense triangular
+// solve, else the tl_/dz_/td_/fd_/rt_ collective selected by op. Both lane 0 (warp_dispatch*) and the
+// parked helpers (warp_helper_loop) go through here, so their internal __syncwarp counts always match
+// (nlev[op] solve, tl_num T-loop, 1 δz, 1 to_dense, 0 from_dense, 0 ratio test).
+__device__ void warp_collective(const warp_solve_config& cfg)
+{
+  if (cfg.op == WARP_TLOOP) { warp_collective_tloop(cfg); }
+  else if (cfg.op == WARP_DZ) { warp_collective_dz(cfg); }
+  else if (cfg.op == WARP_TODENSE) { warp_collective_todense(cfg); }
+  else if (cfg.op == WARP_FROMDENSE) { warp_collective_fromdense(cfg); }
+  else if (cfg.op == WARP_RT) { warp_collective_rt(cfg); }
+  else { warp_collective_solve(cfg); }
+}
+
+// Lanes 1..31 park here for the whole driver, waking to run each op lane 0 posts,
+// and exit when lane 0 posts WARP_DONE. The __syncwarp count per op (A + internal + B)
+// matches the dispatch on lane 0 exactly.
+__device__ void warp_helper_loop(const warp_solve_config* cfg)
+{
+  while (true) {
+    __syncwarp(0xffffffffu);          // A: (x, op) published by lane 0
+    if (cfg->op == WARP_DONE) { break; }
+    warp_collective(*cfg);            // internal __syncwarps (nlev[op] or tl_num)
+    __syncwarp(0xffffffffu);          // B: results committed
+  }
+}
+
+// Build the elimination-level schedule of one gather operator (lane 0, once).
+// `mat` is the gather CSC (its columns are the solve's output rows). Fills
+// level_start[nlev+1] and col_order[m]; returns nlev. `level` is m-sized scratch.
+__device__ int warp_build_levels(const gpu_csc_view& mat, bool diag_first, bool asc_process,
+                                  gpu_vector<i_t>& level, gpu_vector<i_t>& level_start,
+                                  gpu_vector<i_t>& col_order)
+{
+  const i_t m = mat.n;
+  level.assign(m, 0);
+  for (i_t s = 0; s < m; ++s) {                        // pull: level[j] = 1 + max level[dep]
+    const i_t j  = asc_process ? s : (m - 1 - s);
+    const i_t c0 = mat.col_start[j];
+    const i_t c1 = mat.col_start[j + 1];
+    const i_t lo = diag_first ? c0 + 1 : c0;
+    const i_t hi = diag_first ? c1 : (c1 - 1);
+    i_t lv = 1;
+    for (i_t p = lo; p < hi; ++p) {
+      const i_t dep = mat.i[p];
+      if (level[dep] + 1 > lv) { lv = level[dep] + 1; }
+    }
+    level[j] = lv;
+  }
+  i_t nlev = 0;
+  for (i_t j = 0; j < m; ++j) { if (level[j] > nlev) { nlev = level[j]; } }
+  level_start.assign(nlev + 1, 0);                     // counting sort by level
+  for (i_t j = 0; j < m; ++j) { level_start[level[j]]++; }
+  for (i_t k = 1; k <= nlev; ++k) { level_start[k] += level_start[k - 1]; }
+  col_order.resize(m);
+  gpu_vector<i_t> pos(nlev + 1);
+  for (i_t lv = 1; lv <= nlev; ++lv) { pos[lv] = level_start[lv - 1]; }
+  for (i_t j = 0; j < m; ++j) { const i_t lv = level[j]; col_order[pos[lv]++] = j; }
+  return static_cast<int>(nlev);
+}
+
+// Big schedule (mode 1): build the level schedule, then within each level sort columns large-first
+// (large = gather span >= kBigThreshold) and emit the per-32-column bitmask + per-level base word into
+// bits[]/lword[]. `scratch` is m-sized workspace. Returns nlev. Runs on lane 0, once.
+__device__ int warp_build_levels_big(const gpu_csc_view& mat, bool df, bool asc,
+                                     gpu_vector<i_t>& level, gpu_vector<i_t>& level_start,
+                                     gpu_vector<i_t>& col_order, gpu_vector<i_t>& lword,
+                                     gpu_vector<unsigned>& bits, gpu_vector<i_t>& scratch)
+{
+  const int nlev = warp_build_levels(mat, df, asc, level, level_start, col_order);
+  const i_t m    = mat.n;
+  scratch.resize(m);
+  lword.assign(nlev + 1, 0);
+  i_t nwords = 0;                                       // per-level word-aligned bitmask
+  for (int L = 0; L < nlev; ++L) {
+    lword[L] = nwords;
+    nwords += (level_start[L + 1] - level_start[L] + 31) / 32;
+  }
+  lword[nlev] = nwords;
+  bits.assign(nwords, 0u);
+  auto span = [&](i_t j) -> i_t {
+    const i_t c0 = mat.col_start[j], c1 = mat.col_start[j + 1];
+    return df ? (c1 - (c0 + 1)) : ((c1 - 1) - c0);
+  };
+  for (int L = 0; L < nlev; ++L) {
+    const i_t base = level_start[L], end = level_start[L + 1];
+    i_t w = base;                                        // stable partition: large first, then small
+    for (i_t t = base; t < end; ++t) { if (span(col_order[t]) >= kBigThreshold) { scratch[w++] = col_order[t]; } }
+    const i_t nlarge_end = w;
+    for (i_t t = base; t < end; ++t) { if (span(col_order[t]) <  kBigThreshold) { scratch[w++] = col_order[t]; } }
+    for (i_t t = base; t < end; ++t) { col_order[t] = scratch[t]; }
+    const i_t wbase = lword[L], sz = end - base;         // leading nlarge_end-base entries are large
+    for (i_t c = 0; c * 32 < sz; ++c) {
+      unsigned word = 0;
+      for (int i = 0; i < 32; ++i) {
+        const i_t t = base + c * 32 + i;
+        if (t < nlarge_end) { word |= (1u << i); }
+      }
+      bits[wbase + c] = word;
+    }
+  }
+  return nlev;
 }
 
 // ---- sparse triangular solve (reach + iterative DFS) ----------------------
@@ -682,44 +1069,6 @@ __device__ i_t sparse_triangle_solve(
 }
 
 // ---------------------------------------------------------------------------
-// clock64 profiler focused on the b_solve inside update_steepest_edge_norms (the "se" section,
-// the largest slice of the GPU pivot loop). Single-thread <<<1,1>>> kernel => these device
-// globals are race-free. Timing-only: clock64 reads + integer accumulation, no effect on the LP
-// computation (CPU<->GPU bit-parity is unchanged). Emitted as [SEPROF] at kernel exit when
-// CUOPT_GPU_PROFILE=1. The sparse b_solve overwrites g_bsolve on every call; update_steepest_edge_norms
-// harvests it right after ITS b_solve (so only the se-context solve is attributed).
-// ---------------------------------------------------------------------------
-struct bsolve_bd_t {
-  long long permute, lsolve, usolve, hyper_l, hyper_u, nz_in, nz_l, nz_u;
-  long long l0, lrank1, u0;  // base L0 triangular solve, rank-1 T-loop (in l_solve), base U0 solve
-};
-__device__ bsolve_bd_t g_bsolve;
-struct se_prof_t {
-  long long total, bsolve, permute, lsolve, usolve, rest, calls, hyper_l, hyper_u, nz_in, nz_l, nz_u;
-  long long l0, lrank1, u0;
-  // Whole-pivot section timers (accumulated over the loop): steepest-edge pricing, BTran
-  // (compute_delta_y), reduced-cost delta_z (compute_delta_z / dense fallback), ratio test
-  // (phase2_ratio_test), FTran (compute_delta_x). se_total above covers update_steepest_edge_norms.
-  long long pricing, btran, dz, rt, ftran;
-  __device__ void reset()
-  {
-    total = bsolve = permute = lsolve = usolve = rest = calls = hyper_l = hyper_u = nz_in = nz_l =
-      nz_u = l0 = lrank1 = u0 = 0;
-    pricing = btran = dz = rt = ftran = 0;
-  }
-  __device__ void emit(long long kernel_total, int iters) const
-  {
-    printf("[SEPROF] iters=%d kernel_total=%lld se_total=%lld se_bsolve=%lld permute=%lld "
-           "lsolve=%lld usolve=%lld rest=%lld se_calls=%lld hyper_l=%lld hyper_u=%lld "
-           "nz_in=%lld nz_l=%lld nz_u=%lld l0=%lld lrank1=%lld u0=%lld "
-           "pricing=%lld btran=%lld dz=%lld rt=%lld ftran=%lld\n",
-           iters, kernel_total, total, bsolve, permute, lsolve, usolve, rest, calls, hyper_l,
-           hyper_u, nz_in, nz_l, nz_u, l0, lrank1, u0, pricing, btran, dz, rt, ftran);
-  }
-};
-__device__ se_prof_t g_se;
-
-// ---------------------------------------------------------------------------
 // gpu_basis_update_mpf : the MPF LU factorization object. The initial factors
 // L0_/U0_ (+ transposes) and permutations are fixed views uploaded from the
 // host; S_/mu_values_ grow in-kernel as rank-1 updates are stacked.
@@ -733,11 +1082,26 @@ struct gpu_basis_update_mpf {
   gpu_vector<f_t> mu_values_;
   gpu_span<i_t> xi_workspace_;  // size 2*m (scratch)
   gpu_span<f_t> x_workspace_;   // size m   (scratch)
+  // Reused solve scratch (owning; grows to m once, then reused every call) so the b_solve /
+  // b_transpose_solve dense↔sparse conversions and the sparse-Lᵀ gather no longer device-malloc a
+  // fresh temporary per solve. Bit-identical to the per-call locals (same values, same order).
+  mutable gpu_vector<f_t> dense_scratch_;    // solution_dense in the dense b_solve/b_transpose branches
+  mutable gpu_sparse_vector sparse_scratch_; // gathered `b` (sparse Lᵀ) + throwaway Lsol
+  mutable gpu_sparse_vector ei_scratch_;     // unit RHS for compute_delta_y (separate — b_transpose_solve
+                                             // uses sparse_scratch_ internally, so ei can't share it)
+  mutable gpu_vector<f_t> sort_bucket_;      // reused scratch for etilde.sort() (per-pivot sort
+  mutable gpu_vector<i_t> sort_i_;           // in update(): the O(n) bucket + the n·log·n index/value/perm
+  mutable gpu_vector<f_t> sort_x_;           // buffers, all reused instead of malloc'd each pivot.
+  mutable gpu_vector<i_t> sort_perm_;
   // Statistics that drive the hypersparse-vs-dense path choice.
   mutable i_t num_calls_L_{0}, num_calls_U_{0}, num_calls_L_transpose_{0}, num_calls_U_transpose_{0};
   mutable f_t sum_L_{0.0}, sum_U_{0.0}, sum_L_transpose_{0.0}, sum_U_transpose_{0.0};
   f_t hypersparse_threshold_{0.05};
   mutable f_t work_estimate_{0.0};
+  // When non-null (warp-optimized kernel), the 4 dense triangular solves are
+  // dispatched to the whole warp via this shared config instead of running on
+  // one lane. Set by lane 0 before the driver runs.
+  warp_solve_config* warp_cfg_ = nullptr;
 
   __device__ gpu_basis_update_mpf() {}
   gpu_basis_update_mpf(const gpu_basis_update_mpf&)            = delete;
@@ -745,6 +1109,140 @@ struct gpu_basis_update_mpf {
   __device__ ~gpu_basis_update_mpf()                          = default;
 
   __device__ i_t num_updates() const { return num_updates_; }
+
+  // Lane 0 posts a dense-solve request to the warp and joins the collective
+  // solve; lanes 1..31 are waiting in warp_helper_loop. __syncwarp A publishes
+  // (x, op); warp_collective_solve runs nlev internal barriers; __syncwarp B
+  // makes the result visible to lane 0 before it reads x.
+  __device__ void warp_dispatch(int op, f_t* rhs) const
+  {
+    warp_cfg_->x  = rhs;
+    warp_cfg_->op = op;
+    __syncwarp(0xffffffffu);          // A
+    warp_collective(*warp_cfg_);
+    __syncwarp(0xffffffffu);          // B
+  }
+
+  // Post the MPF rank-1 T-loop to the whole warp (op == WARP_TLOOP). One dispatch runs the
+  // entire replay collectively (tl_num internal barriers). S_ pointers are re-read each call
+  // (they can move on resize). dot col = 2k+dotoff, axpy col = 2k+axpyoff; asc selects
+  // l_solve (k up) vs l_transpose (k down).
+  __device__ void warp_dispatch_tloop(f_t* rhs, bool asc, i_t dotoff, i_t axpyoff, f_t tol) const
+  {
+    warp_solve_config* c = warp_cfg_;
+    c->x          = rhs;
+    c->tl_cs      = S_.col_start.data();
+    c->tl_ri      = S_.i.data();
+    c->tl_val     = S_.x.data();
+    c->tl_mu      = mu_values_.data();
+    c->tl_work    = &work_estimate_;
+    c->tl_num     = num_updates_;
+    c->tl_dotoff  = dotoff;
+    c->tl_axpyoff = axpyoff;
+    c->tl_asc     = asc;
+    c->tl_tol     = tol;
+    c->op         = WARP_TLOOP;
+    __syncwarp(0xffffffffu);          // A
+    warp_collective(*c);
+    __syncwarp(0xffffffffu);          // B
+  }
+
+  // Post the reduced-cost SpMv δz = -A_N'·δy to the whole warp (op == WARP_DZ). One dispatch computes
+  // every nonbasic column's δz + the nonzero index list; the count comes back through *dz_count.
+  __device__ void warp_dispatch_dz(const i_t* Acs, const i_t* Ari, const f_t* Aval, const f_t* dy,
+                                   const i_t* basic, const i_t* nonbasic, f_t* dz, i_t* dz_idx,
+                                   i_t* dz_mark, i_t* dz_count, f_t* dz_work,
+                                   i_t m, i_t n, i_t leaving, i_t dir) const
+  {
+    warp_solve_config* c = warp_cfg_;
+    c->dz_Acs      = Acs;
+    c->dz_Ari      = Ari;
+    c->dz_Aval     = Aval;
+    c->dz_dy       = dy;
+    c->dz_basic    = basic;
+    c->dz_nonbasic = nonbasic;
+    c->dz_out      = dz;
+    c->dz_indices  = dz_idx;
+    c->dz_mark     = dz_mark;
+    c->dz_count    = dz_count;
+    c->dz_work     = dz_work;
+    c->dz_m        = m;
+    c->dz_n        = n;
+    c->dz_leaving  = leaving;
+    c->dz_dir      = dir;
+    c->op          = WARP_DZ;
+    __syncwarp(0xffffffffu);          // A
+    warp_collective(*c);
+    __syncwarp(0xffffffffu);          // B
+  }
+
+  // Warp-parallel gpu_sparse_vector::to_dense — lane 0 sizes the dense buffer (no zero-fill), the warp
+  // zeros [0,n) + scatters the nnz. Bit-exact (distinct sparse indices). Replaces the O(n) serial tail
+  // before each dense solve.
+  __device__ void warp_to_dense(const gpu_sparse_vector& sv, gpu_vector<f_t>& dense) const
+  {
+    const i_t n = sv.n;
+    dense.reserve(n);
+    dense.set_size(n);                 // capacity n, contents set by the collective (zero + scatter)
+    warp_solve_config* c = warp_cfg_;
+    c->td_i     = sv.i.data();
+    c->td_x     = sv.x.data();
+    c->td_dense = dense.data();
+    c->td_nz    = static_cast<i_t>(sv.i.size());
+    c->td_n     = n;
+    c->op       = WARP_TODENSE;
+    __syncwarp(0xffffffffu);          // A
+    warp_collective(*c);
+    __syncwarp(0xffffffffu);          // B
+  }
+
+  // Warp-parallel gpu_sparse_vector::from_dense — lane 0 reserves the sparse buffers, the warp compacts
+  // the nonzeros of `dense` in increasing index order, lane 0 sets the final size. Bit-exact.
+  __device__ void warp_from_dense(const gpu_vector<f_t>& dense, gpu_sparse_vector& sv) const
+  {
+    const i_t n = static_cast<i_t>(dense.size());
+    sv.n = n;
+    sv.i.reserve(n);
+    sv.x.reserve(n);
+    i_t count            = 0;
+    warp_solve_config* c = warp_cfg_;
+    c->fd_in    = dense.data();
+    c->fd_i     = sv.i.data();
+    c->fd_x     = sv.x.data();
+    c->fd_count = &count;
+    c->fd_n     = n;
+    c->op       = WARP_FROMDENSE;
+    __syncwarp(0xffffffffu);          // A
+    warp_collective(*c);
+    __syncwarp(0xffffffffu);          // B
+    sv.i.set_size(count);
+    sv.x.set_size(count);
+  }
+
+  // Post the dual ratio test to the whole warp (op == WARP_RT). Returns via the out-pointers:
+  // *entering (column j or -1), *kout (nonbasic_list index), *step (chosen ratio / step length).
+  __device__ void warp_dispatch_rt(const i_t* nonbasic, const variable_status_t* vstatus, const f_t* z,
+                                   const f_t* dz, i_t m, i_t n, f_t ptol, f_t dtol, f_t ztol,
+                                   i_t* entering, i_t* kout, f_t* step) const
+  {
+    warp_solve_config* c = warp_cfg_;
+    c->rt_nonbasic  = nonbasic;
+    c->rt_vstatus   = vstatus;
+    c->rt_z         = z;
+    c->rt_dz        = dz;
+    c->rt_entering  = entering;
+    c->rt_k         = kout;
+    c->rt_step      = step;
+    c->rt_m         = m;
+    c->rt_n         = n;
+    c->rt_pivot_tol = ptol;
+    c->rt_dual_tol  = dtol;
+    c->rt_zero_tol  = ztol;
+    c->op           = WARP_RT;
+    __syncwarp(0xffffffffu);          // A
+    warp_collective(*c);
+    __syncwarp(0xffffffffu);          // B
+  }
 
   __device__ f_t estimate_solution_density(f_t rhs_nz,
                                            f_t sum,
@@ -928,9 +1426,11 @@ struct gpu_basis_update_mpf {
   }
 
   // ---- triangular solves through the MPF form ----
+  template <bool Warp = false>
   __device__ i_t u_transpose_solve(f_t* rhs) const
   {
-    upper_triangular_transpose_solve(U0_, rhs, work_estimate_);
+    if constexpr (Warp) { warp_dispatch(WARP_UT_SOLVE, rhs); }
+    else { upper_triangular_transpose_solve(U0_, rhs, work_estimate_); }
     return 0;
   }
   __device__ i_t u_transpose_solve(gpu_sparse_vector& rhs) const
@@ -941,19 +1441,26 @@ struct gpu_basis_update_mpf {
     return 0;
   }
 
+  template <bool Warp = false>
   __device__ i_t l_transpose_solve(f_t* rhs) const
   {
     const f_t zero_tol = 1e-13;
-    for (i_t k = num_updates_ - 1; k >= 0; --k) {
-      const i_t u_col = 2 * k;
-      const i_t v_col = 2 * k + 1;
-      const f_t mu    = mu_values_[k];
-      f_t dot         = dot_product(u_col, rhs);
-      const f_t theta = dot / mu;
-      if (fabs(theta) > zero_tol) { add_sparse_column(S_, v_col, -theta, rhs); }
+    if constexpr (Warp) {
+      // dot col = u_col (2k), axpy col = v_col (2k+1), descending k.
+      if (num_updates_ > 0) { warp_dispatch_tloop(rhs, /*asc=*/false, /*dotoff=*/0, /*axpyoff=*/1, zero_tol); }
+    } else {
+      for (i_t k = num_updates_ - 1; k >= 0; --k) {
+        const i_t u_col = 2 * k;
+        const i_t v_col = 2 * k + 1;
+        const f_t mu    = mu_values_[k];
+        f_t dot         = dot_product(u_col, rhs);
+        const f_t theta = dot / mu;
+        if (fabs(theta) > zero_tol) { add_sparse_column(S_, v_col, -theta, rhs); }
+      }
     }
     work_estimate_ += 2 * num_updates_;
-    lower_triangular_transpose_solve(L0_, rhs, work_estimate_);
+    if constexpr (Warp) { warp_dispatch(WARP_LT_SOLVE, rhs); }
+    else { lower_triangular_transpose_solve(L0_, rhs, work_estimate_); }
     return 0;
   }
   __device__ i_t l_transpose_solve(gpu_sparse_vector& rhs) const
@@ -975,7 +1482,8 @@ struct gpu_basis_update_mpf {
     }
     work_estimate_ += 2 * num_updates_;
 
-    gpu_sparse_vector b(m, nz);
+    gpu_sparse_vector& b = sparse_scratch_;  // reused (was a per-hypersparse-solve device malloc)
+    b.n = m;
     work_estimate_ += nz;
     gather_into_sparse_vector(nz, b);
     i_t top = sparse_triangle_solve<false>(
@@ -984,52 +1492,50 @@ struct gpu_basis_update_mpf {
     return 0;
   }
 
+  template <bool Warp = false>
   __device__ i_t u_solve(f_t* rhs) const
   {
-    long long _t0 = clock64();
-    upper_triangular_solve(U0_, rhs, work_estimate_);
-    if (g_seprof_on) g_bsolve.u0 = clock64() - _t0;  // [SEPROF] base U0 solve (no rank-1 on U)
+    if constexpr (Warp) { warp_dispatch(WARP_U_SOLVE, rhs); }
+    else { upper_triangular_solve(U0_, rhs, work_estimate_); }
     return 0;
   }
   __device__ i_t u_solve(gpu_sparse_vector& rhs) const
   {
-    long long _t0 = clock64();
     i_t top = sparse_triangle_solve<false>(
       rhs, nullptr, xi_workspace_.data(), U0_, x_workspace_.data(), work_estimate_);
     solve_to_sparse_vector(top, rhs);
-    if (g_seprof_on) g_bsolve.u0 = clock64() - _t0;
     return 0;
   }
 
+  template <bool Warp = false>
   __device__ i_t l_solve(f_t* rhs) const
   {
-    long long _t0 = clock64();
-    lower_triangular_solve(L0_, rhs, work_estimate_);
-    if (g_seprof_on) g_bsolve.l0 = clock64() - _t0;  // [SEPROF] base L0 triangular solve
-    long long _t1 = clock64();
+    if constexpr (Warp) { warp_dispatch(WARP_L_SOLVE, rhs); }
+    else { lower_triangular_solve(L0_, rhs, work_estimate_); }
     const f_t zero_tol = 1e-16;  // Any higher and pilot_ja fails
-    for (i_t k = 0; k < num_updates_; ++k) {
-      const f_t mu    = mu_values_[k];
-      const i_t u_col = 2 * k;
-      const i_t v_col = 2 * k + 1;
-      f_t dot         = dot_product(v_col, rhs);
-      const f_t theta = dot / mu;
-      if (fabs(theta) > zero_tol) { add_sparse_column(S_, u_col, -theta, rhs); }
+    if constexpr (Warp) {
+      // dot col = v_col (2k+1), axpy col = u_col (2k), ascending k.
+      if (num_updates_ > 0) { warp_dispatch_tloop(rhs, /*asc=*/true, /*dotoff=*/1, /*axpyoff=*/0, zero_tol); }
+    } else {
+      for (i_t k = 0; k < num_updates_; ++k) {
+        const f_t mu    = mu_values_[k];
+        const i_t u_col = 2 * k;
+        const i_t v_col = 2 * k + 1;
+        f_t dot         = dot_product(v_col, rhs);
+        const f_t theta = dot / mu;
+        if (fabs(theta) > zero_tol) { add_sparse_column(S_, u_col, -theta, rhs); }
+      }
     }
     work_estimate_ += 2 * num_updates_;
-    if (g_seprof_on) g_bsolve.lrank1 = clock64() - _t1;  // [SEPROF] rank-1 MPF T-loop (grows with num_updates)
     return 0;
   }
   __device__ i_t l_solve(gpu_sparse_vector& rhs) const
   {
     const i_t m = L0_.m;
-    long long _t0 = clock64();
     i_t top     = sparse_triangle_solve<true>(
       rhs, nullptr, xi_workspace_.data(), L0_, x_workspace_.data(), work_estimate_);
     solve_to_workspace(top);
     i_t nz             = m - top;
-    if (g_seprof_on) g_bsolve.l0 = clock64() - _t0;
-    long long _t1      = clock64();
     const f_t zero_tol = 1e-13;
     for (i_t k = 0; k < num_updates_; ++k) {
       const f_t mu    = mu_values_[k];
@@ -1043,53 +1549,43 @@ struct gpu_basis_update_mpf {
     }
     work_estimate_ += 2 * num_updates_;
     gather_into_sparse_vector(nz, rhs);
-    if (g_seprof_on) g_bsolve.lrank1 = clock64() - _t1;
     return 0;
   }
 
   // ---- B solves ----
+  template <bool Warp = false>
   __device__ i_t b_solve(const gpu_vector<f_t>& rhs, gpu_vector<f_t>& solution) const
   {
     permute_vector(row_permutation_.data(), rhs.data(), solution.data(), L0_.m);
     work_estimate_ += 3 * rhs.size();
-    l_solve(solution.data());
-    u_solve(solution.data());
+    l_solve<Warp>(solution.data());
+    u_solve<Warp>(solution.data());
     return 0;
   }
 
+  template <bool Warp = false>
   __device__ i_t b_solve(const gpu_sparse_vector& rhs,
                          gpu_sparse_vector& solution,
                          gpu_sparse_vector& Lsol,
                          bool need_Lsol = true) const
   {
-    long long _bp0 = clock64();  // [SEPROF] b_solve internal timers (fill g_bsolve, harvested by se)
     solution = rhs;
     work_estimate_ += 2 * rhs.i.size();
     solution.inverse_permute_vector(inverse_row_permutation_.data());
     work_estimate_ += 3 * rhs.i.size();
-    if (g_seprof_on) {
-      g_bsolve.permute = clock64() - _bp0;
-      g_bsolve.nz_in   = rhs.i.size();
-    }
 
     bool use_hypersparse;
     const f_t input_size = static_cast<f_t>(rhs.i.size());
     estimate_solution_density(input_size, sum_L_, num_calls_L_, use_hypersparse);
-    long long _bl0 = clock64();
     if (use_hypersparse) {
       l_solve(solution);
     } else {
-      gpu_vector<f_t> solution_dense;
-      solution.to_dense(solution_dense);
+      gpu_vector<f_t>& solution_dense = dense_scratch_;  // reused (was a per-solve device malloc)
+      if constexpr (Warp) { warp_to_dense(solution, solution_dense); } else { solution.to_dense(solution_dense); }
       work_estimate_ += solution_dense.size();
-      l_solve(solution_dense.data());
-      solution.from_dense(solution_dense);
+      l_solve<Warp>(solution_dense.data());
+      if constexpr (Warp) { warp_from_dense(solution_dense, solution); } else { solution.from_dense(solution_dense); }
       work_estimate_ += solution_dense.size();
-    }
-    if (g_seprof_on) {
-      g_bsolve.lsolve  = clock64() - _bl0;
-      g_bsolve.hyper_l = use_hypersparse ? 1 : 0;
-      g_bsolve.nz_l    = solution.i.size();
     }
     if (need_Lsol) {
       Lsol = solution;
@@ -1099,32 +1595,28 @@ struct gpu_basis_update_mpf {
 
     const f_t rhs_size = static_cast<f_t>(solution.i.size());
     estimate_solution_density(rhs_size, sum_U_, num_calls_U_, use_hypersparse);
-    long long _bu0 = clock64();
     if (use_hypersparse) {
       u_solve(solution);
     } else {
-      gpu_vector<f_t> solution_dense;
-      solution.to_dense(solution_dense);
+      gpu_vector<f_t>& solution_dense = dense_scratch_;  // reused (was a per-solve device malloc)
+      if constexpr (Warp) { warp_to_dense(solution, solution_dense); } else { solution.to_dense(solution_dense); }
       work_estimate_ += solution_dense.size();
-      u_solve(solution_dense.data());
-      solution.from_dense(solution_dense);
+      u_solve<Warp>(solution_dense.data());
+      if constexpr (Warp) { warp_from_dense(solution_dense, solution); } else { solution.from_dense(solution_dense); }
       work_estimate_ += solution_dense.size();
-    }
-    if (g_seprof_on) {
-      g_bsolve.usolve  = clock64() - _bu0;
-      g_bsolve.hyper_u = use_hypersparse ? 1 : 0;
-      g_bsolve.nz_u    = solution.i.size();
     }
     sum_U_ += static_cast<f_t>(solution.i.size()) / rhs_size;
     return 0;
   }
 
+  template <bool Warp = false>
   __device__ i_t b_solve(const gpu_sparse_vector& rhs, gpu_sparse_vector& solution) const
   {
     gpu_sparse_vector Lsol(1, 0);
-    return b_solve(rhs, solution, Lsol, false);
+    return b_solve<Warp>(rhs, solution, Lsol, false);
   }
 
+  template <bool Warp = false>
   __device__ i_t b_transpose_solve(const gpu_sparse_vector& rhs,
                                    gpu_sparse_vector& solution,
                                    gpu_sparse_vector& UTsol) const
@@ -1137,10 +1629,10 @@ struct gpu_basis_update_mpf {
       solution = rhs;
       u_transpose_solve(solution);
     } else {
-      gpu_vector<f_t> solution_dense;
-      rhs.to_dense(solution_dense);
-      u_transpose_solve(solution_dense.data());
-      solution.from_dense(solution_dense);
+      gpu_vector<f_t>& solution_dense = dense_scratch_;  // reused (was a per-solve device malloc)
+      if constexpr (Warp) { warp_to_dense(rhs, solution_dense); } else { rhs.to_dense(solution_dense); }
+      u_transpose_solve<Warp>(solution_dense.data());
+      if constexpr (Warp) { warp_from_dense(solution_dense, solution); } else { solution.from_dense(solution_dense); }
     }
     UTsol = solution;
     sum_U_transpose_ += static_cast<f_t>(solution.i.size()) / input_size;
@@ -1151,10 +1643,10 @@ struct gpu_basis_update_mpf {
     if (use_hypersparse) {
       l_transpose_solve(solution);
     } else {
-      gpu_vector<f_t> solution_dense;
-      solution.to_dense(solution_dense);
-      l_transpose_solve(solution_dense.data());
-      solution.from_dense(solution_dense);
+      gpu_vector<f_t>& solution_dense = dense_scratch_;  // reused (was a per-solve device malloc)
+      if constexpr (Warp) { warp_to_dense(solution, solution_dense); } else { solution.to_dense(solution_dense); }
+      l_transpose_solve<Warp>(solution_dense.data());
+      if constexpr (Warp) { warp_from_dense(solution_dense, solution); } else { solution.from_dense(solution_dense); }
     }
     sum_L_transpose_ += static_cast<f_t>(solution.i.size()) / rhs_size;
     solution.inverse_permute_vector(row_permutation_.data());
@@ -1182,7 +1674,7 @@ struct gpu_basis_update_mpf {
     S_.append_column(nz, xi_workspace_.data() + m, x_workspace_.data());
     work_estimate_ += 5 * nz;
 
-    etilde.sort();
+    etilde.sort(sort_bucket_, sort_i_, sort_x_, sort_perm_);  // reused scratch (no per-pivot malloc)
     work_estimate_ += etilde.i.size() * log2((f_t)etilde.i.size());
     {
       // S_.append_column(sparse_vector etilde): append nonzeros directly.
@@ -1286,7 +1778,9 @@ __device__ void update_objective(const i_t* basic_list,
   obj += delta_x[entering_index] * objective[entering_index];
 }
 
+template <bool Warp = false>
 __device__ void compute_reduced_cost_update(const gpu_lp& lp,
+                                            const gpu_basis_update_mpf& ft,
                                             const i_t* basic_list,
                                             const i_t* nonbasic_list,
                                             const f_t* delta_y,
@@ -1299,6 +1793,18 @@ __device__ void compute_reduced_cost_update(const gpu_lp& lp,
 {
   const i_t m = lp.num_rows;
   const i_t n = lp.num_cols;
+
+  if constexpr (Warp) {
+    // One warp dispatch: parallel gather dots (one lane per nonbasic column, bit-exact) + ordered
+    // append of the nonzero columns. delta_z_indices is empty here (cleared each iter) and reserved
+    // to n, so the collective raw-writes [0,count) and we set the size back on return.
+    i_t dz_count = 0;
+    ft.warp_dispatch_dz(lp.A.col_start.data(), lp.A.i.data(), lp.A.x.data(), delta_y, basic_list,
+                        nonbasic_list, delta_z, delta_z_indices.data(), delta_z_mark, &dz_count,
+                        &work_estimate, m, n, leaving_index, direction);
+    delta_z_indices.set_size(dz_count);
+    return;
+  }
 
   size_t nnzs_processed = 0;
   for (i_t k = 0; k < m; k++) {
@@ -1448,6 +1954,7 @@ __device__ void update_Arow(i_t leaving,
 // Exact steepest-edge norm init: gamma_j = ||B^-T e_k||^2 for each basic var, via a
 // singleton-row fast path (1/alpha^2) or a b_transpose_solve. Mirrors the CPU
 // initialize_steepest_edge_norms (the simplified always uses the non-slack/exact path).
+template <bool Warp = false>
 __device__ i_t initialize_steepest_edge_norms(const gpu_lp& lp,
                                               const i_t* basic_list,
                                               gpu_basis_update_mpf& ft,
@@ -1486,7 +1993,7 @@ __device__ i_t initialize_steepest_edge_norms(const gpu_lp& lp,
       sparse_ei.x[0] = -1.0;
       sparse_ei.i[0] = k;
       sparse_dy.clear();
-      ft.b_transpose_solve(sparse_ei, sparse_dy, UTsol_scratch);
+      ft.b_transpose_solve<Warp>(sparse_ei, sparse_dy, UTsol_scratch);
       f_t my_init = 0.0;
       for (i_t p = 0; p < (i_t)sparse_dy.x.size(); ++p) {
         my_init += sparse_dy.x[p] * sparse_dy.x[p];
@@ -1500,6 +2007,7 @@ __device__ i_t initialize_steepest_edge_norms(const gpu_lp& lp,
   return 0;
 }
 
+template <bool Warp = false>
 __device__ void compute_primal_variables(const gpu_basis_update_mpf& ft,
                                          const gpu_span<f_t>& lp_rhs,
                                          const gpu_csc_view& A,
@@ -1530,7 +2038,7 @@ __device__ void compute_primal_variables(const gpu_basis_update_mpf& ft,
 
   xB_workspace.resize(m);
   work_estimate += m;
-  ft.b_solve(rhs, xB_workspace);
+  ft.b_solve<Warp>(rhs, xB_workspace);
 
   for (i_t k = 0; k < m; ++k) {
     const i_t j = basic_list[k];
@@ -1619,25 +2127,10 @@ __device__ i_t steepest_edge_pricing_with_infeasibilities(const gpu_lp& lp,
   return leaving_index;
 }
 
-__device__ void initialize_steepest_edge_norms_from_slack_basis(const i_t* basic_list,
-                                                                const i_t* nonbasic_list,
-                                                                i_t m,
-                                                                i_t n,
-                                                                f_t* delta_y_steepest_edge)
-{
-  for (i_t k = 0; k < m; ++k) {
-    const i_t j              = basic_list[k];
-    delta_y_steepest_edge[j] = 1.0;
-  }
-  const i_t n_minus_m = n - m;
-  for (i_t k = 0; k < n_minus_m; ++k) {
-    const i_t j              = nonbasic_list[k];
-    delta_y_steepest_edge[j] = 1e-4;
-  }
-}
-
+template <bool Warp = false>
 __device__ i_t phase2_ratio_test(const gpu_lp& lp,
                                  const gpu_settings& settings,
+                                 const gpu_basis_update_mpf& ft,
                                  const variable_status_t* vstatus,
                                  const i_t* nonbasic_list,
                                  const f_t* z,
@@ -1652,6 +2145,15 @@ __device__ i_t phase2_ratio_test(const gpu_lp& lp,
   const f_t dual_tol  = settings.dual_tol / 10;
   const f_t zero_tol  = settings.zero_tol;
   f_t min_val         = dev_inf();
+
+  if constexpr (Warp) {
+    i_t entering = -1, kk = -1;
+    f_t step = dev_inf();
+    ft.warp_dispatch_rt(nonbasic_list, vstatus, z, delta_z, m, n, pivot_tol, dual_tol, zero_tol,
+                        &entering, &kk, &step);
+    if (entering != -1) { step_length = step; nonbasic_entering = kk; }
+    return entering;
+  }
 
   for (i_t k = 0; k < n - m; ++k) {
     const i_t j = nonbasic_list[k];
@@ -1688,6 +2190,7 @@ __device__ i_t phase2_ratio_test(const gpu_lp& lp,
   return entering_index;
 }
 
+template <bool Warp = false>
 __device__ void compute_delta_y(const gpu_basis_update_mpf& ft,
                                 i_t basic_leaving_index,
                                 i_t direction,
@@ -1695,10 +2198,13 @@ __device__ void compute_delta_y(const gpu_basis_update_mpf& ft,
                                 gpu_sparse_vector& UTsol_sparse)
 {
   const i_t m = delta_y_sparse.n;
-  gpu_sparse_vector ei_sparse(m, 1);
+  gpu_sparse_vector& ei_sparse = ft.ei_scratch_;  // reused (was a per-pivot device malloc)
+  ei_sparse.n = m;
+  ei_sparse.i.resize(1);
+  ei_sparse.x.resize(1);
   ei_sparse.i[0] = basic_leaving_index;
   ei_sparse.x[0] = -direction;
-  ft.b_transpose_solve(ei_sparse, delta_y_sparse, UTsol_sparse);
+  ft.b_transpose_solve<Warp>(ei_sparse, delta_y_sparse, UTsol_sparse);
 
   if (direction != -1) { UTsol_sparse.negate(); }
 }
@@ -1728,6 +2234,7 @@ __device__ i_t update_dual_variables(const gpu_sparse_vector& delta_y_sparse,
   return 0;
 }
 
+template <bool Warp = false>
 __device__ i_t compute_delta_x(const gpu_lp& lp,
                                const gpu_basis_update_mpf& ft,
                                i_t entering_index,
@@ -1745,7 +2252,7 @@ __device__ i_t compute_delta_x(const gpu_lp& lp,
 {
   f_t delta_x_leaving = direction == 1 ? lp.lower[leaving_index] - x[leaving_index]
                                        : lp.upper[leaving_index] - x[leaving_index];
-  ft.b_solve(rhs_sparse, scaled_delta_xB_sparse, utilde_sparse);
+  ft.b_solve<Warp>(rhs_sparse, scaled_delta_xB_sparse, utilde_sparse);
   scaled_delta_xB_sparse.negate();
   work_estimate += 2 * scaled_delta_xB_sparse.i.size();
 
@@ -1758,7 +2265,7 @@ __device__ i_t compute_delta_x(const gpu_lp& lp,
     const i_t m = lp.num_rows;
     gpu_vector<f_t> scaled_delta_xB(m);
     work_estimate += m;
-    ft.b_solve(rhs, scaled_delta_xB);
+    ft.b_solve<Warp>(rhs, scaled_delta_xB);
     if (scaled_delta_xB[basic_leaving_index] != 0.0 &&
         !isnan(scaled_delta_xB[basic_leaving_index])) {
       scaled_delta_xB_sparse.from_dense(scaled_delta_xB);
@@ -1795,6 +2302,7 @@ __device__ i_t compute_delta_x(const gpu_lp& lp,
   return 0;
 }
 
+template <bool Warp = false>
 __device__ i_t update_steepest_edge_norms(const gpu_settings& settings,
                                           const i_t* basic_list,
                                           const gpu_basis_update_mpf& ft,
@@ -1809,25 +2317,8 @@ __device__ i_t update_steepest_edge_norms(const gpu_settings& settings,
                                           f_t* delta_y_steepest_edge,
                                           f_t& work_estimate)
 {
-  long long _se0 = clock64();  // [SEPROF] se-section timing (b_solve vs rest)
   v_sparse.clear();
-  ft.b_solve(delta_y_sparse, v_sparse);  // fills g_bsolve (permute/lsolve/usolve + hypersparse + nnz)
-  long long _se1 = clock64();
-  if (g_seprof_on) {
-    g_se.calls++;
-    g_se.bsolve += _se1 - _se0;
-    g_se.permute += g_bsolve.permute;
-    g_se.lsolve += g_bsolve.lsolve;
-    g_se.usolve += g_bsolve.usolve;
-    g_se.hyper_l += g_bsolve.hyper_l;   // +1 if the L-solve took the hypersparse path this call
-    g_se.hyper_u += g_bsolve.hyper_u;   // +1 if the U-solve took the hypersparse path this call
-    g_se.nz_in += g_bsolve.nz_in;       // nnz of the RHS (delta_y)
-    g_se.nz_l += g_bsolve.nz_l;         // nnz after the L-solve
-    g_se.nz_u += g_bsolve.nz_u;         // nnz after the U-solve (final v)
-    g_se.l0 += g_bsolve.l0;             // base L0 triangular solve
-    g_se.lrank1 += g_bsolve.lrank1;     // rank-1 MPF updates (T-loop in l_solve)
-    g_se.u0 += g_bsolve.u0;             // base U0 triangular solve
-  }
+  ft.b_solve<Warp>(delta_y_sparse, v_sparse);
   if (direction == -1) {
     v_sparse.negate();
     work_estimate += 2 * v_sparse.i.size();
@@ -1837,13 +2328,7 @@ __device__ i_t update_steepest_edge_norms(const gpu_settings& settings,
 
   const f_t wr = -scaled_delta_xB.find_coefficient(basic_leaving_index);
   work_estimate += scaled_delta_xB.i.size();
-  if (wr == 0) {
-    if (g_seprof_on) {
-      g_se.rest += clock64() - _se1;
-      g_se.total += clock64() - _se0;
-    }
-    return -1;
-  }
+  if (wr == 0) { return -1; }
   const f_t omegar             = dy_norm_squared / (wr * wr);
   const i_t scaled_delta_xB_nz = scaled_delta_xB.i.size();
 
@@ -1868,10 +2353,6 @@ __device__ i_t update_steepest_edge_norms(const gpu_settings& settings,
     v[v_sparse.i[k]] = 0.0;
   }
   work_estimate += 2 * v_nz;
-  if (g_seprof_on) {
-    g_se.rest += clock64() - _se1;
-    g_se.total += clock64() - _se0;
-  }
   return 0;
 }
 
@@ -1935,6 +2416,7 @@ __device__ void set_primal_variables_on_bounds(const gpu_lp& lp,
 // The device driver: a line-for-line copy of simplified_dual_phase2's
 // pure-MPF-stacking path.
 // ---------------------------------------------------------------------------
+template <bool Warp = false>
 __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
                                                             const gpu_settings& settings,
                                                             variable_status_t* vstatus,
@@ -1943,26 +2425,13 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
                                                             i_t* nonbasic_list,
                                                             gpu_solution& sol,
                                                             f_t* delta_y_steepest_edge,
-                                                            bool dy_se_empty,
-                                                            i_t iter_limit_override,
-                                                            bool gpu_log,
-                                                            bool gpu_prof)
+                                                            bool dy_se_empty)
 {
   const i_t m = lp.num_rows;
   const i_t n = lp.num_cols;
 
   // Device wall-clock reference for the time-limit guard.
   const unsigned long long start_ns = dev_globaltimer();
-
-  // [SEPROF] clock64 profiler (emitted at exit when gpu_prof). Reset the accumulators for THIS
-  // solve; prof_t0 = whole-kernel start so se_total can be shown as a share of the total.
-  // g_seprof_on gates every profiling write on the hot path; with gpu_prof off (always the case
-  // in a multi-block batch) the shared g_se/g_bsolve globals are never touched (no cross-block race).
-  g_seprof_on = gpu_prof ? 1 : 0;
-  if (g_seprof_on) g_se.reset();
-  const long long prof_t0 = clock64();
-#define SEPROF_EMIT() \
-  do { if (gpu_prof) g_se.emit(clock64() - prof_t0, iter); } while (0)
 
   f_t* x = sol.x.data();
   f_t* y = sol.y.data();
@@ -1972,13 +2441,13 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
   gpu_vector<f_t> xB_workspace(m);
 
   set_primal_variables_on_bounds(lp, settings, z, vstatus, x);
-  compute_primal_variables(
+  compute_primal_variables<Warp>(
     ft, lp.rhs, lp.A, basic_list, nonbasic_list, settings.tight_tol, x, xB_workspace, work);
 
   if (dy_se_empty) {
     // Exact steepest-edge init (matches the CPU simplified's unconditional exact path).
     for (i_t k = 0; k < n; ++k) { delta_y_steepest_edge[k] = -1.0; }
-    initialize_steepest_edge_norms(lp, basic_list, ft, delta_y_steepest_edge, work);
+    initialize_steepest_edge_norms<Warp>(lp, basic_list, ft, delta_y_steepest_edge, work);
   } else {
     for (i_t k = 0; k < m; ++k) {
       const i_t j = basic_list[k];
@@ -2019,15 +2488,7 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
   gpu_sparse_vector rhs_sparse(m, 0);
   gpu_sparse_vector v_sparse(m, 0);
 
-  i_t iter_limit = min(500000, max(20000, 20 * (m + n)));
-  if (iter_limit_override > 0) { iter_limit = iter_limit_override; }
-  if (gpu_log) {
-    printf("[GMP] start m=%d n=%d p_inf=%016llx iter_limit=%d\n",
-           m,
-           n,
-           (unsigned long long)__double_as_longlong(primal_inf),
-           iter_limit);
-  }
+  const i_t iter_limit = min(500000, max(20000, 20 * (m + n)));
   // Incrementally-tracked objective for the cutoff, mirroring the CPU simplified (and
   // advanced) driver: init fresh once, then update_objective per pivot. Using the true
   // costs lp.objective (the GPU has no perturbation) is a valid dual bound.
@@ -2038,14 +2499,12 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
       sol.objective      = compute_objective(lp, x);
       sol.user_objective = compute_user_objective(lp, sol.objective);
       sol.iterations     = iter;
-      SEPROF_EMIT();
       return dual::status_t::NUMERICAL;
     }
     if (static_cast<f_t>(dev_globaltimer() - start_ns) * 1e-9 > settings.time_limit) {
       sol.objective      = compute_objective(lp, x);
       sol.user_objective = compute_user_objective(lp, sol.objective);
       sol.iterations     = iter;
-      SEPROF_EMIT();
       return dual::status_t::TIME_LIMIT;
     }
 
@@ -2053,25 +2512,20 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     i_t direction        = 0;
     i_t basic_leaving    = -1;
     f_t max_val;
-    const long long _t_pr = clock64();  // [SEPROF]
     const i_t leaving = steepest_edge_pricing_with_infeasibilities(
       lp, settings, x, delta_y_steepest_edge, basic_mark.data(), squared_infeas, infeas_idx,
       direction, basic_leaving, max_val, work);
-    if (g_seprof_on) g_se.pricing += clock64() - _t_pr;  // [SEPROF]
     if (leaving == -1) {
       sol.objective      = compute_objective(lp, x);
       sol.user_objective = compute_user_objective(lp, sol.objective);
       sol.iterations     = iter;
-      SEPROF_EMIT();
       return dual::status_t::OPTIMAL;
     }
 
     // 2. BTran.
     delta_y_sparse.clear();
     UTsol_sparse.clear();
-    const long long _t_bt = clock64();  // [SEPROF]
-    compute_delta_y(ft, basic_leaving, direction, delta_y_sparse, UTsol_sparse);
-    if (g_seprof_on) g_se.btran += clock64() - _t_bt;  // [SEPROF]
+    compute_delta_y<Warp>(ft, basic_leaving, direction, delta_y_sparse, UTsol_sparse);
     const f_t dy_norm_sq = delta_y_sparse.norm2_squared();
 
     // Steepest-edge norm drift safeguard: dy_norm_sq is the true norm of the leaving
@@ -2092,29 +2546,25 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     }
     const f_t delta_y_nz_percentage = delta_y_nz0 / static_cast<f_t>(m) * 100.0;
     const bool used_transpose_dz    = delta_y_nz_percentage <= 30.0;
-    const long long _t_dz = clock64();  // [SEPROF]
     if (used_transpose_dz) {
       compute_delta_z(Arow, delta_y_sparse, leaving, direction, nonbasic_end.data(),
                       delta_z_mark.data(), delta_z_indices, delta_z.data(), work);
     } else {
       delta_y_sparse.to_dense(delta_y);
-      compute_reduced_cost_update(lp, basic_list, nonbasic_list, delta_y.data(), leaving, direction,
-                                  delta_z_mark.data(), delta_z_indices, delta_z.data(), work);
+      compute_reduced_cost_update<Warp>(lp, ft, basic_list, nonbasic_list, delta_y.data(), leaving,
+                                        direction, delta_z_mark.data(), delta_z_indices,
+                                        delta_z.data(), work);
     }
-    if (g_seprof_on) g_se.dz += clock64() - _t_dz;  // [SEPROF]
 
     // 4. Simple ratio test.
     f_t step_length;
     i_t nonbasic_entering = -1;
-    const long long _t_rt = clock64();  // [SEPROF]
-    const i_t entering    = phase2_ratio_test(
-      lp, settings, vstatus, nonbasic_list, z, delta_z.data(), step_length, nonbasic_entering);
-    if (g_seprof_on) g_se.rt += clock64() - _t_rt;  // [SEPROF]
+    const i_t entering    = phase2_ratio_test<Warp>(
+      lp, settings, ft, vstatus, nonbasic_list, z, delta_z.data(), step_length, nonbasic_entering);
     if (entering == -1) {
       sol.objective      = compute_objective(lp, x);
       sol.user_objective = compute_user_objective(lp, sol.objective);
       sol.iterations     = iter;
-      SEPROF_EMIT();
       return dual::status_t::DUAL_UNBOUNDED;
     }
 
@@ -2125,20 +2575,17 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     utilde_sparse.clear();
     scaled_dxB_sparse.clear();
     rhs_sparse.from_csc_column(lp.A, entering);
-    const long long _t_ft = clock64();  // [SEPROF]
     const i_t dx_status =
-      compute_delta_x(lp, ft, entering, leaving, basic_leaving, direction, basic_list, rhs_sparse,
+      compute_delta_x<Warp>(lp, ft, entering, leaving, basic_leaving, direction, basic_list, rhs_sparse,
                       delta_z.data(), x, utilde_sparse, scaled_dxB_sparse, delta_x.data(), work);
-    if (g_seprof_on) g_se.ftran += clock64() - _t_ft;  // [SEPROF]
     if (dx_status == -1) {
       sol.objective      = compute_objective(lp, x);
       sol.user_objective = compute_user_objective(lp, sol.objective);
       sol.iterations     = iter;
-      SEPROF_EMIT();
       return dual::status_t::NUMERICAL;
     }
 
-    update_steepest_edge_norms(settings, basic_list, ft, direction, delta_y_sparse, dy_norm_sq,
+    update_steepest_edge_norms<Warp>(settings, basic_list, ft, direction, delta_y_sparse, dy_norm_sq,
                                scaled_dxB_sparse, basic_leaving, entering, v.data(), v_sparse,
                                delta_y_steepest_edge, work);
 
@@ -2162,31 +2609,17 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     // Keep the CSR nonbasic partition in sync for the next iteration's transpose delta_z.
     update_Arow(leaving, entering, lp.A, row_mark, nonbasic_end.data(), Arow, work);
 
-    if (ft.update(utilde_sparse, UTsol_sparse, basic_leaving) == 1) {
+    const i_t _fu_status = ft.update(utilde_sparse, UTsol_sparse, basic_leaving);
+    if (_fu_status == 1) {
       sol.objective      = compute_objective(lp, x);
       sol.user_objective = compute_user_objective(lp, sol.objective);
       sol.iterations     = iter;
-      SEPROF_EMIT();
       return dual::status_t::NUMERICAL;
     }
 
     compute_initial_primal_infeasibilities(
       lp, settings, basic_list, x, squared_infeas, infeas_idx, primal_inf);
     clear_delta_z(entering, leaving, delta_z_mark.data(), delta_z_indices, delta_z.data());
-
-    if (gpu_log) {
-      printf("[GMP] iter=%d leave=%d dir=%d enter=%d step=%016llx obj=%016llx p_inf=%016llx nInf=%d "
-             "nupd=%d\n",
-             iter,
-             leaving,
-             direction,
-             entering,
-             (unsigned long long)__double_as_longlong(step_length),
-             (unsigned long long)__double_as_longlong(compute_objective(lp, x)),
-             (unsigned long long)__double_as_longlong(primal_inf),
-             (int)infeas_idx.size(),
-             ft.num_updates());
-    }
 
     // Increment only on a COMPLETED iteration, at the end of the body — matching the CPU
     // simplified driver's iter++ (phase2.cpp:4370). The SE-reset `continue` above jumps
@@ -2203,13 +2636,6 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
         sol.objective      = compute_objective(lp, x);
         sol.user_objective = compute_user_objective(lp, sol.objective);
         sol.iterations     = iter;
-        if (gpu_log) {
-          printf("[GMP] cutoff iter=%d obj=%016llx cut_off=%016llx\n",
-                 iter,
-                 (unsigned long long)__double_as_longlong(cutoff_obj),
-                 (unsigned long long)__double_as_longlong(settings.cut_off));
-        }
-        SEPROF_EMIT();
         return dual::status_t::CUTOFF;
       }
     }
@@ -2217,10 +2643,8 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
   sol.objective      = compute_objective(lp, x);
   sol.user_objective = compute_user_objective(lp, sol.objective);
   sol.iterations     = iter_limit;
-  SEPROF_EMIT();
   return dual::status_t::ITERATION_LIMIT;
 }
-#undef SEPROF_EMIT
 
 // ---------------------------------------------------------------------------
 // Kernel argument bundle (all raw device pointers + scalars, passed by value).
@@ -2262,9 +2686,6 @@ struct kernel_args {
   f_t primal_tol, dual_tol, pivot_tol, tight_tol, fixed_tol, zero_tol, time_limit, cut_off,
     steepest_edge_ratio;
   f_t start_time;
-  i_t iter_limit_override;  // >0 forces a fixed iteration cap (for bitwise CPU comparison)
-  i_t gpu_log;              // emit the per-step [CMP] trace
-  i_t gpu_prof;             // emit the [SEPROF] se-b_solve clock64 breakdown at exit
   // outputs
   i_t* out_status;
   f_t* out_objective;
@@ -2286,20 +2707,75 @@ __device__ gpu_csc_view make_view(
 }
 
 
+// Fill the warp-solve config for all 4 operators (lane 0, once at start). The
+// level schedules are written into the caller-owned gpu_vectors ls[o]/co[o]
+// (kept alive for the whole kernel); `lvlscratch` is reused m-sized workspace.
+__device__ void warp_build_config(const gpu_basis_update_mpf& ft, warp_solve_config& cfg,
+                                   gpu_vector<i_t>& lvlscratch, gpu_vector<i_t>& bigscratch,
+                                   gpu_vector<i_t>* ls, gpu_vector<i_t>* co,
+                                   gpu_vector<i_t>* lw, gpu_vector<unsigned>* bt)
+{
+  cfg.mode = g_warp_solve_mode;
+  cfg.m    = ft.L0_.m;
+  // op order: L, U, Lᵀ, Uᵀ (see warp_solve_op). Gather matrix + flags per op.
+  // Indexed by warp_solve_op: {L, U, Lᵀ, Uᵀ}.
+  const gpu_csc_view* mats[kNumWarpSolveOps] = {&ft.L0_transpose_, &ft.U0_transpose_, &ft.L0_, &ft.U0_};
+  const bool df[kNumWarpSolveOps]  = {false, true, true, false};   // diagonal first?
+  const bool dsc[kNumWarpSolveOps] = {false, true, false, false};  // inner accumulation descending?
+  const bool asc[kNumWarpSolveOps] = {true, false, false, true};   // level pull processes j ascending?
+  const bool inc[kNumWarpSolveOps] = {true, true, false, false};   // incremental subtract (L/U) vs sum?
+  for (int o = 0; o < kNumWarpSolveOps; ++o) {
+    cfg.cs[o]         = mats[o]->col_start.data();
+    cfg.ridx[o]       = mats[o]->i.data();
+    cfg.val[o]        = mats[o]->x.data();
+    cfg.diag_first[o] = df[o];
+    cfg.descending[o] = dsc[o];
+    cfg.incremental[o] = inc[o];
+    if (cfg.mode == 1) {     // big: sorted large-first order + bitmask
+      cfg.nlev[o]  = warp_build_levels_big(*mats[o], df[o], asc[o], lvlscratch, ls[o], co[o], lw[o],
+                                           bt[o], bigscratch);
+      cfg.lword[o] = lw[o].data();
+      cfg.bits[o]  = bt[o].data();
+    } else {                 // plain wavefront: one lane per column
+      cfg.nlev[o]  = warp_build_levels(*mats[o], df[o], asc[o], lvlscratch, ls[o], co[o]);
+    }
+    cfg.lstart[o]     = ls[o].data();
+    cfg.corder[o]     = co[o].data();
+  }
+}
+
 // One block == one problem. args points to an N-entry device array; block b solves
 // args[blockIdx.x] entirely on its own device buffers. Launched <<<1,1>>> for the
-// single-problem wrapper (N=1) and <<<N,1>>> for the batch wrapper. g_gpu_alloc_failed
-// is reset by the HOST before launch (not here) so a late block can't clear a failure
-// flag an earlier block already set.
+// single-thread reference (Warp=false) and <<<1,32>>> for the warp-optimized path
+// (Warp=true, lane 0 drives, lanes 1..31 run the collective wavefront solves).
+// g_gpu_alloc_failed is reset by the HOST before launch (not here) so a late block
+// can't clear a failure flag an earlier block already set.
+template <bool Warp>
 __global__ void
-__launch_bounds__(1, 8)
+// Only the max-threads bound must change for the 32-lane warp path; minBlocks stays 8
+// (no effect here: one block is ever launched, and 65536/(32*8) already exceeds the
+// 255-register hardware cap, so the warp kernel keeps the full register budget).
+__launch_bounds__(Warp ? 32 : 1, 8)
 gpu_phase2_kernel(kernel_args* args)
 {
-  if (blockDim.x > 1) {
-    // For now this should never happen, only single thread blocks
-    assert(false);
-    return;
+  // Reject a launch geometry that doesn't match the compiled path (the whole point
+  // of the compile-time Warp parameter: no runtime branch selects opt vs unopt).
+  if constexpr (Warp) {
+    if (blockDim.x != 32) { assert(false); return; }
+  } else {
+    if (blockDim.x != 1) { assert(false); return; }
   }
+
+  // Shared request/config for the persistent helper warp (unused when Warp==false).
+  __shared__ warp_solve_config cfg_shared;
+
+  if constexpr (Warp) {
+    if (threadIdx.x != 0) {  // lanes 1..31: run collective solves until lane 0 says DONE
+      warp_helper_loop(&cfg_shared);
+      return;
+    }
+  }
+
   kernel_args& a = args[blockIdx.x];
 
   const i_t m = a.m;
@@ -2347,7 +2823,21 @@ gpu_phase2_kernel(kernel_args* args)
   sol.y = gpu_span<f_t>(a.y, m);
   sol.z = gpu_span<f_t>(a.z, n);
 
-  dual::status_t status = gpu_simplified_dual_phase2_device(lp,
+  // Warp path: precompute the fixed L0/U0 elimination-level schedules once and
+  // wire ft to the shared config. These gpu_vectors stay alive (lane 0) for the
+  // whole solve; their device buffers are readable by all lanes via the config.
+  gpu_vector<i_t> lvlscratch;
+  gpu_vector<i_t> bigscratch;
+  gpu_vector<i_t> lvl_ls[4];
+  gpu_vector<i_t> lvl_co[4];
+  gpu_vector<i_t> lvl_lw[4];       // mode 1 (big): per-level base word
+  gpu_vector<unsigned> lvl_bt[4];  // mode 1 (big): large-column bitmask
+  if constexpr (Warp) {
+    warp_build_config(ft, cfg_shared, lvlscratch, bigscratch, lvl_ls, lvl_co, lvl_lw, lvl_bt);
+    ft.warp_cfg_ = &cfg_shared;
+  }
+
+  dual::status_t status = gpu_simplified_dual_phase2_device<Warp>(lp,
                                                             settings,
                                                             a.vstatus,
                                                             ft,
@@ -2355,10 +2845,12 @@ gpu_phase2_kernel(kernel_args* args)
                                                             a.nonbasic_list,
                                                             sol,
                                                             a.dy_se,
-                                                            a.dy_se_empty != 0,
-                                                            a.iter_limit_override,
-                                                            a.gpu_log != 0,
-                                                            a.gpu_prof != 0);
+                                                            a.dy_se_empty != 0);
+
+  if constexpr (Warp) {  // release the helper lanes from warp_helper_loop
+    cfg_shared.op = WARP_DONE;
+    __syncwarp(0xffffffffu);
+  }
 
   *a.out_status         = static_cast<i_t>(status);
   *a.out_objective      = sol.objective;
@@ -2508,16 +3000,6 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   a.cut_off             = settings.cut_off;
   a.steepest_edge_ratio = settings.steepest_edge_ratio;
   a.start_time          = tic();
-  // Optional fixed iteration cap (must match the CPU's CUOPT_SIMPLIFIED_ITER_LIMIT).
-  {
-    const char* e         = std::getenv("CUOPT_SIMPLIFIED_ITER_LIMIT");
-    a.iter_limit_override = (e != nullptr) ? std::atoi(e) : 0;
-  }
-  a.gpu_log = settings.log.log ? 1 : 0;
-  {
-    const char* e = std::getenv("CUOPT_GPU_PROFILE");
-    a.gpu_prof    = (e != nullptr && std::string(e) != "0") ? 1 : 0;
-  }
 
   a.out_status         = alloc_zeroed<int>(1);
   a.out_objective      = alloc_zeroed<double>(1);
@@ -2627,9 +3109,27 @@ dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
   kernel_args* d_args = nullptr;
   RAFT_CUDA_TRY(cudaMalloc(&d_args, sizeof(kernel_args)));
   RAFT_CUDA_TRY(cudaMemcpy(d_args, &a, sizeof(kernel_args), cudaMemcpyHostToDevice));
-  gpu_phase2_kernel<<<1, 1>>>(d_args);
+
+  // Compile-time-selected optimized (warp) vs unoptimized (single-thread) kernel.
+  // Both templates are instantiated here so the compiler emits code for both; the
+  // host picks at runtime (env CUOPT_GPU_WARP) which pre-compiled kernel to launch.
+  // CUOPT_GPU_WARP: unset/"0" = single-thread; "1" = plain wavefront; "2" (or higher) = big≥32.
+  const char* warp_env  = std::getenv("CUOPT_GPU_WARP");
+  const bool  warp_mode = (warp_env != nullptr && std::string(warp_env) != "0");
+  int solve_mode = 0;  // device warp dense-solve mode: 0 plain / 1 big
+  if (warp_mode) { const int v = std::atoi(warp_env); solve_mode = (v >= 2) ? 1 : 0; }
+  RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_warp_solve_mode, &solve_mode, sizeof(int)));
+  const auto  _k0 = std::chrono::steady_clock::now();
+  if (warp_mode) {
+    gpu_phase2_kernel<true><<<1, 32>>>(d_args);
+  } else {
+    gpu_phase2_kernel<false><<<1, 1>>>(d_args);
+  }
   RAFT_CUDA_TRY(cudaPeekAtLastError());
   RAFT_CUDA_TRY(cudaDeviceSynchronize());
+  const double _kms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - _k0).count();
+  std::printf("[GPUKERNEL] warp=%d mode=%d ms=%.3f\n", warp_mode ? 1 : 0, solve_mode, _kms);
   cudaFree(d_args);
 
   // Marshal outputs back.
@@ -2730,10 +3230,6 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
     const auto& it = items[b];
     h_args[b] = marshal_problem(*it.lp, *it.settings, *it.vstatus, *it.ft, *it.basic_list,
                                 *it.nonbasic_list, *it.sol, *it.dy_se);
-    // Force profiling + per-step logging OFF for every block: the [SEPROF]/[CMP] globals are
-    // shared across blocks, so writing them from a multi-block launch races and pollutes timing.
-    h_args[b].gpu_prof = 0;
-    h_args[b].gpu_log  = 0;
   }
   kernel_args* d_args = nullptr;
   RAFT_CUDA_TRY(cudaMalloc(&d_args, N * sizeof(kernel_args)));
@@ -2744,11 +3240,24 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
   timing.upload_s = toc(up_t0);
 
   // ---- Launch one block per problem, timed with CUDA events (device compute only) ----
+  // CUOPT_GPU_WARP (unset/"0" = single-thread <<<N,1>>>; else the warp path <<<N,32>>>, one 32-lane
+  // warp per problem — same env mapping as the single-problem launch: "1" plain / "2" big≥32).
+  // Warp results are numeric-equivalent, NOT bit-exact, so the caller must relax its
+  // GPU-vs-reference verification when CUOPT_GPU_WARP is set.
+  const char* warp_env  = std::getenv("CUOPT_GPU_WARP");
+  const bool  warp_mode = (warp_env != nullptr && std::string(warp_env) != "0");
+  int solve_mode = 0;  // 0 plain / 1 big
+  if (warp_mode) { const int v = std::atoi(warp_env); solve_mode = (v >= 2) ? 1 : 0; }
+  RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_warp_solve_mode, &solve_mode, sizeof(int)));
   cudaEvent_t ev_start, ev_stop;
   RAFT_CUDA_TRY(cudaEventCreate(&ev_start));
   RAFT_CUDA_TRY(cudaEventCreate(&ev_stop));
   RAFT_CUDA_TRY(cudaEventRecord(ev_start));
-  gpu_phase2_kernel<<<static_cast<unsigned>(N), 1>>>(d_args);
+  if (warp_mode) {
+    gpu_phase2_kernel<true><<<static_cast<unsigned>(N), 32>>>(d_args);
+  } else {
+    gpu_phase2_kernel<false><<<static_cast<unsigned>(N), 1>>>(d_args);
+  }
   RAFT_CUDA_TRY(cudaEventRecord(ev_stop));
   RAFT_CUDA_TRY(cudaPeekAtLastError());
   RAFT_CUDA_TRY(cudaEventSynchronize(ev_stop));
