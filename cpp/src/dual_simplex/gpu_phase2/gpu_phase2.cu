@@ -619,7 +619,9 @@ enum warp_solve_op {
   WARP_FROMDENSE = kNumWarpSolveOps + 3, // 7: dense→sparse compaction (fd_* fields)
   WARP_RT        = kNumWarpSolveOps + 4, // 8: dual ratio test min-argmin (rt_* fields)
   WARP_SEUPD     = kNumWarpSolveOps + 5, // 9: SE-norm update loop over scaled_delta_xB (su_* fields)
-  WARP_DONE      = kNumWarpSolveOps + 6  // 10: sentinel — never indexes a per-op array
+  WARP_PINF      = kNumWarpSolveOps + 6, // 10: primal infeasibility scan over m (pi_* fields)
+  WARP_UPDDUAL   = kNumWarpSolveOps + 7, // 11: update_dual_variables y/z update (ud_* fields)
+  WARP_DONE      = kNumWarpSolveOps + 8  // 12: sentinel — never indexes a per-op array
 };
 
 // Trivially constructible (no member initializers) so it can be a __shared__
@@ -711,6 +713,32 @@ struct warp_solve_config {
   f_t        su_wr;
   f_t        su_omegar;
   f_t        su_dynormsq;
+  // primal infeasibility scan (op == WARP_PINF): zero squared_infeas[0,n), scan basics k=0..m-1,
+  // scatter squared_infeas[j] (distinct j → bit-exact) + ordered-compact the infeasible indices.
+  const i_t* pi_basic;    // basic_list
+  const f_t* pi_x;        // x
+  const f_t* pi_lower;    // lp.lower
+  const f_t* pi_upper;    // lp.upper
+  f_t*       pi_sqinf;    // squared_infeasibilities (dense, size n, output)
+  i_t*       pi_idx;      // infeasibility_indices (ordered compact output)
+  i_t*       pi_count;    // out: #infeasible
+  f_t*       pi_pinf;     // out: Σ infeas (primal_inf — currently dead, computed defensively)
+  f_t*       pi_pinf_sq;  // out: Σ infeas² (the return value — dead)
+  f_t        pi_tol;      // settings.primal_tol
+  i_t        pi_m;
+  i_t        pi_n;
+  // dual variable update (op == WARP_UPDDUAL): y[i]+=step·δy (distinct i) and z[j]+=step·δz[j]
+  // (distinct j) + z[leaving] (distinct). All distinct locations → no atomics, bit-exact.
+  const i_t* ud_dy_i;    // delta_y_sparse.i
+  const f_t* ud_dy_x;    // delta_y_sparse.x
+  const i_t* ud_dz_idx;  // delta_z_indices
+  const f_t* ud_dz;      // delta_z (dense)
+  f_t*       ud_y;       // y (output)
+  f_t*       ud_z;       // z (output)
+  i_t        ud_dy_nz;
+  i_t        ud_dz_nz;
+  i_t        ud_leaving;
+  f_t        ud_step;
 };
 
 // Collective (all-32-lane) dense solve of operator cfg.op on x = cfg.x. Both modes do exactly
@@ -941,10 +969,65 @@ __device__ void warp_collective_seupd(const warp_solve_config& cfg)
   }
 }
 
+// Collective primal-infeasibility scan: zero squared_infeas[0,n), then scan the m basics — each lane a
+// strided k. For an infeasible basic, squared_infeas[j] (j=basic_list[k], distinct → distinct write,
+// bit-exact) is set and j is appended to infeas_idx by an ordered ballot/popc compaction (increasing k
+// → BIT-IDENTICAL to the serial push order → deterministic). primal_inf / Σinfeas² are warp-reduced
+// (both currently dead → the reorder is harmless). 1 internal __syncwarp (zero before scatter).
+__device__ void warp_collective_pinf(const warp_solve_config& cfg)
+{
+  const int lane = static_cast<int>(threadIdx.x);
+  const i_t n = cfg.pi_n, m = cfg.pi_m;
+  for (i_t k = lane; k < n; k += 32) { cfg.pi_sqinf[k] = 0.0; }
+  __syncwarp(0xffffffffu);
+  i_t count = 0; f_t lpinf = 0.0, lpinf_sq = 0.0;
+  for (i_t base = 0; base < m; base += 32) {
+    const i_t k = base + lane;
+    i_t j = -1; bool inf = false;
+    if (k < m) {
+      j                = cfg.pi_basic[k];
+      const f_t lo     = cfg.pi_lower[j] - cfg.pi_x[j];
+      const f_t up     = cfg.pi_x[j] - cfg.pi_upper[j];
+      const f_t infeas = fmax(lo, up);
+      if (infeas > cfg.pi_tol) {
+        const f_t sq    = infeas * infeas;
+        cfg.pi_sqinf[j] = sq;   // distinct j → race-free
+        inf = true; lpinf += infeas; lpinf_sq += sq;
+      }
+    }
+    const unsigned ball = __ballot_sync(0xffffffffu, inf);
+    const int prefix    = __popc(ball & ((1u << lane) - 1u));
+    if (inf) { cfg.pi_idx[count + prefix] = j; }  // ordered (increasing k) → matches serial
+    count += __popc(ball);
+  }
+  const f_t pinf    = warp_reduce_add(lpinf);
+  const f_t pinf_sq = warp_reduce_add(lpinf_sq);
+  if (lane == 0) { *cfg.pi_count = count; *cfg.pi_pinf = pinf; *cfg.pi_pinf_sq = pinf_sq; }
+}
+
+// Collective dual-variable update: y[i]+=step·δy over the delta_y nonzeros (i distinct → distinct
+// writes) and z[j]+=step·δz[j] over delta_z_indices (j distinct → distinct writes) + z[leaving]
+// (leaving is basic, not in delta_z_indices, and y/z are separate arrays → distinct). No cross-lane
+// conflicts → NO atomics, bit-exact, 0 internal __syncwarps.
+__device__ void warp_collective_upddual(const warp_solve_config& cfg)
+{
+  const int lane = static_cast<int>(threadIdx.x);
+  const f_t step = cfg.ud_step;
+  for (i_t k = lane; k < cfg.ud_dy_nz; k += 32) {
+    const i_t i = cfg.ud_dy_i[k];
+    cfg.ud_y[i] += step * cfg.ud_dy_x[k];
+  }
+  for (i_t k = lane; k < cfg.ud_dz_nz; k += 32) {
+    const i_t j = cfg.ud_dz_idx[k];
+    cfg.ud_z[j] += step * cfg.ud_dz[j];
+  }
+  if (lane == 0) { cfg.ud_z[cfg.ud_leaving] += step * cfg.ud_dz[cfg.ud_leaving]; }
+}
+
 // Route a posted request to the right collective body: op < kNumWarpSolveOps is a dense triangular
-// solve, else the tl_/dz_/td_/fd_/rt_/su_ collective selected by op. Both lane 0 (warp_dispatch*) and
-// the parked helpers (warp_helper_loop) go through here, so their internal __syncwarp counts always
-// match (nlev[op] solve, tl_num T-loop, 1 δz, 1 to_dense, 0 from_dense, 0 ratio test, 0 SE-update).
+// solve, else the tl_/dz_/td_/fd_/rt_/su_/pi_/ud_ collective selected by op. Both lane 0
+// (warp_dispatch*) and the parked helpers (warp_helper_loop) go through here, so their internal
+// __syncwarp counts always match (all these post-solve collectives have 0-or-few, matched by construction).
 __device__ void warp_collective(const warp_solve_config& cfg)
 {
   if (cfg.op == WARP_TLOOP) { warp_collective_tloop(cfg); }
@@ -953,6 +1036,8 @@ __device__ void warp_collective(const warp_solve_config& cfg)
   else if (cfg.op == WARP_FROMDENSE) { warp_collective_fromdense(cfg); }
   else if (cfg.op == WARP_RT) { warp_collective_rt(cfg); }
   else if (cfg.op == WARP_SEUPD) { warp_collective_seupd(cfg); }
+  else if (cfg.op == WARP_PINF) { warp_collective_pinf(cfg); }
+  else if (cfg.op == WARP_UPDDUAL) { warp_collective_upddual(cfg); }
   else { warp_collective_solve(cfg); }
 }
 
@@ -1348,6 +1433,53 @@ struct gpu_basis_update_mpf {
     c->su_omegar   = omegar;
     c->su_dynormsq = dynormsq;
     c->op          = WARP_SEUPD;
+    __syncwarp(0xffffffffu);          // A
+    warp_collective(*c);
+    __syncwarp(0xffffffffu);          // B
+  }
+
+  // Post the primal-infeasibility scan to the whole warp (op == WARP_PINF). Bit-exact on the consumed
+  // outputs (squared_infeas dense scatter + ordered infeas_idx); *count/*pinf/*pinf_sq returned.
+  __device__ void warp_dispatch_pinf(const i_t* basic, const f_t* x, const f_t* lower, const f_t* upper,
+                                     f_t* sqinf, i_t* idx, i_t* count, f_t* pinf, f_t* pinf_sq, f_t tol,
+                                     i_t m, i_t n) const
+  {
+    warp_solve_config* c = warp_cfg_;
+    c->pi_basic   = basic;
+    c->pi_x       = x;
+    c->pi_lower   = lower;
+    c->pi_upper   = upper;
+    c->pi_sqinf   = sqinf;
+    c->pi_idx     = idx;
+    c->pi_count   = count;
+    c->pi_pinf    = pinf;
+    c->pi_pinf_sq = pinf_sq;
+    c->pi_tol     = tol;
+    c->pi_m       = m;
+    c->pi_n       = n;
+    c->op         = WARP_PINF;
+    __syncwarp(0xffffffffu);          // A
+    warp_collective(*c);
+    __syncwarp(0xffffffffu);          // B
+  }
+
+  // Post the dual-variable update to the whole warp (op == WARP_UPDDUAL). Deterministic / bit-exact.
+  __device__ void warp_dispatch_upddual(const i_t* dy_i, const f_t* dy_x, const i_t* dz_idx,
+                                        const f_t* dz, f_t* y, f_t* z, i_t dy_nz, i_t dz_nz, i_t leaving,
+                                        f_t step) const
+  {
+    warp_solve_config* c = warp_cfg_;
+    c->ud_dy_i   = dy_i;
+    c->ud_dy_x   = dy_x;
+    c->ud_dz_idx = dz_idx;
+    c->ud_dz     = dz;
+    c->ud_y      = y;
+    c->ud_z      = z;
+    c->ud_dy_nz  = dy_nz;
+    c->ud_dz_nz  = dz_nz;
+    c->ud_leaving = leaving;
+    c->ud_step   = step;
+    c->op        = WARP_UPDDUAL;
     __syncwarp(0xffffffffu);          // A
     warp_collective(*c);
     __syncwarp(0xffffffffu);          // B
@@ -2170,8 +2302,10 @@ __device__ void clear_delta_z(
   delta_z_indices.clear();
 }
 
+template <bool Warp = false>
 __device__ f_t compute_initial_primal_infeasibilities(const gpu_lp& lp,
                                                       const gpu_settings& settings,
+                                                      const gpu_basis_update_mpf& ft,
                                                       const i_t* basic_list,
                                                       const f_t* x,
                                                       gpu_vector<f_t>& squared_infeasibilities,
@@ -2180,6 +2314,19 @@ __device__ f_t compute_initial_primal_infeasibilities(const gpu_lp& lp,
 {
   const i_t m = lp.num_rows;
   const i_t n = lp.num_cols;
+  if constexpr (Warp) {
+    squared_infeasibilities.reserve(n);
+    squared_infeasibilities.set_size(n);  // no serial zero; the collective zeros [0,n)
+    infeasibility_indices.reserve(n);
+    i_t pi_count = 0;
+    f_t pi_pinf = 0.0, pi_pinf_sq = 0.0;
+    ft.warp_dispatch_pinf(basic_list, x, lp.lower.data(), lp.upper.data(),
+                          squared_infeasibilities.data(), infeasibility_indices.data(), &pi_count,
+                          &pi_pinf, &pi_pinf_sq, settings.primal_tol, m, n);
+    infeasibility_indices.set_size(pi_count);
+    primal_inf = pi_pinf;
+    return pi_pinf_sq;
+  }
   squared_infeasibilities.resize(n);
   for (i_t k = 0; k < n; ++k) { squared_infeasibilities[k] = 0.0; }
   infeasibility_indices.reserve(n);
@@ -2318,7 +2465,9 @@ __device__ void compute_delta_y(const gpu_basis_update_mpf& ft,
   if (direction != -1) { UTsol_sparse.negate(); }
 }
 
-__device__ i_t update_dual_variables(const gpu_sparse_vector& delta_y_sparse,
+template <bool Warp = false>
+__device__ i_t update_dual_variables(const gpu_basis_update_mpf& ft,
+                                     const gpu_sparse_vector& delta_y_sparse,
                                      const gpu_vector<i_t>& delta_z_indices,
                                      const f_t* delta_z,
                                      f_t step_length,
@@ -2328,6 +2477,12 @@ __device__ i_t update_dual_variables(const gpu_sparse_vector& delta_y_sparse,
                                      f_t& work_estimate)
 {
   const i_t delta_y_nz = delta_y_sparse.i.size();
+  if constexpr (Warp) {
+    ft.warp_dispatch_upddual(delta_y_sparse.i.data(), delta_y_sparse.x.data(), delta_z_indices.data(),
+                             delta_z, y, z, delta_y_nz, static_cast<i_t>(delta_z_indices.size()),
+                             leaving_index, step_length);
+    return 0;
+  }
   for (i_t k = 0; k < delta_y_nz; ++k) {
     const i_t i = delta_y_sparse.i[k];
     y[i] += step_length * delta_y_sparse.x[k];
@@ -2597,8 +2752,8 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
   gpu_vector<f_t> squared_infeas;
   gpu_vector<i_t> infeas_idx;
   f_t primal_inf = 0.0;
-  compute_initial_primal_infeasibilities(
-    lp, settings, basic_list, x, squared_infeas, infeas_idx, primal_inf);
+  compute_initial_primal_infeasibilities<Warp>(
+    lp, settings, ft, basic_list, x, squared_infeas, infeas_idx, primal_inf);
 
   gpu_sparse_vector delta_y_sparse(m, 0);
   gpu_sparse_vector UTsol_sparse(m, 0);
@@ -2699,8 +2854,8 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     }
 
     KT_TIC(_kt_ud);
-    update_dual_variables(
-      delta_y_sparse, delta_z_indices, delta_z.data(), step_length, leaving, y, z, work);
+    update_dual_variables<Warp>(
+      ft, delta_y_sparse, delta_z_indices, delta_z.data(), step_length, leaving, y, z, work);
     KT_TOC(KT_UPDDUAL, _kt_ud);
 
     // FTran.
@@ -2762,8 +2917,8 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     }
 
     KT_TIC(_kt_pi);
-    compute_initial_primal_infeasibilities(
-      lp, settings, basic_list, x, squared_infeas, infeas_idx, primal_inf);
+    compute_initial_primal_infeasibilities<Warp>(
+      lp, settings, ft, basic_list, x, squared_infeas, infeas_idx, primal_inf);
     KT_TOC(KT_PINF, _kt_pi);
     KT_TIC(_kt_cd);
     clear_delta_z(entering, leaving, delta_z_mark.data(), delta_z_indices, delta_z.data());
