@@ -64,6 +64,52 @@ __device__ int g_gpu_alloc_failed;
 __device__ int g_warp_solve_mode;
 static constexpr int kBigThreshold = 32;  // "large column" cutoff for the big path
 
+// ================= Per-function kernel timers (COMPILE-TIME GATED) ================================
+// Accumulate clock64 ticks per driver function on lane 0 and print one [KTIMER ...] line per solve
+// at kernel exit. Enable by uncommenting the #define below (or building with -DCUOPT_KTIMER);
+// when undefined every KT_* macro expands to ((void)0) → ZERO overhead → production default.
+// Single-problem launches only (the accumulators are __device__ globals; a multi-block batch would
+// race them, so the emit is gated on gridDim.x==1). Pair with the harness's [SENODE <name>] line
+// (TEST_NETLIB_SE_STATS=1) to group per node. "setup" = kernel entry → first pivot (arg unpack +
+// warp_build_config + the driver's one-time init: bounds/primal-vars/SE-norm-init/Arow/…); "pinf"
+// counts only the per-pivot recompute (the one-time setup call is inside "setup").
+#define CUOPT_KTIMER 1
+
+#ifdef CUOPT_KTIMER
+enum kt_slot {
+  KT_SETUP = 0, KT_PRICING, KT_BTRAN, KT_DZ, KT_RCU, KT_RT, KT_UPDDUAL, KT_FTRAN, KT_SE, KT_SE_SOLVE,
+  KT_UPDPRIM, KT_OBJ, KT_AROW, KT_FTUPD, KT_PINF, KT_CLEARDZ, KT_N
+};
+// KT_SE_SOLVE is a SUB-slot of KT_SE (the ft.b_solve inside update_steepest_edge_norms); se_rest =
+// se - se_solve. It is NOT part of the top-level partition (would double-count KT_SE).
+__device__ unsigned long long g_kt[KT_N];
+__device__ unsigned long long g_kt_calls[KT_N];
+__device__ long long          g_kt_t0;         // kernel-entry clock (origin for "setup" and "total")
+__device__ unsigned long long g_kt_sdxb_sum;   // Σ scaled_delta_xB nnz over pivots (density confirm)
+__device__ unsigned long long g_kt_sdxb_cnt;   // pivot count for the above
+#define KT_RESET()      do { if (threadIdx.x == 0) { for (int _i = 0; _i < KT_N; ++_i) { g_kt[_i] = 0; g_kt_calls[_i] = 0; } g_kt_t0 = clock64(); g_kt_sdxb_sum = 0; g_kt_sdxb_cnt = 0; } } while (0)
+#define KT_TIC(v)       long long v = clock64()
+#define KT_TOC(slot, v) do { if (threadIdx.x == 0) { g_kt[slot] += (unsigned long long)(clock64() - (v)); g_kt_calls[slot]++; } } while (0)
+#define KT_SETUP_DONE() do { if (threadIdx.x == 0) { g_kt[KT_SETUP] += (unsigned long long)(clock64() - g_kt_t0); g_kt_calls[KT_SETUP]++; } } while (0)
+#define KT_SDXB(nz)     do { if (threadIdx.x == 0) { g_kt_sdxb_sum += (unsigned long long)(nz); g_kt_sdxb_cnt++; } } while (0)
+#define KT_EMIT(m)      do { if (threadIdx.x == 0 && gridDim.x == 1) { \
+    const unsigned long long _tot = (unsigned long long)(clock64() - g_kt_t0); \
+    printf("[KTIMER] total=%llu setup=%llu pricing=%llu btran=%llu dz=%llu rcu=%llu rt=%llu " \
+           "upddual=%llu ftran=%llu se=%llu se_solve=%llu updprim=%llu obj=%llu arow=%llu ftupd=%llu " \
+           "pinf=%llu cleardz=%llu sdxb_sum=%llu sdxb_cnt=%llu m=%d\n", _tot, g_kt[KT_SETUP], \
+           g_kt[KT_PRICING], g_kt[KT_BTRAN], g_kt[KT_DZ], g_kt[KT_RCU], g_kt[KT_RT], g_kt[KT_UPDDUAL], \
+           g_kt[KT_FTRAN], g_kt[KT_SE], g_kt[KT_SE_SOLVE], g_kt[KT_UPDPRIM], g_kt[KT_OBJ], g_kt[KT_AROW], \
+           g_kt[KT_FTUPD], g_kt[KT_PINF], g_kt[KT_CLEARDZ], g_kt_sdxb_sum, g_kt_sdxb_cnt, \
+           static_cast<int>(m)); } } while (0)
+#else
+#define KT_RESET()      ((void)0)
+#define KT_TIC(v)       ((void)0)
+#define KT_TOC(slot, v) ((void)0)
+#define KT_SETUP_DONE() ((void)0)
+#define KT_SDXB(nz)     ((void)0)
+#define KT_EMIT(m)      ((void)0)
+#endif
+
 __device__ __forceinline__ f_t dev_inf() { return cuda::std::numeric_limits<f_t>::infinity(); }
 __device__ __forceinline__ f_t dev_nan() { return cuda::std::numeric_limits<f_t>::quiet_NaN(); }
 
@@ -572,7 +618,8 @@ enum warp_solve_op {
   WARP_TODENSE   = kNumWarpSolveOps + 2, // 6: sparse→dense scatter (td_* fields)
   WARP_FROMDENSE = kNumWarpSolveOps + 3, // 7: dense→sparse compaction (fd_* fields)
   WARP_RT        = kNumWarpSolveOps + 4, // 8: dual ratio test min-argmin (rt_* fields)
-  WARP_DONE      = kNumWarpSolveOps + 5  // 9: sentinel — never indexes a per-op array
+  WARP_SEUPD     = kNumWarpSolveOps + 5, // 9: SE-norm update loop over scaled_delta_xB (su_* fields)
+  WARP_DONE      = kNumWarpSolveOps + 6  // 10: sentinel — never indexes a per-op array
 };
 
 // Trivially constructible (no member initializers) so it can be a __shared__
@@ -650,6 +697,20 @@ struct warp_solve_config {
   f_t                       rt_pivot_tol;
   f_t                       rt_dual_tol;
   f_t                       rt_zero_tol;
+  // SE-norm update (op == WARP_SEUPD): one lane per scaled_delta_xB nonzero. Writes are to DISTINCT
+  // delta_y_steepest_edge[j] (j=basic_list[i], i distinct → j distinct) + one distinct entering slot →
+  // no atomics, bit-exact.
+  const i_t* su_sdxb_i;   // scaled_delta_xB.i
+  const f_t* su_sdxb_x;   // scaled_delta_xB.x
+  const i_t* su_basic;    // basic_list
+  f_t*       su_dyse;     // delta_y_steepest_edge (output)
+  const f_t* su_v;        // v (dense, read-only)
+  i_t        su_nz;       // scaled_delta_xB nnz
+  i_t        su_leaving;  // basic_leaving_index
+  i_t        su_entering; // entering_index
+  f_t        su_wr;
+  f_t        su_omegar;
+  f_t        su_dynormsq;
 };
 
 // Collective (all-32-lane) dense solve of operator cfg.op on x = cfg.x. Both modes do exactly
@@ -857,10 +918,33 @@ __device__ void warp_collective_rt(const warp_solve_config& cfg)
   if (lane == 0) { *cfg.rt_entering = best_j; *cfg.rt_k = best_j < 0 ? -1 : best_k; *cfg.rt_step = best_r; }
 }
 
+// Collective steepest-edge norm update: one lane per scaled_delta_xB nonzero h. k=su_sdxb_i[h] are
+// distinct (sparse-vector indices) → j=su_basic[k] distinct → every δy_se[j] write hits a distinct
+// location; the single k==leaving branch writes δy_se[entering] (entering not in basic_list yet, so
+// distinct too). No cross-lane read/write dependency (each h reads+writes its own j) → NO atomics,
+// bit-exact, 0 internal __syncwarps. Same arithmetic as the serial loop, just distinct h per lane.
+__device__ void warp_collective_seupd(const warp_solve_config& cfg)
+{
+  const int lane = static_cast<int>(threadIdx.x);
+  const i_t nz = cfg.su_nz;
+  for (i_t h = lane; h < nz; h += 32) {
+    const i_t k = cfg.su_sdxb_i[h];
+    const i_t j = cfg.su_basic[k];
+    if (k == cfg.su_leaving) {
+      const f_t w = cfg.su_sdxb_x[h];
+      cfg.su_dyse[cfg.su_entering] = (1.0 / (w * w)) * cfg.su_dynormsq;
+    } else {
+      const f_t wk      = -cfg.su_sdxb_x[h];
+      const f_t new_val = cfg.su_dyse[j] + wk * (2.0 * cfg.su_v[k] / cfg.su_wr + wk * cfg.su_omegar);
+      cfg.su_dyse[j]    = fmax(new_val, 1e-4);
+    }
+  }
+}
+
 // Route a posted request to the right collective body: op < kNumWarpSolveOps is a dense triangular
-// solve, else the tl_/dz_/td_/fd_/rt_ collective selected by op. Both lane 0 (warp_dispatch*) and the
-// parked helpers (warp_helper_loop) go through here, so their internal __syncwarp counts always match
-// (nlev[op] solve, tl_num T-loop, 1 δz, 1 to_dense, 0 from_dense, 0 ratio test).
+// solve, else the tl_/dz_/td_/fd_/rt_/su_ collective selected by op. Both lane 0 (warp_dispatch*) and
+// the parked helpers (warp_helper_loop) go through here, so their internal __syncwarp counts always
+// match (nlev[op] solve, tl_num T-loop, 1 δz, 1 to_dense, 0 from_dense, 0 ratio test, 0 SE-update).
 __device__ void warp_collective(const warp_solve_config& cfg)
 {
   if (cfg.op == WARP_TLOOP) { warp_collective_tloop(cfg); }
@@ -868,6 +952,7 @@ __device__ void warp_collective(const warp_solve_config& cfg)
   else if (cfg.op == WARP_TODENSE) { warp_collective_todense(cfg); }
   else if (cfg.op == WARP_FROMDENSE) { warp_collective_fromdense(cfg); }
   else if (cfg.op == WARP_RT) { warp_collective_rt(cfg); }
+  else if (cfg.op == WARP_SEUPD) { warp_collective_seupd(cfg); }
   else { warp_collective_solve(cfg); }
 }
 
@@ -1239,6 +1324,30 @@ struct gpu_basis_update_mpf {
     c->rt_dual_tol  = dtol;
     c->rt_zero_tol  = ztol;
     c->op           = WARP_RT;
+    __syncwarp(0xffffffffu);          // A
+    warp_collective(*c);
+    __syncwarp(0xffffffffu);          // B
+  }
+
+  // Post the steepest-edge norm update loop to the whole warp (op == WARP_SEUPD). Deterministic /
+  // bit-exact (distinct-location writes).
+  __device__ void warp_dispatch_seupd(const i_t* sdxb_i, const f_t* sdxb_x, const i_t* basic,
+                                      f_t* dyse, const f_t* v, i_t nz, i_t leaving, i_t entering,
+                                      f_t wr, f_t omegar, f_t dynormsq) const
+  {
+    warp_solve_config* c = warp_cfg_;
+    c->su_sdxb_i   = sdxb_i;
+    c->su_sdxb_x   = sdxb_x;
+    c->su_basic    = basic;
+    c->su_dyse     = dyse;
+    c->su_v        = v;
+    c->su_nz       = nz;
+    c->su_leaving  = leaving;
+    c->su_entering = entering;
+    c->su_wr       = wr;
+    c->su_omegar   = omegar;
+    c->su_dynormsq = dynormsq;
+    c->op          = WARP_SEUPD;
     __syncwarp(0xffffffffu);          // A
     warp_collective(*c);
     __syncwarp(0xffffffffu);          // B
@@ -2318,7 +2427,9 @@ __device__ i_t update_steepest_edge_norms(const gpu_settings& settings,
                                           f_t& work_estimate)
 {
   v_sparse.clear();
+  KT_TIC(_kt_ses);  // [KTIMER] se sub-split: time the b_solve (se_solve); se_rest = se - se_solve
   ft.b_solve<Warp>(delta_y_sparse, v_sparse);
+  KT_TOC(KT_SE_SOLVE, _kt_ses);
   if (direction == -1) {
     v_sparse.negate();
     work_estimate += 2 * v_sparse.i.size();
@@ -2331,19 +2442,27 @@ __device__ i_t update_steepest_edge_norms(const gpu_settings& settings,
   if (wr == 0) { return -1; }
   const f_t omegar             = dy_norm_squared / (wr * wr);
   const i_t scaled_delta_xB_nz = scaled_delta_xB.i.size();
+  KT_SDXB(scaled_delta_xB_nz);  // [KTIMER] accumulate scaled_delta_xB nnz (density confirmation)
 
-  for (i_t h = 0; h < scaled_delta_xB_nz; ++h) {
-    const i_t k = scaled_delta_xB.i[h];
-    const i_t j = basic_list[k];
-    if (k == basic_leaving_index) {
-      const f_t w                           = scaled_delta_xB.x[h];
-      const f_t w_squared                   = w * w;
-      delta_y_steepest_edge[entering_index] = (1.0 / w_squared) * dy_norm_squared;
-    } else {
-      const f_t wk = -scaled_delta_xB.x[h];
-      f_t new_val  = delta_y_steepest_edge[j] + wk * (2.0 * v[k] / wr + wk * omegar);
-      new_val      = fmax(new_val, 1e-4);
-      delta_y_steepest_edge[j] = new_val;
+  if constexpr (Warp) {
+    // One lane per nonzero: distinct-location writes (see warp_collective_seupd) → bit-exact.
+    ft.warp_dispatch_seupd(scaled_delta_xB.i.data(), scaled_delta_xB.x.data(), basic_list,
+                           delta_y_steepest_edge, v, scaled_delta_xB_nz, basic_leaving_index,
+                           entering_index, wr, omegar, dy_norm_squared);
+  } else {
+    for (i_t h = 0; h < scaled_delta_xB_nz; ++h) {
+      const i_t k = scaled_delta_xB.i[h];
+      const i_t j = basic_list[k];
+      if (k == basic_leaving_index) {
+        const f_t w                           = scaled_delta_xB.x[h];
+        const f_t w_squared                   = w * w;
+        delta_y_steepest_edge[entering_index] = (1.0 / w_squared) * dy_norm_squared;
+      } else {
+        const f_t wk = -scaled_delta_xB.x[h];
+        f_t new_val  = delta_y_steepest_edge[j] + wk * (2.0 * v[k] / wr + wk * omegar);
+        new_val      = fmax(new_val, 1e-4);
+        delta_y_steepest_edge[j] = new_val;
+      }
     }
   }
   work_estimate += 5 * scaled_delta_xB_nz;
@@ -2493,6 +2612,7 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
   // advanced) driver: init fresh once, then update_objective per pivot. Using the true
   // costs lp.objective (the GPU has no perturbation) is a valid dual bound.
   f_t obj  = compute_objective(lp, x);
+  KT_SETUP_DONE();  // [KTIMER] one-time setup (kernel entry → first pivot) done
   i_t iter = 0;
   while (iter < iter_limit) {
     if (g_gpu_alloc_failed) {
@@ -2512,9 +2632,11 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     i_t direction        = 0;
     i_t basic_leaving    = -1;
     f_t max_val;
+    KT_TIC(_kt_pr);
     const i_t leaving = steepest_edge_pricing_with_infeasibilities(
       lp, settings, x, delta_y_steepest_edge, basic_mark.data(), squared_infeas, infeas_idx,
       direction, basic_leaving, max_val, work);
+    KT_TOC(KT_PRICING, _kt_pr);
     if (leaving == -1) {
       sol.objective      = compute_objective(lp, x);
       sol.user_objective = compute_user_objective(lp, sol.objective);
@@ -2525,7 +2647,9 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     // 2. BTran.
     delta_y_sparse.clear();
     UTsol_sparse.clear();
+    KT_TIC(_kt_bt);
     compute_delta_y<Warp>(ft, basic_leaving, direction, delta_y_sparse, UTsol_sparse);
+    KT_TOC(KT_BTRAN, _kt_bt);
     const f_t dy_norm_sq = delta_y_sparse.norm2_squared();
 
     // Steepest-edge norm drift safeguard: dy_norm_sq is the true norm of the leaving
@@ -2547,20 +2671,26 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     const f_t delta_y_nz_percentage = delta_y_nz0 / static_cast<f_t>(m) * 100.0;
     const bool used_transpose_dz    = delta_y_nz_percentage <= 30.0;
     if (used_transpose_dz) {
+      KT_TIC(_kt_dz);
       compute_delta_z(Arow, delta_y_sparse, leaving, direction, nonbasic_end.data(),
                       delta_z_mark.data(), delta_z_indices, delta_z.data(), work);
+      KT_TOC(KT_DZ, _kt_dz);
     } else {
       delta_y_sparse.to_dense(delta_y);
+      KT_TIC(_kt_rcu);
       compute_reduced_cost_update<Warp>(lp, ft, basic_list, nonbasic_list, delta_y.data(), leaving,
                                         direction, delta_z_mark.data(), delta_z_indices,
                                         delta_z.data(), work);
+      KT_TOC(KT_RCU, _kt_rcu);
     }
 
     // 4. Simple ratio test.
     f_t step_length;
     i_t nonbasic_entering = -1;
+    KT_TIC(_kt_rt);
     const i_t entering    = phase2_ratio_test<Warp>(
       lp, settings, ft, vstatus, nonbasic_list, z, delta_z.data(), step_length, nonbasic_entering);
+    KT_TOC(KT_RT, _kt_rt);
     if (entering == -1) {
       sol.objective      = compute_objective(lp, x);
       sol.user_objective = compute_user_objective(lp, sol.objective);
@@ -2568,16 +2698,20 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
       return dual::status_t::DUAL_UNBOUNDED;
     }
 
+    KT_TIC(_kt_ud);
     update_dual_variables(
       delta_y_sparse, delta_z_indices, delta_z.data(), step_length, leaving, y, z, work);
+    KT_TOC(KT_UPDDUAL, _kt_ud);
 
     // FTran.
     utilde_sparse.clear();
     scaled_dxB_sparse.clear();
     rhs_sparse.from_csc_column(lp.A, entering);
+    KT_TIC(_kt_ft);
     const i_t dx_status =
       compute_delta_x<Warp>(lp, ft, entering, leaving, basic_leaving, direction, basic_list, rhs_sparse,
                       delta_z.data(), x, utilde_sparse, scaled_dxB_sparse, delta_x.data(), work);
+    KT_TOC(KT_FTRAN, _kt_ft);
     if (dx_status == -1) {
       sol.objective      = compute_objective(lp, x);
       sol.user_objective = compute_user_objective(lp, sol.objective);
@@ -2585,16 +2719,22 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
       return dual::status_t::NUMERICAL;
     }
 
+    KT_TIC(_kt_se);
     update_steepest_edge_norms<Warp>(settings, basic_list, ft, direction, delta_y_sparse, dy_norm_sq,
                                scaled_dxB_sparse, basic_leaving, entering, v.data(), v_sparse,
                                delta_y_steepest_edge, work);
+    KT_TOC(KT_SE, _kt_se);
 
+    KT_TIC(_kt_up);
     update_primal_variables(scaled_dxB_sparse, basic_list, delta_x.data(), entering, x, work);
+    KT_TOC(KT_UPDPRIM, _kt_up);
 
     // Incrementally update the objective the SAME way the CPU driver does (phase2.cpp:4259):
     // obj += delta_x·objective over the changed basics + entering, true costs, called with the
     // OLD basic_list (before the swap below), WITHOUT the bound-flip contribution.
+    KT_TIC(_kt_ob);
     update_objective(basic_list, scaled_dxB_sparse, lp.objective, delta_x.data(), entering, obj);
+    KT_TOC(KT_OBJ, _kt_ob);
 
     // 5. Basis swap + MPF rank-1 stacking update.
     vstatus[entering] = variable_status_t::BASIC;
@@ -2607,9 +2747,13 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     basic_mark[entering]             = basic_leaving;
 
     // Keep the CSR nonbasic partition in sync for the next iteration's transpose delta_z.
+    KT_TIC(_kt_ar);
     update_Arow(leaving, entering, lp.A, row_mark, nonbasic_end.data(), Arow, work);
+    KT_TOC(KT_AROW, _kt_ar);
 
+    KT_TIC(_kt_fu);
     const i_t _fu_status = ft.update(utilde_sparse, UTsol_sparse, basic_leaving);
+    KT_TOC(KT_FTUPD, _kt_fu);
     if (_fu_status == 1) {
       sol.objective      = compute_objective(lp, x);
       sol.user_objective = compute_user_objective(lp, sol.objective);
@@ -2617,9 +2761,13 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
       return dual::status_t::NUMERICAL;
     }
 
+    KT_TIC(_kt_pi);
     compute_initial_primal_infeasibilities(
       lp, settings, basic_list, x, squared_infeas, infeas_idx, primal_inf);
+    KT_TOC(KT_PINF, _kt_pi);
+    KT_TIC(_kt_cd);
     clear_delta_z(entering, leaving, delta_z_mark.data(), delta_z_indices, delta_z.data());
+    KT_TOC(KT_CLEARDZ, _kt_cd);
 
     // Increment only on a COMPLETED iteration, at the end of the body — matching the CPU
     // simplified driver's iter++ (phase2.cpp:4370). The SE-reset `continue` above jumps
@@ -2777,6 +2925,7 @@ gpu_phase2_kernel(kernel_args* args)
   }
 
   kernel_args& a = args[blockIdx.x];
+  KT_RESET();  // [KTIMER] start-of-solve: zero accumulators + record kernel-entry clock (lane 0)
 
   const i_t m = a.m;
   const i_t n = a.n;
@@ -2856,6 +3005,7 @@ gpu_phase2_kernel(kernel_args* args)
   *a.out_objective      = sol.objective;
   *a.out_user_objective = sol.user_objective;
   *a.out_iterations     = sol.iterations;
+  KT_EMIT(m);  // [KTIMER] print per-function tick totals + scaled_delta_xB density for this solve
 }
 
 // ---------------------------------------------------------------------------
