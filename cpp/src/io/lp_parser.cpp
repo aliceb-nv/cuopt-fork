@@ -5,7 +5,7 @@
  */
 /* clang-format on */
 
-#include <cuopt/linear_programming/io/parser.hpp>
+#include <cuopt/mathematical_optimization/io/parser.hpp>
 
 #include <file_to_string.hpp>
 #include <lp_parser.hpp>
@@ -25,7 +25,7 @@
 #include <utility>
 #include <vector>
 
-namespace cuopt::linear_programming::io {
+namespace cuopt::mathematical_optimization::io {
 
 namespace {
 
@@ -118,44 +118,6 @@ bool is_free_keyword(std::string_view lower) { return lower == "free"; }
 
 bool is_infinity_text(std::string_view lower) { return lower == "inf" || lower == "infinity"; }
 
-// Builds the symmetric Q in CSR from LP-format raw upper-triangular triples.
-// Each input triple (i, j, c) with i <= j represents `c * x_i * x_j` in the
-// LP source. The output Q satisfies x^T Q x = sum of those terms.
-//   Diagonal (i == j): Q[i,i] = c (one entry).
-//   Off-diagonal (i != j): Q[i,j] = Q[j,i] = c/2 (two entries; symmetric split).
-template <typename i_t, typename f_t>
-void build_symmetric_q_csr(const std::vector<std::tuple<i_t, i_t, f_t>>& raw_triples,
-                           i_t n_vars,
-                           std::vector<f_t>& out_values,
-                           std::vector<i_t>& out_indices,
-                           std::vector<i_t>& out_offsets)
-{
-  std::vector<std::vector<std::pair<i_t, f_t>>> row_data(n_vars);
-  for (const auto& [i, j, c] : raw_triples) {
-    if (i == j) {
-      row_data[i].emplace_back(i, c);
-    } else {
-      row_data[i].emplace_back(j, c / f_t(2));
-      row_data[j].emplace_back(i, c / f_t(2));
-    }
-  }
-  for (auto& row : row_data) {
-    std::sort(row.begin(), row.end());
-  }
-  out_offsets.clear();
-  out_indices.clear();
-  out_values.clear();
-  out_offsets.reserve(static_cast<size_t>(n_vars) + 1);
-  out_offsets.push_back(0);
-  for (i_t r = 0; r < n_vars; ++r) {
-    for (const auto& [col, val] : row_data[r]) {
-      out_values.push_back(val);
-      out_indices.push_back(col);
-    }
-    out_offsets.push_back(static_cast<i_t>(out_values.size()));
-  }
-}
-
 // ===========================================================================
 // Token stream
 // ===========================================================================
@@ -199,7 +161,7 @@ template <typename i_t, typename f_t>
 class LpParseEngine {
  public:
   LpParseEngine(lp_parser_t<i_t, f_t>& out, const std::string& file);
-  // Parses `text` directly (used by parse_lp_from_string()).
+  // Parses `text` directly (used by read_lp_from_string()).
   LpParseEngine(lp_parser_t<i_t, f_t>& out, std::string_view text);
 
  private:
@@ -258,13 +220,12 @@ class LpParseEngine {
   //   Objective:  must be followed by '/ 2'; the inner-coefficient convention
   //               is QUADOBJ-style 0.5 x^T Q x, so off-diagonals are halved
   //               and linear-inside-bracket terms also get /2.
-  //   Constraint: must NOT be followed by '/ 2'; coefficients are taken at
-  //               face value (x^T Q x); bracket must contain at least one
-  //               quadratic term.
+  //   Constraint: must NOT be followed by '/ 2'; only the upper triangle of Q is stored;
+  //               bracket must contain at least one quadratic term.
   enum class BracketRole { Objective, Constraint };
   void parse_quadratic_bracket(int outer_sign,
                                BracketRole role,
-                               std::vector<std::tuple<i_t, i_t, f_t>>& out_quad_entries);
+                               coo_entries_t<i_t, f_t>& out_quad_entries);
 
   // Atomic readers.
   f_t parse_signed_number();
@@ -315,7 +276,7 @@ void LpParseEngine<i_t, f_t>::read_and_tokenize(const std::string& file)
   // way as .mps.gz / .mps.bz2 (dlopen-loaded libz / libbz2). The returned
   // buffer is null-terminated; strip it before constructing the string view
   // since `tokenize` walks the entire string range.
-  auto buf = detail::file_to_string(file);
+  auto buf = file_to_string(file);
   std::string text(buf.data(), buf.size() > 0 ? buf.size() - 1 : 0);
   tokenize(text);
 }
@@ -830,15 +791,16 @@ void LpParseEngine<i_t, f_t>::parse_linear_expression(std::vector<LinearTerm>& o
 }
 
 template <typename i_t, typename f_t>
-void LpParseEngine<i_t, f_t>::parse_quadratic_bracket(
-  int outer_sign, BracketRole role, std::vector<std::tuple<i_t, i_t, f_t>>& out_quad_entries)
+void LpParseEngine<i_t, f_t>::parse_quadratic_bracket(int outer_sign,
+                                                      BracketRole role,
+                                                      coo_entries_t<i_t, f_t>& out_quad_entries)
 {
   expect(LpTokenKind::LBracket, "'[' at start of quadratic section");
 
   // Accumulate raw LP-format entries first (diagonal vs off-diagonal), then
   // apply the role-specific convention and outer sign after we see the
   // closing bracket.
-  std::vector<std::tuple<i_t, i_t, f_t>> raw_quad;
+  coo_entries_t<i_t, f_t> raw_quad;
 
   int sign   = 1;
   bool first = true;
@@ -939,13 +901,16 @@ void LpParseEngine<i_t, f_t>::parse_quadratic_bracket(
     // directly to cuOpt's set_quadratic_objective_matrix, which internally
     // computes H = Q + Q^T; the solver then minimizes (1/2) x^T H x, which
     // recovers the user's intended objective.
-    for (auto& [a, b, v] : raw_quad) {
-      v /= f_t(2);
-      out_quad_entries.emplace_back(a, b, sign_scale * v);
+    out_quad_entries.rows.insert(
+      out_quad_entries.rows.end(), raw_quad.rows.begin(), raw_quad.rows.end());
+    out_quad_entries.cols.insert(
+      out_quad_entries.cols.end(), raw_quad.cols.begin(), raw_quad.cols.end());
+    for (size_t p = 0; p < raw_quad.size(); p++) {
+      out_quad_entries.vals.push_back(sign_scale * raw_quad.vals[p] / f_t(2));
     }
   } else {
-    // Constraint: '/ 2' is forbidden — the LP convention is that constraint
-    // quadratic brackets carry bare face-value coefficients of x^T Q x.
+    // Constraint: '/ 2' is forbidden — the LP convention is that x^T Q x is written as upper
+    // triangular form.
     mps_parser_expects(!(peek().kind == LpTokenKind::Slash && peek(1).kind == LpTokenKind::Number &&
                          peek(1).text == "2"),
                        error_type_t::ValidationError,
@@ -961,11 +926,12 @@ void LpParseEngine<i_t, f_t>::parse_quadratic_bracket(
                        "constraint must contain at least one quadratic term",
                        peek().line);
 
-    // Coefficients are at face value — the post-pass that flushes the
-    // quadratic_constraint_block_t to the data model handles the symmetric
-    // expansion and the /2 split for off-diagonals.
-    for (auto& [a, b, v] : raw_quad) {
-      out_quad_entries.emplace_back(a, b, sign_scale * v);
+    out_quad_entries.rows.insert(
+      out_quad_entries.rows.end(), raw_quad.rows.begin(), raw_quad.rows.end());
+    out_quad_entries.cols.insert(
+      out_quad_entries.cols.end(), raw_quad.cols.begin(), raw_quad.cols.end());
+    for (size_t p = 0; p < raw_quad.size(); p++) {
+      out_quad_entries.vals.push_back(sign_scale * raw_quad.vals[p]);
     }
   }
 }
@@ -1044,7 +1010,7 @@ void LpParseEngine<i_t, f_t>::parse_constraints_section()
     // Mirrors the objective handling; if present, this row becomes a
     // quadratic constraint and is stored on quadratic_constraint_blocks
     // instead of the linear arrays.
-    std::vector<std::tuple<i_t, i_t, f_t>> qc_triples;
+    coo_entries_t<i_t, f_t> qc_triples;
     bool is_quadratic_row = false;
     int quad_sign         = 1;
     if (peek().kind == LpTokenKind::Plus && peek(1).kind == LpTokenKind::LBracket) {
@@ -1473,8 +1439,9 @@ void finalize_problem(mps_data_model_t<i_t, f_t>& problem, lp_parser_t<i_t, f_t>
   // recovers the user's intended objective.
   if (!parser.quadobj_entries.empty()) {
     std::vector<std::vector<std::pair<i_t, f_t>>> row_data(n_vars);
-    for (const auto& [row, col, val] : parser.quadobj_entries) {
-      row_data[row].emplace_back(col, val);
+    for (size_t p = 0; p < parser.quadobj_entries.size(); p++) {
+      row_data[parser.quadobj_entries.rows[p]].emplace_back(parser.quadobj_entries.cols[p],
+                                                            parser.quadobj_entries.vals[p]);
     }
     for (auto& row : row_data) {
       std::sort(row.begin(), row.end());
@@ -1503,24 +1470,18 @@ template <typename i_t, typename f_t>
 void flush_quadratic_constraints(mps_data_model_t<i_t, f_t>& problem,
                                  const lp_parser_t<i_t, f_t>& parser)
 {
-  const i_t n_vars           = static_cast<i_t>(parser.var_names.size());
   const i_t linear_row_count = static_cast<i_t>(parser.row_names.size());
-  i_t k                      = 0;
-  for (const auto& block : parser.quadratic_constraint_blocks) {
-    std::vector<f_t> q_values;
-    std::vector<i_t> q_indices;
-    std::vector<i_t> q_offsets;
-    build_symmetric_q_csr(block.quad_triples, n_vars, q_values, q_indices, q_offsets);
+  for (i_t k = 0; k < static_cast<i_t>(parser.quadratic_constraint_blocks.size()); k++) {
+    const auto& block = parser.quadratic_constraint_blocks[k];
     problem.append_quadratic_constraint(linear_row_count + k,
                                         block.row_name,
                                         static_cast<char>(block.row_type),
                                         block.linear_values,
                                         block.linear_indices,
                                         block.rhs_value,
-                                        q_values,
-                                        q_indices,
-                                        q_offsets);
-    ++k;
+                                        block.quad_triples.vals,
+                                        block.quad_triples.rows,
+                                        block.quad_triples.cols);
   }
 }
 
@@ -1546,11 +1507,11 @@ template class lp_parser_t<int, float>;
 template class lp_parser_t<int, double>;
 
 // ===========================================================================
-// Public parse_lp() / parse_lp_from_string()
+// Public read_lp() / read_lp_from_string()
 // ===========================================================================
 
 template <typename i_t, typename f_t>
-mps_data_model_t<i_t, f_t> parse_lp(const std::string& lp_file_path)
+mps_data_model_t<i_t, f_t> read_lp(const std::string& lp_file_path)
 {
   mps_data_model_t<i_t, f_t> problem;
   lp_parser_t<i_t, f_t> parser(problem, lp_file_path);
@@ -1558,16 +1519,16 @@ mps_data_model_t<i_t, f_t> parse_lp(const std::string& lp_file_path)
 }
 
 template <typename i_t, typename f_t>
-mps_data_model_t<i_t, f_t> parse_lp_from_string(std::string_view lp_contents)
+mps_data_model_t<i_t, f_t> read_lp_from_string(std::string_view lp_contents)
 {
   mps_data_model_t<i_t, f_t> problem;
   lp_parser_t<i_t, f_t> parser(problem, lp_contents);
   return problem;
 }
 
-template mps_data_model_t<int, float> parse_lp<int, float>(const std::string&);
-template mps_data_model_t<int, double> parse_lp<int, double>(const std::string&);
-template mps_data_model_t<int, float> parse_lp_from_string<int, float>(std::string_view);
-template mps_data_model_t<int, double> parse_lp_from_string<int, double>(std::string_view);
+template mps_data_model_t<int, float> read_lp<int, float>(const std::string&);
+template mps_data_model_t<int, double> read_lp<int, double>(const std::string&);
+template mps_data_model_t<int, float> read_lp_from_string<int, float>(std::string_view);
+template mps_data_model_t<int, double> read_lp_from_string<int, double>(std::string_view);
 
-}  // namespace cuopt::linear_programming::io
+}  // namespace cuopt::mathematical_optimization::io

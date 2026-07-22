@@ -7,15 +7,14 @@
 
 #pragma once
 
-#include <cuopt/linear_programming/io/mps_data_model.hpp>
+#include <cuopt/mathematical_optimization/io/mps_data_model.hpp>
 #include <mps_parser_internal.hpp>
 
 #include <string>
 #include <string_view>
-#include <tuple>
 #include <vector>
 
-namespace cuopt::linear_programming::io {
+namespace cuopt::mathematical_optimization::io {
 
 /**
  * @brief Parser for the LP format.
@@ -36,7 +35,7 @@ class lp_parser_t {
   lp_parser_t(mps_data_model_t<i_t, f_t>& problem, const std::string& file);
 
   // Parses `input` (LP format text already loaded in memory) and populates
-  // `problem`. Used by parse_lp_from_string() — compressed inputs are only
+  // `problem`. Used by read_lp_from_string() — compressed inputs are only
   // supported via the file-path constructor since compression is detected
   // from the path suffix.
   lp_parser_t(mps_data_model_t<i_t, f_t>& problem, std::string_view input);
@@ -56,10 +55,10 @@ class lp_parser_t {
   std::vector<f_t> variable_upper_bounds{};
   std::vector<f_t> variable_lower_bounds{};
   bool maximize{false};
-  // Quadratic objective entries (row, col, value) in upper-triangular
-  // QUADOBJ convention; finalize_problem() mirrors to the full symmetric
-  // matrix and applies the *0.5 factor required by cuOpt's x^T Q x form.
-  std::vector<std::tuple<i_t, i_t, f_t>> quadobj_entries{};
+  // Quadratic objective entries (row, col, value) in upper-triangular form;
+  // coefficients are /2-scaled in parse_quadratic_bracket for the LP "/ 2"
+  // convention. finalize_problem() emits them as CSR.
+  coo_entries_t<i_t, f_t> quadobj_entries{};
 
   // Per-row data for constraints whose LHS contains a quadratic bracket.
   // These rows do NOT appear in row_names/row_types/A_indices/A_values/
@@ -74,12 +73,12 @@ class lp_parser_t {
     std::vector<i_t> linear_indices{};
     std::vector<f_t> linear_values{};
     f_t rhs_value{};
-    // Upper-triangular (i <= j) raw triples directly from the LP source
-    // (face value, no /2). The post-pass mirrors and halves off-diagonals
-    // to build the symmetric Q in CSR.
-    std::vector<std::tuple<i_t, i_t, f_t>> quad_triples{};
+    // Upper-triangular (i <= j) Q triples as written in the LP source; each
+    // contributes c * x_i * x_j to x^T Q x. Canonicalized in
+    // append_quadratic_constraint().
+    coo_entries_t<i_t, f_t> quad_triples{};
   };
   std::vector<quadratic_constraint_block_t> quadratic_constraint_blocks{};
 };
 
-}  // namespace cuopt::linear_programming::io
+}  // namespace cuopt::mathematical_optimization::io

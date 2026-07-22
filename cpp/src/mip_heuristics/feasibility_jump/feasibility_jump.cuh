@@ -9,7 +9,7 @@
 
 #include "utils.cuh"
 
-#include <cuopt/linear_programming/mip/solver_settings.hpp>
+#include <cuopt/mathematical_optimization/mip/solver_settings.hpp>
 #include <mip_heuristics/diversity/weights.cuh>
 #include <mip_heuristics/logger.cuh>
 #include <mip_heuristics/problem/problem.cuh>
@@ -25,7 +25,7 @@
 #define FJ_DEBUG_LOAD_BALANCING 0
 #define FJ_SINGLE_STEP          0
 
-namespace cuopt::linear_programming::detail {
+namespace cuopt::mathematical_optimization::mip {
 
 template <typename f_t>
 using fj_improvement_callback_t =
@@ -632,9 +632,13 @@ class fj_t {
   std::vector<std::unique_ptr<climber_data_t>> climbers;
   rmm::device_uvector<typename climber_data_t::view_t> climber_views;
   fj_settings_t settings;
+  // Device-side mirror of `settings`. `run_step_device` pushes the host
+  // `settings` here before each kernel launch; kernels read it via
+  // `view_t::settings`.
+  rmm::device_scalar<fj_settings_t> device_settings;
 
   fj_improvement_callback_t<f_t> improvement_callback;
   f_t last_reported_objective_{std::numeric_limits<f_t>::infinity()};
 };
 
-}  // namespace cuopt::linear_programming::detail
+}  // namespace cuopt::mathematical_optimization::mip

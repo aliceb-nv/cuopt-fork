@@ -5,13 +5,16 @@
  */
 /* clang-format on */
 
-#include <cuopt/linear_programming/io/mps_data_model.hpp>
+#include <cuopt/mathematical_optimization/io/mps_data_model.hpp>
 #include <utilities/error.hpp>
 
+#include <mps_parser_internal.hpp>
+
 #include <algorithm>
+#include <numeric>
 #include <utility>
 
-namespace cuopt::linear_programming::io {
+namespace cuopt::mathematical_optimization::io {
 
 template <typename i_t, typename f_t>
 void mps_data_model_t<i_t, f_t>::set_csr_constraint_matrix(std::span<const f_t> A_values,
@@ -145,26 +148,40 @@ void mps_data_model_t<i_t, f_t>::append_quadratic_constraint(i_t constraint_row_
                                                              std::span<const f_t> linear_values,
                                                              std::span<const i_t> linear_indices,
                                                              f_t rhs_value,
-                                                             std::span<const f_t> quadratic_values,
-                                                             std::span<const i_t> quadratic_indices,
-                                                             std::span<const i_t> quadratic_offsets)
+                                                             std::span<const f_t> vals,
+                                                             std::span<const i_t> rows,
+                                                             std::span<const i_t> cols)
 {
   mps_parser_expects(constraint_row_index >= 0,
                      error_type_t::ValidationError,
                      "constraint_row_index must be non-negative");
 
-  mps_parser_expects(constraint_row_type == 'L',
+  mps_parser_expects(constraint_row_type == 'L' || constraint_row_type == 'G',
                      error_type_t::ValidationError,
-                     "Quadratic constraint ROWS type must be 'L' (less-or-equal); got '%c'. "
-                     "Only 'L' is supported for convex quadratic constraints.",
+                     "Quadratic constraint ROWS type must be 'L' (<=) or 'G' (>=); got '%c'.",
                      constraint_row_type);
 
   mps_parser_expects(linear_values.size() == linear_indices.size(),
                      error_type_t::ValidationError,
                      "linear_values and linear_indices must have the same nnz count");
 
+  const size_t q_nnz = vals.size();
   mps_parser_expects(
-    !quadratic_offsets.empty(), error_type_t::ValidationError, "quadratic_offsets cannot be empty");
+    q_nnz == rows.size(), error_type_t::ValidationError, "vals and rows must have the same length");
+  mps_parser_expects(
+    q_nnz == cols.size(), error_type_t::ValidationError, "vals and cols must have the same length");
+
+  if (!linear_values.empty()) {
+    mps_parser_expects(linear_values.data() != nullptr && linear_indices.data() != nullptr,
+                       error_type_t::ValidationError,
+                       "linear_values and linear_indices cannot be null when non-empty");
+  }
+
+  if (q_nnz > 0) {
+    mps_parser_expects(vals.data() != nullptr && rows.data() != nullptr && cols.data() != nullptr,
+                       error_type_t::ValidationError,
+                       "Q COO spans cannot be null when nnz > 0");
+  }
 
   quadratic_constraint_t qc;
   qc.constraint_row_index = constraint_row_index;
@@ -173,9 +190,17 @@ void mps_data_model_t<i_t, f_t>::append_quadratic_constraint(i_t constraint_row_
   qc.rhs_value            = rhs_value;
   qc.linear_values.assign(linear_values.begin(), linear_values.end());
   qc.linear_indices.assign(linear_indices.begin(), linear_indices.end());
-  qc.quadratic_values.assign(quadratic_values.begin(), quadratic_values.end());
-  qc.quadratic_indices.assign(quadratic_indices.begin(), quadratic_indices.end());
-  qc.quadratic_offsets.assign(quadratic_offsets.begin(), quadratic_offsets.end());
+
+  if (q_nnz == 0) {
+    qc.rows.clear();
+    qc.cols.clear();
+    qc.vals.clear();
+  } else {
+    qc.rows.assign(rows.begin(), rows.end());
+    qc.cols.assign(cols.begin(), cols.end());
+    qc.vals.assign(vals.begin(), vals.end());
+    canonicalize_coo_matrix(qc.rows, qc.cols, qc.vals);
+  }
 
   quadratic_constraints_.push_back(std::move(qc));
 }
@@ -434,11 +459,25 @@ bool mps_data_model_t<i_t, f_t>::has_quadratic_constraints() const noexcept
   return !quadratic_constraints_.empty();
 }
 
+template <typename i_t, typename f_t>
+void canonicalize_quadratic_constraints(
+  std::vector<typename mps_data_model_t<i_t, f_t>::quadratic_constraint_t>& constraints)
+{
+  for (auto& qc : constraints) {
+    canonicalize_coo_matrix(qc.rows, qc.cols, qc.vals);
+  }
+}
+
 // NOTE: Explicitly instantiate all types here in order to avoid linker error
 template class mps_data_model_t<int, float>;
 
 template class mps_data_model_t<int, double>;
+
+template void canonicalize_quadratic_constraints<int, float>(
+  std::vector<mps_data_model_t<int, float>::quadratic_constraint_t>&);
+template void canonicalize_quadratic_constraints<int, double>(
+  std::vector<mps_data_model_t<int, double>::quadratic_constraint_t>&);
 //  TODO current raft to cusparse wrappers only support int64_t
 //  can be CUSPARSE_INDEX_16U, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_64I
 
-}  // namespace cuopt::linear_programming::io
+}  // namespace cuopt::mathematical_optimization::io

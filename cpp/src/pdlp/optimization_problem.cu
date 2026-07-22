@@ -5,14 +5,16 @@
  */
 /* clang-format on */
 
-#include <cuopt/linear_programming/cpu_optimization_problem.hpp>
-#include <cuopt/linear_programming/optimization_problem.hpp>
-#include <cuopt/linear_programming/optimization_problem_utils.hpp>
-#include <cuopt/linear_programming/solve_remote.hpp>
+#include <cuopt/mathematical_optimization/cpu_optimization_problem.hpp>
+#include <cuopt/mathematical_optimization/optimization_problem.hpp>
+#include <cuopt/mathematical_optimization/optimization_problem_utils.hpp>
+#include <cuopt/mathematical_optimization/solve_remote.hpp>
+
+#include <mps_parser_internal.hpp>
 
 #include <cuopt/error.hpp>
-#include <cuopt/linear_programming/csr_matrix_utils.hpp>
-#include <cuopt/linear_programming/io/writer.hpp>
+#include <cuopt/mathematical_optimization/csr_matrix_utils.hpp>
+#include <cuopt/mathematical_optimization/io/writer.hpp>
 #include <mip_heuristics/mip_constants.hpp>
 #include <utilities/copy_helpers.hpp>
 #include <utilities/logger.hpp>
@@ -49,7 +51,7 @@
 #include <stdexcept>
 #include <unordered_map>
 
-namespace cuopt::linear_programming {
+namespace cuopt::mathematical_optimization {
 
 template <typename i_t, typename f_t>
 optimization_problem_t<i_t, f_t>::optimization_problem_t(raft::handle_t const* handle_ptr)
@@ -212,6 +214,38 @@ void optimization_problem_t<i_t, f_t>::set_quadratic_constraints(
     constraints)
 {
   quadratic_constraints_ = std::move(constraints);
+}
+
+template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::add_quadratic_constraint(char constraint_row_type,
+                                                                f_t rhs_value,
+                                                                std::span<const i_t> row_index,
+                                                                std::span<const i_t> col_index,
+                                                                std::span<const f_t> coeff,
+                                                                std::span<const f_t> linear_values,
+                                                                std::span<const i_t> linear_indices)
+{
+  cuopt_expects(!row_index.empty(),
+                error_type_t::ValidationError,
+                "quadratic constraint must have at least one matrix entry");
+  cuopt_expects(row_index.size() == col_index.size() && row_index.size() == coeff.size(),
+                error_type_t::ValidationError,
+                "row_index, col_index, and coeff must have the same size");
+  cuopt_expects(linear_values.size() == linear_indices.size(),
+                error_type_t::ValidationError,
+                "linear_values and linear_indices must have the same size");
+
+  typename optimization_problem_interface_t<i_t, f_t>::quadratic_constraint_t qc;
+  qc.constraint_row_index = get_n_constraints() + static_cast<i_t>(quadratic_constraints_.size());
+  qc.constraint_row_type  = constraint_row_type;
+  qc.rhs_value            = rhs_value;
+  qc.rows.assign(row_index.begin(), row_index.end());
+  qc.cols.assign(col_index.begin(), col_index.end());
+  qc.vals.assign(coeff.begin(), coeff.end());
+  qc.linear_values.assign(linear_values.begin(), linear_values.end());
+  qc.linear_indices.assign(linear_indices.begin(), linear_indices.end());
+  io::canonicalize_coo_matrix(qc.rows, qc.cols, qc.vals);
+  quadratic_constraints_.push_back(std::move(qc));
 }
 
 template <typename i_t, typename f_t>
@@ -764,7 +798,7 @@ typename optimization_problem_t<i_t, f_t>::view_t optimization_problem_t<i_t, f_
 template <typename i_t, typename f_t>
 void optimization_problem_t<i_t, f_t>::write_to_mps(const std::string& mps_file_path)
 {
-  cuopt::linear_programming::io::data_model_view_t<i_t, f_t> data_model_view;
+  cuopt::mathematical_optimization::io::data_model_view_t<i_t, f_t> data_model_view;
 
   // Set optimization sense
   data_model_view.set_maximize(get_sense());
@@ -851,7 +885,7 @@ void optimization_problem_t<i_t, f_t>::write_to_mps(const std::string& mps_file_
       variable_types.resize(enum_variable_types.size());
       // Convert enum types to char types
       for (size_t i = 0; i < variable_types.size(); ++i) {
-        variable_types[i] = detail::var_type_to_char(enum_variable_types[i]);
+        variable_types[i] = var_type_to_char(enum_variable_types[i]);
       }
     }
 
@@ -874,7 +908,7 @@ void optimization_problem_t<i_t, f_t>::write_to_mps(const std::string& mps_file_
     data_model_view.set_quadratic_constraints(quadratic_constraints_);
   }
 
-  cuopt::linear_programming::io::write_mps(data_model_view, mps_file_path);
+  cuopt::mathematical_optimization::io::write_mps(data_model_view, mps_file_path);
 }
 
 template <typename i_t, typename f_t>
@@ -1610,4 +1644,4 @@ template optimization_problem_t<int32_t, float>
     rmm::cuda_stream_view) const;
 #endif
 
-}  // namespace cuopt::linear_programming
+}  // namespace cuopt::mathematical_optimization

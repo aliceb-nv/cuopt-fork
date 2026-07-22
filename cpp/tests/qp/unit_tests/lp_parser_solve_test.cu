@@ -1,15 +1,15 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights
- * reserved. SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <utilities/common_utils.hpp>
 #include <utilities/copy_helpers.hpp>
 
-#include <cuopt/linear_programming/io/parser.hpp>
-#include <cuopt/linear_programming/optimization_problem.hpp>
-#include <cuopt/linear_programming/pdlp/solver_settings.hpp>
-#include <cuopt/linear_programming/solve.hpp>
+#include <cuopt/mathematical_optimization/io/parser.hpp>
+#include <cuopt/mathematical_optimization/optimization_problem.hpp>
+#include <cuopt/mathematical_optimization/pdlp/solver_settings.hpp>
+#include <cuopt/mathematical_optimization/solve.hpp>
 #include <utilities/error.hpp>
 
 #include <raft/core/handle.hpp>
@@ -21,7 +21,7 @@
 #include <string>
 #include <vector>
 
-namespace cuopt::linear_programming {
+namespace cuopt::mathematical_optimization {
 
 // End-to-end smoke tests that parse an LP file and solve via PDLP.
 // Validates objective value and primal solution against hand-computed
@@ -37,7 +37,7 @@ void expect_optimal_solution(const std::string& lp_text,
                              const std::vector<double>& expected_x)
 {
   raft::handle_t handle;
-  auto problem  = io::parse_lp_from_string<int, double>(lp_text);
+  auto problem  = io::read_lp_from_string<int, double>(lp_text);
   auto settings = pdlp_solver_settings_t<int, double>();
   auto solution = solve_lp(&handle, problem, settings);
 
@@ -118,4 +118,4 @@ End
                           {4.0, 2.0});
 }
 
-}  // namespace cuopt::linear_programming
+}  // namespace cuopt::mathematical_optimization

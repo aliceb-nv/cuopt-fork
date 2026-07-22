@@ -13,8 +13,8 @@
 #include <dual_simplex/phase2.hpp>
 #include <dual_simplex/random.hpp>
 #include <dual_simplex/solve.hpp>
-#include <dual_simplex/sparse_matrix.hpp>
-#include <dual_simplex/tic_toc.hpp>
+#include <linear_algebra/sparse_matrix.hpp>
+#include <math_optimization/tic_toc.hpp>
 
 #include <utilities/scope_guard.hpp>
 #include <utilities/timing_utils.hpp>
@@ -45,7 +45,7 @@
 #include <map>
 #include <string>
 
-namespace cuopt::linear_programming::dual_simplex {
+namespace cuopt::mathematical_optimization::simplex {
 
 constexpr int FEATURE_LOG_INTERVAL = 100;
 
@@ -265,8 +265,6 @@ void update_Arow(i_t leaving,
   work_estimate += 2 * row_mark.size();
 }
 
-namespace phase2 {
-
 // Computes vectors farkas_y, farkas_zl, farkas_zu that satisfy
 //
 // A'*farkas_y + farkas_zl - farkas_zu ~= 0
@@ -276,6 +274,9 @@ namespace phase2 {
 // This is a Farkas certificate for the infeasibility of the primal problem
 //
 // A*x = b, l <= x <= u
+
+namespace phase2 {
+
 template <typename i_t, typename f_t>
 void compute_farkas_certificate(const lp_problem_t<i_t, f_t>& lp,
                                 const simplex_solver_settings_t<i_t, f_t>& settings,
@@ -2351,16 +2352,16 @@ void prepare_optimality(i_t info,
 
   sol.objective         = compute_objective(lp, sol.x);
   sol.user_objective    = compute_user_objective(lp, sol.objective);
-  f_t perturbation      = phase2::amount_of_perturbation(lp, objective);
+  f_t perturbation      = amount_of_perturbation(lp, objective);
   f_t orig_perturbation = perturbation;
   if (perturbation > 1e-6 && phase == 2) {
     // Try to remove perturbation
     std::vector<f_t> unperturbed_y(m);
     std::vector<f_t> unperturbed_z(n);
-    phase2::compute_dual_solution_from_basis(
+    compute_dual_solution_from_basis(
       lp, ft, basic_list, nonbasic_list, unperturbed_y, unperturbed_z, work_estimate);
     {
-      const f_t dual_infeas = phase2::dual_infeasibility(
+      const f_t dual_infeas = dual_infeasibility(
         lp, settings, vstatus, unperturbed_z, settings.tight_tol, settings.dual_tol);
       if (dual_infeas <= settings.dual_tol) {
         settings.log.printf("Removed perturbation of %.2e.\n", perturbation);
@@ -2375,8 +2376,8 @@ void prepare_optimality(i_t info,
 
   sol.l2_primal_residual  = l2_primal_residual(lp, sol);
   sol.l2_dual_residual    = l2_dual_residual(lp, sol);
-  const f_t dual_infeas   = phase2::dual_infeasibility(lp, settings, vstatus, z, 0.0, 0.0);
-  const f_t primal_infeas = phase2::primal_infeasibility(lp, settings, vstatus, x);
+  const f_t dual_infeas   = dual_infeasibility(lp, settings, vstatus, z, 0.0, 0.0);
+  const f_t primal_infeas = primal_infeasibility(lp, settings, vstatus, x);
   if (phase == 1 && iter > 0) {
     settings.log.printf("Dual phase I complete. Iterations %d. Time %.2f\n", iter, toc(start_time));
   }
@@ -2398,7 +2399,7 @@ void prepare_optimality(i_t info,
     f_t basic_infeas    = 0.0;
     f_t nonbasic_infeas = 0.0;
     f_t basic_over      = 0.0;
-    phase2::primal_infeasibility_breakdown(
+    primal_infeasibility_breakdown(
       lp, settings, vstatus, x, basic_infeas, nonbasic_infeas, basic_over);
     settings.log.printf(
       "Primal infeasibility %e/%e (Basic %e, Nonbasic %e, Basic over %e). Perturbation %e/%e. Info "
@@ -2497,16 +2498,16 @@ class phase2_timers_t {
 }  // namespace phase2
 
 template <typename i_t, typename f_t>
-dual::status_t dual_phase2(i_t phase,
-                           i_t slack_basis,
-                           f_t start_time,
-                           const lp_problem_t<i_t, f_t>& lp,
-                           const simplex_solver_settings_t<i_t, f_t>& settings,
-                           std::vector<variable_status_t>& vstatus,
-                           lp_solution_t<i_t, f_t>& sol,
-                           i_t& iter,
-                           std::vector<f_t>& delta_y_steepest_edge,
-                           work_limit_context_t* work_unit_context)
+dual_status_t dual_phase2(i_t phase,
+                          i_t slack_basis,
+                          f_t start_time,
+                          const lp_problem_t<i_t, f_t>& lp,
+                          const simplex_solver_settings_t<i_t, f_t>& settings,
+                          std::vector<variable_status_t>& vstatus,
+                          lp_solution_t<i_t, f_t>& sol,
+                          i_t& iter,
+                          std::vector<f_t>& delta_y_steepest_edge,
+                          work_limit_context_t* work_unit_context)
 {
   PHASE2_NVTX_RANGE("DualSimplex::phase2");
   const i_t m = lp.num_rows;
@@ -2532,20 +2533,20 @@ dual::status_t dual_phase2(i_t phase,
 }
 
 template <typename i_t, typename f_t>
-dual::status_t dual_phase2_with_advanced_basis(i_t phase,
-                                               i_t slack_basis,
-                                               bool initialize_basis,
-                                               f_t start_time,
-                                               const lp_problem_t<i_t, f_t>& lp,
-                                               const simplex_solver_settings_t<i_t, f_t>& settings,
-                                               std::vector<variable_status_t>& vstatus,
-                                               basis_update_mpf_t<i_t, f_t>& ft,
-                                               std::vector<i_t>& basic_list,
-                                               std::vector<i_t>& nonbasic_list,
-                                               lp_solution_t<i_t, f_t>& sol,
-                                               i_t& iter,
-                                               std::vector<f_t>& delta_y_steepest_edge,
-                                               work_limit_context_t* work_unit_context)
+dual_status_t dual_phase2_with_advanced_basis(i_t phase,
+                                              i_t slack_basis,
+                                              bool initialize_basis,
+                                              f_t start_time,
+                                              const lp_problem_t<i_t, f_t>& lp,
+                                              const simplex_solver_settings_t<i_t, f_t>& settings,
+                                              std::vector<variable_status_t>& vstatus,
+                                              basis_update_mpf_t<i_t, f_t>& ft,
+                                              std::vector<i_t>& basic_list,
+                                              std::vector<i_t>& nonbasic_list,
+                                              lp_solution_t<i_t, f_t>& sol,
+                                              i_t& iter,
+                                              std::vector<f_t>& delta_y_steepest_edge,
+                                              work_limit_context_t* work_unit_context)
 {
   PHASE2_NVTX_RANGE("DualSimplex::phase2_advanced");
   const i_t m = lp.num_rows;
@@ -2573,7 +2574,7 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
 
   phase2_work_estimate += 2 * (n + m);
 
-  dual::status_t status = dual::status_t::UNSET;
+  dual_status_t status = dual_status_t::UNSET;
 
   nvtx_range_guard init_scope("DualSimplex::phase2_advanced_init");
 
@@ -2604,11 +2605,11 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
     i_t refactor_status     = ft.refactor_basis(
       lp.A, settings, lp.lower, lp.upper, start_time, basic_list, nonbasic_list, vstatus);
     refactor_work = ft.work_estimate() - refactor_start_work;
-    if (refactor_status == CONCURRENT_HALT_RETURN) { return dual::status_t::CONCURRENT_LIMIT; }
-    if (refactor_status == TIME_LIMIT_RETURN) { return dual::status_t::TIME_LIMIT; }
-    if (refactor_status > 0) { return dual::status_t::NUMERICAL; }
+    if (refactor_status == CONCURRENT_HALT_RETURN) { return dual_status_t::CONCURRENT_LIMIT; }
+    if (refactor_status == TIME_LIMIT_RETURN) { return dual_status_t::TIME_LIMIT; }
+    if (refactor_status > 0) { return dual_status_t::NUMERICAL; }
 
-    if (toc(start_time) > settings.time_limit) { return dual::status_t::TIME_LIMIT; }
+    if (toc(start_time) > settings.time_limit) { return dual_status_t::TIME_LIMIT; }
   }
 
   // Populate c_basic after basis is initialized
@@ -2620,7 +2621,7 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
 
   // Solve B'*y = cB
   ft.b_transpose_solve(c_basic, y);
-  if (toc(start_time) > settings.time_limit) { return dual::status_t::TIME_LIMIT; }
+  if (toc(start_time) > settings.time_limit) { return dual_status_t::TIME_LIMIT; }
   constexpr bool print_norms = false;
   if constexpr (print_norms) {
     settings.log.printf(
@@ -2676,7 +2677,7 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
                                    xB_workspace,
                                    phase2_work_estimate);
 
-  if (toc(start_time) > settings.time_limit) { return dual::status_t::TIME_LIMIT; }
+  if (toc(start_time) > settings.time_limit) { return dual_status_t::TIME_LIMIT; }
   if (print_norms) { settings.log.printf("|| x || %e\n", vector_norm2<i_t, f_t>(x)); }
 
 #ifdef COMPUTE_PRIMAL_RESIDUAL
@@ -2703,8 +2704,8 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
       i_t status              = phase2::initialize_steepest_edge_norms(
         lp, settings, start_time, basic_list, ft, delta_y_steepest_edge, phase2_work_estimate);
       f_t steepest_edge_time = toc(steepest_edge_start);
-      if (status == CONCURRENT_HALT_RETURN) { return dual::status_t::CONCURRENT_LIMIT; }
-      if (status == -1) { return dual::status_t::TIME_LIMIT; }
+      if (status == CONCURRENT_HALT_RETURN) { return dual_status_t::CONCURRENT_LIMIT; }
+      if (status == -1) { return dual_status_t::TIME_LIMIT; }
     }
   } else {
     // Check that none of the basic variables have a steepest edge that is nonpositive
@@ -2718,7 +2719,7 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
   }
 
   if (settings.concurrent_halt != nullptr && *settings.concurrent_halt == 1) {
-    return dual::status_t::CONCURRENT_LIMIT;
+    return dual_status_t::CONCURRENT_LIMIT;
   }
 
   if (phase == 2) {
@@ -2772,7 +2773,7 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
   lp.A.to_compressed_row(Arow);
   phase2_work_estimate += 2 * lp.A.col_start[lp.A.n];
   if (settings.concurrent_halt != nullptr && *settings.concurrent_halt == 1) {
-    return dual::status_t::CONCURRENT_LIMIT;
+    return dual_status_t::CONCURRENT_LIMIT;
   }
 
   std::vector<i_t> nonbasic_end(m);
@@ -2782,7 +2783,7 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
   phase2_work_estimate += lp.A.col_start[lp.A.n];
 
   if (settings.concurrent_halt != nullptr && *settings.concurrent_halt == 1) {
-    return dual::status_t::CONCURRENT_LIMIT;
+    return dual_status_t::CONCURRENT_LIMIT;
   }
 
   f_t obj = compute_objective(lp, x);
@@ -2947,11 +2948,9 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
           f_t refactor_start_work = ft.work_estimate();
           i_t refactor_status     = ft.refactor_basis(
             lp.A, settings, lp.lower, lp.upper, start_time, basic_list, nonbasic_list, vstatus);
-          if (refactor_status == CONCURRENT_HALT_RETURN) {
-            return dual::status_t::CONCURRENT_LIMIT;
-          }
-          if (refactor_status == TIME_LIMIT_RETURN) { return dual::status_t::TIME_LIMIT; }
-          if (refactor_status > 0) { return dual::status_t::NUMERICAL; }
+          if (refactor_status == CONCURRENT_HALT_RETURN) { return dual_status_t::CONCURRENT_LIMIT; }
+          if (refactor_status == TIME_LIMIT_RETURN) { return dual_status_t::TIME_LIMIT; }
+          if (refactor_status > 0) { return dual_status_t::NUMERICAL; }
           refactor_work = ft.work_estimate() - refactor_start_work;
 
           phase2::reset_basis_mark(
@@ -3000,14 +2999,14 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
                                  y,
                                  z,
                                  sol);
-      status = dual::status_t::OPTIMAL;
+      status = dual_status_t::OPTIMAL;
       break;
     }
 
-    if (toc(start_time) > settings.time_limit) { return dual::status_t::TIME_LIMIT; }
+    if (toc(start_time) > settings.time_limit) { return dual_status_t::TIME_LIMIT; }
 
     if (settings.concurrent_halt != nullptr && *settings.concurrent_halt == 1) {
-      return dual::status_t::CONCURRENT_LIMIT;
+      return dual_status_t::CONCURRENT_LIMIT;
     }
 
     // BTran
@@ -3024,7 +3023,7 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
     solve_work += (ft.work_estimate() - btran_start_work);
 
     if (settings.concurrent_halt != nullptr && *settings.concurrent_halt == 1) {
-      return dual::status_t::CONCURRENT_LIMIT;
+      return dual_status_t::CONCURRENT_LIMIT;
     }
 
     const f_t steepest_edge_norm_check = delta_y_sparse.norm2_squared();
@@ -3085,7 +3084,7 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
     }
     timers.delta_z_time += timers.stop_timer();
     if (settings.concurrent_halt != nullptr && *settings.concurrent_halt == 1) {
-      return dual::status_t::CONCURRENT_LIMIT;
+      return dual_status_t::CONCURRENT_LIMIT;
     }
 
 #ifdef COMPUTE_DUAL_RESIDUAL
@@ -3140,7 +3139,7 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
         phase2_work_estimate += bfrt.work_estimate();
         if (entering_index == RATIO_TEST_NUMERICAL_ISSUES) {
           settings.log.printf("Numerical issues encountered in ratio test.\n");
-          return dual::status_t::NUMERICAL;
+          return dual_status_t::NUMERICAL;
         }
         timers.bfrt_time += timers.stop_timer();
       } else {
@@ -3148,8 +3147,8 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
           lp, settings, vstatus, nonbasic_list, z, delta_z, step_length, nonbasic_entering_index);
       }
     }
-    if (entering_index == RATIO_TEST_TIME_LIMIT) { return dual::status_t::TIME_LIMIT; }
-    if (entering_index == CONCURRENT_HALT_RETURN) { return dual::status_t::CONCURRENT_LIMIT; }
+    if (entering_index == RATIO_TEST_TIME_LIMIT) { return dual_status_t::TIME_LIMIT; }
+    if (entering_index == CONCURRENT_HALT_RETURN) { return dual_status_t::CONCURRENT_LIMIT; }
     if (entering_index == RATIO_TEST_NO_ENTERING_VARIABLE) {
       settings.log.printf("No entering variable found. Iter %d\n", iter);
       settings.log.printf("Scaled infeasibility %e\n", max_val);
@@ -3220,7 +3219,7 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
                                          y,
                                          z,
                                          sol);
-              status = dual::status_t::OPTIMAL;
+              status = dual_status_t::OPTIMAL;
               break;
             }
             settings.log.printf(
@@ -3276,7 +3275,7 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
                                          y,
                                          z,
                                          sol);
-              status = dual::status_t::OPTIMAL;
+              status = dual_status_t::OPTIMAL;
               break;
             }
             settings.log.printf("Failed to remove perturbation of %.2e.\n", perturbation);
@@ -3318,7 +3317,7 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
         phase2::dual_infeasibility(lp, settings, vstatus, z, settings.tight_tol, settings.dual_tol);
       phase2_work_estimate += 3 * n;
       settings.log.printf("Dual infeasibility %e\n", dual_infeas);
-      const f_t primal_inf = phase2::primal_infeasibility(lp, settings, vstatus, x);
+      const f_t primal_inf = simplex::phase2::primal_infeasibility(lp, settings, vstatus, x);
       phase2_work_estimate += 3 * n;
       settings.log.printf("Primal infeasibility %e\n", primal_inf);
       settings.log.printf("Updates %d\n", ft.num_updates());
@@ -3326,9 +3325,9 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
       if (dual_infeas > settings.dual_tol) {
         settings.log.printf(
           "Numerical issues encountered. No entering variable found with large infeasibility.\n");
-        return dual::status_t::NUMERICAL;
+        return dual_status_t::NUMERICAL;
       }
-      return dual::status_t::DUAL_UNBOUNDED;
+      return dual_status_t::DUAL_UNBOUNDED;
     }
 
     timers.start_timer();
@@ -3345,7 +3344,7 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
                                                                      phase2_work_estimate);
     if (update_dual_variables_status == -1) {
       settings.log.printf("Numerical issues encountered in update_dual_variables.\n");
-      return dual::status_t::NUMERICAL;
+      return dual_status_t::NUMERICAL;
     }
     timers.vector_time += timers.stop_timer();
 
@@ -3418,13 +3417,13 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
                                   delta_x,
                                   phase2_work_estimate) == -1) {
         settings.log.printf("Failed to compute delta_x. Iter %d\n", iter);
-        return dual::status_t::NUMERICAL;
+        return dual_status_t::NUMERICAL;
       }
     }
     solve_work += (ft.work_estimate() - ftran_start_work);
     timers.ftran_time += timers.stop_timer();
     if (settings.concurrent_halt != nullptr && *settings.concurrent_halt == 1) {
-      return dual::status_t::CONCURRENT_LIMIT;
+      return dual_status_t::CONCURRENT_LIMIT;
     }
 
 #ifdef CHECK_PRIMAL_STEP
@@ -3460,7 +3459,7 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
     solve_work += (ft.work_estimate() - se_norms_start_work);
 
     if (settings.concurrent_halt != nullptr && *settings.concurrent_halt == 1) {
-      return dual::status_t::CONCURRENT_LIMIT;
+      return dual_status_t::CONCURRENT_LIMIT;
     }
 
     timers.start_timer();
@@ -3606,33 +3605,33 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
         f_t refactor_start_work = ft.work_estimate();
         i_t refactor_status     = ft.refactor_basis(
           lp.A, settings, lp.lower, lp.upper, start_time, basic_list, nonbasic_list, vstatus);
-        if (refactor_status == CONCURRENT_HALT_RETURN) { return dual::status_t::CONCURRENT_LIMIT; }
-        if (refactor_status == TIME_LIMIT_RETURN) { return dual::status_t::TIME_LIMIT; }
+        if (refactor_status == CONCURRENT_HALT_RETURN) { return dual_status_t::CONCURRENT_LIMIT; }
+        if (refactor_status == TIME_LIMIT_RETURN) { return dual_status_t::TIME_LIMIT; }
         if (refactor_status > 0) {
           should_recompute_x = true;
           settings.log.printf("Failed to factorize basis. Iteration %d\n", iter);
-          if (toc(start_time) > settings.time_limit) { return dual::status_t::TIME_LIMIT; }
+          if (toc(start_time) > settings.time_limit) { return dual_status_t::TIME_LIMIT; }
           i_t count          = 0;
           i_t deficient_size = 0;
           while (true) {
             deficient_size = ft.refactor_basis(
               lp.A, settings, lp.lower, lp.upper, start_time, basic_list, nonbasic_list, vstatus);
             if (deficient_size == CONCURRENT_HALT_RETURN) {
-              return dual::status_t::CONCURRENT_LIMIT;
+              return dual_status_t::CONCURRENT_LIMIT;
             }
-            if (deficient_size == TIME_LIMIT_RETURN) { return dual::status_t::TIME_LIMIT; }
+            if (deficient_size == TIME_LIMIT_RETURN) { return dual_status_t::TIME_LIMIT; }
             if (deficient_size <= 0) { break; }
             settings.log.printf("Failed to repair basis. Iteration %d. %d deficient columns.\n",
                                 iter,
                                 static_cast<int>(deficient_size));
 
-            if (toc(start_time) > settings.time_limit) { return dual::status_t::TIME_LIMIT; }
+            if (toc(start_time) > settings.time_limit) { return dual_status_t::TIME_LIMIT; }
             settings.threshold_partial_pivoting_tol = 1.0;
 
             count++;
-            if (count > 10) { return dual::status_t::NUMERICAL; }
+            if (count > 10) { return dual_status_t::NUMERICAL; }
           }
-          if (deficient_size < 0) { return dual::status_t::NUMERICAL; }
+          if (deficient_size < 0) { return dual_status_t::NUMERICAL; }
 
           settings.log.printf("Successfully repaired basis. Iteration %d\n", iter);
         }
@@ -3743,20 +3742,20 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
 
     if (obj >= settings.cut_off) {
       settings.log.printf("Solve cutoff. Current objecive %e. Cutoff %e\n", obj, settings.cut_off);
-      return dual::status_t::CUTOFF;
+      return dual_status_t::CUTOFF;
     }
 
     if (work_unit_context && work_unit_context->global_work_units_elapsed >= settings.work_limit) {
-      return dual::status_t::WORK_LIMIT;
+      return dual_status_t::WORK_LIMIT;
     }
 
-    if (now > settings.time_limit) { return dual::status_t::TIME_LIMIT; }
+    if (now > settings.time_limit) { return dual_status_t::TIME_LIMIT; }
 
     if (settings.concurrent_halt != nullptr && *settings.concurrent_halt == 1) {
-      return dual::status_t::CONCURRENT_LIMIT;
+      return dual_status_t::CONCURRENT_LIMIT;
     }
   }
-  if (iter >= iter_limit) { status = dual::status_t::ITERATION_LIMIT; }
+  if (iter >= iter_limit) { status = dual_status_t::ITERATION_LIMIT; }
 
   if (phase == 2) {
     timers.print_timers(settings);
@@ -4400,7 +4399,7 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
 
 #ifdef DUAL_SIMPLEX_INSTANTIATE_DOUBLE
 
-template dual::status_t dual_phase2<int, double>(
+template dual_status_t dual_phase2<int, double>(
   int phase,
   int slack_basis,
   double start_time,
@@ -4412,7 +4411,7 @@ template dual::status_t dual_phase2<int, double>(
   std::vector<double>& steepest_edge_norms,
   work_limit_context_t* work_unit_context);
 
-template dual::status_t dual_phase2_with_advanced_basis<int, double>(
+template dual_status_t dual_phase2_with_advanced_basis<int, double>(
   int phase,
   int slack_basis,
   bool initialize_basis,
@@ -4464,4 +4463,4 @@ template void compute_initial_nonbasic_end<int, double>(const std::vector<int>& 
                                                         std::vector<int>& nonbasic_end);
 #endif
 
-}  // namespace cuopt::linear_programming::dual_simplex
+}  // namespace cuopt::mathematical_optimization::simplex
