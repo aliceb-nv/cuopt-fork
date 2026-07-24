@@ -12,13 +12,11 @@
 namespace dense_triangle_solve {
 
 // ---- single-thread reference solves ----
-// L/U are scatter (column) form; Lᵀ/Uᵀ are gather form. `we` (optional) accumulates the production
-// kernel's refactor-trigger work estimate with the SAME formulas as the original solves; the
-// benchmark passes nullptr. Arithmetic is unchanged, so results stay bit-for-bit identical.
+// L/U are scatter (column) form; Lᵀ/Uᵀ are gather form. Arithmetic is unchanged, so results stay
+// bit-for-bit identical.
 
 template <typename i_t, typename f_t>
-__device__ inline void lower_solve(const i_t* cs, const i_t* ri, const f_t* val, f_t* x, i_t n,
-                                   f_t* we = nullptr)
+__device__ inline void lower_solve(const i_t* cs, const i_t* ri, const f_t* val, f_t* x, i_t n)
 {
   for (i_t j = 0; j < n; ++j) {
     const i_t c0 = cs[j], c1 = cs[j + 1];
@@ -28,12 +26,10 @@ __device__ inline void lower_solve(const i_t* cs, const i_t* ri, const f_t* val,
       for (i_t p = c0 + 1; p < c1; ++p) { x[ri[p]] -= val[p] * xj; }
     }
   }
-  if (we) { *we += 3 * n + 3 * cs[n]; }
 }
 
 template <typename i_t, typename f_t>
-__device__ inline void upper_solve(const i_t* cs, const i_t* ri, const f_t* val, f_t* x, i_t n,
-                                   f_t* we = nullptr)
+__device__ inline void upper_solve(const i_t* cs, const i_t* ri, const f_t* val, f_t* x, i_t n)
 {
   for (i_t j = n - 1; j >= 0; --j) {
     const i_t c0 = cs[j], ce = cs[j + 1] - 1;
@@ -41,27 +37,24 @@ __device__ inline void upper_solve(const i_t* cs, const i_t* ri, const f_t* val,
       x[j] /= val[ce];
       const f_t xj = x[j];
       for (i_t p = c0; p < ce; ++p) { x[ri[p]] -= val[p] * xj; }
-      if (we) { *we += 3 * (ce - c0) + 3; }
     }
   }
-  if (we) { *we += 3 * n; }
 }
 
 template <typename i_t, typename f_t>
 __device__ inline void lower_transpose_solve(const i_t* cs, const i_t* ri, const f_t* val, f_t* x,
-                                             i_t n, f_t* we = nullptr)
+                                             i_t n)
 {
   for (i_t j = n - 1; j >= 0; --j) {
     f_t sum = 0.0;
     for (i_t p = cs[j] + 1; p < cs[j + 1]; ++p) { sum += val[p] * x[ri[p]]; }
     x[j] = (x[j] - sum) / val[cs[j]];
   }
-  if (we) { *we += 6 * n + 4 * cs[n]; }
 }
 
 template <typename i_t, typename f_t>
 __device__ inline void upper_transpose_solve(const i_t* cs, const i_t* ri, const f_t* val, f_t* x,
-                                             i_t n, f_t* we = nullptr)
+                                             i_t n)
 {
   for (i_t j = 0; j < n; ++j) {
     const i_t ce = cs[j + 1] - 1;
@@ -69,7 +62,6 @@ __device__ inline void upper_transpose_solve(const i_t* cs, const i_t* ri, const
     for (i_t p = cs[j]; p < ce; ++p) { sum += val[p] * x[ri[p]]; }
     x[j] = (x[j] - sum) / val[ce];
   }
-  if (we) { *we += 4 * n + 4 * cs[n]; }
 }
 
 // ---- warp (32-lane) wavefront gather solve core ----

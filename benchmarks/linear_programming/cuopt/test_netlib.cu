@@ -10,9 +10,9 @@
 // `simplified_dual_phase2` driver, started from the same post-phase-1
 // dual-feasible factorized basis.
 
-#include <cuopt/linear_programming/io/parser.hpp>
-#include <cuopt/linear_programming/optimization_problem.hpp>
-#include <cuopt/linear_programming/solve.hpp>
+#include <cuopt/mathematical_optimization/io/parser.hpp>
+#include <cuopt/mathematical_optimization/optimization_problem.hpp>
+#include <cuopt/mathematical_optimization/solve.hpp>
 
 #include <pdlp/translate.hpp>
 
@@ -26,7 +26,7 @@
 #include <dual_simplex/simplex_solver_settings.hpp>
 #include <dual_simplex/solution.hpp>
 #include <dual_simplex/solve.hpp>
-#include <dual_simplex/tic_toc.hpp>
+#include <math_optimization/tic_toc.hpp>
 #include <dual_simplex/user_problem.hpp>
 
 #include <utilities/logger.hpp>
@@ -48,14 +48,21 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <set>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include "benchmark_helper.hpp"
+#include "kargs_dump.hpp"
 
-namespace ds = cuopt::linear_programming::dual_simplex;
+// The shared simplex primitives were promoted to mathematical_optimization::simplex;
+// tic/toc and the linear-algebra types (csc_matrix_t) live in the parent
+// mathematical_optimization; the GPU driver stays in linear_programming::dual_simplex.
+namespace ds  = cuopt::mathematical_optimization::simplex;
+namespace mo  = cuopt::mathematical_optimization;
+namespace gds = cuopt::linear_programming::dual_simplex;
 
 namespace {
 
@@ -107,10 +114,10 @@ struct instance_result_t {
 ds::user_problem_t<int, double> load_user_problem(const raft::handle_t& handle,
                                                   const std::string& path)
 {
-  auto model = cuopt::linear_programming::io::parse_mps<int, double>(path);
+  auto model = cuopt::mathematical_optimization::io::read_mps<int, double>(path);
   auto opt =
-    cuopt::linear_programming::mps_data_model_to_optimization_problem<int, double>(&handle, model);
-  return cuopt::linear_programming::cuopt_optimization_problem_to_user_problem<int, double>(&handle,
+    cuopt::mathematical_optimization::mps_data_model_to_optimization_problem<int, double>(&handle, model);
+  return cuopt::mathematical_optimization::cuopt_optimization_problem_to_user_problem<int, double>(&handle,
                                                                                            opt);
 }
 
@@ -202,7 +209,8 @@ bool setup_dual_feasible_basis(const ds::user_problem_t<int, double>& up,
   ds::lp_problem_t<int, double> lp(
     h, presolved_lp.num_rows, presolved_lp.num_cols, presolved_lp.A.col_start[presolved_lp.num_cols]);
   std::vector<double> column_scales;
-  ds::column_scaling(presolved_lp, settings, lp, column_scales);
+  std::vector<double> row_scales;
+  ds::scaling(presolved_lp, settings, lp, column_scales, row_scales);
 
   if (lp.num_rows == 0) {
     note = "presolved to 0 rows";
@@ -228,7 +236,7 @@ bool setup_dual_feasible_basis(const ds::user_problem_t<int, double>& up,
   int iter = 0;
   ds::lp_solution_t<int, double> phase1_solution(phase1_problem.num_rows, phase1_problem.num_cols);
   std::vector<double> edge_norms;
-  const double start_time = ds::tic();
+  const double start_time = mo::tic();
   const ds::dual::status_t st = ds::dual_phase2(
     1, 1, start_time, phase1_problem, settings, phase1_vstatus, phase1_solution, iter, edge_norms,
     nullptr);
@@ -290,7 +298,7 @@ ds::dual::status_t run_phase2_from_basis(const ds::lp_problem_t<int, double>& lp
   ds::get_basis_from_vstatus<int>(m, vstatus, basic_list, nonbasic_list, superbasic_list);
 
   ds::basis_update_mpf_t<int, double> ft(m, settings.refactor_frequency);
-  const double start_time = ds::tic();
+  const double start_time = mo::tic();
   ft.refactor_basis(
     lp.A, settings, lp.lower, lp.upper, start_time, basic_list, nonbasic_list, vstatus);
 
@@ -318,17 +326,22 @@ ds::dual::status_t run_phase2_from_basis(const ds::lp_problem_t<int, double>& lp
   // Exact replay: feed the B&B's carried steepest-edge norms verbatim (the driver
   // uses a non-empty dy_se as-is instead of reinitializing).
   if (!dy_se_override.empty()) { dy_se = dy_se_override; }
+  // KF fixture dump (CUOPT_DUMP_KARGS): freeze this node's marshaled inputs (pre-solve, fresh
+  // factorization) for a Kernel Factory warp-kernel campaign. See kargs_dump.hpp / DATA_CONTRACT.md.
+  if (mode == 1 && !kf::g_dump_dir.empty()) {
+    kf::dump_inputs(kf::g_dump_dir, lp, settings, vstatus, ft, basic_list, nonbasic_list, sol, dy_se);
+  }
   ds::dual::status_t status;
-  ft.dbg_se_reset();  // [SESTAT] temp: count only THIS driver's SE-context b_solves
+  // [SESTAT] SE debug counters were removed from basis_update_mpf_t; reset is a no-op now.
   // Time JUST the phase-2 driver call (the refactor_basis setup above is identical for both
   // the advanced and the minimal driver, so isolating the driver is the fair time comparison).
-  const double driver_t0 = ds::tic();
+  const double driver_t0 = mo::tic();
   if (mode == 1) {
     status =
       ds::simplified_dual_phase2(lp, settings, vstatus, ft, basic_list, nonbasic_list, sol, dy_se);
     out_iters = sol.iterations;
   } else if (mode == 2) {
-    status = ds::gpu_simplified_dual_phase2(
+    status = gds::gpu_simplified_dual_phase2(
       lp, settings, vstatus, ft, basic_list, nonbasic_list, sol, dy_se);
     out_iters = sol.iterations;
   } else {
@@ -349,20 +362,25 @@ ds::dual::status_t run_phase2_from_basis(const ds::lp_problem_t<int, double>& lp
                                                  nullptr);
     out_iters = iter;
   }
-  if (out_seconds != nullptr) { *out_seconds = ds::toc(driver_t0); }
+  if (out_seconds != nullptr) { *out_seconds = mo::toc(driver_t0); }
   // [SESTAT] temp: for CPU drivers (mode 0/1) the SE counters live on this ft; for the GPU (mode 2)
   // they live in the device g_se global and are emitted separately as [SEPROF].
   if (out_se != nullptr) {
-    out_se->calls   = ft.dbg_se_calls_;
-    out_se->hyper_l = ft.dbg_se_hyper_l_;
-    out_se->hyper_u = ft.dbg_se_hyper_u_;
-    out_se->nz_in   = ft.dbg_se_nz_in_;
-    out_se->nz_l    = ft.dbg_se_nz_l_;
-    out_se->nz_u    = ft.dbg_se_nz_u_;
-    out_se->numupd  = ft.dbg_se_numupd_sum_;
+    // [SESTAT] SE debug counters were removed from basis_update_mpf_t; zero them out.
+    out_se->calls   = 0;
+    out_se->hyper_l = 0;
+    out_se->hyper_u = 0;
+    out_se->nz_in   = 0;
+    out_se->nz_l    = 0;
+    out_se->nz_u    = 0;
+    out_se->numupd  = 0;
   }
   out_obj         = ds::compute_user_objective<int, double>(lp, sol.x);
   out_num_updates = ft.num_updates();
+  // KF fixture dump: freeze the CPU-simplified golden (status/user_obj/iters) — the oracle.
+  if (mode == 1 && !kf::g_dump_dir.empty()) {
+    kf::dump_golden(kf::g_dump_dir, static_cast<int>(status), out_obj, out_iters);
+  }
   return status;
 }
 
@@ -401,9 +419,9 @@ void process_instance(const raft::handle_t& handle,
   {
     auto settings = make_settings(time_limit);
     ds::lp_solution_t<int, double> sol(up.num_rows, up.num_cols);
-    const double t0 = ds::tic();
+    const double t0 = mo::tic();
     r.base_status   = ds::solve_linear_program<int, double>(up, settings, sol);
-    r.base_time     = ds::toc(t0);
+    r.base_time     = mo::toc(t0);
     r.base_obj      = sol.user_objective;
     r.base_iters    = sol.iterations;
   }
@@ -571,9 +589,9 @@ bool solve_lp_to_optimal_vstatus(const ds::lp_problem_t<int, double>& lp,
   ds::lp_solution_t<int, double> p1sol(phase1_problem.num_rows, phase1_problem.num_cols);
   std::vector<double> en1;
   const ds::dual::status_t st1 =
-    ds::dual_phase2(1, 1, ds::tic(), phase1_problem, s, vstatus, p1sol, iter1, en1, nullptr);
+    ds::dual_phase2(1, 1, mo::tic(), phase1_problem, s, vstatus, p1sol, iter1, en1, nullptr);
   if (st1 != ds::dual::status_t::OPTIMAL) {
-    note = "parent phase1: " + ds::dual::status_to_string(st1);
+    note = "parent phase1: " + ds::dual_status_to_string(st1);
     return false;
   }
 
@@ -582,9 +600,9 @@ bool solve_lp_to_optimal_vstatus(const ds::lp_problem_t<int, double>& lp,
   ds::lp_solution_t<int, double> sol(m, n);
   std::vector<double> en2;
   const ds::dual::status_t st2 =
-    ds::dual_phase2(2, 0, ds::tic(), lp, s, vstatus, sol, iter2, en2, nullptr);
+    ds::dual_phase2(2, 0, mo::tic(), lp, s, vstatus, sol, iter2, en2, nullptr);
   if (st2 != ds::dual::status_t::OPTIMAL) {
-    note = "parent phase2: " + ds::dual::status_to_string(st2);
+    note = "parent phase2: " + ds::dual_status_to_string(st2);
     return false;
   }
 
@@ -827,6 +845,13 @@ void verify_nodes_mode(const raft::handle_t& handle, const std::string& dir, dou
 
       // Run advanced (mode 0) and simplified (mode 1) on the child from the
       // warm-start basis, with the recorded objective cutoff + settings + edge norms.
+      // KF fixture dump (CUOPT_DUMP_KARGS): aim the dumper at this node's dir before the
+      // CPU-simplified (mode 1) solve below; the input+golden dump fires inside it.
+      if (const char* kf_base = std::getenv("CUOPT_DUMP_KARGS")) {
+        kf::g_dump_dir = std::string(kf_base) + "/" + name;
+      } else {
+        kf::g_dump_dir.clear();
+      }
       double adv_obj = kNaN, sim_obj = kNaN, dinf = 0.0;
       int adv_it = 0, sim_it = 0, upd = 0;
       double adv_sec = 0.0, sim_sec = 0.0;
@@ -926,11 +951,11 @@ void verify_nodes_mode(const raft::handle_t& handle, const std::string& dir, dou
                   name.c_str(),
                   info.status.c_str(),
                   info.objective,
-                  ds::dual::status_to_string(adv_st).c_str(),
+                  ds::dual_status_to_string(adv_st).c_str(),
                   adv_obj,
                   adv_it,
                   adv_sec,
-                  ds::dual::status_to_string(sim_st).c_str(),
+                  ds::dual_status_to_string(sim_st).c_str(),
                   sim_obj,
                   sim_it,
                   sim_sec,
@@ -939,7 +964,7 @@ void verify_nodes_mode(const raft::handle_t& handle, const std::string& dir, dou
                   basis_src);
       if (run_gpu) {
         std::printf(" || GPU %-10s %10.6g %8d %8.4f [%s]",
-                    ds::dual::status_to_string(gpu_st).c_str(),
+                    ds::dual_status_to_string(gpu_st).c_str(),
                     gpu_obj,
                     gpu_it,
                     gpu_sec,
@@ -1037,7 +1062,7 @@ std::unique_ptr<prepared_problem_t> prepare_from_basis(
   p->vstatus = vstatus_in;
   std::vector<int> superbasic_list;
   ds::get_basis_from_vstatus<int>(m, p->vstatus, p->basic_list, p->nonbasic_list, superbasic_list);
-  const double start_time = ds::tic();
+  const double start_time = mo::tic();
   p->ft.refactor_basis(lp.A, settings, lp.lower, lp.upper, start_time, p->basic_list,
                        p->nonbasic_list, p->vstatus);
   compute_duals(lp, p->ft, p->basic_list, p->nonbasic_list, p->sol.y, p->sol.z);
@@ -1199,9 +1224,21 @@ void benchmark_parallel_mode(const raft::handle_t& handle, const std::string& di
                                            iters, dinf, upd, /*init*/ false, un->edge_norms);
     un->ref_iters = iters;
     un->ref_obj   = obj;
-    un->heap_bytes =
-      static_cast<size_t>(static_cast<double>(iters) * kSparsity * static_cast<double>(un->m) *
-                          12.0 * kHeapSafety);
+    // Two heap contributors per block:
+    //  (a) the iteration-driven S_ MPF stack: ~iters updates x kSparsity*m fill x 12 B (int+double);
+    //  (b) an ITERATION-INDEPENDENT floor that exists even for a 0-iter node — chiefly the on-device
+    //      Arow built by from_csc (row_start (m+1) ints + j (nnz) ints + x (nnz) doubles) when
+    //      CUOPT_GPU_HOST_AROW is off (the default), plus the handful of dense m-length solve
+    //      workspaces. Without (b), warm-start few-iter collections (v6) underestimate the heap and the
+    //      malloc arena is set too small -> in-kernel device malloc fails -> illegal address. gpu_vector
+    //      doubles capacity on growth, so carry the 2x headroom (kHeapSafety) on the floor too.
+    const size_t nnz        = un->lp.A.nnz();
+    const size_t arow_bytes = nnz * (sizeof(int) + sizeof(double)) + (size_t)(un->m + 1) * sizeof(int);
+    const size_t work_bytes = (size_t)un->m * sizeof(double) * 32;  // ~dense m-length solve workspaces
+    const size_t iter_heap  = static_cast<size_t>(static_cast<double>(iters) * kSparsity *
+                                                  static_cast<double>(un->m) * 12.0);
+    un->heap_bytes = static_cast<size_t>((static_cast<double>(iter_heap) +
+                                          static_cast<double>(arow_bytes + work_bytes)) * kHeapSafety);
   }
 
   // ---- Heavy-first order (anti-tailing): sort unique by measured iters desc; each unique's
@@ -1293,7 +1330,7 @@ void benchmark_parallel_mode(const raft::handle_t& handle, const std::string& di
   }
   const double gpu_setup_s = omp_get_wtime() - gpu_setup_t0;
 
-  std::vector<ds::gpu_batch_item<int, double>> items(Ntot);
+  std::vector<gds::gpu_batch_item<int, double>> items(Ntot);
   for (size_t k = 0; k < Ntot; ++k) {
     const int u          = list[k];
     items[k].lp          = &nodes[u]->lp;
@@ -1307,8 +1344,8 @@ void benchmark_parallel_mode(const raft::handle_t& handle, const std::string& di
   }
 
   std::vector<ds::dual::status_t> gpu_status;
-  ds::gpu_batch_timing timing;
-  ds::gpu_simplified_dual_phase2_batch<int, double>(items, vram_heap, gpu_status, timing);
+  gds::gpu_batch_timing timing;
+  gds::gpu_simplified_dual_phase2_batch<int, double>(items, vram_heap, gpu_status, timing);
   if (timing.rejected) {
     std::printf("BENCHMARK REJECTED (GPU pre-flight): %s\n", timing.message.c_str());
     return;
@@ -1332,9 +1369,9 @@ void benchmark_parallel_mode(const raft::handle_t& handle, const std::string& di
     } else {
       gpu_true_mismatch++;
       std::printf("  [TRUE MISMATCH] %-30s ref{%s it=%d obj=%.10g} gpu{%s it=%d obj=%.10g}\n",
-                  nodes[u]->name.c_str(), ds::dual::status_to_string(nodes[u]->ref_status).c_str(),
+                  nodes[u]->name.c_str(), ds::dual_status_to_string(nodes[u]->ref_status).c_str(),
                   nodes[u]->ref_iters, nodes[u]->ref_obj,
-                  ds::dual::status_to_string(gpu_status[k]).c_str(), prepared[k]->sol.iterations,
+                  ds::dual_status_to_string(gpu_status[k]).c_str(), prepared[k]->sol.iterations,
                   gobj);
     }
   }
@@ -1586,10 +1623,10 @@ int main(int argc, char* argv[])
     }
 
     const std::string base_s = ds::lp_status_to_string(r.base_status);
-    const std::string adv_s  = ds::dual::status_to_string(r.adv_status);
-    const std::string sim_s  = r.simpl_ran ? ds::dual::status_to_string(r.simpl_status)
+    const std::string adv_s  = ds::dual_status_to_string(r.adv_status);
+    const std::string sim_s  = r.simpl_ran ? ds::dual_status_to_string(r.simpl_status)
                                            : (r.note.empty() ? "-" : r.note);
-    const std::string gpu_s  = r.gpu_ran ? ds::dual::status_to_string(r.gpu_status) : "-";
+    const std::string gpu_s  = r.gpu_ran ? ds::dual_status_to_string(r.gpu_status) : "-";
     // Results match: same status, and for OPTIMAL the objectives agree. (The CPU
     // does not set sol.iterations on its mid-loop NUMERICAL return, so iteration
     // equality is only meaningful for OPTIMAL.)
@@ -1694,7 +1731,7 @@ int main(int argc, char* argv[])
       r.simpl_status == ds::dual::status_t::OPTIMAL && obj_matches(r.simpl_obj, r.base_obj);
     if (ok) continue;
     std::printf("  %-12s %-16s %8d %14.6g %14.6g\n", r.name.c_str(),
-                ds::dual::status_to_string(r.simpl_status).c_str(), r.simpl_iters, r.simpl_obj,
+                ds::dual_status_to_string(r.simpl_status).c_str(), r.simpl_iters, r.simpl_obj,
                 r.base_obj);
   }
 
@@ -1714,8 +1751,8 @@ int main(int argc, char* argv[])
       if (ok) continue;
       n_mismatch++;
       std::printf("  %-12s %-16s %-16s %8d %8d %14.6g %14.6g\n", r.name.c_str(),
-                  ds::dual::status_to_string(r.simpl_status).c_str(),
-                  ds::dual::status_to_string(r.gpu_status).c_str(), r.simpl_iters, r.gpu_iters,
+                  ds::dual_status_to_string(r.simpl_status).c_str(),
+                  ds::dual_status_to_string(r.gpu_status).c_str(), r.simpl_iters, r.gpu_iters,
                   r.simpl_obj, r.gpu_obj);
     }
     if (n_mismatch == 0) { std::printf("  (none) - GPU exactly reproduced the CPU driver\n"); }

@@ -32,6 +32,15 @@ class problem_t;
 
 }  // namespace detail
 
+// mip::problem_t is used only by the cuopt_problem_to_user_problem(mip::problem_t&)
+// overload (a template whose body is dependent), so a forward declaration lets this
+// header parse standalone (e.g. from test_netlib.cu) without pulling the heavy mip
+// problem.cuh. TUs that instantiate that overload include problem.cuh first.
+namespace mip {
+template <typename i_t, typename f_t>
+class problem_t;
+}
+
 template <typename i_t, typename f_t>
 static simplex::user_problem_t<i_t, f_t> cuopt_problem_to_user_problem(
   raft::handle_t const* handle_ptr, const optimization_problem_interface_t<i_t, f_t>& problem)

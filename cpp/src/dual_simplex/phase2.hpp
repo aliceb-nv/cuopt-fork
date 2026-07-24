@@ -51,6 +51,14 @@ static std::string dual_status_to_string(dual_status_t status)
   return "UNKNOWN";
 }
 
+// The simplified dual-simplex drivers (CPU `simplified_dual_phase2` and its GPU
+// port) spell the phase-2 status enum as `dual::status_t`. Provide that name as
+// an alias of the canonical `dual_status_t` so it resolves in every TU that
+// includes this header.
+namespace dual {
+using status_t = dual_status_t;
+}
+
 template <typename i_t, typename f_t>
 dual_status_t dual_phase2(i_t phase,
                           i_t slack_basis,

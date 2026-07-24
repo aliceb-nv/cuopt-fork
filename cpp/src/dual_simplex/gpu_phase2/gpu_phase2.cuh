@@ -23,13 +23,18 @@
 #include <dual_simplex/presolve.hpp>
 #include <dual_simplex/simplex_solver_settings.hpp>
 #include <dual_simplex/solution.hpp>
-#include <dual_simplex/types.hpp>
+#include <math_optimization/types.hpp>
 
 #include <cstddef>
 #include <string>
 #include <vector>
 
 namespace cuopt::linear_programming::dual_simplex {
+
+// The shared simplex primitives (lp_problem_t, variable_status_t,
+// basis_update_mpf_t, dual::status_t, ...) live in mathematical_optimization::simplex;
+// make them visible unqualified here.
+using namespace cuopt::mathematical_optimization::simplex;
 
 // GPU port of simplified_dual_phase2. Same parameters, same returned status and
 // solution. Only instantiated for <int, double>.

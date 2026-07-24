@@ -29,9 +29,9 @@
 
 #include "dense_triangle_solve.cuh"
 
-#include <dual_simplex/sparse_matrix.hpp>
-#include <dual_simplex/sparse_vector.hpp>
-#include <dual_simplex/tic_toc.hpp>
+#include <linear_algebra/sparse_matrix.hpp>
+#include <linear_algebra/sparse_vector.hpp>
+#include <math_optimization/tic_toc.hpp>
 
 #include <utilities/macros.cuh>
 
@@ -39,11 +39,16 @@
 #include <cuda/std/span>
 
 #include <chrono>
+#include <unordered_map>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
 
 namespace cuopt::linear_programming::dual_simplex {
+// Shared simplex primitives live in mathematical_optimization::simplex; tic/toc
+// live in the parent mathematical_optimization namespace.
+using namespace cuopt::mathematical_optimization;
+using namespace cuopt::mathematical_optimization::simplex;
 namespace gpu_phase2_detail {
 
 using i_t = int;
@@ -63,6 +68,7 @@ __device__ int g_gpu_alloc_failed;
 // (bit-exact, one lane per column), 1 = big≥32 (whole-warp cooperation on large columns).
 __device__ int g_warp_solve_mode;
 static constexpr int kBigThreshold = 32;  // "large column" cutoff for the big path
+
 
 // ================= Per-function kernel timers (COMPILE-TIME GATED) ================================
 // Accumulate clock64 ticks per driver function on lane 0 and print one [KTIMER ...] line per solve
@@ -132,6 +138,15 @@ struct gpu_vector {
   T* data_       = nullptr;
   size_t size_   = 0;
   size_t cap_    = 0;
+  bool owns_     = true;   // false => non-owning view over external device memory (never freed here)
+
+  // Adopt external device memory as a fixed-size, mutable, non-owning view (zero-copy). The caller
+  // owns/frees the buffer; resize/reserve must not be called on a view.
+  __device__ void view(T* ptr, size_t n)
+  {
+    if (owns_ && data_ != nullptr) { free(data_); }
+    data_ = ptr; size_ = n; cap_ = n; owns_ = false;
+  }
 
   __device__ gpu_vector() {}
   __device__ explicit gpu_vector(size_t n) { resize(n); }
@@ -143,11 +158,12 @@ struct gpu_vector {
     size_ = o.size_;
   }
   __device__ gpu_vector(gpu_vector&& o)
-    : data_(o.data_), size_(o.size_), cap_(o.cap_)
+    : data_(o.data_), size_(o.size_), cap_(o.cap_), owns_(o.owns_)
   {
     o.data_ = nullptr;
     o.size_ = 0;
     o.cap_  = 0;
+    o.owns_ = true;
   }
   __device__ gpu_vector& operator=(const gpu_vector& o)
   {
@@ -161,18 +177,20 @@ struct gpu_vector {
   __device__ gpu_vector& operator=(gpu_vector&& o)
   {
     if (this == &o) { return *this; }
-    if (data_ != nullptr) { free(data_); }
+    if (owns_ && data_ != nullptr) { free(data_); }
     data_   = o.data_;
     size_   = o.size_;
     cap_    = o.cap_;
+    owns_   = o.owns_;
     o.data_ = nullptr;
     o.size_ = 0;
     o.cap_  = 0;
+    o.owns_ = true;
     return *this;
   }
   __device__ ~gpu_vector()
   {
-    if (data_ != nullptr) { free(data_); }
+    if (owns_ && data_ != nullptr) { free(data_); }
   }
 
   __device__ size_t size() const { return size_; }
@@ -362,6 +380,18 @@ struct gpu_csr_matrix {
         x[q]        = A.x[p];
       }
     }
+  }
+
+  // Zero-copy: adopt a host-built CSR already in device memory as non-owning views. row_start stays
+  // read-only; j/x are mutated in place by the nonbasic partition, so the passed buffer must be a
+  // fresh per-solve mutable copy (true for the single-problem path — one upload per solve).
+  __device__ void view_device(const i_t* rs, const i_t* jj, const f_t* xx, i_t m_, i_t n_, i_t nz)
+  {
+    m = m_;
+    n = n_;
+    row_start.view(const_cast<i_t*>(rs), m + 1);
+    j.view(const_cast<i_t*>(jj), nz);
+    x.view(const_cast<f_t*>(xx), nz);
   }
 };
 
@@ -563,25 +593,25 @@ __device__ f_t sparse_dot(const i_t* xind, const f_t* xval, i_t nx, const i_t* y
 
 // ---- dense triangular solves (triangle_solve.hpp) -------------------------
 
-__device__ void lower_triangular_solve(const gpu_csc_view& L, f_t* x, f_t& work_estimate)
+__device__ void lower_triangular_solve(const gpu_csc_view& L, f_t* x)
 {
-  dts::lower_solve(L.col_start.data(), L.i.data(), L.x.data(), x, L.n, &work_estimate);
+  dts::lower_solve(L.col_start.data(), L.i.data(), L.x.data(), x, L.n);
 }
 
-__device__ void lower_triangular_transpose_solve(const gpu_csc_view& L, f_t* x, f_t& work_estimate)
+__device__ void lower_triangular_transpose_solve(const gpu_csc_view& L, f_t* x)
 {
-  dts::lower_transpose_solve(L.col_start.data(), L.i.data(), L.x.data(), x, L.n, &work_estimate);
+  dts::lower_transpose_solve(L.col_start.data(), L.i.data(), L.x.data(), x, L.n);
 }
 
-__device__ i_t upper_triangular_solve(const gpu_csc_view& U, f_t* x, f_t& work_estimate)
+__device__ i_t upper_triangular_solve(const gpu_csc_view& U, f_t* x)
 {
-  dts::upper_solve(U.col_start.data(), U.i.data(), U.x.data(), x, U.n, &work_estimate);
+  dts::upper_solve(U.col_start.data(), U.i.data(), U.x.data(), x, U.n);
   return 0;
 }
 
-__device__ i_t upper_triangular_transpose_solve(const gpu_csc_view& U, f_t* x, f_t& work_estimate)
+__device__ i_t upper_triangular_transpose_solve(const gpu_csc_view& U, f_t* x)
 {
-  dts::upper_transpose_solve(U.col_start.data(), U.i.data(), U.x.data(), x, U.n, &work_estimate);
+  dts::upper_transpose_solve(U.col_start.data(), U.i.data(), U.x.data(), x, U.n);
   return 0;
 }
 
@@ -621,7 +651,10 @@ enum warp_solve_op {
   WARP_SEUPD     = kNumWarpSolveOps + 5, // 9: SE-norm update loop over scaled_delta_xB (su_* fields)
   WARP_PINF      = kNumWarpSolveOps + 6, // 10: primal infeasibility scan over m (pi_* fields)
   WARP_UPDDUAL   = kNumWarpSolveOps + 7, // 11: update_dual_variables y/z update (ud_* fields)
-  WARP_DONE      = kNumWarpSolveOps + 8  // 12: sentinel — never indexes a per-op array
+  WARP_DZSCAT    = kNumWarpSolveOps + 8, // 12: scatter δz (CSR row-wise, inner span warp-parallel; dzs_*)
+  WARP_SPTRSV    = kNumWarpSolveOps + 9, // 13: reach-restricted sparse gather solve (sp_* fields)
+  WARP_NBE       = kNumWarpSolveOps + 10,// 14: compute_initial_nonbasic_end row partition (nbe_* fields)
+  WARP_DONE      = kNumWarpSolveOps + 11 // 15: sentinel — never indexes a per-op array
 };
 
 // Trivially constructible (no member initializers) so it can be a __shared__
@@ -634,6 +667,7 @@ struct warp_solve_config {
   const f_t* val[kNumWarpSolveOps];     // gather CSC values
   const i_t* lstart[kNumWarpSolveOps];  // level offsets [nlev+1]
   const i_t* corder[kNumWarpSolveOps];  // columns by level [m] (sorted large-first when mode==big)
+  const i_t* level[kNumWarpSolveOps];   // per-column elimination level [m] (for the reach-restricted sparse solve)
   i_t  nlev[kNumWarpSolveOps];
   bool diag_first[kNumWarpSolveOps];
   bool descending[kNumWarpSolveOps];
@@ -652,7 +686,6 @@ struct warp_solve_config {
   const i_t* tl_ri;      // S_.i
   const f_t* tl_val;     // S_.x
   const f_t* tl_mu;      // mu_values_
-  f_t*       tl_work;    // &work_estimate_ (lane-0 accumulation only)
   i_t        tl_num;     // num_updates_
   i_t        tl_dotoff;  // 0 (u_col) or 1 (v_col)
   i_t        tl_axpyoff; // 0 (u_col) or 1 (v_col)
@@ -669,11 +702,19 @@ struct warp_solve_config {
   i_t*       dz_indices;  // raw index buffer, filled [0,count) in nonbasic order
   i_t*       dz_mark;     // delta_z_mark
   i_t*       dz_count;    // out: number of nonzeros appended (lane 0)
-  f_t*       dz_work;     // out: work_estimate accumulation (lane 0), or nullptr
   i_t        dz_m;
   i_t        dz_n;
   i_t        dz_leaving;
   i_t        dz_dir;
+  // δz scatter (op == WARP_DZSCAT): CSR row-wise, inner span parallel. Reuses dz_out / dz_mark /
+  // dz_indices / dz_count / dz_leaving / dz_dir above; adds the CSR + sparse-δy inputs.
+  const i_t* dzs_rs;   // Arow.row_start
+  const i_t* dzs_j;    // Arow.j (column indices)
+  const f_t* dzs_x;    // Arow.x
+  const i_t* dzs_dyi;  // delta_y.i (sparse nonzero rows)
+  const f_t* dzs_dyx;  // delta_y.x
+  const i_t* dzs_nbe;  // nonbasic_end
+  i_t        dzs_nzdy; // delta_y nnz
   // sparse→dense scatter (op == WARP_TODENSE): dense[0,td_n)=0 then dense[td_i[k]]=td_x[k].
   const i_t* td_i;
   const f_t* td_x;
@@ -739,6 +780,24 @@ struct warp_solve_config {
   i_t        ud_dz_nz;
   i_t        ud_leaving;
   f_t        ud_step;
+  // reach-restricted sparse gather solve (op == WARP_SPTRSV): lane 0 (in warp_dispatch_sptrsv) runs the
+  // serial reach + rhs preload + level-bucketing of the reachable set into sp_ls/sp_co, then the warp
+  // runs wavefront_gather_solve over that sparse schedule using operator sp_op's (cs/ridx/val/flags).
+  // sp_ls/sp_co/sp_pos are m(+1)-sized device scratch wired once; x is cfg.x (= x_workspace_).
+  i_t* sp_ls;    // sparse level offsets [sp_nlev+1] (built per solve)
+  i_t* sp_co;    // reachable columns bucketed by level [|R|] (built per solve)
+  i_t* sp_pos;   // scratch write-cursors [sp_nlev+1] (built per solve)
+  int  sp_op;    // which dense gather operator to reuse (WARP_L/U/LT/UT_SOLVE)
+  int  sp_nlev;  // #levels spanned by the reachable set (== the collective's __syncwarp count)
+  // initial nonbasic-partition of Arow (op == WARP_NBE): one lane per row does the two-pointer partition
+  // of its own [row_start[i], row_start[i+1]) slice (nonbasic first) and writes its own nonbasic_end[i].
+  // Rows are independent → distinct j/x slices + distinct nonbasic_end[i] → no atomics, 0 barriers.
+  const i_t* nbe_basic_mark;
+  const i_t* nbe_rs;   // Arow.row_start
+  i_t*       nbe_j;    // Arow.j (partitioned in place)
+  f_t*       nbe_x;    // Arow.x (partitioned in place)
+  i_t*       nbe_end;  // nonbasic_end (output)
+  i_t        nbe_m;
 };
 
 // Collective (all-32-lane) dense solve of operator cfg.op on x = cfg.x. Both modes do exactly
@@ -778,14 +837,12 @@ __device__ __forceinline__ f_t warp_reduce_min(f_t v)
 // (lane-strided partial + all-reduce), theta = dot/mu, then x += -theta·S(:,acol) (lane-strided
 // distinct writes). One __syncwarp per update (uniform), so the internal barrier count = tl_num
 // on both lane 0 and the helpers. Only the dot reduction is non-bit-exact (relaxed); the axpy
-// writes are distinct rows within a column -> race-free and bit-exact. work_estimate is
-// accumulated on lane 0 only (mirrors the serial dot_product / add_sparse_column accounting).
+// writes are distinct rows within a column -> race-free and bit-exact.
 __device__ void warp_collective_tloop(const warp_solve_config& cfg)
 {
   const int lane = static_cast<int>(threadIdx.x);
   const i_t num  = cfg.tl_num;
   f_t* x         = cfg.x;
-  f_t work       = 0.0;
   for (i_t s = 0; s < num; ++s) {
     const i_t k    = cfg.tl_asc ? s : (num - 1 - s);
     const i_t dcol = 2 * k + cfg.tl_dotoff;
@@ -797,16 +854,13 @@ __device__ void warp_collective_tloop(const warp_solve_config& cfg)
     for (i_t p = dc0 + lane; p < dc1; p += 32) { partial += cfg.tl_val[p] * x[cfg.tl_ri[p]]; }
     const f_t dot   = warp_reduce_add(partial);   // every lane gets the full sum
     const f_t theta = dot / mu;
-    if (lane == 0) { work += 3 * (dc1 - dc0); }
     if (fabs(theta) > cfg.tl_tol) {
       const i_t ac0 = cfg.tl_cs[acol];
       const i_t ac1 = cfg.tl_cs[acol + 1];
       for (i_t p = ac0 + lane; p < ac1; p += 32) { x[cfg.tl_ri[p]] += (-theta) * cfg.tl_val[p]; }
-      if (lane == 0) { work += 3 * (ac1 - ac0); }
     }
     __syncwarp(0xffffffffu);   // x writes visible before the next update's dot reads them
   }
-  if (lane == 0 && cfg.tl_work != nullptr) { *cfg.tl_work += work; }
 }
 
 // Collective (all-32-lane) reduced-cost SpMv: δz[j] = -A(:,j)'·δy for each nonbasic column j
@@ -825,7 +879,6 @@ __device__ void warp_collective_dz(const warp_solve_config& cfg)
   if (lane == 0) { dz[cfg.dz_leaving] = static_cast<f_t>(cfg.dz_dir); }
   const i_t num_nb = n - m;
   i_t count      = 0;    // running #appended (identical on all lanes)
-  f_t nnz_local  = 0.0;
   for (i_t base = 0; base < num_nb; base += 32) {
     const i_t k = base + lane;
     i_t j = -1; f_t dzj = 0.0; bool active = false;
@@ -835,7 +888,6 @@ __device__ void warp_collective_dz(const warp_solve_config& cfg)
       f_t dot      = 0.0;
       for (i_t p = c0; p < c1; ++p) { dot += cfg.dz_Aval[p] * cfg.dz_dy[cfg.dz_Ari[p]]; }
       dzj = -dot; dz[j] = dzj;
-      nnz_local += static_cast<f_t>(c1 - c0);
       active = (dzj != 0.0);
     }
     const unsigned ball = __ballot_sync(0xffffffffu, active);
@@ -844,12 +896,44 @@ __device__ void warp_collective_dz(const warp_solve_config& cfg)
     count += __popc(ball);
   }
   if (lane == 0) { *cfg.dz_count = count; }
-  if (cfg.dz_work != nullptr) {
-    const f_t nnz_total = warp_reduce_add(nnz_local);
-    if (lane == 0) {
-      *cfg.dz_work += 2.0 * m + 3.0 * static_cast<f_t>(num_nb) + 3.0 * nnz_total
-                    + 2.0 * static_cast<f_t>(count);
+}
+
+// Collective SCATTER form of compute_delta_z (op == WARP_DZSCAT). The outer loop over delta_y's
+// nonzeros stays SERIAL (all 32 lanes iterate the same rows in lockstep); the inner loop over a row's
+// nonbasic span [row_start, nonbasic_end] is split across the lanes. Within one CSR row the column
+// indices are distinct, so lanes write distinct delta_z[j] — no atomics. Rows are processed in order
+// and each column is touched once per row, so delta_z[j]'s accumulation order matches the serial driver
+// → bit-exact. New columns are appended in row/lane order (ordered ballot/popc). The __ballot per chunk
+// orders each row's delta_z / delta_z_mark writes before the next row's read-modify-write.
+__device__ void warp_collective_dz_scatter(const warp_solve_config& cfg)
+{
+  const int lane = static_cast<int>(threadIdx.x);
+  const i_t nz   = cfg.dzs_nzdy;
+  f_t* dz        = cfg.dz_out;
+  i_t count             = 0;   // running #appended (identical on all lanes)
+  for (i_t kk = 0; kk < nz; ++kk) {
+    const f_t dyi = cfg.dzs_dyx[kk];
+    if (fabs(dyi) < 1e-12) { continue; }         // uniform skip (dyi identical on all lanes)
+    const i_t i  = cfg.dzs_dyi[kk];
+    const i_t rs = cfg.dzs_rs[i];
+    const i_t re = cfg.dzs_nbe[i] + 1;
+    for (i_t base = rs; base < re; base += 32) {
+      const i_t p = base + lane;
+      i_t j = -1; bool newcol = false;
+      if (p < re) {
+        j = cfg.dzs_j[p];
+        dz[j] -= dyi * cfg.dzs_x[p];             // distinct j within the row → no collision
+        if (!cfg.dz_mark[j]) { cfg.dz_mark[j] = 1; newcol = true; }
+      }
+      const unsigned ball = __ballot_sync(0xffffffffu, newcol);
+      const int prefix    = __popc(ball & ((1u << lane) - 1u));
+      if (newcol) { cfg.dz_indices[count + prefix] = j; }  // increasing k/lane == serial append order
+      count += __popc(ball);
     }
+  }
+  if (lane == 0) {
+    *cfg.dz_count      = count;
+    dz[cfg.dz_leaving] = static_cast<f_t>(cfg.dz_dir);
   }
 }
 
@@ -1024,6 +1108,49 @@ __device__ void warp_collective_upddual(const warp_solve_config& cfg)
   if (lane == 0) { cfg.ud_z[cfg.ud_leaving] += step * cfg.ud_dz[cfg.ud_leaving]; }
 }
 
+// Collective reach-restricted sparse gather solve (op == WARP_SPTRSV). Lane 0 has ALREADY (in
+// warp_dispatch_sptrsv, before the publish barrier) run the serial reach, preloaded the rhs into
+// cfg.x on the reachable set, and bucketed the reachable columns by their precomputed elimination
+// level into sp_ls[sp_nlev+1] / sp_co[|R|]. Here all 32 lanes just run the same wavefront gather core
+// the dense solve uses — over operator sp_op's transpose CSC (cs/ridx/val) with its flags — but driven
+// by the SPARSE (reach-restricted) schedule instead of the full-factor one, so only the ~|R| reachable
+// columns are touched. Each reachable column gathers only its (nonzero) transpose entries, all of which
+// reference reachable rows (reach is transitively closed) → every x[k] read is defined. sp_nlev internal
+// __syncwarps (matched on lane 0 and the helpers, since sp_nlev was published before barrier A). Not
+// bit-exact vs the serial scatter (gather reorders the per-column sum) → warp path only.
+__device__ void warp_collective_sptrsv(const warp_solve_config& cfg)
+{
+  const int op = cfg.sp_op;
+  dts::wavefront_gather_solve(cfg.cs[op], cfg.ridx[op], cfg.val[op], cfg.x, cfg.sp_ls, cfg.sp_co,
+                              cfg.sp_nlev, cfg.diag_first[op], cfg.descending[op], cfg.incremental[op]);
+}
+
+// Collective initial nonbasic-partition of Arow (op == WARP_NBE): one lane per row runs the SAME
+// two-pointer partition the serial compute_initial_nonbasic_end does — nonbasic entries first, basic
+// entries pushed to the row's tail — over its own [row_start[i], row_start[i+1]) slice, then writes
+// nonbasic_end[i]. Rows touch disjoint j/x slices and disjoint nonbasic_end[i] → no atomics, no internal
+// __syncwarp, and each row's result is identical to the serial version regardless of lane scheduling.
+__device__ void warp_collective_nbe(const warp_solve_config& cfg)
+{
+  const int lane = static_cast<int>(threadIdx.x);
+  const i_t m    = cfg.nbe_m;
+  for (i_t i = lane; i < m; i += 32) {
+    i_t lo = cfg.nbe_rs[i];
+    i_t hi = cfg.nbe_rs[i + 1] - 1;
+    while (lo <= hi) {
+      const i_t j = cfg.nbe_j[lo];
+      if (cfg.nbe_basic_mark[j] >= 0) {
+        const i_t tj = cfg.nbe_j[lo]; cfg.nbe_j[lo] = cfg.nbe_j[hi]; cfg.nbe_j[hi] = tj;
+        const f_t tx = cfg.nbe_x[lo]; cfg.nbe_x[lo] = cfg.nbe_x[hi]; cfg.nbe_x[hi] = tx;
+        hi--;
+      } else {
+        lo++;
+      }
+    }
+    cfg.nbe_end[i] = hi;
+  }
+}
+
 // Route a posted request to the right collective body: op < kNumWarpSolveOps is a dense triangular
 // solve, else the tl_/dz_/td_/fd_/rt_/su_/pi_/ud_ collective selected by op. Both lane 0
 // (warp_dispatch*) and the parked helpers (warp_helper_loop) go through here, so their internal
@@ -1038,6 +1165,9 @@ __device__ void warp_collective(const warp_solve_config& cfg)
   else if (cfg.op == WARP_SEUPD) { warp_collective_seupd(cfg); }
   else if (cfg.op == WARP_PINF) { warp_collective_pinf(cfg); }
   else if (cfg.op == WARP_UPDDUAL) { warp_collective_upddual(cfg); }
+  else if (cfg.op == WARP_DZSCAT) { warp_collective_dz_scatter(cfg); }
+  else if (cfg.op == WARP_SPTRSV) { warp_collective_sptrsv(cfg); }
+  else if (cfg.op == WARP_NBE) { warp_collective_nbe(cfg); }
   else { warp_collective_solve(cfg); }
 }
 
@@ -1140,7 +1270,7 @@ __device__ int warp_build_levels_big(const gpu_csc_view& mat, bool df, bool asc,
 
 // pinv == nullptr means no permutation.
 __device__ i_t depth_first_search(
-  i_t j, const i_t* pinv, const gpu_csc_view& G, i_t top, i_t* xi, i_t* pstack, f_t& work_estimate)
+  i_t j, const i_t* pinv, const gpu_csc_view& G, i_t top, i_t* xi, i_t* pstack)
 {
   i_t head = 0;
   xi[0]    = j;
@@ -1164,7 +1294,6 @@ __device__ i_t depth_first_search(
       done         = 0;
       break;
     }
-    work_estimate += 3 * (p - psav) + 10;
     if (done) {
       pstack[head] = 0;
       xi[head]     = 0;
@@ -1176,21 +1305,19 @@ __device__ i_t depth_first_search(
 }
 
 __device__ i_t reach(
-  const gpu_sparse_vector& b, const i_t* pinv, const gpu_csc_view& G, i_t* xi, f_t& work_estimate)
+  const gpu_sparse_vector& b, const i_t* pinv, const gpu_csc_view& G, i_t* xi)
 {
   const i_t m   = G.m;
   i_t top       = m;
   const i_t bnz = b.i.size();
   for (i_t p = 0; p < bnz; ++p) {
     if (!GP_MARKED(G.col_start, b.i[p])) {
-      top = depth_first_search(b.i[p], pinv, G, top, xi, xi + m, work_estimate);
+      top = depth_first_search(b.i[p], pinv, G, top, xi, xi + m);
     }
   }
-  work_estimate += 4 * bnz;
   for (i_t p = top; p < m; ++p) {
     GP_MARK(G.col_start, xi[p]);
   }
-  work_estimate += 3 * (m - top);
   return top;
 }
 
@@ -1198,20 +1325,18 @@ __device__ i_t reach(
 // buffer; xi is a 2*m scratch. Output nonzero pattern is xi[top..m-1].
 template <bool lo>
 __device__ i_t sparse_triangle_solve(
-  const gpu_sparse_vector& b, const i_t* pinv, i_t* xi, const gpu_csc_view& G, f_t* x, f_t& work_estimate)
+  const gpu_sparse_vector& b, const i_t* pinv, i_t* xi, const gpu_csc_view& G, f_t* x)
 {
   i_t m   = G.m;
-  i_t top = reach(b, pinv, G, xi, work_estimate);
+  i_t top = reach(b, pinv, G, xi);
   for (i_t p = top; p < m; ++p) {
     x[xi[p]] = 0;
   }
-  work_estimate += 2 * (m - top);
 
   const i_t bnz = b.i.size();
   for (i_t p = 0; p < bnz; ++p) {
     x[b.i[p]] = b.x[p];
   }
-  work_estimate += 3 * bnz;
 
   for (i_t px = top; px < m; ++px) {
     i_t j = xi[px];
@@ -1230,7 +1355,6 @@ __device__ i_t sparse_triangle_solve(
       end = G.col_start[J + 1] - 1;
     }
     x[j] /= Gjj;
-    work_estimate += 4 * (end - p) + 7;
     for (; p < end; ++p) {
       x[G.i[p]] -= G.x[p] * x[j];
     }
@@ -1267,7 +1391,6 @@ struct gpu_basis_update_mpf {
   mutable i_t num_calls_L_{0}, num_calls_U_{0}, num_calls_L_transpose_{0}, num_calls_U_transpose_{0};
   mutable f_t sum_L_{0.0}, sum_U_{0.0}, sum_L_transpose_{0.0}, sum_U_transpose_{0.0};
   f_t hypersparse_threshold_{0.05};
-  mutable f_t work_estimate_{0.0};
   // When non-null (warp-optimized kernel), the 4 dense triangular solves are
   // dispatched to the whole warp via this shared config instead of running on
   // one lane. Set by lane 0 before the driver runs.
@@ -1305,7 +1428,6 @@ struct gpu_basis_update_mpf {
     c->tl_ri      = S_.i.data();
     c->tl_val     = S_.x.data();
     c->tl_mu      = mu_values_.data();
-    c->tl_work    = &work_estimate_;
     c->tl_num     = num_updates_;
     c->tl_dotoff  = dotoff;
     c->tl_axpyoff = axpyoff;
@@ -1321,7 +1443,7 @@ struct gpu_basis_update_mpf {
   // every nonbasic column's δz + the nonzero index list; the count comes back through *dz_count.
   __device__ void warp_dispatch_dz(const i_t* Acs, const i_t* Ari, const f_t* Aval, const f_t* dy,
                                    const i_t* basic, const i_t* nonbasic, f_t* dz, i_t* dz_idx,
-                                   i_t* dz_mark, i_t* dz_count, f_t* dz_work,
+                                   i_t* dz_mark, i_t* dz_count,
                                    i_t m, i_t n, i_t leaving, i_t dir) const
   {
     warp_solve_config* c = warp_cfg_;
@@ -1335,12 +1457,101 @@ struct gpu_basis_update_mpf {
     c->dz_indices  = dz_idx;
     c->dz_mark     = dz_mark;
     c->dz_count    = dz_count;
-    c->dz_work     = dz_work;
     c->dz_m        = m;
     c->dz_n        = n;
     c->dz_leaving  = leaving;
     c->dz_dir      = dir;
     c->op          = WARP_DZ;
+    __syncwarp(0xffffffffu);          // A
+    warp_collective(*c);
+    __syncwarp(0xffffffffu);          // B
+  }
+
+  // Scatter δz over the transpose (CSR) when delta_y is sparse: outer loop over delta_y's nonzeros
+  // serial, each row's nonbasic span split across the warp (WARP_DZSCAT). See warp_collective_dz_scatter.
+  __device__ void warp_dispatch_dz_scatter(const i_t* rs, const i_t* jj, const f_t* xx,
+                                           const i_t* dyi, const f_t* dyx, i_t nzdy, const i_t* nbe,
+                                           f_t* dz, i_t* dz_mark, i_t* dz_idx, i_t* dz_count,
+                                           i_t leaving, i_t dir) const
+  {
+    warp_solve_config* c = warp_cfg_;
+    c->dzs_rs     = rs;
+    c->dzs_j      = jj;
+    c->dzs_x      = xx;
+    c->dzs_dyi    = dyi;
+    c->dzs_dyx    = dyx;
+    c->dzs_nzdy   = nzdy;
+    c->dzs_nbe    = nbe;
+    c->dz_out     = dz;
+    c->dz_mark    = dz_mark;
+    c->dz_indices = dz_idx;
+    c->dz_count   = dz_count;
+    c->dz_leaving = leaving;
+    c->dz_dir     = dir;
+    c->op         = WARP_DZSCAT;
+    __syncwarp(0xffffffffu);          // A
+    warp_collective(*c);
+    __syncwarp(0xffffffffu);          // B
+  }
+
+  // Reach-restricted sparse gather solve (op == WARP_SPTRSV). `G` is the SCATTER factor the serial
+  // sparse_triangle_solve walks (L0_ / U0_ / their transposes); `op` is the matching dense gather
+  // operator (WARP_L/U/LT/UT_SOLVE) whose transpose CSC + flags + precomputed level[] we reuse. Lane 0
+  // (the only lane running the driver — helpers are parked in warp_helper_loop) runs the serial reach,
+  // preloads the rhs into x on the reachable set, and buckets the reachable columns by their precomputed
+  // elimination level into sp_ls/sp_co; then the whole warp runs the wavefront gather over that sparse
+  // schedule. Returns `top` (reachable pattern is xi_workspace_[top..m), values in x). Mirrors
+  // sparse_triangle_solve's serial pre/post exactly so solve_to_workspace / solve_to_sparse_vector /
+  // the T-loop that follow read the same xi_workspace_/x_workspace_ state.
+  __device__ i_t warp_dispatch_sptrsv(int op, const gpu_sparse_vector& b, const gpu_csc_view& G,
+                                      f_t* x) const
+  {
+    const i_t  m  = G.m;
+    i_t* const xi = xi_workspace_.data();
+    // (1) reach: serial DFS, marks + restores G.col_start in place. xi[top..m) = reachable, topo order.
+    const i_t top = reach(b, nullptr, G, xi);
+    // (2) preload x on the reachable set, then scatter the rhs (identical to sparse_triangle_solve).
+    for (i_t p = top; p < m; ++p) { x[xi[p]] = 0.0; }
+    const i_t bnz = b.i.size();
+    for (i_t p = 0; p < bnz; ++p) { x[b.i[p]] = b.x[p]; }
+    // (3) bucket the reachable columns by their precomputed elimination level (counting sort).
+    warp_solve_config* c = warp_cfg_;
+    const i_t* level = c->level[op];
+    i_t* sp_ls  = c->sp_ls;
+    i_t* sp_co  = c->sp_co;
+    i_t* sp_pos = c->sp_pos;
+    i_t nlevR = 0;
+    for (i_t p = top; p < m; ++p) { const i_t lv = level[xi[p]]; if (lv > nlevR) { nlevR = lv; } }
+    for (i_t k = 0; k <= nlevR; ++k) { sp_ls[k] = 0; }
+    for (i_t p = top; p < m; ++p) { sp_ls[level[xi[p]]]++; }          // level values ∈ [1, nlevR]
+    for (i_t k = 1; k <= nlevR; ++k) { sp_ls[k] += sp_ls[k - 1]; }    // sp_ls[lv]=count(level<=lv)
+    for (i_t lv = 1; lv <= nlevR; ++lv) { sp_pos[lv] = sp_ls[lv - 1]; }
+    for (i_t p = top; p < m; ++p) { const i_t j = xi[p]; sp_co[sp_pos[level[j]]++] = j; }
+    // (4) post the collective gather. sp_nlev is published BEFORE barrier A so lane 0 and the parked
+    //     helpers do the SAME number of internal __syncwarps (sp_nlev, one per level).
+    c->sp_op   = op;
+    c->sp_nlev = static_cast<int>(nlevR);
+    c->x       = x;
+    c->op      = WARP_SPTRSV;
+    __syncwarp(0xffffffffu);          // A
+    warp_collective(*c);
+    __syncwarp(0xffffffffu);          // B
+    return top;
+  }
+
+  // Post the initial nonbasic-partition of Arow (op == WARP_NBE) — one lane per row, see
+  // warp_collective_nbe. Runs once in setup; replaces the serial compute_initial_nonbasic_end.
+  __device__ void warp_dispatch_nbe(const i_t* basic_mark, const i_t* rs, i_t* jj, f_t* xx,
+                                    i_t* nbe, i_t m) const
+  {
+    warp_solve_config* c = warp_cfg_;
+    c->nbe_basic_mark = basic_mark;
+    c->nbe_rs         = rs;
+    c->nbe_j          = jj;
+    c->nbe_x          = xx;
+    c->nbe_end        = nbe;
+    c->nbe_m          = m;
+    c->op             = WARP_NBE;
     __syncwarp(0xffffffffu);          // A
     warp_collective(*c);
     __syncwarp(0xffffffffu);          // B
@@ -1506,7 +1717,6 @@ struct gpu_basis_update_mpf {
     out.x.clear();
     out.i.reserve(nz);
     out.x.reserve(nz);
-    work_estimate_ += 2 * nz;
     const f_t zero_tol = 1e-13;
     for (i_t k = 0; k < nz; ++k) {
       const i_t i = xi_workspace_[m + k];
@@ -1518,8 +1728,6 @@ struct gpu_basis_update_mpf {
       xi_workspace_[i]     = 0;
       x_workspace_[i]      = 0.0;
     }
-    work_estimate_ += 5 * nz;
-    work_estimate_ += 3 * out.i.size();
   }
 
   __device__ void solve_to_workspace(i_t top) const
@@ -1532,12 +1740,10 @@ struct gpu_basis_update_mpf {
       xi_workspace_[p]      = 0;
       nz++;
     }
-    work_estimate_ += 3 * (m - top);
     for (i_t k = 0; k < nz; ++k) {
       const i_t i      = xi_workspace_[m + k];
       xi_workspace_[i] = 1;
     }
-    work_estimate_ += 2 * nz;
   }
 
   __device__ void solve_to_sparse_vector(i_t top, gpu_sparse_vector& out) const
@@ -1549,7 +1755,6 @@ struct gpu_basis_update_mpf {
     out.i.clear();
     out.x.reserve(nz);
     out.i.reserve(nz);
-    work_estimate_ += 2 * nz;
     i_t k              = 0;
     const f_t zero_tol = 1e-13;
     for (i_t p = top; p < m; ++p) {
@@ -1562,7 +1767,6 @@ struct gpu_basis_update_mpf {
       xi_workspace_[p] = 0;
       k++;
     }
-    work_estimate_ += 4 * k + 3 * out.i.size();
   }
 
   __device__ i_t scatter_into_workspace(const gpu_sparse_vector& in) const
@@ -1574,11 +1778,9 @@ struct gpu_basis_update_mpf {
       xi_workspace_[i]     = 1;
       xi_workspace_[m + k] = i;
     }
-    work_estimate_ += 3 * nz;
     for (i_t k = 0; k < nz; ++k) {
       x_workspace_[in.i[k]] = in.x[k];
     }
-    work_estimate_ += 3 * nz;
     return nz;
   }
 
@@ -1588,14 +1790,12 @@ struct gpu_basis_update_mpf {
     const i_t new_last_S_col = last_S_col + 2;
     if (new_last_S_col >= static_cast<i_t>(S_.col_start.size())) {
       S_.col_start.resize(new_last_S_col + refactor_frequency_);
-      work_estimate_ += new_last_S_col + refactor_frequency_;
     }
     S_nz = S_.col_start[last_S_col];
     if (S_nz + nz > static_cast<i_t>(S_.i.size())) {
       const i_t newsz = (2 * S_nz > S_nz + nz) ? 2 * S_nz : S_nz + nz;
       S_.i.resize(newsz);
       S_.x.resize(newsz);
-      work_estimate_ += 2 * newsz;
     }
     S_start = last_S_col;
   }
@@ -1610,7 +1810,6 @@ struct gpu_basis_update_mpf {
       const i_t i = S_.i[p];
       dot += S_.x[p] * x[i];
     }
-    work_estimate_ += 3 * (col_end - col_start);
     return dot;
   }
 
@@ -1628,7 +1827,6 @@ struct gpu_basis_update_mpf {
         nz_mark++;
       }
     }
-    work_estimate_ += 2 * nz_mark + (col_end - col_start);
     return dot;
   }
 
@@ -1642,7 +1840,6 @@ struct gpu_basis_update_mpf {
       const i_t i = S.i[p];
       x[i] += theta * S.x[p];
     }
-    work_estimate_ += 3 * (col_end - col_start);
   }
 
   // x <- x + theta * Mat(:, col)   (sparse x, tracking fill via mark/nz).
@@ -1663,7 +1860,6 @@ struct gpu_basis_update_mpf {
       }
       x[i] += theta * S.x[p];
     }
-    work_estimate_ += 4 * (col_end - col_start) + 2 * (nz - nz_start);
   }
 
   // ---- triangular solves through the MPF form ----
@@ -1671,13 +1867,19 @@ struct gpu_basis_update_mpf {
   __device__ i_t u_transpose_solve(f_t* rhs) const
   {
     if constexpr (Warp) { warp_dispatch(WARP_UT_SOLVE, rhs); }
-    else { upper_triangular_transpose_solve(U0_, rhs, work_estimate_); }
+    else { upper_triangular_transpose_solve(U0_, rhs); }
     return 0;
   }
+  template <bool Warp = false>
   __device__ i_t u_transpose_solve(gpu_sparse_vector& rhs) const
   {
-    i_t top = sparse_triangle_solve<true>(
-      rhs, nullptr, xi_workspace_.data(), U0_transpose_, x_workspace_.data(), work_estimate_);
+    i_t top;
+    if constexpr (Warp) {
+      top = warp_dispatch_sptrsv(WARP_UT_SOLVE, rhs, U0_transpose_, x_workspace_.data());
+    } else {
+      top = sparse_triangle_solve<true>(rhs, nullptr, xi_workspace_.data(), U0_transpose_,
+                                        x_workspace_.data());
+    }
     solve_to_sparse_vector(top, rhs);
     return 0;
   }
@@ -1699,11 +1901,11 @@ struct gpu_basis_update_mpf {
         if (fabs(theta) > zero_tol) { add_sparse_column(S_, v_col, -theta, rhs); }
       }
     }
-    work_estimate_ += 2 * num_updates_;
     if constexpr (Warp) { warp_dispatch(WARP_LT_SOLVE, rhs); }
-    else { lower_triangular_transpose_solve(L0_, rhs, work_estimate_); }
+    else { lower_triangular_transpose_solve(L0_, rhs); }
     return 0;
   }
+  template <bool Warp = false>
   __device__ i_t l_transpose_solve(gpu_sparse_vector& rhs) const
   {
     const i_t m = L0_.m;
@@ -1711,7 +1913,7 @@ struct gpu_basis_update_mpf {
     i_t nz = rhs.i.size();
 
     const f_t zero_tol = 1e-13;
-    for (i_t k = num_updates_ - 1; k >= 0; --k) {
+    for (i_t k = num_updates_ - 1; k >= 0; --k) {   // MPF T-loop kept serial on lane 0 for now
       const i_t u_col = 2 * k;
       const i_t v_col = 2 * k + 1;
       const f_t mu    = mu_values_[k];
@@ -1721,14 +1923,17 @@ struct gpu_basis_update_mpf {
         add_sparse_column(S_, v_col, -theta, xi_workspace_.data(), nz, x_workspace_.data());
       }
     }
-    work_estimate_ += 2 * num_updates_;
 
     gpu_sparse_vector& b = sparse_scratch_;  // reused (was a per-hypersparse-solve device malloc)
     b.n = m;
-    work_estimate_ += nz;
     gather_into_sparse_vector(nz, b);
-    i_t top = sparse_triangle_solve<false>(
-      b, nullptr, xi_workspace_.data(), L0_transpose_, x_workspace_.data(), work_estimate_);
+    i_t top;
+    if constexpr (Warp) {
+      top = warp_dispatch_sptrsv(WARP_LT_SOLVE, b, L0_transpose_, x_workspace_.data());
+    } else {
+      top = sparse_triangle_solve<false>(b, nullptr, xi_workspace_.data(), L0_transpose_,
+                                         x_workspace_.data());
+    }
     solve_to_sparse_vector(top, rhs);
     return 0;
   }
@@ -1737,22 +1942,28 @@ struct gpu_basis_update_mpf {
   __device__ i_t u_solve(f_t* rhs) const
   {
     if constexpr (Warp) { warp_dispatch(WARP_U_SOLVE, rhs); }
-    else { upper_triangular_solve(U0_, rhs, work_estimate_); }
+    else { upper_triangular_solve(U0_, rhs); }
     return 0;
   }
+  template <bool Warp = false>
   __device__ i_t u_solve(gpu_sparse_vector& rhs) const
   {
-    i_t top = sparse_triangle_solve<false>(
-      rhs, nullptr, xi_workspace_.data(), U0_, x_workspace_.data(), work_estimate_);
+    i_t top;
+    if constexpr (Warp) {
+      top = warp_dispatch_sptrsv(WARP_U_SOLVE, rhs, U0_, x_workspace_.data());
+    } else {
+      top = sparse_triangle_solve<false>(rhs, nullptr, xi_workspace_.data(), U0_,
+                                         x_workspace_.data());
+    }
     solve_to_sparse_vector(top, rhs);
     return 0;
   }
 
   template <bool Warp = false>
-  __device__ i_t l_solve(f_t* rhs) const
+  __device__ void l_solve(f_t* rhs) const
   {
     if constexpr (Warp) { warp_dispatch(WARP_L_SOLVE, rhs); }
-    else { lower_triangular_solve(L0_, rhs, work_estimate_); }
+    else { lower_triangular_solve(L0_, rhs); }
     const f_t zero_tol = 1e-16;  // Any higher and pilot_ja fails
     if constexpr (Warp) {
       // dot col = v_col (2k+1), axpy col = u_col (2k), ascending k.
@@ -1767,18 +1978,22 @@ struct gpu_basis_update_mpf {
         if (fabs(theta) > zero_tol) { add_sparse_column(S_, u_col, -theta, rhs); }
       }
     }
-    work_estimate_ += 2 * num_updates_;
-    return 0;
   }
-  __device__ i_t l_solve(gpu_sparse_vector& rhs) const
+  template <bool Warp = false>
+  __device__ void l_solve(gpu_sparse_vector& rhs) const
   {
     const i_t m = L0_.m;
-    i_t top     = sparse_triangle_solve<true>(
-      rhs, nullptr, xi_workspace_.data(), L0_, x_workspace_.data(), work_estimate_);
+    i_t top;
+    if constexpr (Warp) {
+      top = warp_dispatch_sptrsv(WARP_L_SOLVE, rhs, L0_, x_workspace_.data());
+    } else {
+      top = sparse_triangle_solve<true>(rhs, nullptr, xi_workspace_.data(), L0_,
+                                        x_workspace_.data());
+    }
     solve_to_workspace(top);
     i_t nz             = m - top;
     const f_t zero_tol = 1e-13;
-    for (i_t k = 0; k < num_updates_; ++k) {
+    for (i_t k = 0; k < num_updates_; ++k) {   // MPF T-loop kept serial on lane 0 for now
       const f_t mu    = mu_values_[k];
       const i_t u_col = 2 * k;
       const i_t v_col = 2 * k + 1;
@@ -1788,9 +2003,7 @@ struct gpu_basis_update_mpf {
         add_sparse_column(S_, u_col, -theta, xi_workspace_.data(), nz, x_workspace_.data());
       }
     }
-    work_estimate_ += 2 * num_updates_;
     gather_into_sparse_vector(nz, rhs);
-    return 0;
   }
 
   // ---- B solves ----
@@ -1798,7 +2011,6 @@ struct gpu_basis_update_mpf {
   __device__ i_t b_solve(const gpu_vector<f_t>& rhs, gpu_vector<f_t>& solution) const
   {
     permute_vector(row_permutation_.data(), rhs.data(), solution.data(), L0_.m);
-    work_estimate_ += 3 * rhs.size();
     l_solve<Warp>(solution.data());
     u_solve<Warp>(solution.data());
     return 0;
@@ -1811,40 +2023,33 @@ struct gpu_basis_update_mpf {
                          bool need_Lsol = true) const
   {
     solution = rhs;
-    work_estimate_ += 2 * rhs.i.size();
     solution.inverse_permute_vector(inverse_row_permutation_.data());
-    work_estimate_ += 3 * rhs.i.size();
 
     bool use_hypersparse;
     const f_t input_size = static_cast<f_t>(rhs.i.size());
     estimate_solution_density(input_size, sum_L_, num_calls_L_, use_hypersparse);
     if (use_hypersparse) {
-      l_solve(solution);
+      l_solve<Warp>(solution);
     } else {
       gpu_vector<f_t>& solution_dense = dense_scratch_;  // reused (was a per-solve device malloc)
       if constexpr (Warp) { warp_to_dense(solution, solution_dense); } else { solution.to_dense(solution_dense); }
-      work_estimate_ += solution_dense.size();
       l_solve<Warp>(solution_dense.data());
       if constexpr (Warp) { warp_from_dense(solution_dense, solution); } else { solution.from_dense(solution_dense); }
-      work_estimate_ += solution_dense.size();
     }
     if (need_Lsol) {
       Lsol = solution;
-      work_estimate_ += 2 * solution.i.size();
     }
     sum_L_ += static_cast<f_t>(solution.i.size()) / input_size;
 
     const f_t rhs_size = static_cast<f_t>(solution.i.size());
     estimate_solution_density(rhs_size, sum_U_, num_calls_U_, use_hypersparse);
     if (use_hypersparse) {
-      u_solve(solution);
+      u_solve<Warp>(solution);
     } else {
       gpu_vector<f_t>& solution_dense = dense_scratch_;  // reused (was a per-solve device malloc)
       if constexpr (Warp) { warp_to_dense(solution, solution_dense); } else { solution.to_dense(solution_dense); }
-      work_estimate_ += solution_dense.size();
       u_solve<Warp>(solution_dense.data());
       if constexpr (Warp) { warp_from_dense(solution_dense, solution); } else { solution.from_dense(solution_dense); }
-      work_estimate_ += solution_dense.size();
     }
     sum_U_ += static_cast<f_t>(solution.i.size()) / rhs_size;
     return 0;
@@ -1868,7 +2073,7 @@ struct gpu_basis_update_mpf {
       input_size, sum_U_transpose_, num_calls_U_transpose_, use_hypersparse);
     if (use_hypersparse) {
       solution = rhs;
-      u_transpose_solve(solution);
+      u_transpose_solve<Warp>(solution);
     } else {
       gpu_vector<f_t>& solution_dense = dense_scratch_;  // reused (was a per-solve device malloc)
       if constexpr (Warp) { warp_to_dense(rhs, solution_dense); } else { rhs.to_dense(solution_dense); }
@@ -1882,7 +2087,7 @@ struct gpu_basis_update_mpf {
     estimate_solution_density(
       rhs_size, sum_L_transpose_, num_calls_L_transpose_, use_hypersparse);
     if (use_hypersparse) {
-      l_transpose_solve(solution);
+      l_transpose_solve<Warp>(solution);
     } else {
       gpu_vector<f_t>& solution_dense = dense_scratch_;  // reused (was a per-solve device malloc)
       if constexpr (Warp) { warp_to_dense(solution, solution_dense); } else { solution.to_dense(solution_dense); }
@@ -1906,17 +2111,14 @@ struct gpu_basis_update_mpf {
     gpu_sort(xi_workspace_.data() + m,
              xi_workspace_.data() + m + nz,
              [] __device__(i_t a, i_t b) { return a < b; });
-    work_estimate_ += (m + nz) * log2((f_t)(m + nz));
 
     i_t S_start;
     i_t S_nz;
     grow_storage(nz + static_cast<i_t>(etilde.i.size()), S_start, S_nz);
 
     S_.append_column(nz, xi_workspace_.data() + m, x_workspace_.data());
-    work_estimate_ += 5 * nz;
 
     etilde.sort(sort_bucket_, sort_i_, sort_x_, sort_perm_);  // reused scratch (no per-pivot malloc)
-    work_estimate_ += etilde.i.size() * log2((f_t)etilde.i.size());
     {
       // S_.append_column(sparse_vector etilde): append nonzeros directly.
       i_t pos       = S_.col_start[S_.n];
@@ -1932,7 +2134,6 @@ struct gpu_basis_update_mpf {
       S_.col_start[S_.n + 1] = pos;
       S_.n++;
     }
-    work_estimate_ += 4 * etilde.i.size();
 
     const f_t mu = 1.0 + sparse_dot(S_.i.data() + S_.col_start[S_start],
                                     S_.x.data() + S_.col_start[S_start],
@@ -1940,7 +2141,6 @@ struct gpu_basis_update_mpf {
                                     S_.i.data() + S_.col_start[S_start + 1],
                                     S_.x.data() + S_.col_start[S_start + 1],
                                     S_.col_start[S_start + 2] - S_.col_start[S_start + 1]);
-    work_estimate_ += 3 * min(nz, static_cast<i_t>(etilde.i.size()));
 
     if (fabs(mu) < 1E-8 || fabs(mu) > 1E+8) { return 1; }
     mu_values_.push_back(mu);
@@ -1951,7 +2151,6 @@ struct gpu_basis_update_mpf {
       x_workspace_[i]      = 0.0;
       xi_workspace_[m + k] = 0;
     }
-    work_estimate_ += 4 * nz;
     num_updates_++;
     return 0;
   }
@@ -1965,6 +2164,10 @@ struct gpu_lp {
   gpu_csc_view A;
   gpu_span<f_t> rhs, lower, upper, objective;
   f_t obj_scale{1.0}, obj_constant{0.0};
+  // Optional host-built CSR of A (Arow). Null => build on device via from_csc.
+  const i_t* Arow_row_start{nullptr};
+  const i_t* Arow_j{nullptr};
+  const f_t* Arow_x{nullptr};
 };
 
 struct gpu_settings {
@@ -1980,8 +2183,7 @@ struct gpu_solution {
 };
 
 // ---------------------------------------------------------------------------
-// phase2::* helpers (phase2.cpp / solve.cpp). work_estimate is kept for fidelity
-// but is unused by the result.
+// phase2::* helpers (phase2.cpp / solve.cpp).
 // ---------------------------------------------------------------------------
 __device__ f_t compute_objective(const gpu_lp& problem, const f_t* x)
 {
@@ -2029,8 +2231,7 @@ __device__ void compute_reduced_cost_update(const gpu_lp& lp,
                                             i_t direction,
                                             i_t* delta_z_mark,
                                             gpu_vector<i_t>& delta_z_indices,
-                                            f_t* delta_z,
-                                            f_t& work_estimate)
+                                            f_t* delta_z)
 {
   const i_t m = lp.num_rows;
   const i_t n = lp.num_cols;
@@ -2042,17 +2243,15 @@ __device__ void compute_reduced_cost_update(const gpu_lp& lp,
     i_t dz_count = 0;
     ft.warp_dispatch_dz(lp.A.col_start.data(), lp.A.i.data(), lp.A.x.data(), delta_y, basic_list,
                         nonbasic_list, delta_z, delta_z_indices.data(), delta_z_mark, &dz_count,
-                        &work_estimate, m, n, leaving_index, direction);
+                        m, n, leaving_index, direction);
     delta_z_indices.set_size(dz_count);
     return;
   }
 
-  size_t nnzs_processed = 0;
   for (i_t k = 0; k < m; k++) {
     const i_t j = basic_list[k];
     delta_z[j]  = 0;
   }
-  work_estimate += 2 * m;
   delta_z[leaving_index] = direction;
   const i_t num_nonbasic = n - m;
   for (i_t k = 0; k < num_nonbasic; k++) {
@@ -2063,7 +2262,6 @@ __device__ void compute_reduced_cost_update(const gpu_lp& lp,
     for (i_t p = col_start; p < col_end; ++p) {
       dot += lp.A.x[p] * delta_y[lp.A.i[p]];
     }
-    nnzs_processed += col_end - col_start;
 
     delta_z[j] = -dot;
     if (dot != 0.0) {
@@ -2071,33 +2269,42 @@ __device__ void compute_reduced_cost_update(const gpu_lp& lp,
       delta_z_mark[j] = 1;
     }
   }
-  work_estimate += 3 * num_nonbasic;
-  work_estimate += 3 * nnzs_processed;
-  work_estimate += 2 * delta_z_indices.size();
 }
 
 // Transpose delta_z: delta_z_N = -A_N' delta_y, row-wise on the CSR copy Arow,
 // iterating only the nonzero rows of delta_y and only their nonbasic-column portion
 // (Arow.row_start[i] .. nonbasic_end[i]). Mirrors the CPU compute_delta_z bit-for-bit.
-__device__ void compute_delta_z(const gpu_csr_matrix& Arow,
+template <bool Warp>
+__device__ void compute_delta_z(const gpu_basis_update_mpf& ft,
+                                const gpu_csr_matrix& Arow,
                                 const gpu_sparse_vector& delta_y,
                                 i_t leaving_index,
                                 i_t direction,
                                 const i_t* nonbasic_end,
                                 i_t* delta_z_mark,
                                 gpu_vector<i_t>& delta_z_indices,
-                                f_t* delta_z,
-                                f_t& work_estimate)
+                                f_t* delta_z)
 {
+  if constexpr (Warp) {
+    // Collectively scatter (inner span per row split across the warp). delta_z_indices is empty here
+    // (cleared each iter, reserved to n); the collective raw-writes [0,count), we set the size back.
+    // Always taken on the warp path (proven ~1.12x overall, bit-exact — was CUOPT_GPU_DZSCAT, now default).
+    i_t dz_count = 0;
+    ft.warp_dispatch_dz_scatter(Arow.row_start.data(), Arow.j.data(), Arow.x.data(),
+                                delta_y.i.data(), delta_y.x.data(),
+                                static_cast<i_t>(delta_y.i.size()), nonbasic_end, delta_z,
+                                delta_z_mark, delta_z_indices.data(), &dz_count,
+                                leaving_index, direction);
+    delta_z_indices.set_size(dz_count);
+    return;
+  }
   const i_t nz_delta_y = (i_t)delta_y.i.size();
-  size_t nnz_processed = 0;
   for (i_t k = 0; k < nz_delta_y; k++) {
     const i_t i         = delta_y.i[k];
     const f_t delta_y_i = delta_y.x[k];
     if (fabs(delta_y_i) < 1e-12) { continue; }
     const i_t row_start = Arow.row_start[i];
     const i_t row_end   = nonbasic_end[i] + 1;
-    nnz_processed += row_end - row_start;
     for (i_t p = row_start; p < row_end; ++p) {
       const i_t j = Arow.j[p];
       delta_z[j] -= delta_y_i * Arow.x[p];
@@ -2107,19 +2314,24 @@ __device__ void compute_delta_z(const gpu_csr_matrix& Arow,
       }
     }
   }
-  work_estimate += 4 * nz_delta_y;
-  work_estimate += 4 * nnz_processed;
-  work_estimate += 2 * delta_z_indices.size();
   delta_z[leaving_index] = direction;
 }
 
 // Partition each row of Arow so nonbasic-variable coefficients occupy
 // Arow.row_start[i] .. nonbasic_end[i]. Mirrors compute_initial_nonbasic_end.
-__device__ void compute_initial_nonbasic_end(const i_t* basic_mark,
+// Warp path: one lane per row (rows independent) via WARP_NBE; the serial loop is the reference.
+template <bool Warp = false>
+__device__ void compute_initial_nonbasic_end(const gpu_basis_update_mpf& ft,
+                                             const i_t* basic_mark,
                                              gpu_csr_matrix& Arow,
                                              i_t* nonbasic_end)
 {
   const i_t m = Arow.m;
+  if constexpr (Warp) {
+    ft.warp_dispatch_nbe(basic_mark, Arow.row_start.data(), Arow.j.data(), Arow.x.data(),
+                         nonbasic_end, m);
+    return;
+  }
   for (i_t i = 0; i < m; i++) {
     i_t lo = Arow.row_start[i];
     i_t hi = Arow.row_start[i + 1] - 1;
@@ -2144,14 +2356,12 @@ __device__ void update_Arow(i_t leaving,
                             const gpu_csc_view& A,
                             gpu_vector<i_t>& row_mark,
                             i_t* nonbasic_end,
-                            gpu_csr_matrix& Arow,
-                            f_t& work_estimate)
+                            gpu_csr_matrix& Arow)
 {
   row_mark.clear();
   const i_t col_start_enter = A.col_start[entering];
   const i_t col_end_enter   = A.col_start[entering + 1];
   for (i_t p = col_start_enter; p < col_end_enter; p++) { row_mark.push_back(A.i[p]); }
-  work_estimate += 2 * (col_end_enter - col_start_enter);
 
   for (i_t t = 0; t < (i_t)row_mark.size(); ++t) {
     const i_t i         = row_mark[t];
@@ -2165,15 +2375,12 @@ __device__ void update_Arow(i_t leaving,
         break;
       }
     }
-    work_estimate += nb_end - row_start;
   }
-  work_estimate += 2 * row_mark.size();
 
   row_mark.clear();
   const i_t col_start_leave = A.col_start[leaving];
   const i_t col_end_leave   = A.col_start[leaving + 1];
   for (i_t p = col_start_leave; p < col_end_leave; p++) { row_mark.push_back(A.i[p]); }
-  work_estimate += 2 * (col_end_leave - col_start_leave);
 
   for (i_t t = 0; t < (i_t)row_mark.size(); ++t) {
     const i_t i       = row_mark[t];
@@ -2187,9 +2394,7 @@ __device__ void update_Arow(i_t leaving,
         break;
       }
     }
-    work_estimate += row_end - nb_end;
   }
-  work_estimate += 2 * row_mark.size();
 }
 
 // Exact steepest-edge norm init: gamma_j = ||B^-T e_k||^2 for each basic var, via a
@@ -2199,14 +2404,12 @@ template <bool Warp = false>
 __device__ i_t initialize_steepest_edge_norms(const gpu_lp& lp,
                                               const i_t* basic_list,
                                               gpu_basis_update_mpf& ft,
-                                              f_t* delta_y_steepest_edge,
-                                              f_t& work_estimate)
+                                              f_t* delta_y_steepest_edge)
 {
   const i_t m = lp.num_rows;
   gpu_vector<i_t> row_degree(m, 0);
   gpu_vector<i_t> mapping(m, -1);
   gpu_vector<f_t> coeff(m, 0.0);
-  work_estimate += 3 * m;
   for (i_t k = 0; k < m; ++k) {
     const i_t j         = basic_list[k];
     const i_t col_start = lp.A.col_start[j];
@@ -2217,9 +2420,7 @@ __device__ i_t initialize_steepest_edge_norms(const gpu_lp& lp,
       mapping[k] = i;
       coeff[k]   = lp.A.x[p];
     }
-    work_estimate += 5 * (col_end - col_start);
   }
-  work_estimate += 3 * m;
 
   gpu_sparse_vector sparse_dy(m, 0);
   gpu_sparse_vector UTsol_scratch(m, 0);
@@ -2239,12 +2440,10 @@ __device__ i_t initialize_steepest_edge_norms(const gpu_lp& lp,
       for (i_t p = 0; p < (i_t)sparse_dy.x.size(); ++p) {
         my_init += sparse_dy.x[p] * sparse_dy.x[p];
       }
-      work_estimate += 2 * sparse_dy.x.size();
       init = my_init;
     }
     delta_y_steepest_edge[j] = init;
   }
-  work_estimate += 7 * m;
   return 0;
 }
 
@@ -2256,14 +2455,12 @@ __device__ void compute_primal_variables(const gpu_basis_update_mpf& ft,
                                          const i_t* nonbasic_list,
                                          f_t tight_tol,
                                          f_t* x,
-                                         gpu_vector<f_t>& xB_workspace,
-                                         f_t& work_estimate)
+                                         gpu_vector<f_t>& xB_workspace)
 {
   const i_t m = A.m;
   const i_t n = A.n;
   gpu_vector<f_t> rhs(m);
   for (i_t k = 0; k < m; ++k) { rhs[k] = lp_rhs[k]; }
-  work_estimate += 2 * m;
   for (i_t k = 0; k < n - m; ++k) {
     const i_t j         = nonbasic_list[k];
     const i_t col_start = A.col_start[j];
@@ -2273,19 +2470,15 @@ __device__ void compute_primal_variables(const gpu_basis_update_mpf& ft,
     for (i_t p = col_start; p < col_end; ++p) {
       rhs[A.i[p]] -= xj * A.x[p];
     }
-    work_estimate += 3 * (col_end - col_start);
   }
-  work_estimate += 5 * (n - m);
 
   xB_workspace.resize(m);
-  work_estimate += m;
   ft.b_solve<Warp>(rhs, xB_workspace);
 
   for (i_t k = 0; k < m; ++k) {
     const i_t j = basic_list[k];
     x[j]        = xB_workspace[k];
   }
-  work_estimate += 2 * m;
 }
 
 __device__ void clear_delta_z(
@@ -2358,8 +2551,7 @@ __device__ i_t steepest_edge_pricing_with_infeasibilities(const gpu_lp& lp,
                                                           gpu_vector<i_t>& infeasibility_indices,
                                                           i_t& direction,
                                                           i_t& basic_leaving,
-                                                          f_t& max_val,
-                                                          f_t& work_estimate)
+                                                          f_t& max_val)
 {
   max_val           = 0.0;
   i_t leaving_index = -1;
@@ -2378,7 +2570,6 @@ __device__ i_t steepest_edge_pricing_with_infeasibilities(const gpu_lp& lp,
       max_count++;
     }
   }
-  work_estimate += 3 * nz + 3 * max_count;
   basic_leaving = leaving_index >= 0 ? basic_mark[leaving_index] : -1;
   return leaving_index;
 }
@@ -2473,8 +2664,7 @@ __device__ i_t update_dual_variables(const gpu_basis_update_mpf& ft,
                                      f_t step_length,
                                      i_t leaving_index,
                                      f_t* y,
-                                     f_t* z,
-                                     f_t& work_estimate)
+                                     f_t* z)
 {
   const i_t delta_y_nz = delta_y_sparse.i.size();
   if constexpr (Warp) {
@@ -2487,13 +2677,11 @@ __device__ i_t update_dual_variables(const gpu_basis_update_mpf& ft,
     const i_t i = delta_y_sparse.i[k];
     y[i] += step_length * delta_y_sparse.x[k];
   }
-  work_estimate += 3 * delta_y_nz;
   const i_t delta_z_nz = delta_z_indices.size();
   for (i_t k = 0; k < delta_z_nz; ++k) {
     const i_t j = delta_z_indices[k];
     z[j] += step_length * delta_z[j];
   }
-  work_estimate += 3 * delta_z_nz;
   z[leaving_index] += step_length * delta_z[leaving_index];
   return 0;
 }
@@ -2511,30 +2699,24 @@ __device__ i_t compute_delta_x(const gpu_lp& lp,
                                const f_t* x,
                                gpu_sparse_vector& utilde_sparse,
                                gpu_sparse_vector& scaled_delta_xB_sparse,
-                               f_t* delta_x,
-                               f_t& work_estimate)
+                               f_t* delta_x)
 {
   f_t delta_x_leaving = direction == 1 ? lp.lower[leaving_index] - x[leaving_index]
                                        : lp.upper[leaving_index] - x[leaving_index];
   ft.b_solve<Warp>(rhs_sparse, scaled_delta_xB_sparse, utilde_sparse);
   scaled_delta_xB_sparse.negate();
-  work_estimate += 2 * scaled_delta_xB_sparse.i.size();
 
   f_t scale = scaled_delta_xB_sparse.find_coefficient(basic_leaving_index);
-  work_estimate += 2 * scaled_delta_xB_sparse.i.size();
   if (scale != scale) {
     gpu_vector<f_t> rhs;
     rhs_sparse.to_dense(rhs);
-    work_estimate += 2 * rhs.size();
     const i_t m = lp.num_rows;
     gpu_vector<f_t> scaled_delta_xB(m);
-    work_estimate += m;
     ft.b_solve<Warp>(rhs, scaled_delta_xB);
     if (scaled_delta_xB[basic_leaving_index] != 0.0 &&
         !isnan(scaled_delta_xB[basic_leaving_index])) {
       scaled_delta_xB_sparse.from_dense(scaled_delta_xB);
       scaled_delta_xB_sparse.negate();
-      work_estimate += 2 * scaled_delta_xB_sparse.i.size() + scaled_delta_xB.size();
       scale = -scaled_delta_xB[basic_leaving_index];
     } else if (delta_z[entering_index] != 0.0) {
       scale              = -delta_z[entering_index];
@@ -2560,7 +2742,6 @@ __device__ i_t compute_delta_x(const gpu_lp& lp,
     const i_t j = basic_list[scaled_delta_xB_sparse.i[k]];
     delta_x[j]  = primal_step_length * scaled_delta_xB_sparse.x[k];
   }
-  work_estimate += 4 * scaled_delta_xB_nz;
   delta_x[leaving_index]  = delta_x_leaving;
   delta_x[entering_index] = primal_step_length;
   return 0;
@@ -2578,8 +2759,7 @@ __device__ i_t update_steepest_edge_norms(const gpu_settings& settings,
                                           i_t entering_index,
                                           f_t* v,
                                           gpu_sparse_vector& v_sparse,
-                                          f_t* delta_y_steepest_edge,
-                                          f_t& work_estimate)
+                                          f_t* delta_y_steepest_edge)
 {
   v_sparse.clear();
   KT_TIC(_kt_ses);  // [KTIMER] se sub-split: time the b_solve (se_solve); se_rest = se - se_solve
@@ -2587,13 +2767,10 @@ __device__ i_t update_steepest_edge_norms(const gpu_settings& settings,
   KT_TOC(KT_SE_SOLVE, _kt_ses);
   if (direction == -1) {
     v_sparse.negate();
-    work_estimate += 2 * v_sparse.i.size();
   }
   v_sparse.scatter(v);
-  work_estimate += 2 * v_sparse.i.size();
 
   const f_t wr = -scaled_delta_xB.find_coefficient(basic_leaving_index);
-  work_estimate += scaled_delta_xB.i.size();
   if (wr == 0) { return -1; }
   const f_t omegar             = dy_norm_squared / (wr * wr);
   const i_t scaled_delta_xB_nz = scaled_delta_xB.i.size();
@@ -2620,13 +2797,11 @@ __device__ i_t update_steepest_edge_norms(const gpu_settings& settings,
       }
     }
   }
-  work_estimate += 5 * scaled_delta_xB_nz;
 
   const i_t v_nz = v_sparse.i.size();
   for (i_t k = 0; k < v_nz; ++k) {
     v[v_sparse.i[k]] = 0.0;
   }
-  work_estimate += 2 * v_nz;
   return 0;
 }
 
@@ -2634,15 +2809,13 @@ __device__ void update_primal_variables(const gpu_sparse_vector& scaled_delta_xB
                                         const i_t* basic_list,
                                         const f_t* delta_x,
                                         i_t entering_index,
-                                        f_t* x,
-                                        f_t& work_estimate)
+                                        f_t* x)
 {
   const i_t scaled_delta_xB_nz = scaled_delta_xB_sparse.i.size();
   for (i_t k = 0; k < scaled_delta_xB_nz; ++k) {
     const i_t j = basic_list[scaled_delta_xB_sparse.i[k]];
     x[j] += delta_x[j];
   }
-  work_estimate += 4 * scaled_delta_xB_nz;
   x[entering_index] += delta_x[entering_index];
 }
 
@@ -2711,17 +2884,16 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
   f_t* y = sol.y.data();
   f_t* z = sol.z.data();
 
-  f_t work = 0.0;
   gpu_vector<f_t> xB_workspace(m);
 
   set_primal_variables_on_bounds(lp, settings, z, vstatus, x);
   compute_primal_variables<Warp>(
-    ft, lp.rhs, lp.A, basic_list, nonbasic_list, settings.tight_tol, x, xB_workspace, work);
+    ft, lp.rhs, lp.A, basic_list, nonbasic_list, settings.tight_tol, x, xB_workspace);
 
   if (dy_se_empty) {
     // Exact steepest-edge init (matches the CPU simplified's unconditional exact path).
     for (i_t k = 0; k < n; ++k) { delta_y_steepest_edge[k] = -1.0; }
-    initialize_steepest_edge_norms<Warp>(lp, basic_list, ft, delta_y_steepest_edge, work);
+    initialize_steepest_edge_norms<Warp>(lp, basic_list, ft, delta_y_steepest_edge);
   } else {
     for (i_t k = 0; k < m; ++k) {
       const i_t j = basic_list[k];
@@ -2743,11 +2915,18 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
   // once here; nonbasic_end is maintained per pivot by update_Arow (no refactor rebuild
   // needed — the GPU is pure MPF stacking).
   gpu_csr_matrix Arow;
-  Arow.from_csc(lp.A);
+  if (lp.Arow_row_start != nullptr) {
+    // Zero-copy view over the host-built Arow (uploaded per-solve, mutable) — skips the on-device
+    // from_csc transpose. Always used when present (was CUOPT_GPU_HOST_AROW, now default).
+    Arow.view_device(lp.Arow_row_start, lp.Arow_j, lp.Arow_x, m, n, lp.A.col_start[n]);
+  } else {
+    // Arow not uploaded (the RO-shared batch path leaves it null) → build on device off the shared A.
+    Arow.from_csc(lp.A);
+  }
   gpu_vector<i_t> nonbasic_end(m);
   gpu_vector<i_t> row_mark;
   row_mark.reserve(m);
-  compute_initial_nonbasic_end(basic_mark.data(), Arow, nonbasic_end.data());
+  compute_initial_nonbasic_end<Warp>(ft, basic_mark.data(), Arow, nonbasic_end.data());
 
   gpu_vector<f_t> squared_infeas;
   gpu_vector<i_t> infeas_idx;
@@ -2790,7 +2969,7 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     KT_TIC(_kt_pr);
     const i_t leaving = steepest_edge_pricing_with_infeasibilities(
       lp, settings, x, delta_y_steepest_edge, basic_mark.data(), squared_infeas, infeas_idx,
-      direction, basic_leaving, max_val, work);
+      direction, basic_leaving, max_val);
     KT_TOC(KT_PRICING, _kt_pr);
     if (leaving == -1) {
       sol.objective      = compute_objective(lp, x);
@@ -2827,15 +3006,15 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     const bool used_transpose_dz    = delta_y_nz_percentage <= 30.0;
     if (used_transpose_dz) {
       KT_TIC(_kt_dz);
-      compute_delta_z(Arow, delta_y_sparse, leaving, direction, nonbasic_end.data(),
-                      delta_z_mark.data(), delta_z_indices, delta_z.data(), work);
+      compute_delta_z<Warp>(ft, Arow, delta_y_sparse, leaving, direction, nonbasic_end.data(),
+                            delta_z_mark.data(), delta_z_indices, delta_z.data());
       KT_TOC(KT_DZ, _kt_dz);
     } else {
       delta_y_sparse.to_dense(delta_y);
       KT_TIC(_kt_rcu);
       compute_reduced_cost_update<Warp>(lp, ft, basic_list, nonbasic_list, delta_y.data(), leaving,
                                         direction, delta_z_mark.data(), delta_z_indices,
-                                        delta_z.data(), work);
+                                        delta_z.data());
       KT_TOC(KT_RCU, _kt_rcu);
     }
 
@@ -2855,7 +3034,7 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
 
     KT_TIC(_kt_ud);
     update_dual_variables<Warp>(
-      ft, delta_y_sparse, delta_z_indices, delta_z.data(), step_length, leaving, y, z, work);
+      ft, delta_y_sparse, delta_z_indices, delta_z.data(), step_length, leaving, y, z);
     KT_TOC(KT_UPDDUAL, _kt_ud);
 
     // FTran.
@@ -2865,7 +3044,7 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     KT_TIC(_kt_ft);
     const i_t dx_status =
       compute_delta_x<Warp>(lp, ft, entering, leaving, basic_leaving, direction, basic_list, rhs_sparse,
-                      delta_z.data(), x, utilde_sparse, scaled_dxB_sparse, delta_x.data(), work);
+                      delta_z.data(), x, utilde_sparse, scaled_dxB_sparse, delta_x.data());
     KT_TOC(KT_FTRAN, _kt_ft);
     if (dx_status == -1) {
       sol.objective      = compute_objective(lp, x);
@@ -2877,11 +3056,11 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     KT_TIC(_kt_se);
     update_steepest_edge_norms<Warp>(settings, basic_list, ft, direction, delta_y_sparse, dy_norm_sq,
                                scaled_dxB_sparse, basic_leaving, entering, v.data(), v_sparse,
-                               delta_y_steepest_edge, work);
+                               delta_y_steepest_edge);
     KT_TOC(KT_SE, _kt_se);
 
     KT_TIC(_kt_up);
-    update_primal_variables(scaled_dxB_sparse, basic_list, delta_x.data(), entering, x, work);
+    update_primal_variables(scaled_dxB_sparse, basic_list, delta_x.data(), entering, x);
     KT_TOC(KT_UPDPRIM, _kt_up);
 
     // Incrementally update the objective the SAME way the CPU driver does (phase2.cpp:4259):
@@ -2903,7 +3082,7 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
 
     // Keep the CSR nonbasic partition in sync for the next iteration's transpose delta_z.
     KT_TIC(_kt_ar);
-    update_Arow(leaving, entering, lp.A, row_mark, nonbasic_end.data(), Arow, work);
+    update_Arow(leaving, entering, lp.A, row_mark, nonbasic_end.data(), Arow);
     KT_TOC(KT_AROW, _kt_ar);
 
     KT_TIC(_kt_fu);
@@ -2958,6 +3137,9 @@ struct kernel_args {
   i_t *A_col_start, *A_i;
   f_t* A_x;
   i_t A_nz;
+  // Host-built CSR of A (Arow); null when not provided (device builds it via from_csc).
+  i_t *Arow_row_start, *Arow_j;
+  f_t* Arow_x;
   f_t *rhs, *lower, *upper, *objective;
   f_t obj_scale, obj_constant;
   // factorization
@@ -3014,12 +3196,22 @@ __device__ gpu_csc_view make_view(
 // level schedules are written into the caller-owned gpu_vectors ls[o]/co[o]
 // (kept alive for the whole kernel); `lvlscratch` is reused m-sized workspace.
 __device__ void warp_build_config(const gpu_basis_update_mpf& ft, warp_solve_config& cfg,
-                                   gpu_vector<i_t>& lvlscratch, gpu_vector<i_t>& bigscratch,
+                                   gpu_vector<i_t>* lev, gpu_vector<i_t>& bigscratch,
                                    gpu_vector<i_t>* ls, gpu_vector<i_t>* co,
-                                   gpu_vector<i_t>* lw, gpu_vector<unsigned>* bt)
+                                   gpu_vector<i_t>* lw, gpu_vector<unsigned>* bt,
+                                   gpu_vector<i_t>& sp_ls_v, gpu_vector<i_t>& sp_co_v,
+                                   gpu_vector<i_t>& sp_pos_v)
 {
   cfg.mode = g_warp_solve_mode;
   cfg.m    = ft.L0_.m;
+  // Reach-restricted sparse-solve scratch (built fresh per solve in warp_dispatch_sptrsv): m(+1)-sized.
+  const i_t m = ft.L0_.m;
+  sp_co_v.resize(m);
+  sp_ls_v.resize(m + 1);
+  sp_pos_v.resize(m + 1);
+  cfg.sp_co  = sp_co_v.data();
+  cfg.sp_ls  = sp_ls_v.data();
+  cfg.sp_pos = sp_pos_v.data();
   // op order: L, U, Lᵀ, Uᵀ (see warp_solve_op). Gather matrix + flags per op.
   // Indexed by warp_solve_op: {L, U, Lᵀ, Uᵀ}.
   const gpu_csc_view* mats[kNumWarpSolveOps] = {&ft.L0_transpose_, &ft.U0_transpose_, &ft.L0_, &ft.U0_};
@@ -3035,15 +3227,16 @@ __device__ void warp_build_config(const gpu_basis_update_mpf& ft, warp_solve_con
     cfg.descending[o] = dsc[o];
     cfg.incremental[o] = inc[o];
     if (cfg.mode == 1) {     // big: sorted large-first order + bitmask
-      cfg.nlev[o]  = warp_build_levels_big(*mats[o], df[o], asc[o], lvlscratch, ls[o], co[o], lw[o],
+      cfg.nlev[o]  = warp_build_levels_big(*mats[o], df[o], asc[o], lev[o], ls[o], co[o], lw[o],
                                            bt[o], bigscratch);
       cfg.lword[o] = lw[o].data();
       cfg.bits[o]  = bt[o].data();
     } else {                 // plain wavefront: one lane per column
-      cfg.nlev[o]  = warp_build_levels(*mats[o], df[o], asc[o], lvlscratch, ls[o], co[o]);
+      cfg.nlev[o]  = warp_build_levels(*mats[o], df[o], asc[o], lev[o], ls[o], co[o]);
     }
     cfg.lstart[o]     = ls[o].data();
     cfg.corder[o]     = co[o].data();
+    cfg.level[o]      = lev[o].data();  // per-column level, retained for the reach-restricted sparse solve
   }
 }
 
@@ -3053,14 +3246,20 @@ __device__ void warp_build_config(const gpu_basis_update_mpf& ft, warp_solve_con
 // (Warp=true, lane 0 drives, lanes 1..31 run the collective wavefront solves).
 // g_gpu_alloc_failed is reset by the HOST before launch (not here) so a late block
 // can't clear a failure flag an earlier block already set.
-template <bool Warp>
+// MinBlocks = the __launch_bounds__ minBlocksPerMultiprocessor. ptxas caps registers at
+// 65536/(blockDim*MinBlocks): warp path (blockDim 32) → MinBlocks 8 = 256-reg budget (default, the
+// kernel's natural 255 regs, ~8 resident blocks/SM on B200), 16 = 128-reg cap (~16 blocks, some
+// spilling), 32 = 64-reg cap (~32 blocks = the HW max, heavier spilling). The batch launcher picks the
+// variant at runtime (CUOPT_GPU_REGCAP) so throughput-vs-register-pressure can be swept in one binary.
+template <bool Warp, int MinBlocks = 8>
 __global__ void
-// Only the max-threads bound must change for the 32-lane warp path; minBlocks stays 8
-// (no effect here: one block is ever launched, and 65536/(32*8) already exceeds the
-// 255-register hardware cap, so the warp kernel keeps the full register budget).
-__launch_bounds__(Warp ? 32 : 1, 8)
+__launch_bounds__(Warp ? 32 : 1, MinBlocks)
 gpu_phase2_kernel(kernel_args* args)
 {
+  // NOTE: the CUDA 13 `.pragma "enable_smem_spilling"` (spill regs to shared instead of local) is
+  // INCOMPATIBLE here — ptxas fails with "(C7800) Smem spilling should not be enabled when functions
+  // use abi": this kernel makes ABI (non-inlined) device calls into the whole driver, and the pragma
+  // requires a fully-inlined call tree. Not usable without force-inlining everything.
   // Reject a launch geometry that doesn't match the compiled path (the whole point
   // of the compile-time Warp parameter: no runtime branch selects opt vs unopt).
   if constexpr (Warp) {
@@ -3089,6 +3288,9 @@ gpu_phase2_kernel(kernel_args* args)
   lp.num_rows     = m;
   lp.num_cols     = n;
   lp.A            = make_view(m, n, a.A_nz, a.A_col_start, a.A_i, a.A_x);
+  lp.Arow_row_start = a.Arow_row_start;
+  lp.Arow_j         = a.Arow_j;
+  lp.Arow_x         = a.Arow_x;
   lp.rhs          = gpu_span<f_t>(a.rhs, m);
   lp.lower        = gpu_span<f_t>(a.lower, n);
   lp.upper        = gpu_span<f_t>(a.upper, n);
@@ -3130,14 +3332,16 @@ gpu_phase2_kernel(kernel_args* args)
   // Warp path: precompute the fixed L0/U0 elimination-level schedules once and
   // wire ft to the shared config. These gpu_vectors stay alive (lane 0) for the
   // whole solve; their device buffers are readable by all lanes via the config.
-  gpu_vector<i_t> lvlscratch;
   gpu_vector<i_t> bigscratch;
+  gpu_vector<i_t> lvl_lev[4];       // per-op per-column level (retained for the sparse reach-restricted solve)
   gpu_vector<i_t> lvl_ls[4];
   gpu_vector<i_t> lvl_co[4];
   gpu_vector<i_t> lvl_lw[4];       // mode 1 (big): per-level base word
   gpu_vector<unsigned> lvl_bt[4];  // mode 1 (big): large-column bitmask
+  gpu_vector<i_t> sp_ls_v, sp_co_v, sp_pos_v;  // reach-restricted sparse-solve schedule scratch
   if constexpr (Warp) {
-    warp_build_config(ft, cfg_shared, lvlscratch, bigscratch, lvl_ls, lvl_co, lvl_lw, lvl_bt);
+    warp_build_config(ft, cfg_shared, lvl_lev, bigscratch, lvl_ls, lvl_co, lvl_lw, lvl_bt,
+                      sp_ls_v, sp_co_v, sp_pos_v);
     ft.warp_cfg_ = &cfg_shared;
   }
 
@@ -3225,6 +3429,37 @@ static void ensure_device_limits(size_t heap_bytes)
 // single-problem wrapper and the batch wrapper build kernel_args through here, so the device
 // sees byte-identical inputs either way. `ft` must be a fresh factorization (num_updates == 0).
 // Free the buffers afterwards with free_kernel_args.
+// Read-only device buffers shared across all batch items with the same problem+factor (same `lp`
+// pointer). These are never written by the kernel (A CSC, the base LU factor, rhs/bounds/objective,
+// row permutation), so N same-problem blocks read ONE resident copy instead of N (VRAM + L2 reuse).
+// Arow is intentionally NOT here: its j/x are permuted per node, so each block builds it via from_csc
+// off the shared CSC.
+// Only the PROBLEM-INVARIANT read-only data is shared across a problem's nodes: the constraint matrix
+// A (CSC) plus rhs and objective. Everything basis-dependent (the LU factor L0/U0/L0t/U0t, row_perm),
+// the branching bounds (lower/upper), and the per-node-permuted Arow stay PER-NODE — they legitimately
+// differ from node to node. (A's col_start is safe to share: unlike the factor, A is never reach-marked.)
+struct ro_upload {
+  i_t *A_col_start{}, *A_i{}; f_t* A_x{}; i_t A_nz{};
+  f_t *rhs{}, *objective{};
+};
+
+static ro_upload upload_ro(const lp_problem_t<i_t, f_t>& lp)
+{
+  const auto& A = lp.A;
+  ro_upload r{};
+  r.A_col_start = upload(A.col_start); r.A_nz = A.nnz();
+  r.A_i = upload_n(A.i.data(), A.nnz()); r.A_x = upload_n(A.x.data(), A.nnz());
+  r.rhs = upload(lp.rhs); r.objective = upload(lp.objective);
+  return r;
+}
+
+static void free_ro(const ro_upload& r)
+{
+  for (void* p : {(void*)r.A_col_start, (void*)r.A_i, (void*)r.A_x, (void*)r.rhs, (void*)r.objective}) {
+    if (p) { cudaFree(p); }
+  }
+}
+
 static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
                                    const simplex_solver_settings_t<i_t, f_t>& settings,
                                    std::vector<variable_status_t>& vstatus,
@@ -3232,7 +3467,8 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
                                    std::vector<i_t>& basic_list,
                                    std::vector<i_t>& nonbasic_list,
                                    lp_solution_t<i_t, f_t>& sol,
-                                   std::vector<f_t>& delta_y_steepest_edge)
+                                   std::vector<f_t>& delta_y_steepest_edge,
+                                   const ro_upload* ro = nullptr)
 {
   const int m = lp.num_rows;
   const int n = lp.num_cols;
@@ -3246,34 +3482,39 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   a.m = m;
   a.n = n;
 
-  a.A_col_start = upload(A.col_start);
-  a.A_nz        = A.nnz();
-  a.A_i         = upload_n(A.i.data(), A.nnz());
-  a.A_x         = upload_n(A.x.data(), A.nnz());
-  a.rhs         = upload(lp.rhs);
-  a.lower       = upload(lp.lower);
-  a.upper       = upload(lp.upper);
-  a.objective   = upload(lp.objective);
   a.obj_scale   = lp.obj_scale;
   a.obj_constant = lp.obj_constant;
-
-  a.L0_col_start = upload(L0.col_start);
-  a.L0_nz        = L0.nnz();
-  a.L0_i         = upload_n(L0.i.data(), L0.nnz());
-  a.L0_x         = upload_n(L0.x.data(), L0.nnz());
-  a.U0_col_start = upload(U0.col_start);
-  a.U0_nz        = U0.nnz();
-  a.U0_i         = upload_n(U0.i.data(), U0.nnz());
-  a.U0_x         = upload_n(U0.x.data(), U0.nnz());
-  a.L0t_col_start = upload(L0t.col_start);
-  a.L0t_nz        = L0t.nnz();
-  a.L0t_i         = upload_n(L0t.i.data(), L0t.nnz());
-  a.L0t_x         = upload_n(L0t.x.data(), L0t.nnz());
-  a.U0t_col_start = upload(U0t.col_start);
-  a.U0t_nz        = U0t.nnz();
-  a.U0t_i         = upload_n(U0t.i.data(), U0t.nnz());
-  a.U0t_x         = upload_n(U0t.x.data(), U0t.nnz());
-
+  // Problem-invariant, read-only: A CSC + rhs + objective — shared across the problem's nodes when a
+  // shared `ro` is provided, else uploaded per-node. Arow is always per-node (its j/x get permuted in
+  // place), but when sharing it is built on-device via from_csc off the SHARED A → the A reads hit one
+  // cached copy instead of N.
+  if (ro != nullptr) {
+    a.A_col_start = ro->A_col_start; a.A_nz = ro->A_nz; a.A_i = ro->A_i; a.A_x = ro->A_x;
+    a.rhs = ro->rhs; a.objective = ro->objective;
+    a.Arow_row_start = nullptr; a.Arow_j = nullptr; a.Arow_x = nullptr;
+  } else {
+    a.A_col_start = upload(A.col_start); a.A_nz = A.nnz();
+    a.A_i = upload_n(A.i.data(), A.nnz()); a.A_x = upload_n(A.x.data(), A.nnz());
+    a.rhs = upload(lp.rhs); a.objective = upload(lp.objective);
+    // Host-built Arow (CSR of A) — the kernel views it directly and skips the on-device from_csc
+    // transpose. to_compressed_row orders each row by ascending column, matching from_csc bit-for-bit.
+    cuopt::mathematical_optimization::csr_matrix_t<i_t, f_t> Arow_host(m, n, A.nnz());
+    A.to_compressed_row(Arow_host);
+    a.Arow_row_start = upload(Arow_host.row_start);
+    a.Arow_j         = upload(Arow_host.j);
+    a.Arow_x         = upload(Arow_host.x);
+  }
+  // Per-node (basis- or branch-dependent), always uploaded per item: bounds, the LU factor, row perm.
+  a.lower       = upload(lp.lower);
+  a.upper       = upload(lp.upper);
+  a.L0_col_start = upload(L0.col_start); a.L0_nz = L0.nnz();
+  a.L0_i = upload_n(L0.i.data(), L0.nnz()); a.L0_x = upload_n(L0.x.data(), L0.nnz());
+  a.U0_col_start = upload(U0.col_start); a.U0_nz = U0.nnz();
+  a.U0_i = upload_n(U0.i.data(), U0.nnz()); a.U0_x = upload_n(U0.x.data(), U0.nnz());
+  a.L0t_col_start = upload(L0t.col_start); a.L0t_nz = L0t.nnz();
+  a.L0t_i = upload_n(L0t.i.data(), L0t.nnz()); a.L0t_x = upload_n(L0t.x.data(), L0t.nnz());
+  a.U0t_col_start = upload(U0t.col_start); a.U0t_nz = U0t.nnz();
+  a.U0t_i = upload_n(U0t.i.data(), U0t.nnz()); a.U0t_x = upload_n(U0t.x.data(), U0t.nnz());
   a.row_perm     = upload(ft.row_permutation());
   a.inv_row_perm = upload(ft.inverse_row_permutation());
   a.xi_workspace = alloc_zeroed<int>(2 * m);
@@ -3313,17 +3554,27 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   return a;
 }
 
-static void free_kernel_args(const kernel_args& a)
+static void free_kernel_args(const kernel_args& a, bool skip_ro = false)
 {
-  for (void* p : {(void*)a.A_col_start, (void*)a.A_i, (void*)a.A_x, (void*)a.rhs, (void*)a.lower,
-                  (void*)a.upper, (void*)a.objective, (void*)a.L0_col_start, (void*)a.L0_i,
-                  (void*)a.L0_x, (void*)a.U0_col_start, (void*)a.U0_i, (void*)a.U0_x,
-                  (void*)a.L0t_col_start, (void*)a.L0t_i, (void*)a.L0t_x, (void*)a.U0t_col_start,
-                  (void*)a.U0t_i, (void*)a.U0t_x, (void*)a.row_perm, (void*)a.inv_row_perm,
+  // Per-item buffers (always owned by this kernel_args). Arow_* are null when RO-shared (no-op frees).
+  // Everything basis-/branch-dependent — the full LU factor (col_start + i + x), row perm, and the
+  // branching bounds — is per-node and freed here even when RO-shared.
+  for (void* p : {(void*)a.Arow_row_start, (void*)a.Arow_j, (void*)a.Arow_x,
+                  (void*)a.L0_col_start, (void*)a.L0_i, (void*)a.L0_x,
+                  (void*)a.U0_col_start, (void*)a.U0_i, (void*)a.U0_x,
+                  (void*)a.L0t_col_start, (void*)a.L0t_i, (void*)a.L0t_x,
+                  (void*)a.U0t_col_start, (void*)a.U0t_i, (void*)a.U0t_x,
+                  (void*)a.row_perm, (void*)a.inv_row_perm,
+                  (void*)a.lower, (void*)a.upper,
                   (void*)a.xi_workspace, (void*)a.x_workspace, (void*)a.vstatus,
                   (void*)a.basic_list, (void*)a.nonbasic_list, (void*)a.x, (void*)a.y, (void*)a.z,
                   (void*)a.dy_se, (void*)a.out_status, (void*)a.out_objective,
                   (void*)a.out_user_objective, (void*)a.out_iterations}) {
+    if (p) { cudaFree(p); }
+  }
+  if (skip_ro) { return; }  // read-only buffers (A CSC + rhs + objective) shared → freed once via free_ro
+  for (void* p : {(void*)a.A_col_start, (void*)a.A_i, (void*)a.A_x,
+                  (void*)a.rhs, (void*)a.objective}) {
     if (p) { cudaFree(p); }
   }
 }
@@ -3529,12 +3780,25 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
   ensure_device_limits(heap_estimate_bytes);
 
   // ---- Marshal every problem + upload (host-timed) ----
+  // CUOPT_GPU_SHARE_RO: dedup the problem-invariant read-only device buffers (A CSC + rhs + objective)
+  // across items with the same `lp` pointer — N same-problem blocks read ONE resident copy of A instead
+  // of N (VRAM + L2 reuse). The basis-dependent factor L/U, row perm, and branching bounds stay per-node
+  // (they differ per B&B node). Arow is per-node too but built on-device off the shared A. Default ON (=0 opts out).
+  const char* share_env  = std::getenv("CUOPT_GPU_SHARE_RO");
+  const bool  share_ro   = (share_env == nullptr || std::string(share_env) != "0");  // default ON, opt out =0
   const double up_t0 = tic();
   std::vector<kernel_args> h_args(N);
+  std::unordered_map<const void*, ro_upload> ro_cache;
   for (size_t b = 0; b < N; ++b) {
     const auto& it = items[b];
+    const ro_upload* ro = nullptr;
+    if (share_ro) {
+      auto res = ro_cache.try_emplace(static_cast<const void*>(it.lp));
+      if (res.second) { res.first->second = upload_ro(*it.lp); }
+      ro = &res.first->second;
+    }
     h_args[b] = marshal_problem(*it.lp, *it.settings, *it.vstatus, *it.ft, *it.basic_list,
-                                *it.nonbasic_list, *it.sol, *it.dy_se);
+                                *it.nonbasic_list, *it.sol, *it.dy_se, ro);
   }
   kernel_args* d_args = nullptr;
   RAFT_CUDA_TRY(cudaMalloc(&d_args, N * sizeof(kernel_args)));
@@ -3554,12 +3818,37 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
   int solve_mode = 0;  // 0 plain / 1 big
   if (warp_mode) { const int v = std::atoi(warp_env); solve_mode = (v >= 2) ? 1 : 0; }
   RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_warp_solve_mode, &solve_mode, sizeof(int)));
+  // CUOPT_GPU_REGCAP: warp-path register/occupancy target (throughput sweep). Maps to the kernel's
+  // __launch_bounds__ MinBlocks so ptxas caps registers → more resident blocks/SM:
+  //   unset / 255  → MinBlocks 8  (255 regs, ~8 blocks/SM   — current default)
+  //   128          → MinBlocks 16 (128-reg cap, ~16 blocks/SM)
+  //   64           → MinBlocks 32 (64-reg cap,  ~32 blocks/SM = HW max)
+  const char* regcap_env = std::getenv("CUOPT_GPU_REGCAP");
+  const int   regcap     = (regcap_env != nullptr) ? std::atoi(regcap_env) : 0;
+  // Fix the shared-memory occupancy ceiling: our per-block static shared (~0.6 KB) + the 1 KB driver
+  // reservation is tiny, but the DEFAULT carveout (32 KB on B200) only fits ~19 blocks. Prefer a larger
+  // shared carveout so shared stops capping occupancy below 32 blocks/SM (leaves the rest as L1). This is
+  // a hint the driver rounds to a supported bucket; harmless when occupancy is register-limited.
+  auto raise_carveout = [](const void* fn) {
+    // 40% of B200's ~228 KB unified cache ≈ 90 KB shared → ~55 blocks worth, well past 32; ~60% stays L1.
+    cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, 40);
+  };
   cudaEvent_t ev_start, ev_stop;
   RAFT_CUDA_TRY(cudaEventCreate(&ev_start));
   RAFT_CUDA_TRY(cudaEventCreate(&ev_stop));
   RAFT_CUDA_TRY(cudaEventRecord(ev_start));
   if (warp_mode) {
-    gpu_phase2_kernel<true><<<static_cast<unsigned>(N), 32>>>(d_args);
+    const unsigned nb = static_cast<unsigned>(N);
+    if (regcap == 64) {
+      raise_carveout(reinterpret_cast<const void*>(&gpu_phase2_kernel<true, 32>));
+      gpu_phase2_kernel<true, 32><<<nb, 32>>>(d_args);
+    } else if (regcap == 128) {
+      raise_carveout(reinterpret_cast<const void*>(&gpu_phase2_kernel<true, 16>));
+      gpu_phase2_kernel<true, 16><<<nb, 32>>>(d_args);
+    } else {
+      raise_carveout(reinterpret_cast<const void*>(&gpu_phase2_kernel<true, 8>));
+      gpu_phase2_kernel<true, 8><<<nb, 32>>>(d_args);
+    }
   } else {
     gpu_phase2_kernel<false><<<static_cast<unsigned>(N), 1>>>(d_args);
   }
@@ -3603,7 +3892,8 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
     std::fprintf(stderr, "[gpu_phase2] batch WARNING: %s\n", timing.message.c_str());
   }
 
-  for (size_t b = 0; b < N; ++b) { free_kernel_args(h_args[b]); }
+  for (size_t b = 0; b < N; ++b) { free_kernel_args(h_args[b], share_ro); }
+  if (share_ro) { for (const auto& kv : ro_cache) { free_ro(kv.second); } }
   cudaFree(d_args);
 }
 
