@@ -11,6 +11,7 @@
 #include <mip_heuristics/mip_constants.hpp>
 #include <mip_heuristics/presolve/third_party_presolve.hpp>
 
+#include <mip_heuristics/presolve/block_bve.cuh>
 #include <mip_heuristics/presolve/conflict_graph/clique_table.cuh>
 #include <mip_heuristics/presolve/probing_cache.cuh>
 #include <mip_heuristics/presolve/trivial_presolve.cuh>
@@ -18,10 +19,18 @@
 
 #include <pdlp/solve.cuh>
 
+#include <cuopt/mathematical_optimization/io/mps_data_model.hpp>
+#include <cuopt/mathematical_optimization/io/mps_writer.hpp>
+#include <cuopt/mathematical_optimization/optimization_problem_utils.hpp>
+#include <utilities/copy_helpers.hpp>
 #include <utilities/scope_guard.hpp>
 
+#include <cstdlib>
 #include <memory>
 #include <numeric>
+#include <span>
+#include <string>
+#include <vector>
 
 constexpr bool fj_only_run = false;
 
@@ -38,6 +47,59 @@ size_t sub_mip_recombiner_config_t::max_n_of_vars_from_other =
 
 template <typename i_t, typename f_t>
 std::vector<recombiner_enum_t> recombiner_t<i_t, f_t>::enabled_recombiners;
+
+template <typename i_t, typename f_t>
+static cuopt::mathematical_optimization::io::mps_data_model_t<i_t, f_t> problem_to_mps_data_model(
+  const problem_t<i_t, f_t>& problem)
+{
+  auto stream = problem.handle_ptr->get_stream();
+  auto h_off  = cuopt::host_copy(problem.offsets, stream);
+  auto h_ind  = cuopt::host_copy(problem.variables, stream);
+  auto h_val  = cuopt::host_copy(problem.coefficients, stream);
+  auto h_clb  = cuopt::host_copy(problem.constraint_lower_bounds, stream);
+  auto h_cub  = cuopt::host_copy(problem.constraint_upper_bounds, stream);
+  auto h_obj  = cuopt::host_copy(problem.objective_coefficients, stream);
+  auto h_vb   = cuopt::host_copy(problem.variable_bounds, stream);
+  auto h_vt   = cuopt::host_copy(problem.variable_types, stream);
+  problem.handle_ptr->sync_stream();
+
+  const i_t n_vars = problem.n_variables;
+  std::vector<f_t> var_lower(n_vars), var_upper(n_vars);
+  for (i_t v = 0; v < n_vars; ++v) {
+    var_lower[v] = get_lower(h_vb[v]);
+    var_upper[v] = get_upper(h_vb[v]);
+  }
+  std::vector<char> var_types(n_vars);
+  for (i_t v = 0; v < n_vars; ++v)
+    var_types[v] = var_type_to_char(h_vt[v]);
+
+  cuopt::mathematical_optimization::io::mps_data_model_t<i_t, f_t> model;
+  model.set_maximize(false);
+  if (!h_off.empty()) {
+    model.set_csr_constraint_matrix(std::span<const f_t>{h_val.data(), h_val.size()},
+                                    std::span<const i_t>{h_ind.data(), h_ind.size()},
+                                    std::span<const i_t>{h_off.data(), h_off.size()});
+  }
+  if (problem.n_constraints != 0) {
+    model.set_constraint_lower_bounds(std::span<const f_t>{h_clb.data(), h_clb.size()});
+    model.set_constraint_upper_bounds(std::span<const f_t>{h_cub.data(), h_cub.size()});
+  }
+  if (n_vars != 0) {
+    model.set_objective_coefficients(std::span<const f_t>{h_obj.data(), h_obj.size()});
+    model.set_variable_lower_bounds(std::span<const f_t>{var_lower.data(), var_lower.size()});
+    model.set_variable_upper_bounds(std::span<const f_t>{var_upper.data(), var_upper.size()});
+    model.set_variable_types(var_types);
+  }
+  model.set_objective_scaling_factor(problem.presolve_data.objective_scaling_factor);
+  model.set_objective_offset(problem.presolve_data.objective_offset);
+  if (problem.original_problem_ptr != nullptr &&
+      !problem.original_problem_ptr->get_problem_name().empty()) {
+    model.set_problem_name(problem.original_problem_ptr->get_problem_name());
+  } else {
+    model.set_problem_name("cuopt");
+  }
+  return model;
+}
 
 template <typename i_t, typename f_t>
 diversity_manager_t<i_t, f_t>::diversity_manager_t(mip_solver_context_t<i_t, f_t>& context_)
@@ -304,19 +366,66 @@ bool diversity_manager_t<i_t, f_t>::run_presolve(f_t time_limit, timer_t global_
     CUOPT_LOG_INFO("Probing-cache step disabled via %s=false", CUOPT_MIP_PROBING);
     run_probing_cache = false;
   }
-  if (run_probing_cache) {
-    // Run probing cache before trivial presolve to discover variable implications
-    const f_t max_time_on_probing = diversity_config.max_time_on_probing;
-    f_t time_for_probing_cache    = std::min(max_time_on_probing, time_limit);
-    timer_t probing_timer{time_for_probing_cache};
-    // this function computes probing cache, finds singletons, substitutions and changes the problem
-    bool problem_is_infeasible =
-      compute_probing_cache(ls.constraint_prop.bounds_update, *problem_ptr, probing_timer);
-    if (problem_is_infeasible) { return false; }
-  }
   const bool remap_cache_ids           = true;
   problem_ptr->related_vars_time_limit = context.settings.heuristic_params.related_vars_time_limit;
-  if (!global_timer.check_time_limit()) { trivial_presolve(*problem_ptr, remap_cache_ids); }
+
+  // run block-BVE presolve rounds
+  const i_t max_bve_rounds = 3;
+  for (i_t bve_round = 0;; ++bve_round) {
+    if (run_probing_cache) {
+      if (global_timer.check_time_limit() || presolve_timer.check_time_limit()) { break; }
+      if (bve_round > 0) { ls.constraint_prop.bounds_update.resize(*problem_ptr); }
+      const f_t max_time_on_probing = diversity_config.max_time_on_probing;
+      f_t time_for_probing_cache =
+        std::min(max_time_on_probing, std::min(time_limit, (f_t)presolve_timer.remaining_time()));
+      timer_t probing_timer{time_for_probing_cache};
+      bool problem_is_infeasible =
+        compute_probing_cache(ls.constraint_prop.bounds_update, *problem_ptr, probing_timer);
+      if (problem_is_infeasible) { return false; }
+    } else if (bve_round > 0) {
+      break;
+    }
+
+    if (!global_timer.check_time_limit()) { trivial_presolve(*problem_ptr, remap_cache_ids); }
+
+    if (!context.settings.block_bve || problem_ptr->empty || global_timer.check_time_limit() ||
+        presolve_timer.check_time_limit()) {
+      break;
+    }
+
+    const i_t n_vars_before = problem_ptr->n_variables;
+    const i_t n_rows_before = problem_ptr->n_constraints;
+    auto impl_adj           = bve_build_impl_adj(ls.constraint_prop.bounds_update.probing_cache,
+                                       problem_ptr->reverse_original_ids,
+                                       problem_ptr->n_variables);
+    double bve_work_units   = 0.0;
+    timer_t bve_timer(global_timer.clamp_remaining_time(presolve_timer.remaining_time()));
+    const bool reduced = block_bve_presolve(*problem_ptr, impl_adj, bve_timer, bve_work_units);
+    CUOPT_LOG_DEBUG("Block-BVE outer round %d/%d: reduced=%d vars %d->%d rows %d->%d",
+                    bve_round + 1,
+                    max_bve_rounds,
+                    (int)reduced,
+                    n_vars_before,
+                    problem_ptr->n_variables,
+                    n_rows_before,
+                    problem_ptr->n_constraints);
+    if (!reduced || !run_probing_cache || bve_round + 1 >= max_bve_rounds) { break; }
+    if (problem_ptr->n_variables >= n_vars_before) { break; }
+  }
+
+  if (const char* export_flag = std::getenv("CUOPT_EXPORT_GPU_PRESOLVED_PROBLEM");
+      export_flag != nullptr && std::atoi(export_flag) != 0) {
+    const std::string instance_name =
+      (problem_ptr->original_problem_ptr != nullptr &&
+       !problem_ptr->original_problem_ptr->get_problem_name().empty())
+        ? problem_ptr->original_problem_ptr->get_problem_name()
+        : std::string("cuopt");
+    const std::string mps_path = instance_name + "_gpupresolved.mps";
+    CUOPT_LOG_DEBUG("Exporting GPU-presolved problem to %s", mps_path.c_str());
+    auto model = problem_to_mps_data_model(*problem_ptr);
+    cuopt::mathematical_optimization::io::mps_writer_t<i_t, f_t> writer(model);
+    writer.write(mps_path);
+  }
   if (!problem_ptr->empty && !check_bounds_sanity(*problem_ptr)) { return false; }
   // if (!presolve_timer.check_time_limit() && !context.settings.heuristics_only &&
   //     !problem_ptr->empty) {

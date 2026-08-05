@@ -171,6 +171,7 @@ cuopt/
 - Keep operations stream-ordered
 - Follow existing RAFT/RMM patterns
 - No raw `new`/`delete` - use RMM allocators
+- Prefer modern CCCL bit/math helpers in kernels (`cuda::bitfield_extract`, `cuda::bitmask`, pow2 utilities) over hand-rolled `%`/`/` by runtime powers of two — see [references/conventions.md](references/conventions.md)
 
 ## Build & Test
 
@@ -224,7 +225,7 @@ For pre-commit setup, DCO sign-off (`git commit -s`), the fork-based PR workflow
 
 ## Coding Conventions
 
-For C++ naming (`snake_case`, `d_`/`h_` prefixes, `_t` suffix), file extensions (`.hpp`/`.cpp`/`.cu`/`.cuh` and which compiler each uses), include order, Python style, error handling (`CUOPT_EXPECTS`, `RAFT_CUDA_TRY`), memory management (RMM patterns, no raw `new`/`delete`), test-impact rules, and volatile-comment rules (hardware names and self-referential issue/PR numbers in comments or skip messages go stale; issue links to a separate tracking issue are fine), see [references/conventions.md](references/conventions.md).
+For C++ naming (`snake_case`, `d_`/`h_` prefixes, `_t` suffix), file extensions (`.hpp`/`.cpp`/`.cu`/`.cuh` and which compiler each uses), include order, Python style, error handling (`CUOPT_EXPECTS`, `RAFT_CUDA_TRY`), memory management (RMM patterns, no raw `new`/`delete`), CCCL bit/math helpers in device code, test-impact rules, and volatile-comment rules (hardware names and self-referential issue/PR numbers in comments or skip messages go stale; issue links to a separate tracking issue are fine), see [references/conventions.md](references/conventions.md).
 
 ## OpenMP task/runtime compatibility
 

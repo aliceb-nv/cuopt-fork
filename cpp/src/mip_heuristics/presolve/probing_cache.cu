@@ -21,6 +21,8 @@
 #include <utilities/copy_helpers.hpp>
 #include <utilities/timer.hpp>
 
+#include <algorithm>
+#include <iterator>
 #include <unordered_set>
 #include <utilities/omp_helpers.hpp>
 
@@ -161,9 +163,14 @@ void inline insert_current_probing_to_cache(i_t var_idx,
                                             const std::vector<f_t>& modified_lb,
                                             const std::vector<f_t>& modified_ub,
                                             const std::vector<i_t>& h_integer_indices,
+                                            const std::vector<i_t>& original_ids,
                                             std::atomic<size_t>& n_implied_singletons)
 {
   f_t int_tol = bound_presolve.context.settings.tolerances.integrality_tolerance;
+
+  cuopt_assert(var_idx >= 0 && var_idx < (i_t)original_ids.size(),
+               "probe var out of original_ids range");
+  const i_t var_original = original_ids[var_idx];
 
   cache_entry_t<i_t, f_t> cache_item;
   cache_item.val_interval = probe_val;
@@ -179,18 +186,21 @@ void inline insert_current_probing_to_cache(i_t var_idx,
                    "Lower bound must be greater than or equal to original lower bound");
       cuopt_assert(modified_ub[impacted_var_idx] <= get_upper(original_var_bounds),
                    "Upper bound must be less than or equal to original upper bound");
+      cuopt_assert(impacted_var_idx >= 0 && impacted_var_idx < (i_t)original_ids.size(),
+                   "impacted var out of original_ids range");
       cached_bound_t<f_t> new_bound{modified_lb[impacted_var_idx], modified_ub[impacted_var_idx]};
-      cache_item.var_to_cached_bound_map.insert({impacted_var_idx, new_bound});
+      // Map keys are original-frame ids (same frame as reverse_original_ids / bve_build_impl_adj).
+      cache_item.var_to_cached_bound_map.insert({original_ids[impacted_var_idx], new_bound});
     }
   }
   {
     std::lock_guard<std::mutex> lock(bound_presolve.probing_cache.probing_cache_mutex);
-    if (!bound_presolve.probing_cache.probing_cache.count(var_idx) > 0) {
+    if (!bound_presolve.probing_cache.probing_cache.count(var_original) > 0) {
       std::array<cache_entry_t<i_t, f_t>, 2> entries_per_var;
       entries_per_var[0] = cache_item;
-      bound_presolve.probing_cache.probing_cache.insert({var_idx, entries_per_var});
+      bound_presolve.probing_cache.probing_cache.insert({var_original, entries_per_var});
     } else {
-      bound_presolve.probing_cache.probing_cache[var_idx][1] = cache_item;
+      bound_presolve.probing_cache.probing_cache[var_original][1] = cache_item;
     }
   }
 }
@@ -496,6 +506,7 @@ void compute_cache_for_var(i_t var_idx,
                                       h_improved_lower_bounds,
                                       h_improved_upper_bounds,
                                       h_integer_indices,
+                                      problem.original_ids,
                                       n_of_implied_singletons);
     }
   }
@@ -703,36 +714,52 @@ void apply_substitution_queue_to_problem(
   std::vector<f_t> offset_values;
   std::vector<f_t> coefficient_values;
 
-  // Get variable_mapping to convert current indices to original indices
+  // Get variable_mapping to convert current indices to post-Papilo frame
   auto h_variable_mapping =
     host_copy(problem.presolve_data.variable_mapping, problem.handle_ptr->get_stream());
   problem.handle_ptr->sync_stream();
 
+  // Collect AffineSub reconstructions, then append in deterministic order (by substituted_var).
+  std::vector<var_postsolve_t<i_t, f_t>> batch_recs;
+  batch_recs.reserve(all_substitutions.size());
   for (const auto& [substituting_var, substitutions] : all_substitutions) {
     for (const auto& [substituted_var, substitution] : substitutions) {
       CUOPT_LOG_TRACE("Applying substitution: %d -> %d",
                       substitution.substituting_var,
                       substitution.substituted_var);
+      cuopt_assert(substitution.substituted_var >= 0 &&
+                     substitution.substituted_var < (i_t)h_variable_mapping.size(),
+                   "substituted_var out of variable_mapping range");
+      cuopt_assert(substitution.substituting_var >= 0 &&
+                     substitution.substituting_var < (i_t)h_variable_mapping.size(),
+                   "substituting_var out of variable_mapping range");
       var_indices.push_back(substitution.substituted_var);
       substituting_var_indices.push_back(substitution.substituting_var);
       offset_values.push_back(substitution.offset);
       coefficient_values.push_back(substitution.coefficient);
 
-      // Store substitution for post-processing (convert to original variable IDs)
-      substitution_t<i_t, f_t> sub;
-      sub.timestamp        = substitution.timestamp;
-      sub.substituted_var  = h_variable_mapping[substitution.substituted_var];
-      sub.substituting_var = h_variable_mapping[substitution.substituting_var];
-      sub.offset           = substitution.offset;
-      sub.coefficient      = substitution.coefficient;
-      problem.presolve_data.variable_substitutions.push_back(sub);
-      CUOPT_LOG_TRACE("Stored substitution for post-processing: x[%d] = %f + %f * x[%d]",
-                      sub.substituted_var,
-                      sub.offset,
-                      sub.coefficient,
-                      sub.substituting_var);
+      var_postsolve_t<i_t, f_t> rec;
+      rec.kind                 = reconstruction_kind_t::AffineSub;
+      rec.sub                  = substitution;
+      rec.sub.substituted_var  = h_variable_mapping[substitution.substituted_var];
+      rec.sub.substituting_var = h_variable_mapping[substitution.substituting_var];
+      batch_recs.push_back(std::move(rec));
+      CUOPT_LOG_TRACE("Stored AffineSub for post-processing: x[%d] = %f + %f * x[%d]",
+                      batch_recs.back().sub.substituted_var,
+                      batch_recs.back().sub.offset,
+                      batch_recs.back().sub.coefficient,
+                      batch_recs.back().sub.substituting_var);
     }
   }
+  std::sort(batch_recs.begin(),
+            batch_recs.end(),
+            [](const var_postsolve_t<i_t, f_t>& a, const var_postsolve_t<i_t, f_t>& b) {
+              return a.sub.substituted_var < b.sub.substituted_var;
+            });
+  auto& recs = problem.presolve_data.var_postsolve;
+  recs.insert(recs.end(),
+              std::make_move_iterator(batch_recs.begin()),
+              std::make_move_iterator(batch_recs.end()));
 
   if (!var_indices.empty()) {
     problem.substitute_variables(
@@ -850,6 +877,21 @@ bool compute_probing_cache(bound_presolve_t<i_t, f_t>& bound_presolve,
                            timer_t timer)
 {
   raft::common::nvtx::range fun_scope("compute_probing_cache");
+
+  bound_presolve.probing_cache.probing_cache.clear();
+  {
+    auto stream = problem.handle_ptr->get_stream();
+    auto h_vmap = host_copy(problem.presolve_data.variable_mapping, stream);
+    problem.handle_ptr->sync_stream();
+    problem.original_ids.assign(h_vmap.begin(), h_vmap.end());
+    std::fill(problem.reverse_original_ids.begin(), problem.reverse_original_ids.end(), -1);
+    for (size_t i = 0; i < problem.original_ids.size(); ++i) {
+      cuopt_assert(problem.original_ids[i] >= 0 &&
+                     problem.original_ids[i] < (i_t)problem.reverse_original_ids.size(),
+                   "Variable index out of bounds");
+      problem.reverse_original_ids[problem.original_ids[i]] = (i_t)i;
+    }
+  }
   // we dont want to compute the probing cache for all variables for time and computation resources
   auto priority_indices = compute_priority_indices_by_implied_integers(problem);
   CUOPT_LOG_DEBUG("Computing probing cache");
