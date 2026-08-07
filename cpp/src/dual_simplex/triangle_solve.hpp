@@ -60,10 +60,13 @@ i_t lower_triangular_transpose_solve(const csc_matrix_t<i_t, f_t>& L,
   for (i_t j = n - 1; j >= 0; --j) {
     const i_t col_start = L.col_start[j] + 1;
     const i_t col_end   = L.col_start[j + 1];
+    // Local accumulator (single subtract), matching the GPU dts::lower_transpose_solve bit-for-bit:
+    // x[j] - (t0 + t1 + ...), NOT the running ((x[j]-t0)-t1)-... (FP is not associative).
+    f_t sum = 0.0;
     for (i_t p = col_start; p < col_end; ++p) {
-      x[j] -= L.x[p] * x[L.i[p]];
+      sum += L.x[p] * x[L.i[p]];
     }
-    x[j] /= L.x[L.col_start[j]];
+    x[j] = (x[j] - sum) / L.x[L.col_start[j]];
   }
   work_estimate += 6 * n + 4 * L.col_start[n];
   return 0;
@@ -104,10 +107,12 @@ i_t upper_triangular_transpose_solve(const csc_matrix_t<i_t, f_t>& U,
   for (i_t j = 0; j < n; ++j) {
     const i_t col_start = U.col_start[j];
     const i_t col_end   = U.col_start[j + 1] - 1;
+    // Local accumulator (single subtract), matching the GPU dts::upper_transpose_solve bit-for-bit.
+    f_t sum = 0.0;
     for (i_t p = col_start; p < col_end; ++p) {
-      x[j] -= U.x[p] * x[U.i[p]];
+      sum += U.x[p] * x[U.i[p]];
     }
-    x[j] /= U.x[col_end];
+    x[j] = (x[j] - sum) / U.x[col_end];
   }
   work_estimate += 4 * n + 4 * U.col_start[n];
   return 0;

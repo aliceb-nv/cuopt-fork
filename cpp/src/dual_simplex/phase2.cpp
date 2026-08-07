@@ -4166,6 +4166,13 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
           dz_above_tol,
           primal_inf);
       }
+      // Set the solution fields on the DUAL_UNBOUNDED exit too (this return path had omitted them,
+      // leaving sol.iterations at 0 — the GPU port sets iter here, so the harness's iters comparison
+      // wrongly flagged a mismatch on DUAL_UNBOUNDED-at-iter>0 nodes even though the pivot path was
+      // bit-identical). Mirrors the GPU driver's DUAL_UNBOUNDED return + every other CPU exit.
+      sol.objective      = compute_objective(lp, x);
+      sol.user_objective = compute_user_objective(lp, sol.objective);
+      sol.iterations     = iter;
       return dual::status_t::DUAL_UNBOUNDED;
     }
 

@@ -79,7 +79,18 @@ static constexpr int kBigThreshold = 32;  // "large column" cutoff for the big p
 // (TEST_NETLIB_SE_STATS=1) to group per node. "setup" = kernel entry → first pivot (arg unpack +
 // warp_build_config + the driver's one-time init: bounds/primal-vars/SE-norm-init/Arow/…); "pinf"
 // counts only the per-pivot recompute (the one-time setup call is inside "setup").
-#define CUOPT_KTIMER 1
+// #define CUOPT_KTIMER 1   <- uncomment (or build with -DCUOPT_KTIMER) to re-enable the profilers
+// below: [KTIMER]/[KTIMER2] per-function ticks + per-branch call counts, [STAT] per-stage histograms
+// (ST_TIC/ST_TOC), [ESTSTAT]/[R2HIST] routing-estimate distributions, [QPFILL] Q/P fill.
+// Left OFF for production: every KT_*/ST_*/ES_* macro expands to ((void)0), so the overhead is zero.
+// These profilers cost ~4% and, being compiled ON by default, silently inflated EVERY timing in the
+// 2026-08 campaign. The host-side [GPUKERNEL] line is not gated by this and always prints; it carries
+// prof= so no timing can be quoted from a profiling build without the log saying so.
+#ifdef CUOPT_KTIMER
+#define CUOPT_PROF_BUILD 1
+#else
+#define CUOPT_PROF_BUILD 0
+#endif
 
 #ifdef CUOPT_KTIMER
 enum kt_slot {
@@ -995,6 +1006,17 @@ __device__ void warp_collective_rt(const warp_solve_config& cfg)
     if (ratio < lmin) { lmin = ratio; }
   }
   const f_t gmin = warp_reduce_min(lmin);
+
+  // TRUE DUAL_UNBOUNDED: gmin == INF means NO column was eligible, and the serial scan returns -1
+  // here. This early-out is REQUIRED because pass 2's candidate test `ratio <= gmin` degenerates to
+  // `INF <= INF` — true for EVERY column — so without it the warp picks an arbitrary max-|z| column
+  // and returns step_length = INF. The driver then does z[j] += INF * delta_z[j] and the solve
+  // detonates: objective -> ~-3.7e15 and the node exits NUMERICAL instead of DUAL_UNBOUNDED.
+  // (Observed on csched008/node_d79_id150; invisible while the warp gate only counted bit-exactness.)
+  if (!isfinite(gmin)) {
+    if (lane == 0) { *cfg.rt_entering = -1; *cfg.rt_k = -1; *cfg.rt_step = INF; }
+    return;
+  }
 
   // Pass 2: among ratio < gmin+ztol, pick max |z[j]| (tie → smaller k).
   f_t best_absz = -1.0; i_t best_k = 0x7fffffff; i_t best_j = -1; f_t best_r = INF;
@@ -3650,6 +3672,16 @@ dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
     size_t heap = static_cast<size_t>(0.7 * static_cast<double>(free_b));
     const size_t cap = static_cast<size_t>(8) << 30;  // 8 GiB cap
     if (heap > cap) { heap = cap; }
+    // The malloc arena is only actually reserved at the first malloc-using LAUNCH, on top of the
+    // per-thread local reservation (cudaLimitStackSize x every resident thread) and the per-problem
+    // cudaMallocs. On a small-VRAM card those three together can exceed the device and the launch
+    // fails with cudaErrorLaunchOutOfResources -- which reads like a kernel-config problem but is not.
+    // CUOPT_GPU_HEAP_MB pins the arena so the margin can be controlled explicitly (4096 works on a
+    // 12 GB card where the 0.7*free default does not).
+    if (const char* e = std::getenv("CUOPT_GPU_HEAP_MB")) {
+      const long long v = std::atoll(e);
+      if (v > 0) { heap = static_cast<size_t>(v) << 20; }
+    }
     ensure_device_limits(heap);
   }
 
@@ -3685,7 +3717,8 @@ dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
   RAFT_CUDA_TRY(cudaDeviceSynchronize());
   const double _kms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - _k0).count();
-  std::printf("[GPUKERNEL] warp=%d mode=%d ms=%.3f\n", warp_mode ? 1 : 0, solve_mode, _kms);
+  std::printf("[GPUKERNEL] warp=%d mode=%d prof=%d ms=%.3f\n", warp_mode ? 1 : 0, solve_mode,
+              CUOPT_PROF_BUILD, _kms);
   cudaFree(d_args);
 
   // Marshal outputs back.
@@ -3825,30 +3858,12 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
   //   64           → MinBlocks 32 (64-reg cap,  ~32 blocks/SM = HW max)
   const char* regcap_env = std::getenv("CUOPT_GPU_REGCAP");
   const int   regcap     = (regcap_env != nullptr) ? std::atoi(regcap_env) : 0;
-  // Fix the shared-memory occupancy ceiling: our per-block static shared (~0.6 KB) + the 1 KB driver
-  // reservation is tiny, but the DEFAULT carveout (32 KB on B200) only fits ~19 blocks. Prefer a larger
-  // shared carveout so shared stops capping occupancy below 32 blocks/SM (leaves the rest as L1). This is
-  // a hint the driver rounds to a supported bucket; harmless when occupancy is register-limited.
-  auto raise_carveout = [](const void* fn) {
-    // 40% of B200's ~228 KB unified cache ≈ 90 KB shared → ~55 blocks worth, well past 32; ~60% stays L1.
-    cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, 40);
-  };
   cudaEvent_t ev_start, ev_stop;
   RAFT_CUDA_TRY(cudaEventCreate(&ev_start));
   RAFT_CUDA_TRY(cudaEventCreate(&ev_stop));
   RAFT_CUDA_TRY(cudaEventRecord(ev_start));
   if (warp_mode) {
-    const unsigned nb = static_cast<unsigned>(N);
-    if (regcap == 64) {
-      raise_carveout(reinterpret_cast<const void*>(&gpu_phase2_kernel<true, 32>));
-      gpu_phase2_kernel<true, 32><<<nb, 32>>>(d_args);
-    } else if (regcap == 128) {
-      raise_carveout(reinterpret_cast<const void*>(&gpu_phase2_kernel<true, 16>));
-      gpu_phase2_kernel<true, 16><<<nb, 32>>>(d_args);
-    } else {
-      raise_carveout(reinterpret_cast<const void*>(&gpu_phase2_kernel<true, 8>));
-      gpu_phase2_kernel<true, 8><<<nb, 32>>>(d_args);
-    }
+    gpu_phase2_kernel<true, 8><<<static_cast<unsigned>(N), 32>>>(d_args);
   } else {
     gpu_phase2_kernel<false><<<static_cast<unsigned>(N), 1>>>(d_args);
   }
