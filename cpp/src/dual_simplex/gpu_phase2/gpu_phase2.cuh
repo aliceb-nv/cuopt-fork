@@ -91,4 +91,17 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
                                       std::vector<dual::status_t>& out_status,
                                       gpu_batch_timing& timing);
 
+// KERNEL-FISSION variant of the batch solve (Phase 1a). Same contract, same inputs/outputs, but the
+// per-pivot pipeline is split into five per-primitive kernels driven by a host super-step loop
+// (setup, then K1..K5 repeated until every problem terminates) instead of one monolithic kernel.
+// Purpose: cut the monolith's register union (255 regs -> ~8 blocks/SM) so the light stages reach
+// higher occupancy. Single-thread <<<N,1>>>, fixed batch (no slot refill), and the SE-drift reprice
+// is OMITTED — so its bit-exact reference is the monolith run with CUOPT_SEREP_OFF=1.
+// See gpu_phase2/FISSION_CHALLENGES.md. Only instantiated for <int, double>.
+template <typename i_t, typename f_t>
+void gpu_simplified_dual_phase2_batch_fission(const std::vector<gpu_batch_item<i_t, f_t>>& items,
+                                              std::size_t heap_estimate_bytes,
+                                              std::vector<dual::status_t>& out_status,
+                                              gpu_batch_timing& timing);
+
 }  // namespace cuopt::linear_programming::dual_simplex
