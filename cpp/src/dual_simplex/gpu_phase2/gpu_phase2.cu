@@ -34,6 +34,10 @@
 #include <math_optimization/tic_toc.hpp>
 
 #include <utilities/macros.cuh>
+#include <utilities/manual_cuda_graph.cuh>   // run_while: the device-controlled super-step loop
+
+#include <rmm/cuda_stream.hpp>
+#include <rmm/cuda_stream_view.hpp>
 
 #include <cuda/std/limits>
 #include <cuda/std/span>
@@ -4641,6 +4645,31 @@ static T* alloc_zeroed(size_t count)
   return d;
 }
 
+// Loop condition for the CUDA-graph WHILE node. Evaluates the SAME predicate the host loop used to:
+// "keep going while at least one slot is still UNSET, and the super-step cap is not reached", and
+// writes it to the conditional handle so the loop runs entirely on the device.
+//
+// One block: N is the batch size, so a grid-stride scan by one block is ample, and it keeps the
+// conditional write trivially single-threaded (concurrent writes to a handle are UB).
+__global__ void gpu_fission_cond(cudaGraphConditionalHandle handle,
+                                 const i_t* status,
+                                 i_t n,
+                                 unsigned long long* steps,
+                                 unsigned long long cap)
+{
+  __shared__ int any_unset;
+  if (threadIdx.x == 0) { any_unset = 0; }
+  __syncthreads();
+  for (i_t b = static_cast<i_t>(threadIdx.x); b < n; b += static_cast<i_t>(blockDim.x)) {
+    if (status[b] == static_cast<i_t>(dual::status_t::UNSET)) { atomicOr(&any_unset, 1); }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    const unsigned long long s = ++(*steps);   // counts COMPLETED super-steps
+    cudaGraphSetConditional(handle, (any_unset != 0 && s < cap) ? 1u : 0u);
+  }
+}
+
 // Device heap (in-kernel gpu_vector malloc arena) + stack are per-CONTEXT limits and the heap
 // can ONLY be set before the first malloc-using kernel launch, so set them exactly once per
 // process. First caller wins: the batch wrapper (the only/first GPU kernel in the throughput
@@ -5340,51 +5369,86 @@ void gpu_simplified_dual_phase2_batch_fission(const std::vector<gpu_batch_item<i
 
   // ---- Super-step loop ----
   const unsigned nb = static_cast<unsigned>(N);
+
+  // ---- The super-step loop is a CUDA GRAPH WITH A DEVICE-CONTROLLED WHILE NODE ----------------
+  // `manual_cuda_graph_t::run_while` builds a graph whose single conditional node loops on a handle
+  // written from the device by gpu_fission_cond. The whole solve is therefore ONE graph launch: the
+  // host never sees an iteration, so there is no per-super-step D2H, stream sync, or status poll.
+  //
+  // Unconditional — there is no opt-out. It is bit-exact against the old host-polled loop (0/100
+  // differing on the 100 v6 nodes in every geometry) and never slower, so a fallback would only be
+  // dead code. CUDA 12.9+ is a hard requirement of this repo, well above the 12.4 that conditional
+  // nodes need, so there is no version guard either.
+  //
+  // Capture requires a non-default stream, hence the owned stream below.
+  // Device-side super-step counter, read back once at the end. Allocated HERE, before the timed
+  // region and before Ksetup is issued: cudaMalloc implicitly synchronizes the device, so allocating
+  // it later would stall the host on Ksetup and be misattributed to graph capture.
+  unsigned long long* d_steps = alloc_zeroed<unsigned long long>(1);
+
+  rmm::cuda_stream stream_owner;
+  const rmm::cuda_stream_view stream = stream_owner.view();
+
+  // One iteration = K1..K5, issued in order. Host-idempotent: launches only.
+  auto issue_super_step = [&] {
+    cudaStream_t s = stream.value();
+    if (fiss_warp) {
+      gpu_fission_k1<true><<<nb, 32, 0, s>>>(d_args);
+      gpu_fission_k2<true><<<nb, 32, 0, s>>>(d_args);
+      gpu_fission_k3<true><<<nb, 32, 0, s>>>(d_args);
+      gpu_fission_k4<true><<<nb, 32, 0, s>>>(d_args);
+      gpu_fission_k5<true><<<nb, 32, 0, s>>>(d_args);
+    } else {
+      gpu_fission_k1<false><<<nb, 1, 0, s>>>(d_args);
+      gpu_fission_k2<false><<<nb, 1, 0, s>>>(d_args);
+      gpu_fission_k3<false><<<nb, 1, 0, s>>>(d_args);
+      gpu_fission_k4<false><<<nb, 1, 0, s>>>(d_args);
+      gpu_fission_k5<false><<<nb, 1, 0, s>>>(d_args);
+    }
+  };
+  cuopt::manual_cuda_graph_t step_graph;
+
   cudaEvent_t ev_start, ev_stop;
   RAFT_CUDA_TRY(cudaEventCreate(&ev_start));
   RAFT_CUDA_TRY(cudaEventCreate(&ev_stop));
-  RAFT_CUDA_TRY(cudaEventRecord(ev_start));
+  RAFT_CUDA_TRY(cudaEventRecord(ev_start, stream.value()));
 
   // Ksetup geometry. Its prologue is nearly all allocation/RMW (lane 0 either way); the warp form
   // exists so the collectives inside it (WARP_NBE, WARP_PINF) can run on 32 lanes.
-  if (fiss_warp) { gpu_fission_setup<true><<<nb, 32>>>(d_args); }
-  else            { gpu_fission_setup<false><<<nb, 1>>>(d_args); }
+  // Deliberately OUTSIDE the graph: it runs exactly once, so capturing it would buy nothing, and it
+  // is where the per-slot device allocation happens.
+  if (fiss_warp) { gpu_fission_setup<true><<<nb, 32, 0, stream.value()>>>(d_args); }
+  else            { gpu_fission_setup<false><<<nb, 1, 0, stream.value()>>>(d_args); }
 
   // Host owns the iteration/wall-clock bound (the device kernels have no time-limit check). The cap
   // mirrors the device iter_limit so a pathological batch cannot spin forever.
   size_t max_super_steps = 500000;
   if (const char* e = std::getenv("CUOPT_FISSION_MAX_STEPS")) { max_super_steps = std::strtoull(e, nullptr, 10); }
-  std::vector<i_t> h_status(N);
   size_t steps = 0;
-  for (; steps < max_super_steps; ++steps) {
-    if (fiss_warp) { gpu_fission_k1<true><<<nb, 32>>>(d_args); }
-    else         { gpu_fission_k1<false><<<nb, 1>>>(d_args); }
-    if (fiss_warp) { gpu_fission_k2<true><<<nb, 32>>>(d_args); }
-    else         { gpu_fission_k2<false><<<nb, 1>>>(d_args); }
-    if (fiss_warp) { gpu_fission_k3<true><<<nb, 32>>>(d_args); }
-    else         { gpu_fission_k3<false><<<nb, 1>>>(d_args); }
-    if (fiss_warp) { gpu_fission_k4<true><<<nb, 32>>>(d_args); }
-    else         { gpu_fission_k4<false><<<nb, 1>>>(d_args); }
-    if (fiss_warp) { gpu_fission_k5<true><<<nb, 32>>>(d_args); }
-    else         { gpu_fission_k5<false><<<nb, 1>>>(d_args); }
-    // Phase 1a harvests every super-step (one N-int D2H). Batching this over T ticks — needed
-    // before CUDA-graph replay pays off — is FISSION_CHALLENGES.md #6.
-    RAFT_CUDA_TRY(cudaMemcpy(h_status.data(), d_status, N * sizeof(i_t), cudaMemcpyDeviceToHost));
-    bool all_done = true;
-    for (size_t b = 0; b < N; ++b) {
-      if (h_status[b] == static_cast<i_t>(dual::status_t::UNSET)) { all_done = false; break; }
-    }
-    if (all_done) { ++steps; break; }
-  }
-
-  RAFT_CUDA_TRY(cudaEventRecord(ev_stop));
+  // The ENTIRE loop runs inside ONE graph launch: a cudaGraphCondTypeWhile node whose body is
+  // K1..K5 + gpu_fission_cond. The condition kernel evaluates the same predicate the host loop used
+  // to ("any slot still UNSET, and under the super-step cap") and writes it to the conditional
+  // handle, so the host does no per-super-step work at all — no D2H, no stream sync, no poll.
+  step_graph.run_while(stream, [&](cudaGraphConditionalHandle handle) {
+    issue_super_step();
+    gpu_fission_cond<<<1, 128, 0, stream.value()>>>(
+      handle, d_status, static_cast<i_t>(N), d_steps, max_super_steps);
+  });
+  RAFT_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+  
+  RAFT_CUDA_TRY(cudaEventRecord(ev_stop, stream.value()));
   RAFT_CUDA_TRY(cudaPeekAtLastError());
   RAFT_CUDA_TRY(cudaEventSynchronize(ev_stop));
+  unsigned long long dev_steps = 0;
+  RAFT_CUDA_TRY(cudaMemcpy(&dev_steps, d_steps, sizeof(dev_steps), cudaMemcpyDeviceToHost));
+  steps = static_cast<size_t>(dev_steps);
+  RAFT_CUDA_TRY_NO_THROW(cudaFree(d_steps));
   float kernel_ms = 0.0f;
   RAFT_CUDA_TRY(cudaEventElapsedTime(&kernel_ms, ev_start, ev_stop));
   timing.kernel_s = kernel_ms / 1000.0;
   cudaEventDestroy(ev_start);
   cudaEventDestroy(ev_stop);
+
   if (steps >= max_super_steps) {
     timing.message = "fission batch hit the super-step cap (" + std::to_string(max_super_steps) +
                      ") — some problems did not terminate";

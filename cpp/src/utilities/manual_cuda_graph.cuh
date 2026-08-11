@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <cuopt/error.hpp>
 #include <utilities/logger.hpp>
 #include <utilities/macros.cuh>
 
@@ -85,6 +86,88 @@ class manual_cuda_graph_t {
     cudaGraph_t captured = nullptr;
     try {
       work();
+    } catch (...) {
+      // A CUDA / cuBLAS / cuSPARSE call inside `work` threw mid-capture (commonly
+      // CUBLAS_STATUS_INTERNAL_ERROR when a concurrent capture-hostile op
+      // invalidated this capture and the failure was observed inside the library
+      // call). End the capture and let its status disambiguate: if the capture was
+      // invalidated the recorded work was never issued, so recover by re-running
+      // `work` eagerly; otherwise the error is genuine and is rethrown.
+      cudaError_t catch_end_err = cudaStreamEndCapture(stream.value(), &captured);
+      guard.capture_active      = false;
+      if (catch_end_err == cudaErrorStreamCaptureInvalidated) {
+        cudaGetLastError();
+        work();
+        return;
+      }
+      if (captured != nullptr) { RAFT_CUDA_TRY_NO_THROW(cudaGraphDestroy(captured)); }
+      throw;
+    }
+
+    cudaError_t end_err  = cudaStreamEndCapture(stream.value(), &captured);
+    guard.capture_active = false;
+
+    if (end_err == cudaErrorStreamCaptureInvalidated) {
+      // The recorded work has NOT been issued; drain the sticky error and re-run
+      // eagerly so this iteration still produces correct results. Stay uninitialized
+      // so the next call retries capture. EndCapture sets `captured` to nullptr on
+      // invalidation, so there is no graph to free here.
+      cudaGetLastError();
+      work();
+      return;
+    }
+    RAFT_CUDA_TRY(end_err);
+
+    // Destroy the source graph regardless of whether instantiation succeeded:
+    // on failure cudaGraphInstantiate leaves instance_ at nullptr per the API
+    // contract, and the source graph is unconditionally not needed any more.
+    cudaError_t inst_err = cudaGraphInstantiate(&instance_, captured);
+    RAFT_CUDA_TRY_NO_THROW(cudaGraphDestroy(captured));
+    RAFT_CUDA_TRY(inst_err);
+
+    RAFT_CUDA_TRY(cudaGraphLaunch(instance_, stream.value()));
+  }
+
+  template <typename F>
+  void run_while(rmm::cuda_stream_view stream, F&& work)
+  {
+    if (instance_ != nullptr) {
+      RAFT_CUDA_TRY(cudaGraphLaunch(instance_, stream.value()));
+      return;
+    }
+
+    cudaGraph_t graph = nullptr;
+    RAFT_CUDA_TRY(cudaGraphCreate(&graph, 0));
+
+    cudaGraphConditionalHandle handle{};
+    RAFT_CUDA_TRY(cudaGraphConditionalHandleCreate(&handle, graph, 1, cudaGraphCondAssignDefault));
+
+    cudaGraphNodeParams params{};
+    params.type               = cudaGraphNodeTypeConditional;
+    params.conditional.handle = handle;
+    params.conditional.type   = cudaGraphCondTypeWhile;
+    params.conditional.size   = 1;
+    cudaGraphNode_t cond_node = nullptr;
+    cudaError_t add_err = cudaGraphAddNode(&cond_node, graph, nullptr, nullptr, 0, &params);
+    if (add_err != cudaSuccess) {
+      RAFT_CUDA_TRY_NO_THROW(cudaGraphDestroy(graph));
+      RAFT_CUDA_TRY(add_err);
+    }
+
+    cudaGraph_t body = params.conditional.phGraph_out[0];
+
+    capture_guard_t guard{stream.value()};
+    cudaError_t begin_err = cudaStreamBeginCaptureToGraph(
+      stream.value(), body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal);
+    if (begin_err != cudaSuccess) {
+      RAFT_CUDA_TRY_NO_THROW(cudaGraphDestroy(graph));
+      RAFT_CUDA_TRY(begin_err);
+    }
+    guard.capture_active = true;
+
+    cudaGraph_t captured = nullptr;
+    try {
+      work(handle);
     } catch (...) {
       // A CUDA / cuBLAS / cuSPARSE call inside `work` threw mid-capture (commonly
       // CUBLAS_STATUS_INTERNAL_ERROR when a concurrent capture-hostile op
