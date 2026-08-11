@@ -134,29 +134,15 @@ __device__ int g_fission_warp;
 
 
 
-// ===== Monolith __launch_bounds__ control (kernel-fission finding) ============================
-// The fission kernels showed that __launch_bounds__(maxThreads=1, N) COSTS ~40 registers on the
-// single-thread path: it tells ptxas the kernel runs one thread per block => no occupancy pressure
-// => spend registers freely toward 255. The monolith's <<<N,1>>> batch path has the identical
-// declaration, so it may be paying the same penalty on the SHIPPING path.
-//   CUOPT_MONO_LB = 1 -> keep __launch_bounds__(Warp?32:1, MinBlocks)   [default, production]
-//                 = 0 -> drop it (diagnostic)
-// ⚠ Only the Warp=false instantiation is expected to benefit. For Warp=true (blockDim 32) the bound
-// is a REAL cap — 65536/(32*MinBlocks) = 256/128/64 for MinBlocks 8/16/32 — and it is what
-// CUOPT_GPU_REGCAP steers, so dropping it there may cause spilling. Measure both before adopting.
-#ifndef CUOPT_MONO_LB
-#define CUOPT_MONO_LB 1
-#endif
-#if CUOPT_MONO_LB
-#define MONO_LB __launch_bounds__(Warp ? 32 : 1, MinBlocks)
-#else
-#define MONO_LB
-#endif
-
-// The fission kernels carry NO __launch_bounds__ — deliberately, and this is NOT a knob.
-// Challenge #13 measured that `__launch_bounds__(maxThreadsPerBlock=1, N)` COSTS ~40 registers per
-// kernel: it tells ptxas there is no occupancy pressure, so it spends registers freely toward the
-// 255 cap. Letting ptxas use its own heuristic is strictly better on this path.
+// ===== NO __launch_bounds__ ANYWHERE (monolith or fission) ====================================
+// Removed 2026-08-11. Challenge #13 measured that `__launch_bounds__(maxThreadsPerBlock=1, N)`
+// COSTS ~40 registers per kernel: it tells ptxas there is no occupancy pressure, so it spends
+// registers freely toward the 255 cap. The fission kernels never carried it for that reason; the
+// monolith did, and now does not — ptxas's own heuristic is used everywhere.
+//
+// Consequence: `MinBlocks` is now an inert template parameter, and `CUOPT_GPU_REGCAP` (which only
+// ever steered it through the launch bound) no longer caps anything. Both are kept so the sweep
+// scaffolding can be restored in one line if a cap is ever wanted again.
 
 // ================= Per-function kernel timers (COMPILE-TIME GATED) ================================
 // Accumulate clock64 ticks per driver function on lane 0 and print one [KTIMER ...] line per solve
@@ -4066,9 +4052,7 @@ __device__ void warp_build_config(const gpu_basis_update_mpf& ft, warp_solve_con
 // spilling), 32 = 64-reg cap (~32 blocks = the HW max, heavier spilling). The batch launcher picks the
 // variant at runtime (CUOPT_GPU_REGCAP) so throughput-vs-register-pressure can be swept in one binary.
 template <bool Warp, int MinBlocks = 8, class FT = gpu_basis_update_mpf>
-__global__ void
-MONO_LB
-gpu_phase2_kernel(kernel_args* args)
+__global__ void gpu_phase2_kernel(kernel_args* args)
 {
   // NOTE: the CUDA 13 `.pragma "enable_smem_spilling"` (spill regs to shared instead of local) is
   // INCOMPATIBLE here — ptxas fails with "(C7800) Smem spilling should not be enabled when functions
