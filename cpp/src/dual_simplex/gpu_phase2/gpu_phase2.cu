@@ -673,6 +673,41 @@ struct gpu_sparse_vector {
     }
   }
 
+  // ---- warp siblings for the fission `Direct` path ----------------------------------------------
+  // On the fission path all 32 lanes are already in the kernel body, so these need no op-code and no
+  // cfg_shared dispatch — just a strided loop. Both are element-wise maps over DISTINCT destinations
+  // (a gpu_sparse_vector's indices are unique), so the strided form is bit-identical to the serial
+  // one: no lane pair touches the same slot, and no arithmetic is reordered.
+  // Direct=false forwards to the serial body — the monolith MUST take that arm, because lanes 1-31
+  // are parked in warp_helper_loop there and a __syncwarp would deadlock.
+  template <bool Direct>
+  __device__ void warp_negate()
+  {
+    if constexpr (Direct) {
+      const int lane = static_cast<int>(threadIdx.x);
+      const i_t nz   = x.size();
+      for (i_t k = lane; k < nz; k += 32) { x[k] *= -1.0; }
+      __syncwarp(0xffffffffu);
+    } else {
+      negate();
+    }
+  }
+
+  // scatter() accumulates (`+=`), but with distinct indices no two lanes hit the same x_dense slot,
+  // so this needs no atomics. Callers must still honour the "x_dense already cleared" precondition.
+  template <bool Direct>
+  __device__ void warp_scatter(f_t* x_dense) const
+  {
+    if constexpr (Direct) {
+      const int lane = static_cast<int>(threadIdx.x);
+      const i_t nz   = i.size();
+      for (i_t k = lane; k < nz; k += 32) { x_dense[i[k]] += x[k]; }
+      __syncwarp(0xffffffffu);
+    } else {
+      scatter(x_dense);
+    }
+  }
+
   __device__ f_t find_coefficient(i_t index) const
   {
     const i_t nz = i.size();
@@ -2573,6 +2608,11 @@ __device__ f_t compute_user_objective(const gpu_lp& lp, f_t obj)
 // OLD basic_list (before the basis swap) and — like the advanced/CPU-simplified driver —
 // WITHOUT the bound-flip contribution. changed_basic_indices == scaled_dxB_sparse (its .i are
 // the changed positions in basic_list). O(nnz), not O(n).
+// Direct=true reduces the sum with a warp butterfly (warp_reduce_add). This is NOT bit-exact vs the
+// serial left-to-right accumulation — the adds are reordered — and `obj` is the CUTOFF comparand read
+// in K5, so this is one of the two places where the fission warp path deliberately stops being
+// bit-identical to the monolith warp. See FISSION_CHALLENGES.md §20.
+template <bool Direct = false>
 __device__ void update_objective(const i_t* basic_list,
                                  const gpu_sparse_vector& changed_basic_indices,
                                  const gpu_span<f_t>& objective,
@@ -2581,12 +2621,28 @@ __device__ void update_objective(const i_t* basic_list,
                                  f_t& obj)
 {
   const i_t changed_basic_nz = (i_t)changed_basic_indices.i.size();
-  for (i_t k = 0; k < changed_basic_nz; ++k) {
-    const i_t j = basic_list[changed_basic_indices.i[k]];
-    obj += delta_x[j] * objective[j];
+  if constexpr (Direct) {
+    const int lane = static_cast<int>(threadIdx.x);
+    f_t part = 0.0;
+    for (i_t k = lane; k < changed_basic_nz; k += 32) {
+      const i_t j = basic_list[changed_basic_indices.i[k]];
+      part += delta_x[j] * objective[j];
+    }
+    const f_t total = warp_reduce_add(part);   // every lane leaves with the full sum
+    // `obj` aliases st.obj in global memory — one writer only.
+    lane0_serial<true>([&] {
+      obj += total;
+      // Leaving index already included above
+      obj += delta_x[entering_index] * objective[entering_index];
+    });
+  } else {
+    for (i_t k = 0; k < changed_basic_nz; ++k) {
+      const i_t j = basic_list[changed_basic_indices.i[k]];
+      obj += delta_x[j] * objective[j];
+    }
+    // Leaving index already included above
+    obj += delta_x[entering_index] * objective[entering_index];
   }
-  // Leaving index already included above
-  obj += delta_x[entering_index] * objective[entering_index];
 }
 
 // Direct=true (kernel fission, warp): ALL 32 lanes execute this, so the collective is called
@@ -2904,18 +2960,35 @@ __device__ void compute_primal_variables(const FT& ft,
   });
 }
 
+template <bool Direct = false>
 __device__ void clear_delta_z(
   i_t entering_index, i_t leaving_index, i_t* delta_z_mark, gpu_vector<i_t>& delta_z_indices, f_t* delta_z)
 {
   const i_t nz = delta_z_indices.size();
-  for (i_t k = 0; k < nz; k++) {
-    const i_t j     = delta_z_indices[k];
-    delta_z[j]      = 0.0;
-    delta_z_mark[j] = 0;
+  // delta_z_indices is a mark-guarded append list, so each column appears at most once -> the
+  // destinations are distinct and the strided form is bit-exact.
+  if constexpr (Direct) {
+    const int lane = static_cast<int>(threadIdx.x);
+    for (i_t k = lane; k < nz; k += 32) {
+      const i_t j     = delta_z_indices[k];
+      delta_z[j]      = 0.0;
+      delta_z_mark[j] = 0;
+    }
+    __syncwarp(0xffffffffu);
+  } else {
+    for (i_t k = 0; k < nz; k++) {
+      const i_t j     = delta_z_indices[k];
+      delta_z[j]      = 0.0;
+      delta_z_mark[j] = 0;
+    }
   }
-  if (entering_index != -1) { delta_z[entering_index] = 0.0; }
-  delta_z[leaving_index] = 0.0;
-  delta_z_indices.clear();
+  // The two tail writes may duplicate an index already zeroed above, but both store 0.0, so the
+  // overlap is idempotent and order-free. clear() is a header RMW -> exactly one lane.
+  lane0_serial<Direct>([&] {
+    if (entering_index != -1) { delta_z[entering_index] = 0.0; }
+    delta_z[leaving_index] = 0.0;
+    delta_z_indices.clear();
+  });
 }
 
 template <bool Warp = false, bool Direct = false, class FT>
@@ -3137,7 +3210,9 @@ __device__ void compute_delta_y(const FT& ft,
   });
   ft.template b_transpose_solve<Warp, Direct>(ei_sparse, delta_y_sparse, UTsol_sparse);
 
-  lane0_serial<Direct>([&] { if (direction != -1) { UTsol_sparse.negate(); } });
+  // `direction` is warp-uniform (read from st.direction), so the branch is uniform and the
+  // __syncwarp count inside warp_negate matches across the warp.
+  if (direction != -1) { UTsol_sparse.template warp_negate<Direct>(); }
 }
 
 template <bool Warp = false, bool Direct = false, class FT>
@@ -3198,7 +3273,9 @@ __device__ i_t compute_delta_x(const gpu_lp& lp,
   f_t delta_x_leaving = direction == 1 ? lp.lower[leaving_index] - x[leaving_index]
                                        : lp.upper[leaving_index] - x[leaving_index];
   ft.template b_solve<Warp, Direct>(rhs_sparse, scaled_delta_xB_sparse, utilde_sparse);
-  lane0_serial<Direct>([&] { scaled_delta_xB_sparse.negate(); });
+  // warp_negate's trailing __syncwarp is what publishes the negated values to the other lanes
+  // before find_coefficient below reads them on all 32.
+  scaled_delta_xB_sparse.template warp_negate<Direct>();
 
   // find_coefficient is read-only, so every lane may compute `scale` itself — no guard needed.
   f_t scale     = scaled_delta_xB_sparse.find_coefficient(basic_leaving_index);
@@ -3272,12 +3349,11 @@ __device__ i_t update_steepest_edge_norms(const gpu_settings& settings,
   KT_TIC(_kt_ses);  // [KTIMER] se sub-split: time the b_solve (se_solve); se_rest = se - se_solve
   ft.template b_solve<Warp, Direct>(delta_y_sparse, v_sparse);
   KT_TOC(KT_SE_SOLVE, _kt_ses);
-  lane0_serial<Direct>([&] {
-    if (direction == -1) {
-      v_sparse.negate();
-    }
-    v_sparse.scatter(v);   // read-modify-write of the dense v -> lane 0 only
-  });
+  // `direction` is warp-uniform. The scatter accumulates into the dense `v`, but v_sparse's indices
+  // are distinct AND `v` is left all-zero by the v_nz loop at the end of every call below, so no two
+  // lanes touch the same slot and no atomics are needed.
+  if (direction == -1) { v_sparse.template warp_negate<Direct>(); }
+  v_sparse.template warp_scatter<Direct>(v);
 
   // find_coefficient is read-only: every lane computes the same wr/omegar, so `return -1` is taken
   // uniformly and no broadcast is needed.
@@ -3315,15 +3391,24 @@ __device__ i_t update_steepest_edge_norms(const gpu_settings& settings,
     }
   }
 
-  lane0_serial<Direct>([&] {
+  // Restore `v` to all-zero for the next pivot. Distinct indices -> strided zeroing is bit-exact,
+  // and this is precisely the invariant warp_scatter above relies on.
+  {
     const i_t v_nz = v_sparse.i.size();
-    for (i_t k = 0; k < v_nz; ++k) {
-      v[v_sparse.i[k]] = 0.0;
+    if constexpr (Direct) {
+      const int lane = static_cast<int>(threadIdx.x);
+      for (i_t k = lane; k < v_nz; k += 32) { v[v_sparse.i[k]] = 0.0; }
+      __syncwarp(0xffffffffu);
+    } else {
+      for (i_t k = 0; k < v_nz; ++k) { v[v_sparse.i[k]] = 0.0; }
     }
-  });
+  }
   return 0;
 }
 
+// `x[j] += delta_x[j]` is a read-modify-write, but the destinations are DISTINCT: scaled_delta_xB's
+// indices are unique, so basic_list[.i[k]] is unique too. Hence the strided form is bit-exact.
+template <bool Direct = false>
 __device__ void update_primal_variables(const gpu_sparse_vector& scaled_delta_xB_sparse,
                                         const i_t* basic_list,
                                         const f_t* delta_x,
@@ -3331,13 +3416,29 @@ __device__ void update_primal_variables(const gpu_sparse_vector& scaled_delta_xB
                                         f_t* x)
 {
   const i_t scaled_delta_xB_nz = scaled_delta_xB_sparse.i.size();
-  for (i_t k = 0; k < scaled_delta_xB_nz; ++k) {
-    const i_t j = basic_list[scaled_delta_xB_sparse.i[k]];
-    x[j] += delta_x[j];
+  if constexpr (Direct) {
+    const int lane = static_cast<int>(threadIdx.x);
+    for (i_t k = lane; k < scaled_delta_xB_nz; k += 32) {
+      const i_t j = basic_list[scaled_delta_xB_sparse.i[k]];
+      x[j] += delta_x[j];
+    }
+    // The entering column is NOT yet in basic_list (K5 does the swap), so this slot is disjoint from
+    // every j above — but exactly one lane must own it.
+    if (threadIdx.x == 0) { x[entering_index] += delta_x[entering_index]; }
+    __syncwarp(0xffffffffu);
+  } else {
+    for (i_t k = 0; k < scaled_delta_xB_nz; ++k) {
+      const i_t j = basic_list[scaled_delta_xB_sparse.i[k]];
+      x[j] += delta_x[j];
+    }
+    x[entering_index] += delta_x[entering_index];
   }
-  x[entering_index] += delta_x[entering_index];
 }
 
+// Every column j is independent: the branch chain reads only column-j data and writes only x[j] and
+// vstatus[j], so no slot is touched twice and the strided form is bit-exact. The per-column body is
+// a lambda so the two loop shapes share one copy of the chain.
+template <bool Direct = false>
 __device__ void set_primal_variables_on_bounds(const gpu_lp& lp,
                                                const gpu_settings& settings,
                                                const f_t* z,
@@ -3347,8 +3448,8 @@ __device__ void set_primal_variables_on_bounds(const gpu_lp& lp,
   const i_t n = lp.num_cols;
   const f_t inf = dev_inf();
   f_t tol       = 1e-10;
-  for (i_t j = 0; j < n; ++j) {
-    if (vstatus[j] == variable_status_t::BASIC) { continue; }
+  auto one_column = [&](i_t j) {
+    if (vstatus[j] == variable_status_t::BASIC) { return; }
     const f_t fixed_tolerance = settings.fixed_tol;
     if (fabs(lp.lower[j] - lp.upper[j]) < fixed_tolerance) {
       x[j]       = lp.lower[j];
@@ -3375,6 +3476,13 @@ __device__ void set_primal_variables_on_bounds(const gpu_lp& lp,
       x[j]       = 0;
       vstatus[j] = variable_status_t::NONBASIC_FREE;
     }
+  };
+  if constexpr (Direct) {
+    const int lane = static_cast<int>(threadIdx.x);
+    for (i_t j = lane; j < n; j += 32) { one_column(j); }
+    __syncwarp(0xffffffffu);
+  } else {
+    for (i_t j = 0; j < n; ++j) { one_column(j); }
   }
 }
 
@@ -3484,13 +3592,13 @@ struct slot_state {
     f_t* x      = sol.x.data();
     f_t* z      = sol.z.data();
 
-    lane0_serial<Direct>([&] {
     // assign (not resize) throughout: a slot is REUSED by the next B&B node, so every buffer must be
     // fully re-initialized, not just grown — resize would leave the previous node's tail values.
-    xB_workspace.assign(m, 0.0);
+    // assign() may device-malloc, so it stays on lane 0; the O(n) bound-setting scan next to it does
+    // not, so the two are split rather than sharing one lane-0 region.
+    lane0_serial<Direct>([&] { xB_workspace.assign(m, 0.0); });
 
-    set_primal_variables_on_bounds(lp, settings, z, vstatus, x);
-    });   // end lane-0 prologue part 1
+    set_primal_variables_on_bounds<Direct>(lp, settings, z, vstatus, x);
 
     // Both of these solve through the factors, so they follow the kernel's geometry — the monolith
     // has always run them on the warp, and fission now does too via Direct.
@@ -3506,12 +3614,21 @@ struct slot_state {
                                                    se_row_degree, se_mapping, se_coeff, se_dy,
                                                    se_UTsol, se_ei);
     } else {
-      lane0_serial<Direct>([&] {
+      // basic_list holds m DISTINCT column indices, so each delta_y_steepest_edge[j] is visited by
+      // exactly one lane — bit-exact.
+      if constexpr (Direct) {
+        const int lane = static_cast<int>(threadIdx.x);
+        for (i_t k = lane; k < m; k += 32) {
+          const i_t j = basic_list[k];
+          if (delta_y_steepest_edge[j] <= 0.0) { delta_y_steepest_edge[j] = 1e-4; }
+        }
+        __syncwarp(0xffffffffu);
+      } else {
         for (i_t k = 0; k < m; ++k) {
           const i_t j = basic_list[k];
           if (delta_y_steepest_edge[j] <= 0.0) { delta_y_steepest_edge[j] = 1e-4; }
         }
-      });
+      }
     }
 
     lane0_serial<Direct>([&] {
@@ -3521,7 +3638,22 @@ struct slot_state {
     delta_x.assign(n, 0.0);
     v.assign(m, 0.0);
     basic_mark.assign(n, -1);
-    for (i_t k = 0; k < m; ++k) { basic_mark[basic_list[k]] = k; }
+    });
+
+    // basic_list holds m DISTINCT column indices, so no two lanes write the same slot — bit-exact.
+    // data() is read AFTER the lane-0 region above because assign() may have relocated the buffer.
+    {
+      i_t* bm = basic_mark.data();
+      if constexpr (Direct) {
+        const int lane = static_cast<int>(threadIdx.x);
+        for (i_t k = lane; k < m; k += 32) { bm[basic_list[k]] = k; }
+        __syncwarp(0xffffffffu);
+      } else {
+        for (i_t k = 0; k < m; ++k) { bm[basic_list[k]] = k; }
+      }
+    }
+
+    lane0_serial<Direct>([&] {
     delta_z_mark.assign(n, 0);
     delta_z_indices.clear();
     delta_z_indices.reserve(n);
@@ -4251,7 +4383,19 @@ __global__ void gpu_fission_k1(kernel_args* args)
     st.UTsol_sparse.clear();
   });
   compute_delta_y<Warp, Direct>(ft, basic_leaving, direction, st.delta_y_sparse, st.UTsol_sparse);
-  lane0_serial<Direct>([&] { st.dy_norm_sq = st.delta_y_sparse.norm2_squared(); });
+  // Butterfly reduction of ||delta_y||^2. Reordered vs the serial sum, and dy_norm_sq feeds the SE
+  // norms -> pricing, so this is the second deliberate break from monolith bit-identity (§20).
+  if constexpr (Direct) {
+    const int lane = static_cast<int>(threadIdx.x);
+    const f_t* dyx = st.delta_y_sparse.x.data();
+    const i_t nz   = (i_t)st.delta_y_sparse.i.size();   // trip count as in norm2_squared()
+    f_t part = 0.0;
+    for (i_t k = lane; k < nz; k += 32) { part += dyx[k] * dyx[k]; }
+    const f_t total = warp_reduce_add(part);
+    lane0_serial<true>([&] { st.dy_norm_sq = total; });
+  } else {
+    st.dy_norm_sq = st.delta_y_sparse.norm2_squared();
+  }
 }
 
 // ---- K2: delta_z + ratio test + dual update  (monolith L3, L4, L5) ----------------------------
@@ -4274,8 +4418,22 @@ __global__ void gpu_fission_k2(kernel_args* args)
   // 3. Reduced-cost SpMv: transpose (CSR) when delta_y is sparse (<=30% dense), else dense CSC.
   i_t delta_y_nz0      = 0;
   const i_t nz_delta_y = (i_t)st.delta_y_sparse.i.size();
-  for (i_t k = 0; k < nz_delta_y; ++k) {
-    if (fabs(st.delta_y_sparse.x[k]) > 1e-12) { delta_y_nz0++; }
+  if constexpr (Direct) {
+    // INTEGER count, so a ballot/popc reduction is exact — nothing is reordered the way an FP sum
+    // would be. Every lane accumulates the same running total, which keeps delta_y_nz0 (and the
+    // used_transpose_dz branch it gates) warp-uniform. nz_delta_y is warp-uniform, so all lanes
+    // execute the same number of __ballot_sync calls.
+    const int lane = static_cast<int>(threadIdx.x);
+    const f_t* dyx = st.delta_y_sparse.x.data();
+    for (i_t base = 0; base < nz_delta_y; base += 32) {
+      const i_t k    = base + lane;
+      const bool hit = (k < nz_delta_y) && (fabs(dyx[k]) > 1e-12);
+      delta_y_nz0 += __popc(__ballot_sync(0xffffffffu, hit));
+    }
+  } else {
+    for (i_t k = 0; k < nz_delta_y; ++k) {
+      if (fabs(st.delta_y_sparse.x[k]) > 1e-12) { delta_y_nz0++; }
+    }
   }
   const f_t delta_y_nz_percentage = delta_y_nz0 / static_cast<f_t>(m) * 100.0;
   st.used_transpose_dz            = delta_y_nz_percentage <= 30.0;
@@ -4286,11 +4444,16 @@ __global__ void gpu_fission_k2(kernel_args* args)
                                 st.nonbasic_end.data(), st.delta_z_mark.data(), st.delta_z_indices,
                                 st.delta_z.data());
   } else {
-    // Dense route. to_dense RESIZES delta_y (header RMW + possible device malloc) -> lane 0, exactly
-    // as the monolith runs it. The delta_z update itself is now the WARP_DZ collective: one lane per
+    // Dense route. warp_to_dense keeps the sizing (reserve + set_size, a header RMW that may
+    // device-malloc) on lane 0 and warps the O(n) zero-fill + the nnz scatter — bit-exact, since the
+    // sparse indices are distinct. The delta_z update itself is the WARP_DZ collective: one lane per
     // nonbasic column, gather dots, ordered ballot/popc append -> bit-exact vs the serial scan, so
     // the push_back that used to force this whole branch onto lane 0 is gone.
-    lane0_serial<Direct>([&] { st.delta_y_sparse.to_dense(st.delta_y); });
+    if constexpr (Warp) {
+      ft.template warp_to_dense<Direct>(st.delta_y_sparse, st.delta_y);
+    } else {
+      st.delta_y_sparse.to_dense(st.delta_y);
+    }
     compute_reduced_cost_update<Warp, Direct>(lp, ft, a.basic_list, a.nonbasic_list,
                                               st.delta_y.data(), st.leaving, st.direction,
                                               st.delta_z_mark.data(), st.delta_z_indices,
@@ -4381,15 +4544,14 @@ __global__ void gpu_fission_k4(kernel_args* args)
                                            st.delta_y_sparse, st.dy_norm_sq, st.scaled_dxB_sparse,
                                            st.basic_leaving, st.entering, st.v.data(), st.v_sparse,
                                            a.dy_se);
-  // Both are read-modify-writes over the sparse nnz (x[j] += …, obj += …) — lane 0 only. They are
-  // O(nnz) and off the critical path; warping them is a later, separate step.
-  lane0_serial<Direct>([&] {
-    update_primal_variables(st.scaled_dxB_sparse, a.basic_list, st.delta_x.data(), st.entering,
-                            sol.x.data());
-    // Called with the OLD basic_list (before K5's swap), true costs, no bound-flip term.
-    update_objective(a.basic_list, st.scaled_dxB_sparse, lp.objective, st.delta_x.data(),
-                     st.entering, st.obj);
-  });
+  // The two used to share one lane-0 region. They are independent (update_objective reads delta_x
+  // and objective, never x), so splitting them is safe.
+  update_primal_variables<Direct>(st.scaled_dxB_sparse, a.basic_list, st.delta_x.data(), st.entering,
+                                  sol.x.data());
+  // Called with the OLD basic_list (before K5's swap), true costs, no bound-flip term.
+  // Under Direct this reduces with a butterfly — a reordered sum into the CUTOFF comparand.
+  update_objective<Direct>(a.basic_list, st.scaled_dxB_sparse, lp.objective, st.delta_x.data(),
+                           st.entering, st.obj);
 }
 
 // ---- K5: basis swap + Arow sync + ft.update + infeasibilities + clear + iter++ + cutoff -------
@@ -4436,9 +4598,8 @@ __global__ void gpu_fission_k5(kernel_args* args)
   compute_initial_primal_infeasibilities<Warp, Direct>(lp, settings, ft, a.basic_list, sol.x.data(),
                                                        st.squared_infeas, st.infeas_idx,
                                                        st.primal_inf);
-  lane0_serial<Direct>([&] {
-    clear_delta_z(entering, leaving, st.delta_z_mark.data(), st.delta_z_indices, st.delta_z.data());
-  });
+  clear_delta_z<Direct>(entering, leaving, st.delta_z_mark.data(), st.delta_z_indices,
+                        st.delta_z.data());
 
   lane0_serial<Direct>([&] { st.iter++; });   // counts COMPLETED pivots, matching the monolith
 
