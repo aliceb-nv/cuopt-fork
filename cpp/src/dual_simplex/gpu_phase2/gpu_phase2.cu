@@ -70,32 +70,34 @@ using gpu_span = cuda::std::span<T>;
 // the host before each launch; set with atomicOr so concurrent blocks don't tear.
 __device__ int g_gpu_alloc_failed;
 
-// Steepest-edge drift reprice switch. **DEFAULT: reprice OFF** (g_serep_off = 1).
-//   CUOPT_SEREP_ON=1  -> restore the reprice
-//   CUOPT_SEREP_OFF   -> still accepted; it now only reaffirms the default (kept so existing
-//                        harnesses and the B200 benchmark scripts keep working unchanged)
+// Steepest-edge drift reprice switch. **DEFAULT: reprice ON** (g_serep_off = 0).
+//   CUOPT_SEREP_OFF=1 -> disable the reprice
+//   unset / "0"       -> reprice enabled (the default, and the historical meaning)
 //
-// WHY OFF BY DEFAULT (measured 2026-08-11, 100 v6 nodes, after the Direct conversion):
+// The actual state of this switch is printed by report_config() as `reprice=ON|OFF` on the [CONFIG]
+// line at every launch, so no log can be ambiguous about which configuration produced it.
+//
+// SPEED NOTE (measured 2026-08-11, 100 v6 nodes, laptop, after the Direct conversion):
 //   reprice ON   3.410 s / 3866 pivots      reprice OFF   2.863 s / 5148 pivots
-// It fires 7285 times to save 1282 pivots — ~1.9 firings per pivot saved, i.e. it has ALWAYS been a
-// near-break-even trade. A reprice pass is pricing + BTran ~= 16% of a full pivot, so 7285 of them
-// cost roughly the 1282 pivots they buy back. Before the Direct conversion the trade landed just on
-// the winning side (4.792 vs 5.515 s); afterwards it lands just on the losing side. Nothing about
-// the reprice regressed — a coin-flip trade flipped.
+// Off is ~1.19x faster here. It fires 7285 times to save 1282 pivots — ~1.9 firings per pivot saved,
+// i.e. it has ALWAYS been a near-break-even trade. A reprice pass is pricing + BTran ~= 16% of a full
+// pivot, so 7285 of them cost roughly the 1282 pivots they buy back. Before the Direct conversion the
+// trade landed just on the winning side (4.792 vs 5.515 s); afterwards just on the losing side.
+// Nothing about the reprice regressed — a coin-flip trade flipped.
 //
-// ⚠ IT IS A NUMERICAL SAFEGUARD, and off costs 33% MORE PIVOTS (5148 vs 3866) — i.e. measurably
-// worse pivot choices. This default is a speed decision taken on ONE 100-node laptop benchmark; it
-// is not evidence that the safeguard is unnecessary on harder or larger problems. Re-check it on the
-// large-batch B200 run before treating it as settled.
+// It stays ON by default anyway, for two reasons:
+//   1. It is a NUMERICAL SAFEGUARD, and off costs 33% MORE PIVOTS (5148 vs 3866) — measurably worse
+//      pivot choices. One 100-node laptop benchmark is not evidence it is unnecessary at scale;
+//      that is what the large-batch B200 throughput run is for. Pass CUOPT_SEREP_OFF=1 to A/B it.
+//   2. The CPU driver (phase2.cpp) in this tree always reprices, so ON is the configuration in which
+//      the single-thread GPU is 100/100 bit-exact vs the CPU (dual_simplex/CLAUDE.md rules 2 and 8).
 //
-// ⚠ CPU-PARITY CONSEQUENCE: this tree's CPU driver (phase2.cpp) does NOT honour CUOPT_SEREP_OFF at
-// all, so the CPU always reprices. With the GPU now defaulting OFF, the single-thread GPU no longer
-// matches the CPU bit-for-bit unless you pass CUOPT_SEREP_ON=1. Use CUOPT_SEREP_ON=1 for the
-// 100/100 bit-exactness gate (dual_simplex/CLAUDE.md rules 2 and 8).
+// ⚠ DO NOT FLIP THIS DEFAULT without renaming the switch. See resolve_reprice() for what happened
+// on 2026-08-12 when the default moved but the variable name did not.
 //
-// It also remains the mechanism that lets the monolith run in the SAME reprice-free configuration as
-// the fissioned pipeline, which structurally cannot express the `continue` back-edge:
-//     GPU monolith (default, reprice off)  0-diff vs  GPU fission   [the Direct-conversion gate]
+// CUOPT_SEREP_OFF=1 also remains the mechanism that lets the monolith run in the SAME reprice-free
+// configuration as the fissioned pipeline, which structurally cannot express the `continue` back-edge:
+//     GPU monolith (CUOPT_SEREP_OFF=1)  0-diff vs  GPU fission   [the Direct-conversion gate]
 __device__ int g_serep_off;
 
 // Force the SERIAL (walking-Harris-band) ratio test even on the warp path (host: CUOPT_RT_SERIAL).
@@ -4246,6 +4248,37 @@ __global__ void gpu_fission_cond(cudaGraphConditionalHandle handle,
   }
 }
 
+// ---- reprice switch resolution (ONE place, so every launcher agrees) --------------------------
+// Returns g_serep_off: 0 = reprice ENABLED (the default), 1 = disabled.
+//
+// SEMANTICS ARE THE HISTORICAL ONES and must stay that way: unset/"0" -> reprice ON,
+// CUOPT_SEREP_OFF=1 -> reprice OFF. Every harness in claude_scripts/ and both agents' workflows
+// depend on this meaning.
+//
+// ⚠ DO NOT FLIP THIS DEFAULT. It was briefly flipped to OFF on 2026-08-11 because reprice-off
+// benchmarks faster (2.86 s vs 3.41 s on the 100 v6 nodes). Flipping it silently changed what an
+// existing command line MEANT: "unset" stopped meaning "reprice ON", so harnesses kept running and
+// mislabelled their results. On 2026-08-12 that produced a confident, wrong conclusion -- a run
+// reported "reprice ON 2.878 s vs OFF 3.118 s" when BOTH legs actually had the reprice OFF on the
+// GPU (identical 5148 GPU pivots); only the CPU reference leg differed between them.
+// If the reprice is ever to be off by default, the switch must be RENAMED at the same time so no
+// existing command line can silently change meaning.
+static int resolve_reprice()
+{
+  const char* e = std::getenv("CUOPT_SEREP_OFF");
+  return (e != nullptr && std::string(e) != "0") ? 1 : 0;
+}
+
+// ---- [CONFIG] self-report -------------------------------------------------------------------
+// Every launch states its own decisive configuration. A measurement that reports its configuration
+// cannot be mislabelled by the operator, the shell history, or another agent reading the output.
+static void report_config(const char* path, bool warp, int serep_off, size_t nprob)
+{
+  std::printf("[CONFIG] path=%s geometry=%s reprice=%s problems=%zu\n",
+              path, warp ? "warp<<<N,32>>>" : "single<<<N,1>>>",
+              serep_off ? "OFF" : "ON", nprob);
+}
+
 // Device heap (in-kernel gpu_vector malloc arena) + stack are per-CONTEXT limits and the heap
 // can ONLY be set before the first malloc-using kernel launch, so set them exactly once per
 // process. First caller wins: the batch wrapper (the only/first GPU kernel in the throughput
@@ -4557,14 +4590,11 @@ dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
   // CUOPT_GPU_WARP: unset/"0" = single-thread; "1" = plain wavefront; "2" (or higher) = big≥32.
   const char* warp_env  = std::getenv("CUOPT_GPU_WARP");
   const bool  warp_mode = (warp_env != nullptr && std::string(warp_env) != "0");
-  // Kernel-fission bit-exact reference: CUOPT_SEREP_OFF=1 disables the SE-drift reprice so the
-  // monolith matches the reprice-free fissioned pipeline (FISSION_CHALLENGES.md #3).
-  { // DEFAULT: reprice OFF (see the g_serep_off banner). CUOPT_SEREP_ON=1 restores it.
-    // CUOPT_SEREP_OFF is still accepted so existing harnesses keep working — it now merely
-    // reaffirms the default.
-    const char* on      = std::getenv("CUOPT_SEREP_ON");
-    const int   serep_off = (on != nullptr && std::string(on) != "0") ? 0 : 1;
-    RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_serep_off, &serep_off, sizeof(int))); }
+  // SE-drift reprice: ON by default; CUOPT_SEREP_OFF=1 disables it. report_config() prints which of
+  // the two actually ran, so the resulting log is self-describing — see the g_serep_off banner.
+  const int serep_off = resolve_reprice();
+  report_config("monolith", warp_mode, serep_off, 1);
+  { RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_serep_off, &serep_off, sizeof(int))); }
   { const char* e = std::getenv("CUOPT_RT_SERIAL");
     const int rt_serial = (e != nullptr && std::string(e) != "0") ? 1 : 0;
     RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_rt_serial, &rt_serial, sizeof(int))); }
@@ -4718,14 +4748,11 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
   // GPU-vs-reference verification when CUOPT_GPU_WARP is set.
   const char* warp_env  = std::getenv("CUOPT_GPU_WARP");
   const bool  warp_mode = (warp_env != nullptr && std::string(warp_env) != "0");
-  // Kernel-fission bit-exact reference: CUOPT_SEREP_OFF=1 disables the SE-drift reprice so the
-  // monolith matches the reprice-free fissioned pipeline (FISSION_CHALLENGES.md #3).
-  { // DEFAULT: reprice OFF (see the g_serep_off banner). CUOPT_SEREP_ON=1 restores it.
-    // CUOPT_SEREP_OFF is still accepted so existing harnesses keep working — it now merely
-    // reaffirms the default.
-    const char* on      = std::getenv("CUOPT_SEREP_ON");
-    const int   serep_off = (on != nullptr && std::string(on) != "0") ? 0 : 1;
-    RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_serep_off, &serep_off, sizeof(int))); }
+  // SE-drift reprice: ON by default; CUOPT_SEREP_OFF=1 disables it. report_config() prints which of
+  // the two actually ran, so the resulting log is self-describing — see the g_serep_off banner.
+  const int serep_off = resolve_reprice();
+  report_config("monolith", warp_mode, serep_off, items.size());
+  { RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_serep_off, &serep_off, sizeof(int))); }
   { const char* e = std::getenv("CUOPT_RT_SERIAL");
     const int rt_serial = (e != nullptr && std::string(e) != "0") ? 1 : 0;
     RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_rt_serial, &rt_serial, sizeof(int))); }
@@ -4879,12 +4906,13 @@ void gpu_simplified_dual_phase2_batch_fission(const std::vector<gpu_batch_item<i
   }
   ensure_device_limits(heap_estimate_bytes);
 
-  { // DEFAULT: reprice OFF (see the g_serep_off banner). CUOPT_SEREP_ON=1 restores it.
-    // CUOPT_SEREP_OFF is still accepted so existing harnesses keep working — it now merely
-    // reaffirms the default.
-    const char* on      = std::getenv("CUOPT_SEREP_ON");
-    const int   serep_off = (on != nullptr && std::string(on) != "0") ? 0 : 1;
-    RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_serep_off, &serep_off, sizeof(int))); }
+  // The fissioned pipeline is STRUCTURALLY reprice-free: the SE-drift safeguard is a `continue`
+  // back-edge inside the monolith's pivot loop, and there is no such edge to take when the loop is
+  // a host-driven sequence of super-steps. So this is not a choice the env can make here -- it is
+  // forced, CUOPT_SEREP_OFF is irrelevant on this path, and [CONFIG] reports reprice=OFF because
+  // that is what actually runs. (Uploading 1 also keeps the device symbol consistent with it.)
+  const int serep_off = 1;
+  { RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_serep_off, &serep_off, sizeof(int))); }
   { const char* e = std::getenv("CUOPT_RT_SERIAL");
     const int rt_serial = (e != nullptr && std::string(e) != "0") ? 1 : 0;
     RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_rt_serial, &rt_serial, sizeof(int))); }
@@ -4898,6 +4926,7 @@ void gpu_simplified_dual_phase2_batch_fission(const std::vector<gpu_batch_item<i
   // Parsed BEFORE Ksetup launches: g_fission_warp gates the level-schedule build inside it.
   const char* fiss_warp_env = std::getenv("CUOPT_GPU_WARP");
   const bool  fiss_warp = (fiss_warp_env != nullptr && std::string(fiss_warp_env) != "0");
+  report_config("fission", fiss_warp, serep_off, static_cast<size_t>(N));
   // Ksetup builds the elimination-level schedules into the slot only when the solve stages need them.
   { const int fw = fiss_warp ? 1 : 0;
     RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_fission_warp, &fw, sizeof(int))); }
