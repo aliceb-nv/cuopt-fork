@@ -69,6 +69,16 @@ TEST(SolverSettingsTest, TestSetGet)
   EXPECT_FALSE(solver_settings.first_primal_feasible);
   solver_settings.first_primal_feasible = true;
   EXPECT_TRUE(solver_settings.first_primal_feasible);
+
+  EXPECT_EQ(solver_settings.postsolve_info, -1);
+  solver_settings.postsolve_info = 1;
+  EXPECT_EQ(solver_settings.postsolve_info, 1);
+
+  EXPECT_EQ(solver_settings.barrier_presolve_bound_free_variables, -1);
+  solver_settings.barrier_presolve_bound_free_variables = 0;
+  EXPECT_EQ(solver_settings.barrier_presolve_bound_free_variables, 0);
+  solver_settings.barrier_presolve_bound_free_variables = 1;
+  EXPECT_EQ(solver_settings.barrier_presolve_bound_free_variables, 1);
 }
 
 TEST(SolverSettingsTest, warm_start_smaller_vector)
