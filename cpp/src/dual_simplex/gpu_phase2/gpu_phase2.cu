@@ -70,103 +70,71 @@ using gpu_span = cuda::std::span<T>;
 // the host before each launch; set with atomicOr so concurrent blocks don't tear.
 __device__ int g_gpu_alloc_failed;
 
-// Steepest-edge drift reprice switch. **DEFAULT: reprice ON** (g_serep_off = 0).
-//   CUOPT_SEREP_OFF=1 -> disable the reprice
-//   unset / "0"       -> reprice enabled (the default, and the historical meaning)
-//
-// The actual state of this switch is printed by report_config() as `reprice=ON|OFF` on the [CONFIG]
-// line at every launch, so no log can be ambiguous about which configuration produced it.
-//
-// SPEED NOTE (measured 2026-08-11, 100 v6 nodes, laptop, after the Direct conversion):
-//   reprice ON   3.410 s / 3866 pivots      reprice OFF   2.863 s / 5148 pivots
-// Off is ~1.19x faster here. It fires 7285 times to save 1282 pivots — ~1.9 firings per pivot saved,
-// i.e. it has ALWAYS been a near-break-even trade. A reprice pass is pricing + BTran ~= 16% of a full
-// pivot, so 7285 of them cost roughly the 1282 pivots they buy back. Before the Direct conversion the
-// trade landed just on the winning side (4.792 vs 5.515 s); afterwards just on the losing side.
-// Nothing about the reprice regressed — a coin-flip trade flipped.
-//
-// It stays ON by default anyway, for two reasons:
-//   1. It is a NUMERICAL SAFEGUARD, and off costs 33% MORE PIVOTS (5148 vs 3866) — measurably worse
-//      pivot choices. One 100-node laptop benchmark is not evidence it is unnecessary at scale;
-//      that is what the large-batch B200 throughput run is for. Pass CUOPT_SEREP_OFF=1 to A/B it.
-//   2. The CPU driver (phase2.cpp) in this tree always reprices, so ON is the configuration in which
-//      the single-thread GPU is 100/100 bit-exact vs the CPU (dual_simplex/CLAUDE.md rules 2 and 8).
-//
-// ⚠ DO NOT FLIP THIS DEFAULT without renaming the switch. See resolve_reprice() for what happened
-// on 2026-08-12 when the default moved but the variable name did not.
-//
-// CUOPT_SEREP_OFF=1 also remains the mechanism that lets the monolith run in the SAME reprice-free
-// configuration as the fissioned pipeline, which structurally cannot express the `continue` back-edge:
-//     GPU monolith (CUOPT_SEREP_OFF=1)  0-diff vs  GPU fission   [the Direct-conversion gate]
-__device__ int g_serep_off;
 
-// Force the SERIAL (walking-Harris-band) ratio test even on the warp path (host: CUOPT_RT_SERIAL).
-// Default 0 = parallel warp_collective_rt (the MPF production choice). See phase2_ratio_test.
-__device__ int g_rt_serial;
-
-// Kernel fission: set by the host when ANY of the pivot kernels runs on a warp AND needs the
-// elimination-level schedules (K1/K3/K4 — the solve kernels). Ksetup then builds warp_build_config
-// into slot_state and wires ft.warp_cfg_. K2 does NOT need it (its collectives take explicit
-// arguments), so a K2-only warp run leaves this 0 and skips the (per-node, O(m + nnz)) build.
-__device__ int g_fission_warp;
-
-// ===== Dev-loop build lever: SKIP THE MONOLITH WARP KERNEL ==================================
-// `gpu_phase2_kernel<Warp=true>` is one giant fused kernel (whole driver inlined + the 10-branch
-// warp_collective op-code dispatch, ~212 regs, 1632 B stack). ptxas cost is superlinear in function
-// size, so it dominates this translation unit completely.
-//
-// MEASURED 2026-08-07 (`--ptxas-options=-v`, per-entry "Compile time", sm_89):
-//     gpu_phase2_kernel<Warp=true>    131,449 ms      <-- 99.95% of the TU
-//     gpu_phase2_kernel<Warp=false>        43 ms
-//     gpu_fission_setup                    17 ms
-//     the 11 gpu_fission_k* kernels     2-12 ms each  (~0.09 s for ALL of them)
-//     TOTAL WALL for gpu_phase2.cu     131.51 s
-// i.e. every other kernel in the file COMBINED is ~0.13 s of ptxas.
-//
-// END-TO-END effect of the flag, measured on the same command (not just the ptxas share, which would
-// wrongly predict ~1000x — the front end does NOT disappear):
-//     default                         134.64 s
-//     -DCUOPT_SKIP_MONOLITH_WARP=1     21.20 s      -> 6.35x, ~113 s saved per rebuild
-// The residual ~21 s is cicc/front-end + host compilation for everything else in the TU, which is
-// the floor. (The monolith warp costs more than its 131 s of ptxas: cicc must also inline the whole
-// fused driver to PTX first, so the flag saves front-end time too.)
-//
-// ⚠ WHAT IT DOES **NOT** DISABLE: the FISSION warp kernels (gpu_fission_k1..k4<true>) are launched
-// outside these guards, so `CUOPT_GPU_FISSION=1 CUOPT_FISSION_K<N>_WARP=1` still works fully. Only
-// the MONOLITH warp path becomes unavailable; CUOPT_GPU_WARP on the monolith then falls back to the
-// single-thread kernel with a one-time warning. So this is the right flag for any fission-side dev
-// loop, and must be OFF for the monolith-vs-fission warp comparisons (sweep legs 2 and 4) and for
-// any production build that ships CUOPT_GPU_WARP.
-//
-// Set it from the build, no source edit needed:   -DCUOPT_SKIP_MONOLITH_WARP=1
-#ifndef CUOPT_SKIP_MONOLITH_WARP
-#define CUOPT_SKIP_MONOLITH_WARP 0
-#endif
-// Backward-compatible alias for the old (misleadingly named) switch.
-#ifdef CUOPT_GPU_SINGLE_THREAD_ONLY
-#undef CUOPT_SKIP_MONOLITH_WARP
-#define CUOPT_SKIP_MONOLITH_WARP 1
-#endif
+// MEASURED AND REJECTED (2026-08-18): making the hypersparse-vs-dense routing threshold tunable
+// per solve entry point. The KTIMER solve table appears to say the single hard-coded 0.05 is badly
+// mistuned (hypersparse l_solve mean 4.88M cycles against dense's 1.80M), but a sweep over four
+// independent runtime thresholds says otherwise: all-dense 9.125 s and all-hypersparse 13.816 s
+// against 0.759 s at 0.05, and every per-entry-point forcing was neutral-to-worse. Re-swept after
+// the hypersparse l_solve tail was made collective, which inverts those per-call means (hypersparse
+// now 1.08M vs dense 1.85M): 0.10 -> 5.014, 0.20 -> 5.168, 0.40 -> 5.154, 1.00 -> 5.200, all worse
+// than 0.05's 4.725. The per-call means are not a valid basis for routing in EITHER direction --
+// the dense rows exclude their to_dense/from_dense conversions, and the hypersparse calls are
+// selected for small reach, so the two populations are not comparable. 0.05 stays.
+// To re-run either sweep, override the threshold at build time and re-measure; 0.05 stays.
 
 
 
+// ===== No-op gather column elision =========================================================
+// The four warp triangular solves are all GATHER form (see the operator table below): column j of
+// the gather matrix computes x[j] = (x[j] - sum over the OFF-DIAGONAL span) / diag. When that span
+// is empty and the diagonal is exactly 1.0 the column writes back exactly what it read, so it can
+// be dropped from the wavefront schedule outright. Nothing downstream can tell "wrote the same
+// value" from "did not write": the dense path leaves x[j] as it found it, and the hypersparse path
+// leaves the value warp_sptrsv_preload_body put there (the scattered rhs, or 0), which is what the
+// solve would have produced. Bit-identical -- pivot counts must not move.
+//
+// Measured over the 100 v6 nodes this is 90.8% of L-solve columns, 83.0% of L-transpose, 73.2% of
+// U-transpose and 29.4% of U-solve -- the gather form excludes the diagonal from the inner loop,
+// and for most columns of these factors there is nothing else in the column.
+//
+// The flag is carried in the SIGN BIT of the existing per-column level array
+// (warp_solve_config::level[op]). Both consumers already load that word, so the classification
+// costs no extra memory traffic. Levels are small (max ~413 over this workload). Every read of the
+// array must go through factor_level().
+//
+// DEFAULT ON since 2026-08-21, after measuring -3.6% (4.186 -> 4.035 s) over three independent
+// A/Bs with pivots, bit-exact count, registers (128) and smem (1016 B) all unchanged, racecheck
+// clean and the <<<1,1>>> reference still 100/100 bit-exact.
+// Consumed ONLY in warp_build_levels -- the lane-0 prologue -- so unlike a flag in the wavefront
+// inner loop it costs no registers on the hot path and one binary measures both arms.
+__device__ int g_elide_noop;
 
-// Occupancy target for the Direct warp monolith.
-//   0  (default) -> NO __launch_bounds__; ptxas picks 182 regs / 11 blocks/SM
-//   16           -> __launch_bounds__(32,16) -> 128 regs / 16 blocks/SM, 8 B spill
-// MEASURED 2026-08-11 on RTX 3500 Ada (40 SMs), 100-node batch: capping is 2-3% SLOWER. That is not
-// evidence against the cap — it is evidence the benchmark cannot test it. 40 SMs x 11 blocks/SM =
-// 440 concurrent block slots vs a 100-BLOCK launch: occupancy never binds, so the cap buys nothing
-// and the spill costs a little. It must be A/B'd on the large-batch B200 run (20k nodes >> slots),
-// where higher occupancy is exactly the lever. Switch with -DCUOPT_MONO_DIRECT_MINBLOCKS=16.
-#ifndef CUOPT_MONO_DIRECT_MINBLOCKS
-#define CUOPT_MONO_DIRECT_MINBLOCKS 0
-#endif
+// REORDERING THE LEVEL SCHEDULE IS A DEAD END, measured 2026-08-26. Emitting each level by
+// descending column length instead of ascending index was built and measured at only -1.0%, and
+// removed as not worth an LSD radix pass in the lane-0 prologue. The general reason: a level's cost
+// equals `max(longest column, ceil(work/32))` to within 1-5% as scheduled today, so a level costs
+// the length of its single longest column and no permutation can beat that. SELL-C-sigma and
+// two-columns-per-lane were also built and lost (+7.5%, +7.2%).
+
+
+static constexpr i_t kColNoop = static_cast<i_t>(0x80000000u);  // level[] sign bit
+__device__ __forceinline__ i_t  factor_level(i_t lv) { return lv & 0x7fffffff; }
+__device__ __forceinline__ bool level_is_noop(i_t lv) { return lv < 0; }
+
+
+// CHASING REGISTERS BELOW 128 IS NOT WORTH IT, measured 2026-08-26. Two routes were built. Hoisting
+// the one-time prologue into its own <<<N,32>>> launch reached 102 regs (the largest saving found
+// here) but cost +14.3%, because a kernel boundary is a global barrier and all N setups must finish
+// before ANY pivot loop starts. And __launch_bounds__(32,17) DOES reach the next occupancy step --
+// 96 regs, 20 blocks/SM -- for +23%, as the extra spill (112 -> 176 B) outweighs the 1.25x
+// occupancy. The 97..128 register band is one step at 16 blocks/SM, so saving registers inside it
+// buys nothing and crossing out of it measures worse.
 
 // ===== __launch_bounds__: only on the Direct warp monolith (see MinBlocks note at the kernel) ====================================
 // Removed 2026-08-11. Challenge #13 measured that `__launch_bounds__(maxThreadsPerBlock=1, N)`
 // COSTS ~40 registers per kernel: it tells ptxas there is no occupancy pressure, so it spends
-// registers freely toward the 255 cap. The fission kernels never carried it for that reason; the
+// registers freely toward the 255 cap. That is why it is not used here; the
 // monolith did, and now does not — ptxas's own heuristic is used everywhere.
 //
 // Consequence: `MinBlocks` is now an inert template parameter, and `CUOPT_GPU_REGCAP` (which only
@@ -174,100 +142,8 @@ __device__ int g_fission_warp;
 // scaffolding can be restored in one line if a cap is ever wanted again.
 
 // ================= Per-function kernel timers (COMPILE-TIME GATED) ================================
-// Accumulate clock64 ticks per driver function on lane 0 and print one [KTIMER ...] line per solve
-// at kernel exit. Enable by uncommenting the #define below (or building with -DCUOPT_KTIMER);
-// when undefined every KT_* macro expands to ((void)0) → ZERO overhead → production default.
-// Single-problem launches only (the accumulators are __device__ globals; a multi-block batch would
-// race them, so the emit is gated on gridDim.x==1). Pair with the harness's [SENODE <name>] line
-// (TEST_NETLIB_SE_STATS=1) to group per node. "setup" = kernel entry → first pivot (arg unpack +
-// warp_build_config + the driver's one-time init: bounds/primal-vars/SE-norm-init/Arow/…); "pinf"
-// counts only the per-pivot recompute (the one-time setup call is inside "setup").
-// #define CUOPT_KTIMER 1   <- uncomment (or build with -DCUOPT_KTIMER) to re-enable the profilers
-// below: [KTIMER]/[KTIMER2] per-function ticks + per-branch call counts, [STAT] per-stage histograms
-// (ST_TIC/ST_TOC), [ESTSTAT]/[R2HIST] routing-estimate distributions, [QPFILL] Q/P fill.
-// Left OFF for production: every KT_*/ST_*/ES_* macro expands to ((void)0), so the overhead is zero.
-// These profilers cost ~4% and, being compiled ON by default, silently inflated EVERY timing in the
-// 2026-08 campaign. The host-side [GPUKERNEL] line is not gated by this and always prints; it carries
-// prof= so no timing can be quoted from a profiling build without the log saying so.
-#ifdef CUOPT_KTIMER
-#define CUOPT_PROF_BUILD 1
-#else
-#define CUOPT_PROF_BUILD 0
-#endif
 
-#ifdef CUOPT_KTIMER
-enum kt_slot {
-  KT_SETUP = 0, KT_PRICING, KT_BTRAN, KT_DZ, KT_RCU, KT_RT, KT_UPDDUAL, KT_FTRAN, KT_SE, KT_SE_SOLVE,
-  KT_UPDPRIM, KT_OBJ, KT_AROW, KT_FTUPD, KT_PINF, KT_CLEARDZ,
-  KT_N
-};
-// KT_SE_SOLVE is a SUB-slot of KT_SE (the ft.b_solve inside update_steepest_edge_norms); se_rest =
-// se - se_solve. It is NOT part of the top-level partition (would double-count KT_SE).
-__device__ unsigned long long g_kt[KT_N];
-__device__ unsigned long long g_kt_calls[KT_N];
-__device__ long long          g_kt_t0;         // kernel-entry clock (origin for "setup" and "total")
-__device__ unsigned long long g_kt_sdxb_sum;   // Σ scaled_delta_xB nnz over pivots (density confirm)
-__device__ unsigned long long g_kt_sdxb_cnt;   // pivot count for the above
-// Per-CALL statistics for 4 inverse-add op groups (cycle-count distribution, exact cnt/sum/min/max +
-// 24-bucket log2 histogram for the median). Groups: 0 hypersparse-SpMV (spa_.multiply, hybrid first solve),
-// 1 SpMV (dense gather), 2 hypersparse-DMV (FIRSTMULT, P^T/Q^T rhs first call), 3 DMV (AXPY correction).
-// Symmetric per-call stat groups for the LU(MPF)-vs-SpMV(inverse) primitive comparison. Both drivers do
-// two factor-applies per direction; each apply picks a HYPersparse or DENse path. Naming:
-//   <driver>_<direction>_<factor>_<path> ; B = b_solve, BT = b_transpose_solve.
-// Plus the product-form "update application" each driver pays per solve: MPF = T-loop, inverse = DMV.
-enum stat_grp {
-  // ---- MPF (LU) driver ----
-  SG_LU_B_L_HYP = 0, SG_LU_B_L_DEN,     // b_solve      L  triangular solve
-  SG_LU_B_U_HYP, SG_LU_B_U_DEN,     // b_solve      U  triangular solve
-  SG_LU_BT_U_HYP, SG_LU_BT_U_DEN,   // b_transpose  U^T triangular solve
-  SG_LU_BT_L_HYP, SG_LU_BT_L_DEN,   // b_transpose  L^T triangular solve
-  SG_LU_TLOOP,        // MPF product-form apply: the T-loop (nested INSIDE the L / L^T solve groups)
-  SG_N
-};
-__device__ unsigned long long g_st_cnt[SG_N], g_st_sum[SG_N], g_st_min[SG_N], g_st_max[SG_N];
-__device__ unsigned long long g_st_hist[SG_N][24];
-#define ST_TIC(v)  long long v = clock64()
-#define ST_TOC(g, v) do { if (threadIdx.x == 0) { const unsigned long long _d = (unsigned long long)(clock64() - (v)); \
-    g_st_cnt[g]++; g_st_sum[g] += _d; if (g_st_min[g] == 0ULL || _d < g_st_min[g]) g_st_min[g] = _d; \
-    if (_d > g_st_max[g]) g_st_max[g] = _d; int _b = 0; unsigned long long _t = _d; \
-    while (_t > 1ULL && _b < 23) { _t >>= 1; ++_b; } g_st_hist[g][_b]++; } } while (0)
-#define ST_EMIT() do { if (threadIdx.x == 0 && gridDim.x == 1) { for (int _g = 0; _g < SG_N; ++_g) { \
-    printf("[STAT] g=%d cnt=%llu sum=%llu min=%llu max=%llu h=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", \
-      _g, g_st_cnt[_g], g_st_sum[_g], g_st_min[_g], g_st_max[_g], \
-      g_st_hist[_g][0],g_st_hist[_g][1],g_st_hist[_g][2],g_st_hist[_g][3],g_st_hist[_g][4],g_st_hist[_g][5], \
-      g_st_hist[_g][6],g_st_hist[_g][7],g_st_hist[_g][8],g_st_hist[_g][9],g_st_hist[_g][10],g_st_hist[_g][11], \
-      g_st_hist[_g][12],g_st_hist[_g][13],g_st_hist[_g][14],g_st_hist[_g][15],g_st_hist[_g][16],g_st_hist[_g][17], \
-      g_st_hist[_g][18],g_st_hist[_g][19],g_st_hist[_g][20],g_st_hist[_g][21],g_st_hist[_g][22],g_st_hist[_g][23]); } } } while (0)
-#define KT_RESET()      do { if (threadIdx.x == 0) { for (int _i = 0; _i < KT_N; ++_i) { g_kt[_i] = 0; g_kt_calls[_i] = 0; } g_kt_t0 = clock64(); g_kt_sdxb_sum = 0; g_kt_sdxb_cnt = 0; \
-    for (int _g = 0; _g < SG_N; ++_g) { g_st_cnt[_g] = 0; g_st_sum[_g] = 0; g_st_min[_g] = 0; g_st_max[_g] = 0; for (int _b = 0; _b < 24; ++_b) g_st_hist[_g][_b] = 0; } \
-    } } while (0)
-#define KT_TIC(v)       long long v = clock64()
-#define KT_TOC(slot, v) do { if (threadIdx.x == 0) { g_kt[slot] += (unsigned long long)(clock64() - (v)); g_kt_calls[slot]++; } } while (0)
-#define KT_BUMP(slot)   do { if (threadIdx.x == 0) { g_kt_calls[slot]++; } } while (0)
-#define KT_SETUP_DONE() do { if (threadIdx.x == 0) { g_kt[KT_SETUP] += (unsigned long long)(clock64() - g_kt_t0); g_kt_calls[KT_SETUP]++; } } while (0)
-#define KT_SDXB(nz)     do { if (threadIdx.x == 0) { g_kt_sdxb_sum += (unsigned long long)(nz); g_kt_sdxb_cnt++; } } while (0)
-#define KT_EMIT(m)      do { if (threadIdx.x == 0 && gridDim.x == 1) { \
-    const unsigned long long _tot = (unsigned long long)(clock64() - g_kt_t0); \
-    printf("[KTIMER] total=%llu setup=%llu pricing=%llu btran=%llu dz=%llu rcu=%llu rt=%llu " \
-           "upddual=%llu ftran=%llu se=%llu se_solve=%llu updprim=%llu obj=%llu arow=%llu ftupd=%llu " \
-           "pinf=%llu cleardz=%llu sdxb_sum=%llu sdxb_cnt=%llu m=%d\n", _tot, g_kt[KT_SETUP], \
-           g_kt[KT_PRICING], g_kt[KT_BTRAN], g_kt[KT_DZ], g_kt[KT_RCU], g_kt[KT_RT], g_kt[KT_UPDDUAL], \
-           g_kt[KT_FTRAN], g_kt[KT_SE], g_kt[KT_SE_SOLVE], g_kt[KT_UPDPRIM], g_kt[KT_OBJ], g_kt[KT_AROW], \
-           g_kt[KT_FTUPD], g_kt[KT_PINF], g_kt[KT_CLEARDZ], \
-           g_kt_sdxb_sum, g_kt_sdxb_cnt, \
-           static_cast<int>(m)); } } while (0)
-#else
-#define KT_RESET()      ((void)0)
-#define KT_TIC(v)       ((void)0)
-#define KT_TOC(slot, v) ((void)0)
-#define KT_BUMP(slot)   ((void)0)
-#define ST_TIC(v)       ((void)0)
-#define ST_TOC(g, v)    ((void)0)
-#define ST_EMIT()       ((void)0)
-#define KT_SETUP_DONE() ((void)0)
-#define KT_SDXB(nz)     ((void)0)
-#define KT_EMIT(m)      ((void)0)
-#endif
+
 
 __device__ __forceinline__ f_t dev_inf() { return cuda::std::numeric_limits<f_t>::infinity(); }
 __device__ __forceinline__ f_t dev_nan() { return cuda::std::numeric_limits<f_t>::quiet_NaN(); }
@@ -282,6 +158,48 @@ __device__ __forceinline__ unsigned long long dev_globaltimer()
 }
 
 // ---------------------------------------------------------------------------
+// gpu_arena : per-block bump allocator over ORDINARY, HOST-ALLOCATED VRAM.
+//
+// WHY THIS EXISTS. Everything a solve allocates used to come from the in-kernel malloc() heap.
+// That heap is a fixed arena the driver caps at ~16 GB on EVERY device (measured by bisection on a
+// 12 GB RTX 3500 Ada and on a 178 GB B200; usable is ~0.82x granted, so ~13.1 GB). It is not a
+// fraction of device memory, and no environment variable raises it. Ordinary cudaMalloc VRAM on the
+// same B200 is 177 GB free. So the batch size was being limited by the smallest pool on the card
+// while the largest sat idle.
+//
+// Most of what a solve allocates is FIXED SIZE -- m-, n- or nz-sized workspaces the host already
+// knows the dimensions of, because it computes exactly those sizes for its own VRAM pre-flight.
+// Those now come from here. What stays on malloc() is only what is genuinely dynamic: S_/mu_values_
+// (the MPF rank-1 update store, one column per pivot, reset at refactor) and function-local vectors.
+//
+// Bump, never free: a block's arena is handed out once and reclaimed wholesale when the batch ends.
+// A gpu_vector that GROWS while arena-bound abandons its old slice, so the arena is sized with
+// slack (see arena_bytes_for). Running out is NOT a failure -- take() returns nullptr and
+// gpu_vector::grow_to falls back to device malloc(), i.e. to exactly today's behaviour.
+//
+// take() uses atomicAdd on `used`: gpu_vector::grow_to is normally reached inside a lane0_serial
+// region, but ALLOC_STATS' g_alloc_multilane counter proves multi-lane allocation does occur, and a
+// racing bump would hand two lanes the same bytes. The atomic makes each caller's slice private.
+// ---------------------------------------------------------------------------
+struct gpu_arena {
+  char* base{nullptr};
+  unsigned long long cap{0};
+  unsigned long long used{0};
+
+  // Returns a 16-byte-aligned slice, or nullptr when the arena is unset or exhausted.
+  __device__ void* take(size_t bytes)
+  {
+    if (base == nullptr || bytes == 0) { return nullptr; }
+    // Round the REQUEST up, then bump: every slice is a multiple of 16 and `base` is cudaMalloc'd
+    // (256-byte aligned), so every returned pointer is 16-aligned without a separate align step.
+    const unsigned long long need = (static_cast<unsigned long long>(bytes) + 15ull) & ~15ull;
+    const unsigned long long off  = atomicAdd(&used, need);
+    if (off + need > cap) { return nullptr; }  // exhausted -> caller falls back to malloc()
+    return base + off;
+  }
+};
+
+// ---------------------------------------------------------------------------
 // gpu_vector<T> : owning device container, mirrors the std::vector ops used by
 // the CPU code. Allocates with device malloc(), frees with free(). Used only
 // for data created dynamically inside the kernel.
@@ -291,7 +209,11 @@ struct gpu_vector {
   T* data_       = nullptr;
   size_t size_   = 0;
   size_t cap_    = 0;
-  bool owns_     = true;   // false => non-owning view over external device memory (never freed here)
+  bool owns_     = true;   // false => memory belongs to someone else (a view, or an arena slice)
+  // When set, grow_to() takes from this per-block arena before it falls back to device malloc().
+  // Bound once at slot construction (slot_state::bind_arena_buffers) and never cleared, so a
+  // regrow also comes from the arena. Null on every function-local vector.
+  gpu_arena* arena_ = nullptr;
 
   // Adopt external device memory as a fixed-size, mutable, non-owning view (zero-copy). The caller
   // owns/frees the buffer; resize/reserve must not be called on a view.
@@ -300,6 +222,10 @@ struct gpu_vector {
     if (owns_ && data_ != nullptr) { free(data_); }
     data_ = ptr; size_ = n; cap_ = n; owns_ = false;
   }
+
+  // Route this vector's allocations through a per-block arena. Must be called BEFORE the first
+  // resize/reserve — an already-allocated buffer keeps its malloc'd storage until it next grows.
+  __device__ void bind_arena(gpu_arena* a) { arena_ = a; }
 
   __device__ gpu_vector() {}
   __device__ explicit gpu_vector(size_t n) { resize(n); }
@@ -311,12 +237,13 @@ struct gpu_vector {
     size_ = o.size_;
   }
   __device__ gpu_vector(gpu_vector&& o)
-    : data_(o.data_), size_(o.size_), cap_(o.cap_), owns_(o.owns_)
+    : data_(o.data_), size_(o.size_), cap_(o.cap_), owns_(o.owns_), arena_(o.arena_)
   {
-    o.data_ = nullptr;
-    o.size_ = 0;
-    o.cap_  = 0;
-    o.owns_ = true;
+    o.data_  = nullptr;
+    o.size_  = 0;
+    o.cap_   = 0;
+    o.owns_  = true;
+    o.arena_ = nullptr;
   }
   __device__ gpu_vector& operator=(const gpu_vector& o)
   {
@@ -335,10 +262,14 @@ struct gpu_vector {
     size_   = o.size_;
     cap_    = o.cap_;
     owns_   = o.owns_;
-    o.data_ = nullptr;
-    o.size_ = 0;
-    o.cap_  = 0;
-    o.owns_ = true;
+    // arena_ is NOT taken from `o`: it says where THIS vector should allocate in future, which is a
+    // property of the destination slot, not of the buffer being moved in. Taking a function-local's
+    // null binding here would silently unbind a slot member for the rest of the solve.
+    o.data_  = nullptr;
+    o.size_  = 0;
+    o.cap_   = 0;
+    o.owns_  = true;
+    o.arena_ = nullptr;
     return *this;
   }
   __device__ ~gpu_vector()
@@ -366,24 +297,41 @@ struct gpu_vector {
     T* d = data_; data_ = o.data_; o.data_ = d;
     size_t s = size_; size_ = o.size_; o.size_ = s;
     size_t c = cap_; cap_ = o.cap_; o.cap_ = c;
+    // owns_ follows the BUFFER, so it must swap with it. Previously it did not. That was benign
+    // only while every swapped pair was malloc-owning; with arena slices in play, leaving owns_
+    // behind would hand an arena pointer to a vector that frees it -- heap corruption. arena_ does
+    // NOT swap: it says where each vector allocates next, which stays with the vector.
+    bool w = owns_; owns_ = o.owns_; o.owns_ = w;
   }
 
   __device__ void grow_to(size_t newcap)
   {
     if (newcap <= cap_) { return; }
-    T* p = static_cast<T*>(malloc(newcap * sizeof(T)));
+    const size_t want = newcap * sizeof(T);
+    // Arena first (ordinary VRAM, no driver cap). Null arena, or an exhausted one, falls straight
+    // through to malloc() -- i.e. to the behaviour this had before the arena existed.
+    T*   p          = (arena_ != nullptr) ? static_cast<T*>(arena_->take(want)) : nullptr;
+    bool from_arena = (p != nullptr);
+    if (!from_arena) {
+      p = static_cast<T*>(malloc(want));
+    }
     if (p == nullptr) {
       printf("[gpu_phase2] device malloc FAILED for %llu bytes (cap %llu -> %llu)\n",
-             (unsigned long long)(newcap * sizeof(T)),
+             (unsigned long long)want,
              (unsigned long long)cap_,
              (unsigned long long)newcap);
       atomicOr(&g_gpu_alloc_failed, 1);
       return;
     }
     for (size_t k = 0; k < size_; ++k) { p[k] = data_[k]; }
-    if (data_ != nullptr) { free(data_); }
+    // Free ONLY a buffer we malloc'd. An arena slice is bump-allocated and reclaimed with the whole
+    // arena; a view() buffer belongs to the host. Passing either to free() corrupts the heap.
+    // (This used to free unconditionally, which was safe only by the convention that views are
+    // never resized.)
+    if (owns_ && data_ != nullptr) { free(data_); }
     data_ = p;
     cap_  = newcap;
+    owns_ = !from_arena;
   }
   __device__ void reserve(size_t n) { grow_to(n); }
   __device__ void resize(size_t n)
@@ -435,13 +383,13 @@ __device__ void gpu_sort(T* first, T* last, Cmp cmp)
 }
 
 // ---------------------------------------------------------------------------
-// Non-owning sparse-matrix view (CSC). Backs the LP matrix and the fixed LU
-// factors / their transposes. col_start is a MUTABLE span because reach()/DFS
-// temporarily flip-and-restore the column pointers.
+// Non-owning sparse-matrix view (CSC). Backs the LP matrix and the fixed LU factors / their
+// transposes. col_start is read-only because reach()/DFS keeps visited state in a private byte-mark
+// workspace instead of temporarily modifying the factor.
 // ---------------------------------------------------------------------------
 struct gpu_csc_view {
   i_t m{0}, n{0}, nz_max{0};
-  gpu_span<i_t> col_start;
+  gpu_span<const i_t> col_start;
   gpu_span<i_t> i;
   gpu_span<f_t> x;
   __device__ i_t nnz() const { return col_start[n]; }
@@ -559,6 +507,9 @@ struct gpu_sparse_vector {
   i_t n{0};
   gpu_vector<i_t> i;
   gpu_vector<f_t> x;
+
+  // Route both payloads through a per-block arena (see gpu_arena / slot_state::bind_arena_buffers).
+  __device__ void bind_arena(gpu_arena* a) { i.bind_arena(a); x.bind_arena(a); }
 
   __device__ gpu_sparse_vector() {}
   __device__ gpu_sparse_vector(i_t n_, i_t nz) : n(n_), i(nz), x(nz) {}
@@ -692,8 +643,8 @@ struct gpu_sparse_vector {
     }
   }
 
-  // ---- warp siblings for the fission `Direct` path ----------------------------------------------
-  // On the fission path all 32 lanes are already in the kernel body, so these need no op-code and no
+  // ---- warp siblings for the `Direct` path ----------------------------------------------
+  // On the Direct path all 32 lanes are already in the kernel body, so these need no op-code and no
   // cfg_shared dispatch — just a strided loop. Both are element-wise maps over DISTINCT destinations
   // (a gpu_sparse_vector's indices are unique), so the strided form is bit-identical to the serial
   // one: no lane pair touches the same slot, and no arithmetic is reordered.
@@ -868,7 +819,7 @@ struct warp_solve_config {
   // path passes those values as call arguments to the warp_*_body collectives instead.
   // Also gone: diag_first/descending/incremental/m, which warp_build_config wrote but nothing ever
   // read — superseded by the compile-time op_diag_first/op_descending/op_incremental constexprs.
-  // Built once (monolith: by the kernel prologue on lane 0; fission: by Ksetup), read-only after.
+  // Built once (by the kernel prologue on lane 0), read-only after.
   const i_t* cs[kNumWarpSolveOps];      // gather CSC col_start
   const i_t* ridx[kNumWarpSolveOps];    // gather CSC row indices
   const f_t* val[kNumWarpSolveOps];     // gather CSC values
@@ -876,11 +827,17 @@ struct warp_solve_config {
   const i_t* corder[kNumWarpSolveOps];  // columns by level [m]
   const i_t* level[kNumWarpSolveOps];   // per-column elimination level [m] (reach-restricted solve)
   i_t        nlev[kNumWarpSolveOps];
-  // reach-restricted sparse gather solve: sptrsv_prologue buckets the reachable set into sp_ls/sp_co
-  // using sp_pos as write-cursors, then the warp runs the wavefront over that sparse schedule.
+  // reach-restricted sparse gather solve: warp_dispatch_sptrsv buckets the reachable set into
+  // sp_ls/sp_co using sp_pos as write-cursors, then runs the wavefront over that sparse schedule.
   i_t* sp_ls;    // sparse level offsets [sp_nlev+1] (built per solve)
   i_t* sp_co;    // reachable columns bucketed by level [|R|] (built per solve)
   i_t* sp_pos;   // scratch write-cursors [sp_nlev+1] (built per solve)
+  // Lane-0 DFS hot stack. In the monolith this config is shared memory, so the active DFS frames
+  // avoid round trips through the global xi/pstack workspace. The measured maximum depth is 47;
+  // depth 64 safely falls back to the general global-stack DFS below.
+  i_t dfs_node[64];
+  i_t dfs_next[64];
+  i_t dfs_end[64];
 };
 
 // Collective (all-32-lane) dense solve of operator cfg.op on x = cfg.x. Both modes do exactly
@@ -890,7 +847,6 @@ struct warp_solve_config {
 // Each body takes ONLY what it needs as plain parameters (a_ prefix avoids collisions with locals).
 // TWO call paths, ONE copy of the math:
 //   * monolith : warp_collective_X(cfg) below is a thin unpacker -> calls the body.
-//   * fission  : the warp K1..K5 kernels will call warp_X_body(...) DIRECTLY -- no cfg_shared, no
 //                op-code dispatch, so ptxas sees ONE known body per call site instead of the
 //                10-branch union that pins the warp monolith at 250 registers.
 // __forceinline__ is REQUIRED: it collapses the wrapper's unpack-then-pass back to the original
@@ -901,7 +857,7 @@ struct warp_solve_config {
 __device__ __forceinline__ f_t warp_reduce_add(f_t v);
 __device__ __forceinline__ f_t warp_reduce_min(f_t v);
 
-// COMPILE-TIME operator variant, for the fission `Direct` path where the op is a literal at the call
+// COMPILE-TIME operator variant, for the `Direct` path where the op is a literal at the call
 // site. Nothing about the solve is decided at runtime: no op code, no flag loads, no per-column
 // branches — ptxas emits one specialized wavefront body per call site.
 template <int Op>
@@ -924,9 +880,35 @@ __device__ __forceinline__ void warp_tloop_body(bool a_tl_asc, i_t a_tl_axpyoff,
     const f_t mu   = a_tl_mu[k];
     const i_t dc0  = a_tl_cs[dcol];
     const i_t dc1  = a_tl_cs[dcol + 1];
-    f_t partial    = 0.0;
-    for (i_t p = dc0 + lane; p < dc1; p += 32) { partial += a_tl_val[p] * x[a_tl_ri[p]]; }
-    const f_t dot   = warp_reduce_add(partial);   // every lane gets the full sum
+    // Short-column fast path. The T-loop is 16.2% of all block cycles and its dot products run on
+    // the product-form update columns, which are mostly 0-2 entries long. For those the 5-level
+    // butterfly (10 shfl instructions for a double) costs far more than the arithmetic it reduces,
+    // and it sits on the loop's serial dependency chain: update k+1's dot cannot start until update
+    // k's axpy has landed, so this latency is not hidden by other work.
+    //
+    // BIT-IDENTICAL, not merely equivalent, and only for len <= 2. With len entries only lanes
+    // 0..len-1 hold a nonzero partial, and the butterfly's accumulation order for len <= 2 is
+    // exactly v0 (len==1) or v0 + v1 (len==2) -- the same order every lane computes directly here.
+    // At len == 3 the butterfly folds as (v0 + v2) + v1, which a serial v0 + v1 + v2 does NOT
+    // reproduce, so the fast path stops at 2 and everything longer takes the original butterfly.
+    // The redundant loads are warp-uniform, so they broadcast out of L1.
+    const i_t dlen = dc1 - dc0;
+    f_t dot;
+    if (dlen <= 2) {
+      dot = 0.0;
+      if (dlen >= 1) { dot = a_tl_val[dc0] * x[a_tl_ri[dc0]]; }
+      if (dlen == 2) { dot += a_tl_val[dc0 + 1] * x[a_tl_ri[dc0 + 1]]; }
+      // REQUIRED. In the butterfly arm warp_reduce_add's __shfl_xor_sync is what separates this
+      // update's dot READS of x from its axpy WRITES to x; the u_col and v_col row sets overlap, so
+      // without a convergence point here a lane that finished its dot could store into x[i] while
+      // another lane is still loading x[i] for the same dot. Independent thread scheduling makes
+      // that reachable on sm_100. Dropping this is the missing-__syncwarp bug class.
+      __syncwarp(0xffffffffu);
+    } else {
+      f_t partial = 0.0;
+      for (i_t p = dc0 + lane; p < dc1; p += 32) { partial += a_tl_val[p] * x[a_tl_ri[p]]; }
+      dot = warp_reduce_add(partial);   // every lane gets the full sum
+    }
     const f_t theta = dot / mu;
     if (fabs(theta) > a_tl_tol) {
       const i_t ac0 = a_tl_cs[acol];
@@ -944,6 +926,9 @@ __device__ __forceinline__ void warp_dz_body(const i_t* a_dz_Acs, const i_t* a_d
   f_t* dz = a_dz_out;
   for (i_t k = lane; k < m; k += 32) { dz[a_dz_basic[k]] = 0.0; }  // clear basic entries
   __syncwarp(0xffffffffu);                                           // clears done before leaving set
+  // No barrier needed straight after this single-lane store: `leaving` is a BASIC column and the
+  // loop below writes only NONBASIC ones, so no other lane touches this slot. The trailing
+  // __syncwarp at the end of the body is what publishes it to the caller.
   if (lane == 0) { dz[a_dz_leaving] = static_cast<f_t>(a_dz_dir); }
   const i_t num_nb = n - m;
   i_t count      = 0;    // running #appended (identical on all lanes)
@@ -963,7 +948,11 @@ __device__ __forceinline__ void warp_dz_body(const i_t* a_dz_Acs, const i_t* a_d
     if (active) { a_dz_indices[count + prefix] = j; a_dz_mark[j] = 1; }  // distinct offsets/rows
     count += __popc(ball);
   }
-  if (lane == 0) { *a_dz_count = count; }
+  *a_dz_count = count;  // every lane: count is warp-uniform, so no broadcast is needed (see lane0_bcast)
+  // Publish every global write above (dz, a_dz_indices, a_dz_mark, and the lane-0 dz[leaving]) to
+  // the rest of the warp. The caller's next collective reads them from ALL lanes, so without this
+  // the reader may see a slot its writer has not stored yet -- a plain cross-lane RAW hazard.
+  __syncwarp(0xffffffffu);
 }
 
 __device__ __forceinline__ void warp_dz_scatter_body(i_t* a_dz_count, i_t a_dz_dir, i_t* a_dz_indices, i_t a_dz_leaving, i_t* a_dz_mark, f_t* a_dz_out, const i_t* a_dzs_dyi, const f_t* a_dzs_dyx, const i_t* a_dzs_j, const i_t* a_dzs_nbe, i_t a_dzs_nzdy, const i_t* a_dzs_rs, const f_t* a_dzs_x)
@@ -992,10 +981,13 @@ __device__ __forceinline__ void warp_dz_scatter_body(i_t* a_dz_count, i_t a_dz_d
       count += __popc(ball);
     }
   }
-  if (lane == 0) {
-    *a_dz_count      = count;
-    dz[a_dz_leaving] = static_cast<f_t>(a_dz_dir);
-  }
+  *a_dz_count = count;  // every lane: count is warp-uniform, so no broadcast is needed (see lane0_bcast)
+  // Converge before the single-lane store: the loop above wrote dz from all 32 lanes.
+  __syncwarp(0xffffffffu);
+  if (lane == 0) { dz[a_dz_leaving] = static_cast<f_t>(a_dz_dir); }
+  // ...and publish it, plus a_dz_indices/a_dz_mark, before the caller's next collective reads them
+  // from every lane. Without this the reader can race the writer (cross-lane RAW).
+  __syncwarp(0xffffffffu);
 }
 
 __device__ __forceinline__ void warp_todense_body(f_t* a_td_dense, const i_t* a_td_i, i_t a_td_n, i_t a_td_nz, const f_t* a_td_x)
@@ -1006,6 +998,8 @@ __device__ __forceinline__ void warp_todense_body(f_t* a_td_dense, const i_t* a_
   __syncwarp(0xffffffffu);
   const i_t nz = a_td_nz;
   for (i_t k = lane; k < nz; k += 32) { a_td_dense[a_td_i[k]] = a_td_x[k]; }
+  // Publish the dense buffer before the solve that consumes it reads it from every lane.
+  __syncwarp(0xffffffffu);
 }
 
 __device__ __forceinline__ void warp_fromdense_body(i_t* a_fd_count, i_t* a_fd_i, const f_t* a_fd_in, i_t a_fd_n, f_t* a_fd_x)
@@ -1022,7 +1016,9 @@ __device__ __forceinline__ void warp_fromdense_body(i_t* a_fd_count, i_t* a_fd_i
     if (active) { a_fd_i[count + prefix] = k; a_fd_x[count + prefix] = v; }
     count += __popc(ball);
   }
-  if (lane == 0) { *a_fd_count = count; }
+  *a_fd_count = count;  // every lane: count is warp-uniform (same ballot on every lane)
+  // Publish a_fd_i / a_fd_x before the caller's next collective reads them from every lane.
+  __syncwarp(0xffffffffu);
 }
 
 __device__ __forceinline__ void warp_rt_body(f_t a_rt_dual_tol, const f_t* a_rt_dz, i_t* a_rt_entering, i_t* a_rt_k, i_t a_rt_m, i_t a_rt_n, const i_t* a_rt_nonbasic, f_t a_rt_pivot_tol, f_t* a_rt_step, const variable_status_t* a_rt_vstatus, const f_t* a_rt_z, f_t a_rt_zero_tol)
@@ -1057,7 +1053,8 @@ __device__ __forceinline__ void warp_rt_body(f_t a_rt_dual_tol, const f_t* a_rt_
   // The `ratio <= gmin` form is still right for the FINITE case — see the note below.
   if (!isfinite(gmin)) {
     if (lane == 0) { *a_rt_entering = -1; *a_rt_k = -1; *a_rt_step = INF; }
-    return;
+    __syncwarp(0xffffffffu);  // same publish as the normal exit below; gmin is warp-uniform so all
+    return;                   // 32 lanes take this path together
   }
 
   // Pass 2: among ratio < gmin+ztol, pick max |z[j]| (tie → smaller k).
@@ -1092,6 +1089,9 @@ __device__ __forceinline__ void warp_rt_body(f_t a_rt_dual_tol, const f_t* a_rt_
     }
   }
   if (lane == 0) { *a_rt_entering = best_j; *a_rt_k = best_j < 0 ? -1 : best_k; *a_rt_step = best_r; }
+  // These three go to GLOBAL slot state and every lane reads them back immediately, so publish them
+  // here rather than relying on the caller to remember a barrier.
+  __syncwarp(0xffffffffu);
 }
 
 __device__ __forceinline__ void warp_seupd_body(const i_t* a_su_basic, f_t a_su_dynormsq, f_t* a_su_dyse, i_t a_su_entering, i_t a_su_leaving, i_t a_su_nz, f_t a_su_omegar, const i_t* a_su_sdxb_i, const f_t* a_su_sdxb_x, const f_t* a_su_v, f_t a_su_wr)
@@ -1110,6 +1110,11 @@ __device__ __forceinline__ void warp_seupd_body(const i_t* a_su_basic, f_t a_su_
       a_su_dyse[j]    = fmax(new_val, 1e-4);
     }
   }
+  // Publish the updated steepest-edge norms. steepest_edge_pricing_with_infeasibilities runs
+  // SERIALLY ON EVERY LANE, so each lane reads norms that other lanes wrote here. Without this
+  // barrier a lane can price on a stale norm and pick a different leaving row -- which is exactly
+  // how this showed up on B200: identical iteration 0, then a different `leaving` at iteration 1.
+  __syncwarp(0xffffffffu);
 }
 
 __device__ __forceinline__ void warp_pinf_body(const i_t* a_pi_basic, i_t* a_pi_count, i_t* a_pi_idx, const f_t* a_pi_lower, i_t a_pi_m, i_t a_pi_n, f_t* a_pi_pinf, f_t* a_pi_pinf_sq, f_t* a_pi_sqinf, f_t a_pi_tol, const f_t* a_pi_upper, const f_t* a_pi_x)
@@ -1140,7 +1145,15 @@ __device__ __forceinline__ void warp_pinf_body(const i_t* a_pi_basic, i_t* a_pi_
   }
   const f_t pinf    = warp_reduce_add(lpinf);
   const f_t pinf_sq = warp_reduce_add(lpinf_sq);
-  if (lane == 0) { *a_pi_count = count; *a_pi_pinf = pinf; *a_pi_pinf_sq = pinf_sq; }
+  // Written by EVERY lane, not just lane 0. All three are warp-uniform by construction (count is
+  // accumulated from the same ballot on every lane; pinf/pinf_sq come from warp_reduce_add), so
+  // each lane stores its own copy and the caller needs no broadcast at all. These pointers address
+  // the CALLER'S LOCALS, so this is 32 independent per-lane stores, not a race.
+  *a_pi_count = count; *a_pi_pinf = pinf; *a_pi_pinf_sq = pinf_sq;
+  // Publish a_pi_idx / a_pi_sqinf before the caller's next collective reads them from every lane.
+  // The pricing scan that follows is SERIAL ON EVERY LANE, so every lane reads slots that other
+  // lanes wrote -- exactly the cross-lane RAW this barrier closes.
+  __syncwarp(0xffffffffu);
 }
 
 __device__ __forceinline__ void warp_upddual_body(const i_t* a_ud_dy_i, i_t a_ud_dy_nz, const f_t* a_ud_dy_x, const f_t* a_ud_dz, const i_t* a_ud_dz_idx, i_t a_ud_dz_nz, i_t a_ud_leaving, f_t a_ud_step, f_t* a_ud_y, f_t* a_ud_z)
@@ -1155,10 +1168,368 @@ __device__ __forceinline__ void warp_upddual_body(const i_t* a_ud_dy_i, i_t a_ud
     const i_t j = a_ud_dz_idx[k];
     a_ud_z[j] += step * a_ud_dz[j];
   }
+  // Converge before the single-lane update: the loop above wrote a_ud_z from all 32 lanes.
+  __syncwarp(0xffffffffu);
   if (lane == 0) { a_ud_z[a_ud_leaving] += step * a_ud_dz[a_ud_leaving]; }
+  // Publish y and z before the caller's next collective reads them from every lane.
+  __syncwarp(0xffffffffu);
 }
 
-// COMPILE-TIME operator variant of the reach-restricted gather (fission `Direct` path).
+// Warp compaction of a reach-restricted solve result. Replaces solve_to_sparse_vector's serial
+// O(reach) tail, which ran on lane 0 after EVERY hypersparse solve -- and hypersparse is 59.2% of
+// all solve cycles, so this tail was paid on the majority of the kernel's work.
+//
+// BIT-IDENTICAL to the serial loop. The output order is by increasing p (the ballot prefix orders
+// within a step by lane == by p, and `count` accumulates across steps), which is the order the
+// serial push_back produced. No arithmetic is performed at all -- values are copied, and the
+// filter `fabs(v) > zero_tol` is evaluated per element exactly as before.
+//
+// The in-place clears are race-free because xi[top..m) is the reach SET: its entries are distinct,
+// so no two lanes ever touch the same a_x[i]. Each lane also reads a_x[i] before clearing it itself.
+__device__ __forceinline__ void warp_gather_reach_body(
+  i_t* a_count, i_t* a_out_i, f_t* a_out_x, i_t a_top, i_t a_m, i_t* a_xi, f_t* a_x)
+{
+  const int lane     = static_cast<int>(threadIdx.x);
+  const f_t zero_tol = 1e-13;
+  i_t count          = 0;
+  for (i_t base = a_top; base < a_m; base += 32) {
+    const i_t p = base + lane;
+    bool active = false;
+    i_t  i      = 0;
+    f_t  v      = 0.0;
+    if (p < a_m) {
+      i      = a_xi[p];
+      v      = a_x[i];
+      active = (fabs(v) > zero_tol);
+    }
+    const unsigned ball = __ballot_sync(0xffffffffu, active);
+    const int prefix    = __popc(ball & ((1u << lane) - 1u));
+    if (active) {
+      a_out_i[count + prefix] = i;
+      a_out_x[count + prefix] = v;
+    }
+    if (p < a_m) {
+      a_x[i]  = 0.0;   // same index this lane just read; distinct across lanes
+      a_xi[p] = 0;
+    }
+    count += __popc(ball);   // warp-uniform: same ballot on every lane
+  }
+  *a_count = count;
+  // Publish the compacted arrays and the cleared workspaces before the caller's set_size and before
+  // the next solve reads x_workspace_/xi_workspace_ from every lane.
+  __syncwarp(0xffffffffu);
+}
+
+// ---- warp forms of the HYPERSPARSE l_solve tail --------------------------------------------------
+// l_solve(gpu_sparse_vector&) ran its whole tail -- solve_to_workspace, the MPF T-loop, and
+// gather_into_sparse_vector -- serially on lane 0 ("kept serial on lane 0 for now"), while the DENSE
+// l_solve got the warp T-loop. That is the single largest serial site left in the kernel: the
+// b_solve/l_solve/hyper_sparse row is 20.47% of all solve cycles at a 4.88M mean against the dense
+// path's 1.80M, and this is why -- same algorithm, 1 lane instead of 32.
+//
+// The workspace representation the tail operates on is:
+//   x [i]                values, i in [0,m)
+//   mark[i]              0/1 membership flag, i in [0,m)
+//   mark[m + k]          the index list, k in [0,nz)
+// add_sparse_column appends to that list as fill-in appears, which is what made it look serial. A
+// ballot prefix-sum appends in the identical order, so the list -- and hence the output sparse
+// vector's index order -- is unchanged.
+
+// Compaction of the reach into the workspace index list, then the membership marks.
+// Bit-identical. The two phases MUST stay separated by a barrier: phase 1 clears positions
+// [top,m) of mark[] and phase 2 sets mark[i] for the reach indices, and those two index sets
+// overlap arbitrarily (a position and an index are different things over the same array).
+__device__ __forceinline__ void warp_solve_to_workspace_body(i_t a_m, i_t* a_mark, i_t a_top)
+{
+  const int lane = static_cast<int>(threadIdx.x);
+  const i_t nz   = a_m - a_top;
+  for (i_t k = lane; k < nz; k += 32) { a_mark[a_m + k] = a_mark[a_top + k]; }
+  __syncwarp(0xffffffffu);
+  for (i_t k = lane; k < nz; k += 32) { a_mark[a_top + k] = 0; }
+  __syncwarp(0xffffffffu);
+  for (i_t k = lane; k < nz; k += 32) { a_mark[a_mark[a_m + k]] = 1; }
+  __syncwarp(0xffffffffu);
+}
+
+// The MPF T-loop over the sparse workspace form.
+//
+// NOT bit-identical, and deliberately so: the dot product is reassociated by the butterfly exactly
+// as the already-accepted dense warp T-loop (warp_tloop_body) reassociates its own. Everything else
+// IS exact -- the fill-in append order is preserved by the ballot prefix, and each x[i] takes one
+// += per column (a CSC column has distinct row indices), so no accumulation is reordered.
+// The <=2 dot fast path is bit-identical for the same reason as in warp_tloop_body.
+template <bool Ascending, int DotOffset, int AxpyOffset>
+__device__ __forceinline__ void warp_tloop_sparse_body(const i_t* a_cs,
+                                                       const f_t* a_mu,
+                                                       i_t a_num,
+                                                       const i_t* a_ri,
+                                                       f_t a_tol,
+                                                       const f_t* a_val,
+                                                       i_t a_m,
+                                                       i_t* a_mark,
+                                                       i_t* a_nz,
+                                                       f_t* a_x)
+{
+  static_assert(DotOffset == 0 || DotOffset == 1);
+  static_assert(AxpyOffset == 0 || AxpyOffset == 1);
+  static_assert(DotOffset != AxpyOffset);
+  const int lane = static_cast<int>(threadIdx.x);
+  i_t nz         = *a_nz;   // warp-uniform on entry, and every update below keeps it uniform
+  for (i_t step = 0; step < a_num; ++step) {
+    const i_t k = Ascending ? step : (a_num - 1 - step);
+    const f_t mu   = a_mu[k];
+    const i_t dcol = 2 * k + DotOffset;
+    const i_t d0   = a_cs[dcol];
+    const i_t d1   = a_cs[dcol + 1];
+    const i_t dlen = d1 - d0;
+    f_t dot;
+    if (dlen <= 2) {
+      dot = 0.0;
+      if (dlen >= 1) { const i_t i = a_ri[d0];     if (a_mark[i]) { dot = a_val[d0] * a_x[i]; } }
+      if (dlen == 2) { const i_t i = a_ri[d0 + 1]; if (a_mark[i]) { dot += a_val[d0 + 1] * a_x[i]; } }
+      __syncwarp(0xffffffffu);   // separates these x READS from the axpy WRITES below
+    } else {
+      f_t partial = 0.0;
+      for (i_t p = d0 + lane; p < d1; p += 32) {
+        const i_t i = a_ri[p];
+        if (a_mark[i]) { partial += a_val[p] * a_x[i]; }
+      }
+      dot = warp_reduce_add(partial);
+    }
+    const f_t theta = dot / mu;
+    if (fabs(theta) > a_tol) {
+      // The dot and AXPY CSC columns are adjacent, so one AXPY boundary is already in d0/d1.
+      // Compile-time offsets let both directions reuse it without adding a runtime branch.
+      const i_t a0 = (AxpyOffset > DotOffset) ? d1 : a_cs[dcol - 1];
+      const i_t a1 = (AxpyOffset > DotOffset) ? a_cs[dcol + 2] : d0;
+      for (i_t base = a0; base < a1; base += 32) {
+        const i_t p  = base + lane;
+        const bool have = (p < a1);
+        i_t i        = 0;
+        bool isnew   = false;
+        if (have) {
+          i     = a_ri[p];
+          isnew = (a_mark[i] == 0);   // distinct i across lanes: a CSC column has distinct rows
+        }
+        const unsigned ball = __ballot_sync(0xffffffffu, isnew);
+        const int prefix    = __popc(ball & ((1u << lane) - 1u));
+        if (isnew) {
+          a_mark[i]                 = 1;
+          a_mark[a_m + nz + prefix] = i;   // append, in increasing p == the serial append order
+        }
+        nz += __popc(ball);                // warp-uniform: identical ballot on every lane
+        if (have) { a_x[i] += (-theta) * a_val[p]; }
+        __syncwarp(0xffffffffu);           // publish marks/x before the next chunk reads them
+      }
+    }
+    // An active AXPY always ends with the inner __syncwarp above, which publishes its last chunk
+    // before the next update reads x. An inactive AXPY performs no writes. A second unconditional
+    // barrier here was therefore redundant (and especially costly for short MPF columns).
+  }
+  *a_nz = nz;
+}
+
+// Warp form of gather_into_sparse_vector: compact the workspace index list into a sparse vector and
+// clear all three workspaces. Bit-identical -- output order is increasing k, as the serial
+// push_back produced, and the list entries are distinct so the clears never collide.
+__device__ __forceinline__ void warp_gather_workspace_body(
+  i_t* a_count, i_t* a_out_i, f_t* a_out_x, i_t a_m, i_t* a_mark, i_t a_nz, f_t* a_x)
+{
+  const int lane     = static_cast<int>(threadIdx.x);
+  const f_t zero_tol = 1e-13;
+  i_t count          = 0;
+  for (i_t base = 0; base < a_nz; base += 32) {
+    const i_t k = base + lane;
+    bool active = false;
+    i_t  i      = 0;
+    f_t  v      = 0.0;
+    if (k < a_nz) {
+      i      = a_mark[a_m + k];
+      v      = a_x[i];
+      active = (fabs(v) > zero_tol);
+    }
+    const unsigned ball = __ballot_sync(0xffffffffu, active);
+    const int prefix    = __popc(ball & ((1u << lane) - 1u));
+    if (active) {
+      a_out_i[count + prefix] = i;
+      a_out_x[count + prefix] = v;
+    }
+    if (k < a_nz) {
+      a_mark[a_m + k] = 0;
+      a_mark[i]       = 0;
+      a_x[i]          = 0.0;
+    }
+    count += __popc(ball);
+  }
+  *a_count = count;
+  __syncwarp(0xffffffffu);
+}
+
+// ---- warp forms of the per-pivot MPF update (ft.update) ------------------------------------------
+// ft.update ran entirely inside one lane0_serial and is 8.54% of all block-resident cycles. Its two
+// sorts and its fill-tracking append genuinely need one lane, but the scatter, the two column
+// appends and the workspace clear are data-parallel. All three below are bit-identical: the appends
+// keep source order via the ballot prefix, and the scatter/clear touch distinct indices.
+__device__ __forceinline__ void warp_scatter_ws_body(const i_t* a_in_i, const f_t* a_in_x, i_t a_m,
+                                                     i_t a_nz, i_t* a_mark, f_t* a_x)
+{
+  const int lane = static_cast<int>(threadIdx.x);
+  for (i_t k = lane; k < a_nz; k += 32) {
+    const i_t i     = a_in_i[k];
+    a_mark[i]       = 1;
+    a_mark[a_m + k] = i;
+    a_x[i]          = a_in_x[k];
+  }
+  __syncwarp(0xffffffffu);
+}
+
+// csc append of a column held as (index list, scatter values); drops exact zeros. Returns the new
+// end cursor, warp-uniform.
+__device__ __forceinline__ i_t warp_append_scatter_body(i_t a_base, i_t* a_dst_i, f_t* a_dst_x,
+                                                        const i_t* a_idx, i_t a_n, const f_t* a_xs)
+{
+  const int lane = static_cast<int>(threadIdx.x);
+  i_t pos        = a_base;
+  for (i_t b = 0; b < a_n; b += 32) {
+    const i_t k = b + lane;
+    bool active = false;
+    i_t  iv     = 0;
+    f_t  xv     = 0.0;
+    if (k < a_n) {
+      iv     = a_idx[k];
+      xv     = a_xs[iv];
+      active = (xv != 0.0);
+    }
+    const unsigned ball = __ballot_sync(0xffffffffu, active);
+    const int prefix    = __popc(ball & ((1u << lane) - 1u));
+    if (active) {
+      a_dst_i[pos + prefix] = iv;
+      a_dst_x[pos + prefix] = xv;
+    }
+    pos += __popc(ball);
+  }
+  __syncwarp(0xffffffffu);
+  return pos;
+}
+
+// Same, for a column held as an explicit (index, value) sparse vector.
+__device__ __forceinline__ i_t warp_append_sv_body(i_t a_base, i_t* a_dst_i, f_t* a_dst_x,
+                                                   const i_t* a_src_i, const f_t* a_src_x, i_t a_n)
+{
+  const int lane = static_cast<int>(threadIdx.x);
+  i_t pos        = a_base;
+  for (i_t b = 0; b < a_n; b += 32) {
+    const i_t k = b + lane;
+    bool active = false;
+    i_t  iv     = 0;
+    f_t  xv     = 0.0;
+    if (k < a_n) {
+      iv     = a_src_i[k];
+      xv     = a_src_x[k];
+      active = (xv != 0.0);
+    }
+    const unsigned ball = __ballot_sync(0xffffffffu, active);
+    const int prefix    = __popc(ball & ((1u << lane) - 1u));
+    if (active) {
+      a_dst_i[pos + prefix] = iv;
+      a_dst_x[pos + prefix] = xv;
+    }
+    pos += __popc(ball);
+  }
+  __syncwarp(0xffffffffu);
+  return pos;
+}
+
+__device__ __forceinline__ void warp_clear_ws_body(i_t a_m, i_t* a_mark, i_t a_nz, f_t* a_x)
+{
+  const int lane = static_cast<int>(threadIdx.x);
+  for (i_t k = lane; k < a_nz; k += 32) {
+    const i_t i     = a_mark[a_m + k];
+    a_mark[i]       = 0;
+    a_x[i]          = 0.0;
+    a_mark[a_m + k] = 0;
+  }
+  __syncwarp(0xffffffffu);
+}
+
+// ---- warp forms of the per-solve data movement ---------------------------------------------------
+// b_solve / b_transpose_solve wrap several O(nnz) and O(m) copies in lane0_serial: the sparse-vector
+// copy-assigns (solution = rhs, Lsol = solution, UTsol = solution), the in-place index permutes, and
+// the dense row permute. They are pure data movement -- no arithmetic, distinct destinations -- so
+// they are bit-identical when spread across the warp, and they run on every pivot.
+__device__ __forceinline__ void warp_copy_i_body(i_t* a_dst, const i_t* a_src, i_t a_n)
+{
+  const int lane = static_cast<int>(threadIdx.x);
+  for (i_t k = lane; k < a_n; k += 32) { a_dst[k] = a_src[k]; }
+  __syncwarp(0xffffffffu);
+}
+
+__device__ __forceinline__ void warp_copy_f_body(f_t* a_dst, const f_t* a_src, i_t a_n)
+{
+  const int lane = static_cast<int>(threadIdx.x);
+  for (i_t k = lane; k < a_n; k += 32) { a_dst[k] = a_src[k]; }
+  __syncwarp(0xffffffffu);
+}
+
+// In-place i[k] <- p[i[k]]. Each entry is remapped independently, so order is irrelevant.
+__device__ __forceinline__ void warp_permute_idx_body(i_t* a_idx, i_t a_n, const i_t* a_p)
+{
+  const int lane = static_cast<int>(threadIdx.x);
+  for (i_t k = lane; k < a_n; k += 32) { a_idx[k] = a_p[a_idx[k]]; }
+  __syncwarp(0xffffffffu);
+}
+
+// x[k] = b[p[k]] over a dense length-n vector (permute_vector).
+__device__ __forceinline__ void warp_permute_dense_body(const f_t* a_b, i_t a_n, const i_t* a_p,
+                                                        f_t* a_x)
+{
+  const int lane = static_cast<int>(threadIdx.x);
+  for (i_t k = lane; k < a_n; k += 32) { a_x[k] = a_b[a_p[k]]; }
+  __syncwarp(0xffffffffu);
+}
+
+// Warp forms of the sptrsv prologue's data-parallel passes. The reach DFS itself is a pointer-chase
+// and stays on lane 0, but the O(reach) sweeps around it do not have to.
+//
+// All bit-identical: stores of the same values to the same distinct addresses, and an integer max.
+//
+// The barrier between the two phases is REQUIRED: b.i is a subset of the reach, so zeroing x over
+// the reach after scattering the rhs would silently erase the rhs.
+__device__ __forceinline__ void warp_sptrsv_preload_body(const i_t* a_bi, i_t a_bnz, const f_t* a_bx,
+                                                         i_t a_m, i_t a_top, const i_t* a_xi,
+                                                         f_t* a_x)
+{
+  const int lane = static_cast<int>(threadIdx.x);
+  for (i_t p = a_top + lane; p < a_m; p += 32) { a_x[a_xi[p]] = 0.0; }
+  __syncwarp(0xffffffffu);
+  for (i_t p = lane; p < a_bnz; p += 32) { a_x[a_bi[p]] = a_bx[p]; }
+  __syncwarp(0xffffffffu);
+}
+
+// Largest elimination level over the reach, on every lane. Integer max => exact and order-free.
+// No-op columns are excluded: they are also filtered out of the sp_co work list below, so counting
+// them here would leave trailing levels that cost a __syncwarp each and process nothing. `best`
+// starting at 0 already handles "every reachable column is a no-op" -> zero wavefront levels.
+__device__ __forceinline__ i_t warp_sptrsv_maxlevel_body(const i_t* a_level, i_t a_m, i_t a_top,
+                                                         const i_t* a_xi)
+{
+  const int lane = static_cast<int>(threadIdx.x);
+  i_t best       = 0;
+  for (i_t p = a_top + lane; p < a_m; p += 32) {
+    const i_t w = a_level[a_xi[p]];
+    if (level_is_noop(w)) { continue; }
+    const i_t lv = factor_level(w);
+    if (lv > best) { best = lv; }
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    const i_t o = __shfl_xor_sync(0xffffffffu, best, off);
+    if (o > best) { best = o; }
+  }
+  return best;
+}
+
+// COMPILE-TIME operator variant of the reach-restricted gather (`Direct` path).
 template <int Op>
 __device__ __forceinline__ void warp_sptrsv_body_op(const i_t* a_cs, const i_t* a_ridx,
                                                     const f_t* a_val, i_t* a_sp_co, i_t* a_sp_ls,
@@ -1186,6 +1557,9 @@ __device__ __forceinline__ void warp_nbe_body(const i_t* a_nbe_basic_mark, i_t* 
     }
     a_nbe_end[i] = hi;
   }
+  // Publish the per-row nonbasic partition (a_nbe_end) and the permuted Arow row/value arrays
+  // before compute_delta_z reads them from every lane.
+  __syncwarp(0xffffffffu);
 }
 
 // All-lane butterfly sum: every lane returns the full 32-lane total, so all lanes then compute the
@@ -1234,27 +1608,42 @@ __device__ int warp_build_levels(const gpu_csc_view& mat, bool diag_first, bool 
   }
   i_t nlev = 0;
   for (i_t j = 0; j < m; ++j) { if (level[j] > nlev) { nlev = level[j]; } }
-  level_start.assign(nlev + 1, 0);                     // counting sort by level
-  for (i_t j = 0; j < m; ++j) { level_start[level[j]]++; }
+  // No-op columns (see g_elide_noop). With length 1 the diagonal sits at col_start[j] whichever end
+  // diag_first puts it, so one test covers all four operators. Length 0 cannot occur in a
+  // nonsingular triangular factor and is left to the existing (unconditional val[dp]) path.
+  const bool elide = (g_elide_noop != 0);
+  auto is_noop = [&](i_t j) {
+    return elide && mat.col_start[j + 1] - mat.col_start[j] == 1 && mat.x[mat.col_start[j]] == 1.0;
+  };
+  col_order.resize(m);                                 // sized m; the tail is unused when eliding
+  // One counting sort by level, ascending j within a level.
+  level_start.assign(nlev + 1, 0);
+  for (i_t j = 0; j < m; ++j) { if (!is_noop(j)) { level_start[level[j]]++; } }
   for (i_t k = 1; k <= nlev; ++k) { level_start[k] += level_start[k - 1]; }
-  col_order.resize(m);
   gpu_vector<i_t> pos(nlev + 1);
   for (i_t lv = 1; lv <= nlev; ++lv) { pos[lv] = level_start[lv - 1]; }
-  for (i_t j = 0; j < m; ++j) { const i_t lv = level[j]; col_order[pos[lv]++] = j; }
+  for (i_t j = 0; j < m; ++j) {
+    if (is_noop(j)) { continue; }
+    col_order[pos[level[j]]++] = j;
+  }
+  // Tag AFTER the level pull and the counting sort, both of which read PLAIN level values. From
+  // here on level[] is a tagged word: read it through factor_level().
+  if (elide) {
+    for (i_t j = 0; j < m; ++j) { if (is_noop(j)) { level[j] |= kColNoop; } }
+  }
   return static_cast<int>(nlev);
 }
 
 
 // ---- sparse triangular solve (reach + iterative DFS) ----------------------
-// G.col_start is flipped to mark visited nodes and restored on the way out.
-#define GP_FLIP(i)       (-(i) - 2)
-#define GP_UNFLIP(i)     (((i) < 0) ? GP_FLIP(i) : (i))
-#define GP_MARKED(w, j)  ((w)[j] < 0)
-#define GP_MARK(w, j)    { (w)[j] = GP_FLIP((w)[j]); }
+// Visited state lives in a private byte array so the factor CSC remains read-only. Only lane 0
+// walks the DFS, so byte loads/stores are sufficient; reached entries are cleared on exit instead
+// of sweeping all m rows per solve.
 
 // pinv == nullptr means no permutation.
 __device__ i_t depth_first_search(
-  i_t j, const i_t* pinv, const gpu_csc_view& G, i_t top, i_t* xi, i_t* pstack)
+  i_t j, const i_t* pinv, const gpu_csc_view& G, unsigned char* marked, i_t top, i_t* xi,
+  i_t* pstack)
 {
   i_t head = 0;
   xi[0]    = j;
@@ -1262,17 +1651,17 @@ __device__ i_t depth_first_search(
   while (head >= 0) {
     j        = xi[head];
     i_t jnew = pinv ? pinv[j] : j;
-    if (!GP_MARKED(G.col_start, j)) {
-      GP_MARK(G.col_start, j)
-      pstack[head] = (jnew < 0) ? 0 : GP_UNFLIP(G.col_start[jnew]);
+    if (marked[j] == 0) {
+      marked[j]    = 1;
+      pstack[head] = (jnew < 0) ? 0 : G.col_start[jnew];
     }
     done           = 1;
-    i_t p2         = (jnew < 0) ? 0 : GP_UNFLIP(G.col_start[jnew + 1]);
+    i_t p2         = (jnew < 0) ? 0 : G.col_start[jnew + 1];
     const i_t psav = pstack[head];
     i_t p;
     for (p = psav; p < p2; ++p) {
       i_t i = G.i[p];
-      if (GP_MARKED(G.col_start, i)) { continue; }
+      if (marked[i] != 0) { continue; }
       pstack[head] = p;
       xi[++head]   = i;
       done         = 0;
@@ -1288,19 +1677,121 @@ __device__ i_t depth_first_search(
   return top;
 }
 
-__device__ i_t reach(
-  const gpu_sparse_vector& b, const i_t* pinv, const gpu_csc_view& G, i_t* xi)
+using reach_mark_word = unsigned int;
+
+__device__ __forceinline__ bool reach_bit_marked(const reach_mark_word* marked, i_t row)
+{
+  return (marked[row >> 5] & (1u << (row & 31))) != 0;
+}
+
+__device__ __forceinline__ void reach_bit_set(reach_mark_word* marked, i_t row)
+{
+  marked[row >> 5] |= 1u << (row & 31);
+}
+
+__device__ __forceinline__ void reach_bit_clear(reach_mark_word* marked, i_t row)
+{
+  marked[row >> 5] &= ~(1u << (row & 31));
+}
+
+// General global-stack fallback for a bit-packed reach whose active depth exceeds the shared hot
+// stack. Lane 0 is the only accessor, so ordinary word read-modify-write operations are sufficient.
+__device__ i_t depth_first_search_bits(
+  i_t root, const gpu_csc_view& G, reach_mark_word* marked, i_t top, i_t* xi, i_t* pstack)
+{
+  i_t head = 0;
+  xi[0]    = root;
+  while (head >= 0) {
+    const i_t row = xi[head];
+    if (!reach_bit_marked(marked, row)) {
+      reach_bit_set(marked, row);
+      pstack[head] = G.col_start[row];
+    }
+    const i_t end = G.col_start[row + 1];
+    i_t p         = pstack[head];
+    while (p < end && reach_bit_marked(marked, G.i[p])) { ++p; }
+    if (p < end) {
+      pstack[head] = p;
+      xi[++head]   = G.i[p];
+    } else {
+      pstack[head] = 0;
+      xi[head--]   = 0;
+      xi[--top]    = row;
+    }
+  }
+  return top;
+}
+
+// pinv-free DFS specialized for the warp hypersparse path. Keep the live frames in the config's
+// 64-entry hot stack (shared memory in the monolith), cache both CSC bounds once per discovered
+// vertex, and resume at p+1 instead of reloading the edge that led to the child. If an unusually
+// deep factor exceeds the hot stack, the general bitset DFS handles that subtree in xi/xi+m.
+__device__ i_t depth_first_search_hot(
+  i_t root, const gpu_csc_view& G, reach_mark_word* marked, i_t top, i_t* xi,
+  i_t* dfs_node, i_t* dfs_next, i_t* dfs_end)
+{
+  constexpr i_t hot_depth = 64;
+  i_t head                = 0;
+  reach_bit_set(marked, root);
+  dfs_node[0]              = root;
+  dfs_next[0]              = G.col_start[root];
+  dfs_end[0]               = G.col_start[root + 1];
+
+  while (head >= 0) {
+    i_t p        = dfs_next[head];
+    const i_t p2 = dfs_end[head];
+    while (p < p2 && reach_bit_marked(marked, G.i[p])) { ++p; }
+
+    if (p < p2) {
+      const i_t child = G.i[p];
+      dfs_next[head]   = p + 1;
+      if (head + 1 < hot_depth) {
+        reach_bit_set(marked, child);
+        ++head;
+        dfs_node[head] = child;
+        dfs_next[head] = G.col_start[child];
+        dfs_end[head]  = G.col_start[child + 1];
+      } else {
+        top = depth_first_search_bits(child, G, marked, top, xi, xi + G.m);
+      }
+    } else {
+      xi[--top] = dfs_node[head--];
+    }
+  }
+  return top;
+}
+
+__device__ i_t reach_hot(
+  const gpu_sparse_vector& b, const gpu_csc_view& G, reach_mark_word* marked, i_t* xi,
+  i_t* dfs_node, i_t* dfs_next, i_t* dfs_end)
 {
   const i_t m   = G.m;
   i_t top       = m;
   const i_t bnz = b.i.size();
   for (i_t p = 0; p < bnz; ++p) {
-    if (!GP_MARKED(G.col_start, b.i[p])) {
-      top = depth_first_search(b.i[p], pinv, G, top, xi, xi + m);
+    const i_t root = b.i[p];
+    if (!reach_bit_marked(marked, root)) {
+      top = depth_first_search_hot(root, G, marked, top, xi, dfs_node, dfs_next, dfs_end);
+    }
+  }
+  for (i_t p = top; p < m; ++p) { reach_bit_clear(marked, xi[p]); }
+  return top;
+}
+
+__device__ i_t reach(
+  const gpu_sparse_vector& b, const i_t* pinv, const gpu_csc_view& G, unsigned char* marked,
+  i_t* xi)
+{
+  const i_t m   = G.m;
+  i_t top       = m;
+  const i_t bnz = b.i.size();
+  for (i_t p = 0; p < bnz; ++p) {
+    if (marked[b.i[p]] == 0) {
+      top = depth_first_search(b.i[p], pinv, G, marked, top, xi, xi + m);
     }
   }
   for (i_t p = top; p < m; ++p) {
-    GP_MARK(G.col_start, xi[p]);
+    marked[xi[p]] = 0;
   }
   return top;
 }
@@ -1309,10 +1800,11 @@ __device__ i_t reach(
 // buffer; xi is a 2*m scratch. Output nonzero pattern is xi[top..m-1].
 template <bool lo>
 __device__ i_t sparse_triangle_solve(
-  const gpu_sparse_vector& b, const i_t* pinv, i_t* xi, const gpu_csc_view& G, f_t* x)
+  const gpu_sparse_vector& b, const i_t* pinv, i_t* xi, const gpu_csc_view& G,
+  unsigned char* marked, f_t* x)
 {
   i_t m   = G.m;
-  i_t top = reach(b, pinv, G, xi);
+  i_t top = reach(b, pinv, G, marked, xi);
   for (i_t p = top; p < m; ++p) {
     x[xi[p]] = 0;
   }
@@ -1347,32 +1839,6 @@ __device__ i_t sparse_triangle_solve(
 }
 
 // ===========================================================================================
-// KERNEL FISSION, WARP PATH — the `Direct` execution mode
-//
-// Two warp execution models coexist in this file, and confusing them is the #1 source of bugs:
-//
-//   * MONOLITH (Direct == false). Lane 0 runs the ENTIRE driver; lanes 1..31 are parked in
-//     warp_helper_loop. Work reaches them only by staging a request into `cfg_shared` and calling
-//     warp_collective (a 10-branch runtime op-code dispatch — the thing that pins the warp monolith
-//     at ~250 registers). Because only lane 0 is executing driver code here, a __syncwarp or
-//     __shfl_sync emitted on this path DEADLOCKS: the other lanes are blocked on the dispatch
-//     barrier, not on ours.
-//
-//   * FISSION  (Direct == true).  ALL 32 lanes execute the kernel body, so the collective BODIES
-//     (warp_X_body) are called directly — no cfg staging, no op code, statically-known callees.
-//     But every statement the monolith ran on lane 0 alone now runs 32 times. That is fine for pure
-//     reads and for stores that are identical from every lane; it is FATAL for
-//       (a) anything that ALLOCATES — gpu_vector::reserve/resize/push_back call device malloc(),
-//           so 32 lanes malloc 32 buffers, 31 leak, and each lane ends up with a DIFFERENT data_
-//           pointer (the collective then writes 32 private buffers instead of one shared one), and
-//       (b) any READ-MODIFY-WRITE on shared state — a size counter, an ft routing statistic, a
-//           push_back cursor.
-//     Those statements go inside lane0_serial<Direct>(), which runs them on lane 0 and re-converges.
-//
-// `Direct` must be a COMPILE-TIME parameter (if constexpr), never a runtime flag: a runtime branch
-// keeps both arms live and ptxas re-allocates the register union we split the driver to escape.
-// It is only ever instantiated as Direct == Warp.
-// ===========================================================================================
 
 // Run serial glue (allocation / read-modify-write) on lane 0, then re-converge. Under !Direct this
 // is a plain call — see the deadlock note above.
@@ -1380,6 +1846,14 @@ template <bool Direct, class Fn>
 __device__ __forceinline__ void lane0_serial(Fn&& f)
 {
   if constexpr (Direct) {
+    // Converge BEFORE the lane-0 region. Under independent thread scheduling (sm_70+) the lanes of
+    // a warp are NOT implicitly in lockstep, so without this lane 0 can run ahead into `f()` while
+    // the other lanes are still in the PRECEDING collective -- and `f()` is exactly the code that
+    // reallocates and rewrites the buffers those lanes are still reading. Omitting it produced
+    // wild reads on B200 (garbage vector sizes, a column index of -533,214,976) that moved with
+    // every codegen change, and racecheck reported the hazard directly. sm_89 tolerated it; sm_100
+    // does not.
+    __syncwarp(0xffffffffu);
     if (threadIdx.x == 0) { f(); }
     // Re-converge AND publish lane 0's global writes to the rest of the warp (__syncwarp orders
     // memory among the participating lanes), so the following collective reads what lane 0 wrote.
@@ -1391,10 +1865,30 @@ __device__ __forceinline__ void lane0_serial(Fn&& f)
 
 // Publish a value computed inside a lane0_serial region (only lane 0 holds it) to every lane.
 // Must be called by all 32 lanes, i.e. AFTER the lane0_serial that produced it.
+//
+// This publishes through SHARED memory rather than __shfl_sync. Both are correct now that
+// lane0_serial converges the warp on entry; shared memory is used because it does not depend on
+// lane participation at all, and this is the site where the convergence bug first showed itself --
+// on B200, __shfl_sync(mask, top, 0) returned 8191 while lane 0 held top=760, ON LANE 0 ITSELF.
+// That looks impossible, and it is, for a converged warp: a shuffle whose named lanes have not all
+// arrived is undefined, and the lanes had not arrived because lane 0 had already run ahead into the
+// preceding lane-0 region. The garbage then indexed sp_co / delta_z_indices far out of bounds and
+// the kernel died with an illegal address (csched008/node_d24_id239).
+// Related cleanup, not a fix: warp_dz_body / warp_fromdense_body / warp_pinf_body produce
+// warp-uniform results, so they now write them on every lane and need no broadcast at all.
 template <bool Direct, class T>
 __device__ __forceinline__ T lane0_bcast(T v)
 {
-  if constexpr (Direct) { return __shfl_sync(0xffffffffu, v, 0); } else { return v; }
+  if constexpr (Direct) {
+    __shared__ T s_bcast;
+    if (threadIdx.x == 0) { s_bcast = v; }
+    __syncwarp(0xffffffffu);
+    const T r = s_bcast;
+    __syncwarp(0xffffffffu);  // no lane may overwrite s_bcast before every lane has read it
+    return r;
+  } else {
+    return v;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1414,6 +1908,7 @@ struct gpu_basis_update_mpf {
   gpu_vector<f_t> mu_values_;
   gpu_span<i_t> xi_workspace_;  // size 2*m (scratch)
   gpu_span<f_t> x_workspace_;   // size m   (scratch)
+  gpu_span<unsigned char> reach_mark_;  // size m, private visited bytes for immutable factor DFS
   // Reused solve scratch (owning; grows to m once, then reused every call) so the b_solve /
   // b_transpose_solve dense↔sparse conversions and the sparse-Lᵀ gather no longer device-malloc a
   // fresh temporary per solve. Bit-identical to the per-call locals (same values, same order).
@@ -1434,6 +1929,23 @@ struct gpu_basis_update_mpf {
   // one lane. Set by lane 0 before the driver runs.
   warp_solve_config* warp_cfg_ = nullptr;
 
+  // Route the REUSED scratch through the block's arena. Each of these grows to m or n once and is
+  // then reused for the whole solve, so it is exactly what the arena is for.
+  //
+  // S_ and mu_values_ are deliberately NOT bound. They grow by one column per pivot and are only
+  // reset at refactor, so their size is data-dependent and unbounded within a refactor window --
+  // the one allocation here that genuinely belongs on the dynamic heap.
+  __device__ void bind_arena(gpu_arena* a)
+  {
+    dense_scratch_.bind_arena(a);
+    sparse_scratch_.bind_arena(a);
+    ei_scratch_.bind_arena(a);
+    sort_bucket_.bind_arena(a);
+    sort_i_.bind_arena(a);
+    sort_x_.bind_arena(a);
+    sort_perm_.bind_arena(a);
+  }
+
   __device__ gpu_basis_update_mpf() {}
   gpu_basis_update_mpf(const gpu_basis_update_mpf&)            = delete;
   gpu_basis_update_mpf& operator=(const gpu_basis_update_mpf&) = delete;
@@ -1445,9 +1957,8 @@ struct gpu_basis_update_mpf {
   // solve. (Historical: this used to publish (x, op) to lanes parked in warp_helper_loop via
   // (x, op); warp_collective_solve runs nlev internal barriers; __syncwarp B
   // makes the result visible to lane 0 before it reads x.
-  // Direct (fission): all 32 lanes are already here, so call the one known body instead of posting
-  // an op code. The level SCHEDULE still comes from warp_cfg_ — in fission it lives in slot_state
-  // and is built once by Ksetup, not on a kernel stack.
+  // Direct: all 32 lanes are already here, so call the one known body instead of posting
+  // an op code. The level SCHEDULE still comes from warp_cfg_.
   // `Op` is a template parameter: every caller names its operator as a literal, so on the Direct
   // path there is no op code, no flag load and no branch left anywhere below this point.
   template <bool Direct, int Op>
@@ -1476,58 +1987,77 @@ struct gpu_basis_update_mpf {
 
   // Reach-restricted sparse gather solve (op == WARP_SPTRSV). `G` is the SCATTER factor the serial
   // sparse_triangle_solve walks (L0_ / U0_ / their transposes); `op` is the matching dense gather
-  // operator (WARP_L/U/LT/UT_SOLVE) whose transpose CSC + flags + precomputed level[] we reuse. Lane 0
-  // (the lane that owns the serial glue under Direct) runs the serial reach,
-  // preloads the rhs into x on the reachable set, and buckets the reachable columns by their precomputed
-  // elimination level into sp_ls/sp_co; then the whole warp runs the wavefront gather over that sparse
-  // schedule. Returns `top` (reachable pattern is xi_workspace_[top..m), values in x). Mirrors
+  // operator (WARP_L/U/LT/UT_SOLVE) whose transpose CSC + flags + precomputed level[] we reuse.
+  // Lane 0 runs the serial reach and the order-dependent counting sort; the O(reach) sweeps between
+  // them are collective. Then the whole warp runs the wavefront gather over that sparse schedule.
+  // Returns `top` (reachable pattern is xi_workspace_[top..m), values in x). Mirrors
   // sparse_triangle_solve's serial pre/post exactly so solve_to_workspace / solve_to_sparse_vector /
   // the T-loop that follow read the same xi_workspace_/x_workspace_ state.
-  // The SERIAL half: reach + rhs preload + level-bucketing. Runs on ONE lane in both models (lane 0
-  // by construction in the monolith; under a lane0_serial guard in fission). It marks/restores
-  // G.col_start in place and rewrites the shared sp_ls/sp_co/sp_pos buckets, so replicating it
-  // across 32 lanes would corrupt both. Returns `top`; publishes the reachable level count in nlevR.
-  __device__ i_t sptrsv_prologue(int op, const gpu_sparse_vector& b, const gpu_csc_view& G, f_t* x,
-                                 i_t& nlevR) const
-  {
-    const i_t  m  = G.m;
-    i_t* const xi = xi_workspace_.data();
-    // (1) reach: serial DFS, marks + restores G.col_start in place. xi[top..m) = reachable, topo order.
-    const i_t top = reach(b, nullptr, G, xi);
-    // (2) preload x on the reachable set, then scatter the rhs (identical to sparse_triangle_solve).
-    for (i_t p = top; p < m; ++p) { x[xi[p]] = 0.0; }
-    const i_t bnz = b.i.size();
-    for (i_t p = 0; p < bnz; ++p) { x[b.i[p]] = b.x[p]; }
-    // (3) bucket the reachable columns by their precomputed elimination level (counting sort).
-    const warp_solve_config* c = warp_cfg_;
-    const i_t* level = c->level[op];
-    i_t* sp_ls  = c->sp_ls;
-    i_t* sp_co  = c->sp_co;
-    i_t* sp_pos = c->sp_pos;
-    nlevR = 0;
-    for (i_t p = top; p < m; ++p) { const i_t lv = level[xi[p]]; if (lv > nlevR) { nlevR = lv; } }
-    for (i_t k = 0; k <= nlevR; ++k) { sp_ls[k] = 0; }
-    for (i_t p = top; p < m; ++p) { sp_ls[level[xi[p]]]++; }          // level values ∈ [1, nlevR]
-    for (i_t k = 1; k <= nlevR; ++k) { sp_ls[k] += sp_ls[k - 1]; }    // sp_ls[lv]=count(level<=lv)
-    for (i_t lv = 1; lv <= nlevR; ++lv) { sp_pos[lv] = sp_ls[lv - 1]; }
-    for (i_t p = top; p < m; ++p) { const i_t j = xi[p]; sp_co[sp_pos[level[j]]++] = j; }
-    return top;
-  }
 
   template <bool Direct, int Op>
   __device__ i_t warp_dispatch_sptrsv(const gpu_sparse_vector& b, const gpu_csc_view& G,
                                       f_t* x) const
   {
     constexpr int op = Op;
-    i_t nlevR = 0;
     static_assert(Direct, "the parked-helper (Direct=false) warp path was deleted");
+    warp_solve_config* c = warp_cfg_;
+    const i_t  m  = G.m;
+    i_t* const xi = xi_workspace_.data();
+
+    // The prologue used to run end-to-end inside one lane0_serial. Only the DFS and the counting
+    // sort actually need a single lane; the O(reach) sweeps around them are data-parallel, and with
+    // the T-loop now collective they were a visible share of the hypersparse solve.
+
+    // (1) reach: serial DFS (pointer-chase), using bit-packed marks and the shared hot stack.
     i_t top = 0;
-    lane0_serial<true>([&] { top = sptrsv_prologue(op, b, G, x, nlevR); });
-    top   = lane0_bcast<true>(top);
-    // EVERY lane needs nlevR: it is the wavefront's internal __syncwarp count, so a lane that
-    // disagreed would desynchronize the whole warp.
-    nlevR = lane0_bcast<true>(nlevR);
-    const warp_solve_config* c = warp_cfg_;
+    lane0_serial<true>([&] {
+      if (m >= static_cast<i_t>(sizeof(reach_mark_word))) {
+        auto* marked = reinterpret_cast<reach_mark_word*>(reach_mark_.data());
+        top = reach_hot(b, G, marked, xi, c->dfs_node, c->dfs_next, c->dfs_end);
+      } else {
+        top = reach(b, nullptr, G, reach_mark_.data(), xi);
+      }
+    });
+    top = lane0_bcast<true>(top);
+
+    // (2) zero x over the reach, then scatter the rhs — collective, barrier-separated.
+    warp_sptrsv_preload_body(b.i.data(), static_cast<i_t>(b.i.size()), b.x.data(), m, top, xi, x);
+
+    // (3) level bucketing. EVERY lane needs nlevR: it is the wavefront's internal __syncwarp count,
+    // so a lane that disagreed would desynchronize the whole warp. The max-reduce already leaves it
+    // warp-uniform, so no broadcast is needed.
+    const i_t* level = c->level[op];
+    const i_t nlevR  = warp_sptrsv_maxlevel_body(level, m, top, xi);
+    {
+      const int lane = static_cast<int>(threadIdx.x);
+      i_t* sp_ls     = c->sp_ls;
+      for (i_t k = lane; k <= nlevR; k += 32) { sp_ls[k] = 0; }
+      __syncwarp(0xffffffffu);
+    }
+    // The histogram, its prefix sum and the counting-sort scatter are order-dependent (sp_co's
+    // within-level order comes from the running sp_pos cursor), so they stay on one lane.
+    lane0_serial<true>([&] {
+      i_t* sp_ls  = c->sp_ls;
+      i_t* sp_co  = c->sp_co;
+      i_t* sp_pos = c->sp_pos;
+      // No-op columns are skipped: x[j] already holds what the solve would have written (the
+      // scattered rhs, or the zero warp_sptrsv_preload_body left there). `top` and xi[top..m) are
+      // deliberately NOT filtered -- the reachable PATTERN is unchanged, only the work list.
+      for (i_t p = top; p < m; ++p) {
+        const i_t w = level[xi[p]];
+        if (level_is_noop(w)) { continue; }
+        sp_ls[factor_level(w)]++;                                       // level values ∈ [1, nlevR]
+      }
+      for (i_t k = 1; k <= nlevR; ++k) { sp_ls[k] += sp_ls[k - 1]; }    // sp_ls[lv]=count(level<=lv)
+      for (i_t lv = 1; lv <= nlevR; ++lv) { sp_pos[lv] = sp_ls[lv - 1]; }
+      for (i_t p = top; p < m; ++p) {
+        const i_t j = xi[p];
+        const i_t w = level[j];
+        if (level_is_noop(w)) { continue; }
+        sp_co[sp_pos[factor_level(w)]++] = j;
+      }
+    });
+
     warp_sptrsv_body_op<Op>(c->cs[Op], c->ridx[Op], c->val[Op], c->sp_co, c->sp_ls,
                             static_cast<int>(nlevR), x);
     return top;
@@ -1616,6 +2146,51 @@ struct gpu_basis_update_mpf {
       const i_t i      = xi_workspace_[m + k];
       xi_workspace_[i] = 1;
     }
+  }
+
+  // Warp-parallel `dst = src` for a sparse vector. Same result as the defaulted copy-assign
+  // (memberwise gpu_vector::operator=, which is size_=0; reserve; copy; size_=n).
+  // Callers never self-assign or alias here; both call sites copy between distinct vectors.
+  template <bool Direct = false>
+  __device__ void warp_sv_copy(const gpu_sparse_vector& src, gpu_sparse_vector& dst) const
+  {
+    static_assert(Direct, "the parked-helper (Direct=false) warp path was deleted");
+    const i_t nz = static_cast<i_t>(src.i.size());
+    // reserve() may device-malloc; read dst.i.data()/dst.x.data() only after lane0_serial's
+    // trailing __syncwarp has published the (possibly relocated) pointers.
+    lane0_serial<true>([&] {
+      dst.n = src.n;
+      dst.i.clear();
+      dst.x.clear();
+      dst.i.reserve(nz);
+      dst.x.reserve(nz);
+    });
+    warp_copy_i_body(dst.i.data(), src.i.data(), nz);
+    warp_copy_f_body(dst.x.data(), src.x.data(), nz);
+    lane0_serial<true>([&] { dst.i.set_size(nz); dst.x.set_size(nz); });
+  }
+
+  // Warp-parallel solve_to_sparse_vector. Same contract, same output, same cleared workspaces.
+  // See warp_gather_reach_body for why it is bit-identical.
+  template <bool Direct = false>
+  __device__ void warp_solve_to_sparse_vector(i_t top, gpu_sparse_vector& out) const
+  {
+    static_assert(Direct, "the parked-helper (Direct=false) warp path was deleted");
+    const i_t m  = L0_.m;
+    const i_t nz = m - top;
+    // reserve() may device-malloc; the __syncwarp inside lane0_serial publishes the (possibly
+    // relocated) data_ pointers, so out.i.data()/out.x.data() must be read AFTER it.
+    lane0_serial<true>([&] {
+      out.n = m;
+      out.x.clear();
+      out.i.clear();
+      out.x.reserve(nz);
+      out.i.reserve(nz);
+    });
+    i_t count = 0;   // every lane keeps its own; the body makes it warp-uniform
+    warp_gather_reach_body(&count, out.i.data(), out.x.data(), top, m, xi_workspace_.data(),
+                           x_workspace_.data());
+    lane0_serial<true>([&] { out.i.set_size(count); out.x.set_size(count); });
   }
 
   __device__ void solve_to_sparse_vector(i_t top, gpu_sparse_vector& out) const
@@ -1735,7 +2310,7 @@ struct gpu_basis_update_mpf {
   }
 
   // ---- triangular solves through the MPF form ----
-  // `Direct` is only ever true together with Warp (fission warp path) — see the Direct-mode banner
+  // `Direct` is only ever true together with Warp — all 32 lanes execute the body
   // above gpu_basis_update_mpf. It selects direct body calls + lane-0 guards on the serial glue.
   template <bool Warp = false, bool Direct = false>
   __device__ i_t u_transpose_solve(f_t* rhs) const
@@ -1752,10 +2327,11 @@ struct gpu_basis_update_mpf {
       top = warp_dispatch_sptrsv<Direct, WARP_UT_SOLVE>(rhs, U0_transpose_, x_workspace_.data());
     } else {
       top = sparse_triangle_solve<true>(rhs, nullptr, xi_workspace_.data(), U0_transpose_,
-                                        x_workspace_.data());
+                                        reach_mark_.data(), x_workspace_.data());
     }
     // push_back + workspace RMW -> lane 0 only under Direct.
-    lane0_serial<Direct>([&] { solve_to_sparse_vector(top, rhs); });
+    if constexpr (Warp) { warp_solve_to_sparse_vector<Direct>(top, rhs); }
+    else { solve_to_sparse_vector(top, rhs); }
     return 0;
   }
 
@@ -1765,7 +2341,9 @@ struct gpu_basis_update_mpf {
     const f_t zero_tol = 1e-13;
     if constexpr (Warp) {
       // dot col = u_col (2k), axpy col = v_col (2k+1), descending k.
-      if (num_updates_ > 0) { ST_TIC(_tl1); warp_dispatch_tloop<Direct>(rhs, /*asc=*/false, /*dotoff=*/0, /*axpyoff=*/1, zero_tol); ST_TOC(SG_LU_TLOOP, _tl1); }
+      if (num_updates_ > 0) {
+        warp_dispatch_tloop<Direct>(rhs, /*asc=*/false, /*dotoff=*/0, /*axpyoff=*/1, zero_tol);
+      }
     } else {
       for (i_t k = num_updates_ - 1; k >= 0; --k) {
         const i_t u_col = 2 * k;
@@ -1784,15 +2362,38 @@ struct gpu_basis_update_mpf {
   __device__ i_t l_transpose_solve(gpu_sparse_vector& rhs) const
   {
     const i_t m = L0_.m;
-    // One lane-0 region: scatter + the SPARSE MPF T-loop (serial in both warp models) + the gather.
-    // All three read-modify-write xi_workspace_/x_workspace_/sparse_scratch_ and carry `nz`.
-    lane0_serial<Direct>([&] {
+    gpu_sparse_vector& b = sparse_scratch_;
+    if constexpr (Warp) {
+      // Keep the sparse representation through the MPF T^T replay. The historical path ran this
+      // whole section on lane 0; the forward sparse L solve already proved the same membership-list
+      // representation can preserve fill order while distributing dot/AXPY work over the warp.
+      i_t nz = static_cast<i_t>(rhs.i.size());
+      lane0_serial<Direct>([&] { scatter_into_workspace(rhs); });
+      const f_t zero_tol = 1e-13;
+      if (num_updates_ > 0) {
+        // T^T: updates descend; dot u_col (2k), then AXPY v_col (2k+1).
+        warp_tloop_sparse_body<false, 0, 1>(
+          S_.col_start.data(), mu_values_.data(), num_updates_, S_.i.data(), zero_tol,
+          S_.x.data(), m, xi_workspace_.data(), &nz, x_workspace_.data());
+      }
+
+      // Warp-compacted equivalent of gather_into_sparse_vector(nz, b), including workspace clears.
+      lane0_serial<Direct>([&] {
+        b.n = m;
+        b.i.clear();
+        b.x.clear();
+        b.i.reserve(nz);
+        b.x.reserve(nz);
+      });
+      i_t count = 0;
+      warp_gather_workspace_body(&count, b.i.data(), b.x.data(), m, xi_workspace_.data(), nz,
+                                 x_workspace_.data());
+      lane0_serial<Direct>([&] { b.i.set_size(count); b.x.set_size(count); });
+    } else {
       scatter_into_workspace(rhs);
       i_t nz = rhs.i.size();
-
       const f_t zero_tol = 1e-13;
-      ST_TIC(_tl3);
-      for (i_t k = num_updates_ - 1; k >= 0; --k) {   // MPF T-loop kept serial on lane 0 for now
+      for (i_t k = num_updates_ - 1; k >= 0; --k) {
         const i_t u_col = 2 * k;
         const i_t v_col = 2 * k + 1;
         const f_t mu    = mu_values_[k];
@@ -1802,21 +2403,18 @@ struct gpu_basis_update_mpf {
           add_sparse_column(S_, v_col, -theta, xi_workspace_.data(), nz, x_workspace_.data());
         }
       }
-      ST_TOC(SG_LU_TLOOP, _tl3);
-
-      gpu_sparse_vector& b = sparse_scratch_;  // reused (was a per-hypersparse-solve device malloc)
       b.n = m;
       gather_into_sparse_vector(nz, b);
-    });
-    gpu_sparse_vector& b = sparse_scratch_;
+    }
     i_t top;
     if constexpr (Warp) {
       top = warp_dispatch_sptrsv<Direct, WARP_LT_SOLVE>(b, L0_transpose_, x_workspace_.data());
     } else {
       top = sparse_triangle_solve<false>(b, nullptr, xi_workspace_.data(), L0_transpose_,
-                                         x_workspace_.data());
+                                         reach_mark_.data(), x_workspace_.data());
     }
-    lane0_serial<Direct>([&] { solve_to_sparse_vector(top, rhs); });
+    if constexpr (Warp) { warp_solve_to_sparse_vector<Direct>(top, rhs); }
+    else { solve_to_sparse_vector(top, rhs); }
     return 0;
   }
 
@@ -1835,9 +2433,10 @@ struct gpu_basis_update_mpf {
       top = warp_dispatch_sptrsv<Direct, WARP_U_SOLVE>(rhs, U0_, x_workspace_.data());
     } else {
       top = sparse_triangle_solve<false>(rhs, nullptr, xi_workspace_.data(), U0_,
-                                         x_workspace_.data());
+                                         reach_mark_.data(), x_workspace_.data());
     }
-    lane0_serial<Direct>([&] { solve_to_sparse_vector(top, rhs); });
+    if constexpr (Warp) { warp_solve_to_sparse_vector<Direct>(top, rhs); }
+    else { solve_to_sparse_vector(top, rhs); }
     return 0;
   }
 
@@ -1849,7 +2448,9 @@ struct gpu_basis_update_mpf {
     const f_t zero_tol = 1e-16;  // Any higher and pilot_ja fails
     if constexpr (Warp) {
       // dot col = v_col (2k+1), axpy col = u_col (2k), ascending k.
-      if (num_updates_ > 0) { ST_TIC(_tl2); warp_dispatch_tloop<Direct>(rhs, /*asc=*/true, /*dotoff=*/1, /*axpyoff=*/0, zero_tol); ST_TOC(SG_LU_TLOOP, _tl2); }
+      if (num_updates_ > 0) {
+        warp_dispatch_tloop<Direct>(rhs, /*asc=*/true, /*dotoff=*/1, /*axpyoff=*/0, zero_tol);
+      }
     } else {
       for (i_t k = 0; k < num_updates_; ++k) {
         const f_t mu    = mu_values_[k];
@@ -1870,14 +2471,38 @@ struct gpu_basis_update_mpf {
       top = warp_dispatch_sptrsv<Direct, WARP_L_SOLVE>(rhs, L0_, x_workspace_.data());
     } else {
       top = sparse_triangle_solve<true>(rhs, nullptr, xi_workspace_.data(), L0_,
-                                        x_workspace_.data());
+                                        reach_mark_.data(), x_workspace_.data());
     }
-    lane0_serial<Direct>([&] {
+    if constexpr (Warp) {
+      // The whole tail is collective now. This used to be one lane0_serial block containing the
+      // MPF T-loop, which is why the hypersparse l_solve cost ~2.7x the dense one per call.
+      const f_t zero_tol = 1e-13;
+      i_t nz             = m - top;
+      warp_solve_to_workspace_body(m, xi_workspace_.data(), top);
+      if (num_updates_ > 0) {
+        // S_ pointers are re-read here (they move on resize) — every lane reads the same globals.
+        warp_tloop_sparse_body<true, 1, 0>(
+          S_.col_start.data(), mu_values_.data(), num_updates_, S_.i.data(), zero_tol,
+          S_.x.data(), m, xi_workspace_.data(), &nz, x_workspace_.data());
+      }
+      // gather_into_sparse_vector, warp form. reserve() may device-malloc, so the data() pointers
+      // must be read after lane0_serial's __syncwarp. n is deliberately left alone: the serial
+      // gather_into_sparse_vector did not set it either.
+      lane0_serial<Direct>([&] {
+        rhs.i.clear();
+        rhs.x.clear();
+        rhs.i.reserve(nz);
+        rhs.x.reserve(nz);
+      });
+      i_t count = 0;
+      warp_gather_workspace_body(&count, rhs.i.data(), rhs.x.data(), m, xi_workspace_.data(), nz,
+                                 x_workspace_.data());
+      lane0_serial<Direct>([&] { rhs.i.set_size(count); rhs.x.set_size(count); });
+    } else {
       solve_to_workspace(top);
       i_t nz             = m - top;
       const f_t zero_tol = 1e-13;
-      ST_TIC(_tl4);
-      for (i_t k = 0; k < num_updates_; ++k) {   // MPF T-loop kept serial on lane 0 for now
+      for (i_t k = 0; k < num_updates_; ++k) {
         const f_t mu    = mu_values_[k];
         const i_t u_col = 2 * k;
         const i_t v_col = 2 * k + 1;
@@ -1887,9 +2512,8 @@ struct gpu_basis_update_mpf {
           add_sparse_column(S_, u_col, -theta, xi_workspace_.data(), nz, x_workspace_.data());
         }
       }
-      ST_TOC(SG_LU_TLOOP, _tl4);
       gather_into_sparse_vector(nz, rhs);
-    });
+    }
   }
 
   // ---- B solves ----
@@ -1900,8 +2524,11 @@ struct gpu_basis_update_mpf {
   template <bool Warp = false, bool Direct = false>
   __device__ i_t b_solve(const gpu_vector<f_t>& rhs, gpu_vector<f_t>& solution) const
   {
-    lane0_serial<Direct>(
-      [&] { permute_vector(row_permutation_.data(), rhs.data(), solution.data(), L0_.m); });
+    if constexpr (Warp) {
+      warp_permute_dense_body(rhs.data(), L0_.m, row_permutation_.data(), solution.data());
+    } else {
+      permute_vector(row_permutation_.data(), rhs.data(), solution.data(), L0_.m);
+    }
     l_solve<Warp, Direct>(solution.data());
     u_solve<Warp, Direct>(solution.data());
     return 0;
@@ -1915,35 +2542,50 @@ struct gpu_basis_update_mpf {
   {
     bool use_hypersparse = false;
     const f_t input_size = static_cast<f_t>(rhs.i.size());
-    lane0_serial<Direct>([&] {
+    if constexpr (Warp) {
+      warp_sv_copy<Direct>(rhs, solution);
+      warp_permute_idx_body(solution.i.data(), static_cast<i_t>(solution.i.size()),
+                            inverse_row_permutation_.data());
+    } else {
       solution = rhs;                 // copy-assign: reserve() -> device malloc
       solution.inverse_permute_vector(inverse_row_permutation_.data());
+    }
+    lane0_serial<Direct>([&] {
       estimate_solution_density(input_size, sum_L_, num_calls_L_, use_hypersparse);
     });
     use_hypersparse = lane0_bcast<Direct>(static_cast<int>(use_hypersparse)) != 0;
+    // TRIED AND REVERTED: eliding the U leg's warp_to_dense when the L leg already routed dense.
+    // dense_scratch_ still holds dense(solution) at that point (from_dense keeps exactly the
+    // v != 0.0 entries, to_dense zeroes and re-scatters those same entries), so skipping it is
+    // bit-identical and removes an O(m) zero + scatter on the ~618k calls per run where both legs
+    // are dense. But carrying the one bool it needs cost one live register: the monolith went
+    // 128 -> 129, and blk/SM = 4*floor(16384/(32*roundup8(regs))) then drops 16 -> 12.
+    // Measured 4.701 -> 5.151 s. On this kernel a single register is worth more than the work.
     if (use_hypersparse) {
-      ST_TIC(_slh); l_solve<Warp, Direct>(solution); ST_TOC(SG_LU_B_L_HYP, _slh);
+      l_solve<Warp, Direct>(solution);
     } else {
       gpu_vector<f_t>& solution_dense = dense_scratch_;  // reused (was a per-solve device malloc)
       if constexpr (Warp) { warp_to_dense<Direct>(solution, solution_dense); } else { solution.to_dense(solution_dense); }
-      ST_TIC(_sld); l_solve<Warp, Direct>(solution_dense.data()); ST_TOC(SG_LU_B_L_DEN, _sld);
+      l_solve<Warp, Direct>(solution_dense.data());
       if constexpr (Warp) { warp_from_dense<Direct>(solution_dense, solution); } else { solution.from_dense(solution_dense); }
     }
-    lane0_serial<Direct>([&] {
+    if constexpr (Warp) {
+      if (need_Lsol) { warp_sv_copy<Direct>(solution, Lsol); }
+    } else {
       if (need_Lsol) { Lsol = solution; }
-      sum_L_ += static_cast<f_t>(solution.i.size()) / input_size;
-    });
+    }
+    lane0_serial<Direct>([&] { sum_L_ += static_cast<f_t>(solution.i.size()) / input_size; });
 
     const f_t rhs_size = static_cast<f_t>(solution.i.size());
     lane0_serial<Direct>(
       [&] { estimate_solution_density(rhs_size, sum_U_, num_calls_U_, use_hypersparse); });
     use_hypersparse = lane0_bcast<Direct>(static_cast<int>(use_hypersparse)) != 0;
     if (use_hypersparse) {
-      ST_TIC(_suh); u_solve<Warp, Direct>(solution); ST_TOC(SG_LU_B_U_HYP, _suh);
+      u_solve<Warp, Direct>(solution);
     } else {
       gpu_vector<f_t>& solution_dense = dense_scratch_;  // reused (was a per-solve device malloc)
       if constexpr (Warp) { warp_to_dense<Direct>(solution, solution_dense); } else { solution.to_dense(solution_dense); }
-      ST_TIC(_sud); u_solve<Warp, Direct>(solution_dense.data()); ST_TOC(SG_LU_B_U_DEN, _sud);
+      u_solve<Warp, Direct>(solution_dense.data());
       if constexpr (Warp) { warp_from_dense<Direct>(solution_dense, solution); } else { solution.from_dense(solution_dense); }
     }
     lane0_serial<Direct>([&] { sum_U_ += static_cast<f_t>(solution.i.size()) / rhs_size; });
@@ -1971,19 +2613,24 @@ struct gpu_basis_update_mpf {
         input_size, sum_U_transpose_, num_calls_U_transpose_, use_hypersparse);
     });
     use_hypersparse = lane0_bcast<Direct>(static_cast<int>(use_hypersparse)) != 0;
+    // NO redundant-to_dense elision here, unlike b_solve. It is valid, but u_transpose_solve routes
+    // hypersparse on 99.9% of calls (2,131,200 vs 2,700), so the flag would almost always be false
+    // — and carrying it cost one extra live register, which took the monolith 128 -> 129 and so
+    // 16 -> 12 blocks/SM (blk/SM = 4*floor(16384/(32*roundup8(regs)))). Measured: 4.701 -> 5.151 s.
     if (use_hypersparse) {
-      lane0_serial<Direct>([&] { solution = rhs; });   // copy-assign: allocates
-      ST_TIC(_suth); u_transpose_solve<Warp, Direct>(solution); ST_TOC(SG_LU_BT_U_HYP, _suth);
+      if constexpr (Warp) { warp_sv_copy<Direct>(rhs, solution); }
+      else { solution = rhs; }                        // copy-assign: allocates
+      u_transpose_solve<Warp, Direct>(solution);
     } else {
       gpu_vector<f_t>& solution_dense = dense_scratch_;  // reused (was a per-solve device malloc)
       if constexpr (Warp) { warp_to_dense<Direct>(rhs, solution_dense); } else { rhs.to_dense(solution_dense); }
-      ST_TIC(_sutd); u_transpose_solve<Warp, Direct>(solution_dense.data()); ST_TOC(SG_LU_BT_U_DEN, _sutd);
+      u_transpose_solve<Warp, Direct>(solution_dense.data());
       if constexpr (Warp) { warp_from_dense<Direct>(solution_dense, solution); } else { solution.from_dense(solution_dense); }
     }
-    lane0_serial<Direct>([&] {
-      UTsol = solution;                                 // copy-assign: allocates
-      sum_U_transpose_ += static_cast<f_t>(solution.i.size()) / input_size;
-    });
+    if constexpr (Warp) { warp_sv_copy<Direct>(solution, UTsol); }
+    else { UTsol = solution; }                          // copy-assign: allocates
+    lane0_serial<Direct>(
+      [&] { sum_U_transpose_ += static_cast<f_t>(solution.i.size()) / input_size; });
 
     const f_t rhs_size = static_cast<f_t>(solution.i.size());
     lane0_serial<Direct>([&] {
@@ -1992,21 +2639,93 @@ struct gpu_basis_update_mpf {
     });
     use_hypersparse = lane0_bcast<Direct>(static_cast<int>(use_hypersparse)) != 0;
     if (use_hypersparse) {
-      ST_TIC(_slth); l_transpose_solve<Warp, Direct>(solution); ST_TOC(SG_LU_BT_L_HYP, _slth);
+      l_transpose_solve<Warp, Direct>(solution);
     } else {
       gpu_vector<f_t>& solution_dense = dense_scratch_;  // reused (was a per-solve device malloc)
       if constexpr (Warp) { warp_to_dense<Direct>(solution, solution_dense); } else { solution.to_dense(solution_dense); }
-      ST_TIC(_sltd); l_transpose_solve<Warp, Direct>(solution_dense.data()); ST_TOC(SG_LU_BT_L_DEN, _sltd);
+      l_transpose_solve<Warp, Direct>(solution_dense.data());
       if constexpr (Warp) { warp_from_dense<Direct>(solution_dense, solution); } else { solution.from_dense(solution_dense); }
     }
-    lane0_serial<Direct>([&] {
-      sum_L_transpose_ += static_cast<f_t>(solution.i.size()) / rhs_size;
+    lane0_serial<Direct>([&] { sum_L_transpose_ += static_cast<f_t>(solution.i.size()) / rhs_size; });
+    if constexpr (Warp) {
+      warp_permute_idx_body(solution.i.data(), static_cast<i_t>(solution.i.size()),
+                            row_permutation_.data());
+    } else {
       solution.inverse_permute_vector(row_permutation_.data());
-    });
+    }
     return 0;
   }
 
   // ---- stacking rank-1 update (sparse form) ----
+  // Collective form of update(). Same sequence, same results; only the data-parallel spans are
+  // hoisted out of the lane-0 region. The fill-tracking add_sparse_column, the two sorts and the
+  // mu dot product stay on lane 0 (order-dependent append cursor / floating-point order).
+  template <bool Warp = false, bool Direct = false>
+  __device__ i_t warp_update(const gpu_sparse_vector& utilde, gpu_sparse_vector& etilde,
+                             i_t leaving_index)
+  {
+    if constexpr (!Warp) { return update(utilde, etilde, leaving_index); }
+    const i_t m = L0_.m;
+    i_t nz      = static_cast<i_t>(utilde.i.size());
+
+    warp_scatter_ws_body(utilde.i.data(), utilde.x.data(), m, nz, xi_workspace_.data(),
+                         x_workspace_.data());
+
+    // add_sparse_column appends fill to the index list through a running cursor, and gpu_sort is
+    // serial; grow_storage allocates. One lane, one region.
+    i_t base = 0;
+    lane0_serial<Direct>([&] {
+      add_sparse_column(U0_, leaving_index, -1.0, xi_workspace_.data(), nz, x_workspace_.data());
+      gpu_sort(xi_workspace_.data() + m, xi_workspace_.data() + m + nz,
+               [] __device__(i_t a, i_t b) { return a < b; });
+      i_t S_start_l = 0, S_nz_l = 0;
+      grow_storage(nz + static_cast<i_t>(etilde.i.size()), S_start_l, S_nz_l);
+      base = S_.col_start[S_.n];
+    });
+    nz   = lane0_bcast<Direct>(nz);     // add_sparse_column grew it on lane 0 only
+    base = lane0_bcast<Direct>(base);
+    // S_.i/S_.x may have been relocated by grow_storage — data() is read here, after the barrier.
+    const i_t end1 =
+      warp_append_scatter_body(base, S_.i.data(), S_.x.data(), xi_workspace_.data() + m, nz,
+                               x_workspace_.data());
+
+    i_t base2 = 0;
+    lane0_serial<Direct>([&] {
+      S_.col_start[S_.n + 1] = end1;
+      S_.n++;
+      etilde.sort(sort_bucket_, sort_i_, sort_x_, sort_perm_);   // reused scratch, may reallocate
+      base2 = S_.col_start[S_.n];
+    });
+    base2 = lane0_bcast<Direct>(base2);
+    const i_t enz  = static_cast<i_t>(etilde.i.size());
+    const i_t end2 =
+      warp_append_sv_body(base2, S_.i.data(), S_.x.data(), etilde.i.data(), etilde.x.data(), enz);
+
+    i_t status = 0;
+    lane0_serial<Direct>([&] {
+      S_.col_start[S_.n + 1] = end2;
+      S_.n++;
+      // The two columns just appended are S_.n-2 and S_.n-1; that is grow_storage's S_start.
+      const i_t S_start = S_.n - 2;
+      const f_t mu      = 1.0 + sparse_dot(S_.i.data() + S_.col_start[S_start],
+                                      S_.x.data() + S_.col_start[S_start],
+                                      S_.col_start[S_start + 1] - S_.col_start[S_start],
+                                      S_.i.data() + S_.col_start[S_start + 1],
+                                      S_.x.data() + S_.col_start[S_start + 1],
+                                      S_.col_start[S_start + 2] - S_.col_start[S_start + 1]);
+      if (fabs(mu) < 1E-8 || fabs(mu) > 1E+8) { status = 1; }
+      else { mu_values_.push_back(mu); }
+    });
+    status = lane0_bcast<Direct>(status);
+    // Matches the serial version: on the numerical bail-out the workspace is NOT cleared and
+    // num_updates_ is NOT bumped.
+    if (status == 1) { return 1; }
+
+    warp_clear_ws_body(m, xi_workspace_.data(), nz, x_workspace_.data());
+    lane0_serial<Direct>([&] { num_updates_++; });
+    return 0;
+  }
+
   __device__ i_t update(const gpu_sparse_vector& utilde, gpu_sparse_vector& etilde, i_t leaving_index)
   {
     const i_t m = L0_.m;
@@ -2114,8 +2833,6 @@ __device__ f_t compute_user_objective(const gpu_lp& lp, f_t obj)
 // the changed positions in basic_list). O(nnz), not O(n).
 // Direct=true reduces the sum with a warp butterfly (warp_reduce_add). This is NOT bit-exact vs the
 // serial left-to-right accumulation — the adds are reordered — and `obj` is the CUTOFF comparand read
-// in K5, so this is one of the two places where the fission warp path deliberately stops being
-// bit-identical to the monolith warp. See FISSION_CHALLENGES.md §20.
 template <bool Direct = false>
 __device__ void update_objective(const i_t* basic_list,
                                  const gpu_sparse_vector& changed_basic_indices,
@@ -2149,7 +2866,7 @@ __device__ void update_objective(const i_t* basic_list,
   }
 }
 
-// Direct=true (kernel fission, warp): ALL 32 lanes execute this, so the collective is called
+// Direct=true (warp): ALL 32 lanes execute this, so the collective is called
 // directly (no cfg_shared / op-code dispatch) and the lane-0-only *dz_count must be broadcast before
 // the global-memory set_size. Direct=false (monolith): only lane 0 is here — a __shfl_sync would
 // deadlock against the lanes parked in warp_helper_loop. Same contract as compute_delta_z.
@@ -2177,8 +2894,9 @@ __device__ void compute_reduced_cost_update(const gpu_lp& lp,
       warp_dz_body(lp.A.col_start.data(), lp.A.i.data(), lp.A.x.data(), basic_list, &dz_count,
                    direction, delta_y, delta_z_indices.data(), leaving_index, m, delta_z_mark, n,
                    nonbasic_list, delta_z);
-      // the body writes *dz_count on lane 0 only; every lane needs it for set_size (global memory).
-      dz_count = __shfl_sync(0xffffffffu, dz_count, 0);
+      // No broadcast: the body writes *dz_count on EVERY lane (the count is warp-uniform), and
+      // &dz_count is this lane's own local. The body also ends with __syncwarp, so the global
+      // writes it made are visible before set_size below.
     }
     delta_z_indices.set_size(dz_count);
     return;
@@ -2210,7 +2928,7 @@ __device__ void compute_reduced_cost_update(const gpu_lp& lp,
 // Transpose delta_z: delta_z_N = -A_N' delta_y, row-wise on the CSR copy Arow,
 // iterating only the nonzero rows of delta_y and only their nonbasic-column portion
 // (Arow.row_start[i] .. nonbasic_end[i]). Mirrors the CPU compute_delta_z bit-for-bit.
-// Direct=true (kernel fission, warp): ALL 32 lanes execute this function, so the collective is
+// Direct=true (warp): ALL 32 lanes execute this function, so the collective is
 // called directly (no cfg_shared / op-code dispatch) and the lane-0-only output must be broadcast
 // before the global-memory set_size. Direct=false (monolith): only lane 0 is here — a __shfl_sync
 // would deadlock waiting for lanes parked in warp_helper_loop, so it must NOT be emitted.
@@ -2234,8 +2952,9 @@ __device__ void compute_delta_z(const FT& ft,
       warp_dz_scatter_body(&dz_count, direction, delta_z_indices.data(), leaving_index, delta_z_mark,
                            delta_z, delta_y.i.data(), delta_y.x.data(), Arow.j.data(), nonbasic_end,
                            static_cast<i_t>(delta_y.i.size()), Arow.row_start.data(), Arow.x.data());
-      // the body writes *dz_count on lane 0 only; every lane needs it for set_size (global memory).
-      dz_count = __shfl_sync(0xffffffffu, dz_count, 0);
+      // No broadcast: the body writes *dz_count on EVERY lane (the count is warp-uniform), and
+      // &dz_count is this lane's own local. The body also ends with __syncwarp, so the global
+      // writes it made are visible before set_size below.
     }
     delta_z_indices.set_size(dz_count);
     return;
@@ -2508,10 +3227,9 @@ __device__ f_t compute_initial_primal_infeasibilities(const gpu_lp& lp,
       warp_pinf_body(basic_list, &pi_count, infeasibility_indices.data(), lp.lower.data(), m, n,
                      &pi_pinf, &pi_pinf_sq, squared_infeasibilities.data(), settings.primal_tol,
                      lp.upper.data(), x);
-      // the body writes the three scalars on lane 0; every lane needs them (set_size is global).
-      pi_count   = __shfl_sync(0xffffffffu, pi_count, 0);
-      pi_pinf    = __shfl_sync(0xffffffffu, pi_pinf, 0);
-      pi_pinf_sq = __shfl_sync(0xffffffffu, pi_pinf_sq, 0);
+      // No broadcast: the body writes all three scalars on EVERY lane (all three are warp-uniform),
+      // and the pointers address this lane's own locals. The body ends with __syncwarp, so the
+      // index/infeasibility arrays it filled are visible to the set_size and the pricing scan.
       lane0_serial<true>([&] { infeasibility_indices.set_size(pi_count); });
       primal_inf = pi_pinf;
       return pi_pinf_sq;
@@ -2539,6 +3257,21 @@ __device__ f_t compute_initial_primal_infeasibilities(const gpu_lp& lp,
   return primal_inf_squared;
 }
 
+// Under <Warp,Direct> this runs as a strided warp scan + butterfly reduction; otherwise it is the
+// original serial loop.
+//
+// The warp form is BIT-IDENTICAL to the serial one, not merely equivalent. The serial loop is a
+// maximum over the pairs (val, j) under a total order -- val larger wins, j larger breaks ties --
+// with (0.0, -1) as the bottom element (val = squared_infeas / dy_se >= 0 always, and every j >= 0).
+// A maximum over a total order is associative and commutative, so partitioning the index set across
+// lanes and folding with the SAME comparator returns the same winner regardless of visit order. No
+// floating-point arithmetic is reassociated: `val` is computed from the same two loads per element
+// either way, and the fold only compares. Hence the pivot sequence must not move -- if it does, this
+// is a bug, not an algorithm change.
+//
+// This was previously left serial on the grounds that warping it would change the tie-break. It does
+// not: the `j > leaving_index` tie-break is what makes the reduction order-independent.
+template <bool Warp = false, bool Direct = false>
 __device__ i_t steepest_edge_pricing_with_infeasibilities(const gpu_lp& lp,
                                                           const gpu_settings& settings,
                                                           const f_t* x,
@@ -2550,10 +3283,40 @@ __device__ i_t steepest_edge_pricing_with_infeasibilities(const gpu_lp& lp,
                                                           i_t& basic_leaving,
                                                           f_t& max_val)
 {
-  max_val           = 0.0;
-  i_t leaving_index = -1;
   const i_t nz      = infeasibility_indices.size();
-  i_t max_count     = 0;
+  i_t leaving_index = -1;
+  if constexpr (Warp && Direct) {
+    // Every lane already executes this function (it is not inside lane0_serial), so the serial form
+    // did the identical nz-length scan 32 times over. Split it instead.
+    const i_t* __restrict__ idx = infeasibility_indices.data();
+    const f_t* __restrict__ sq  = squared_infeasibilities.data();
+    const i_t lane              = static_cast<i_t>(threadIdx.x);
+    f_t best_val                = 0.0;
+    i_t best_j                  = -1;
+    for (i_t k = lane; k < nz; k += 32) {
+      const i_t j   = idx[k];
+      const f_t val = sq[j] / dy_steepest_edge[j];
+      if (val > best_val || (val == best_val && j > best_j)) { best_val = val; best_j = j; }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      const f_t oval = __shfl_xor_sync(0xffffffffu, best_val, off);
+      const i_t oj   = __shfl_xor_sync(0xffffffffu, best_j, off);
+      if (oval > best_val || (oval == best_val && oj > best_j)) { best_val = oval; best_j = oj; }
+    }
+    // Butterfly => every lane holds the winner, so no broadcast is needed and the caller's
+    // warp-uniform reads of leaving/direction/max_val stay warp-uniform.
+    max_val       = best_val;
+    leaving_index = best_j;
+    if (leaving_index >= 0) {
+      const f_t lower_infeas = lp.lower[leaving_index] - x[leaving_index];
+      const f_t upper_infeas = x[leaving_index] - lp.upper[leaving_index];
+      direction              = lower_infeas >= upper_infeas ? 1 : -1;
+    }
+    basic_leaving = leaving_index >= 0 ? basic_mark[leaving_index] : -1;
+    return leaving_index;
+  }
+  max_val = 0.0;
   for (i_t k = 0; k < nz; ++k) {
     const i_t j              = infeasibility_indices[k];
     const f_t squared_infeas = squared_infeasibilities[j];
@@ -2564,7 +3327,6 @@ __device__ i_t steepest_edge_pricing_with_infeasibilities(const gpu_lp& lp,
       const f_t lower_infeas = lp.lower[j] - x[j];
       const f_t upper_infeas = x[j] - lp.upper[j];
       direction              = lower_infeas >= upper_infeas ? 1 : -1;
-      max_count++;
     }
   }
   basic_leaving = leaving_index >= 0 ? basic_mark[leaving_index] : -1;
@@ -2609,7 +3371,6 @@ __device__ i_t phase2_ratio_test(const gpu_lp& lp,
   //
   // CONSEQUENCE: on near-degenerate ties the two can choose a different entering variable, hence a
   // different pivot and a divergent iteration path. Any GPU-vs-CPU bitwise check must therefore run
-  // the SERIAL scan (CUOPT_RT_SERIAL=1); with the warp band the expected MPF signature is
   // 59/100 cpu==gpu, and that is NOT a bug.
   //
   // MEASURED, 100 v6 nodes, MPF/LU warp (claude_scripts/run_rt_band_ab.sh):
@@ -2625,13 +3386,11 @@ __device__ i_t phase2_ratio_test(const gpu_lp& lp,
   // node the parallel band is the one that gets CUTOFF (correct) while serial gets DUAL_UNBOUNDED.
   // (Original rationale: nvidia_cuopt/cpp/src/dual_simplex/gpu_phase2/gpu_phase2.cu, pre-strip.)
   //
-  // CUOPT_RT_SERIAL=1 forces the serial walking band even under Warp — used for bitwise checks and
   // to re-measure this trade on a new workload.
   // ============================================================================================
   // NOTE: the Warp arm that dispatched to warp_rt_body via ft.warp_dispatch_rt was removed with the
   // parked-helper layer (2026-08-11). Warp=true no longer reaches this function at all: the Direct
-  // driver calls warp_rt_body inline (see gpu_simplified_dual_phase2_device) and fission K2 does the
-  // same, so only the single-thread serial walking band below is live here. CUOPT_RT_SERIAL therefore
+  // driver calls warp_rt_body inline (see gpu_simplified_dual_phase2_device).
   // no longer has anything to switch on this path.
 
   for (i_t k = 0; k < n - m; ++k) {
@@ -2708,7 +3467,7 @@ __device__ void update_dual_variables(const FT& ft,
     // return here — mirroring the dispatch;return idiom of compute_delta_z / phase2_ratio_test / pinf.
     // Without this return the serial loops below would double-update y and z (2×step) on the warp path.
     if constexpr (Direct) {
-      // fission: all lanes here; the body is internally lane-guarded (distinct-location writes
+      // All lanes are here; the body is internally lane-guarded (distinct-location writes
       // plus a lane-0 guard on z[leaving]) so no broadcast is needed.
       warp_upddual_body(delta_y_sparse.i.data(), static_cast<i_t>(delta_y_sparse.i.size()),
                         delta_y_sparse.x.data(), delta_z, delta_z_indices.data(),
@@ -2753,8 +3512,10 @@ __device__ i_t compute_delta_x(const gpu_lp& lp,
   // find_coefficient is read-only, so every lane may compute `scale` itself — no guard needed.
   f_t scale     = scaled_delta_xB_sparse.find_coefficient(basic_leaving_index);
   i_t numerical = 0;
-  if (scale != scale) {
-    // Rare NaN-recovery branch. Under Direct it runs ENTIRELY on lane 0, with the inner b_solve
+  if (isnan(scale)) {
+    // We could not find a coefficient for the basic leaving index; it may be very small.
+    // Switch to a regular dense solve and try to recover -- mirrors the CPU compute_delta_x.
+    // Under Direct this runs ENTIRELY on lane 0, with the inner b_solve
     // forced to the SERIAL (<<<,1>>>) instantiation: `rhs` / `scaled_delta_xB` are stack-local
     // gpu_vectors, so 32 lanes would each malloc a PRIVATE buffer and the collective would write
     // 32 different ones. Serial here is also exactly what the single-thread gate expects.
@@ -2819,9 +3580,8 @@ __device__ i_t update_steepest_edge_norms(const gpu_settings& settings,
                                           f_t* delta_y_steepest_edge)
 {
   lane0_serial<Direct>([&] { v_sparse.clear(); });
-  KT_TIC(_kt_ses);  // [KTIMER] se sub-split: time the b_solve (se_solve); se_rest = se - se_solve
+  __syncwarp(0xffffffffu);
   ft.template b_solve<Warp, Direct>(delta_y_sparse, v_sparse);
-  KT_TOC(KT_SE_SOLVE, _kt_ses);
   // `direction` is warp-uniform. The scatter accumulates into the dense `v`, but v_sparse's indices
   // are distinct AND `v` is left all-zero by the v_nz loop at the end of every call below, so no two
   // lanes touch the same slot and no atomics are needed.
@@ -2834,7 +3594,6 @@ __device__ i_t update_steepest_edge_norms(const gpu_settings& settings,
   if (wr == 0) { return -1; }
   const f_t omegar             = dy_norm_squared / (wr * wr);
   const i_t scaled_delta_xB_nz = scaled_delta_xB.i.size();
-  KT_SDXB(scaled_delta_xB_nz);  // [KTIMER] accumulate scaled_delta_xB nnz (density confirmation)
 
   if constexpr (Warp) {
     // One lane per nonzero: distinct-location writes (see warp_collective_seupd) → bit-exact.
@@ -2963,7 +3722,7 @@ __device__ void set_primal_variables_on_bounds(const gpu_lp& lp,
 // slot_state : the PERSISTENT per-slot state of one solve.
 //
 // Every member here used to be a local in gpu_simplified_dual_phase2_device's stack frame, so it
-// died when the driver returned and was published nowhere. Kernel fission splits the per-pivot
+// died when the driver returned and was published nowhere. The per-pivot state therefore
 // pipeline across SEPARATE kernel launches, so anything that crosses a pivot-step boundary must
 // outlive a single launch — it is owned here instead: one instance per batch slot (blockIdx.x),
 // allocated once by the host and reused across super-steps AND across the successive B&B nodes
@@ -2975,16 +3734,20 @@ __device__ void set_primal_variables_on_bounds(const gpu_lp& lp,
 // estimate_solution_density consumes and every solve updates. If those reset per launch the
 // route decisions would drift from the monolith's, breaking both parity and the timing model.
 //
-// setup() is the one-time S1-S7 prologue, kept as its own method so the fissioned pipeline can
+// setup() is the one-time S1-S7 prologue, kept as its own method so a persistent slot can
 // later run it as a dedicated setup kernel for a freshly refilled slot.
 // ---------------------------------------------------------------------------
 template <class FT>
 struct slot_state {
   bool inited{false};
-  // Kernel fission: terminal state of this slot. dual::status_t::UNSET (8) == still running; any
-  // other value means a kernel called fission_finish() and every later kernel must skip this slot.
   // Stored as i_t so the host can read it back as a plain int array.
   i_t status{static_cast<i_t>(dual::status_t::UNSET)};
+
+  // This slot's slice of the host-allocated arena (ordinary VRAM). Wired by the kernel on first
+  // entry from kernel_args::arena/arena_bytes, then handed to every fixed-size buffer below by
+  // bind_arena_buffers(). Zero-initialised, so a slot whose host never allocated an arena simply
+  // keeps using device malloc().
+  gpu_arena arena;
 
   FT ft;  // basis update: S_/mu_values_, num_updates_, routing stats, reused scratch
 
@@ -2999,20 +3762,13 @@ struct slot_state {
   // CSR row copy of A + its incrementally maintained nonbasic partition.
   gpu_csr_matrix Arow;
 
-  // ---- Kernel fission, WARP path: the elimination-level schedules (challenge #1, again) --------
   // In the monolith these are gpu_phase2_kernel STACK LOCALS (lvl_* + a __shared__ cfg), so they die
-  // when the kernel exits — a fission kernel launched later would read freed memory. They therefore
-  // live in the slot, built ONCE by Ksetup (which is <<<N,1>>>, i.e. exactly the monolith's lane 0)
-  // and read by every warp fission kernel through ft.warp_cfg_. Unused (and unbuilt) when no
-  // warp-mode kernel is enabled — see g_fission_warp.
   warp_solve_config wcfg;
   gpu_vector<i_t>      lvl_lev[kNumWarpSolveOps];   // per-column level (drives the sparse reach solve)
   gpu_vector<i_t>      lvl_ls[kNumWarpSolveOps];    // level offsets
   gpu_vector<i_t>      lvl_co[kNumWarpSolveOps];    // columns in level order
   gpu_vector<i_t>      sp_ls_v, sp_co_v, sp_pos_v;  // reach-restricted sparse-solve schedule scratch
 
-  // Kernel fission: the marshaled device views, built ONCE by Ksetup and then read from here.
-  // Previously every fission kernel rebuilt these on its stack (fission_bind), which forced ~79
   // registers' worth of pointers/spans/doubles live for the kernel's whole duration before any work
   // — the suspected floor under the measured 96-120. Living in the slot they are read lazily
   // (L1/L2-cached), so the compiler loads only the fields a given kernel touches and still hoists
@@ -3029,6 +3785,42 @@ struct slot_state {
   gpu_vector<f_t>   se_coeff;
   gpu_sparse_vector se_dy, se_UTsol, se_ei;
 
+  // ---- Arena binding -----------------------------------------------------------------------
+  // Point every FIXED-SIZE per-problem buffer at this slot's arena. Called ONCE, immediately after
+  // the placement-new and before any resize/reserve runs, so nothing has malloc'd yet.
+  //
+  // Everything listed here is sized from m or n, which the host already knows (it computes the same
+  // sizes for its VRAM pre-flight). What is deliberately absent:
+  //   * ft.S_ / ft.mu_values_ -- dynamic, one column per pivot (see gpu_basis_update_mpf::bind_arena)
+  //   * Arow -- normally a zero-copy view over the host-uploaded CSR (view_device), so it costs no
+  //     heap at all; only the rare from_csc fallback allocates, and binding it would force the
+  //     arena to carry an nz-sized term for a path that does not normally run.
+  //   * every function-local gpu_vector -- short-lived, and some are per-LANE under Direct.
+  __device__ void bind_arena_buffers()
+  {
+    gpu_arena* a = &arena;
+
+    xB_workspace.bind_arena(a);   delta_y.bind_arena(a);        delta_z.bind_arena(a);
+    delta_x.bind_arena(a);        v.bind_arena(a);              squared_infeas.bind_arena(a);
+
+    basic_mark.bind_arena(a);     delta_z_mark.bind_arena(a);   delta_z_indices.bind_arena(a);
+    nonbasic_end.bind_arena(a);   row_mark.bind_arena(a);       infeas_idx.bind_arena(a);
+
+    delta_y_sparse.bind_arena(a); UTsol_sparse.bind_arena(a);   utilde_sparse.bind_arena(a);
+    scaled_dxB_sparse.bind_arena(a); rhs_sparse.bind_arena(a);  v_sparse.bind_arena(a);
+
+    for (int o = 0; o < kNumWarpSolveOps; ++o) {
+      lvl_lev[o].bind_arena(a);   lvl_ls[o].bind_arena(a);      lvl_co[o].bind_arena(a);
+    }
+    sp_ls_v.bind_arena(a);        sp_co_v.bind_arena(a);        sp_pos_v.bind_arena(a);
+
+    setup_rhs.bind_arena(a);      se_coeff.bind_arena(a);
+    se_row_degree.bind_arena(a);  se_mapping.bind_arena(a);
+    se_dy.bind_arena(a);          se_UTsol.bind_arena(a);       se_ei.bind_arena(a);
+
+    ft.bind_arena(a);
+  }
+
   // Loop-carried scalars.
   f_t obj{0.0}, primal_inf{0.0};
   i_t iter{0};
@@ -3042,7 +3834,7 @@ struct slot_state {
   // One-time prologue: S1 bounds -> S2 primal -> S3 SE-init -> S4 workspaces -> S5 Arow ->
   // S6 nonbasic partition -> S7 primal infeasibilities. Byte-for-byte the setup the monolithic
   // driver used to run inline, in the same order (bit-exactness depends on that order).
-  // Direct=true: Ksetup runs <<<N,32>>>. The prologue is almost entirely allocation and
+  // Direct=true: the prologue is almost entirely allocation and
   // read-modify-write (assign/reserve/clear, sparse-vector construction, Arow build) so it stays on
   // lane 0; the collectives are opted in one at a time. The serial parts deliberately call the
   // <false> variants so porting one collective cannot silently move any other computation.
@@ -3070,7 +3862,7 @@ struct slot_state {
     set_primal_variables_on_bounds<Direct>(lp, settings, z, vstatus, x);
 
     // Both of these solve through the factors, so they follow the kernel's geometry — the monolith
-    // has always run them on the warp, and fission now does too via Direct.
+    // has always run them on the warp via Direct.
     compute_primal_variables<Warp, Direct>(
       ft, lp.rhs, lp.A, basic_list, nonbasic_list, settings.tight_tol, x, xB_workspace, setup_rhs);
 
@@ -3173,7 +3965,7 @@ struct slot_state {
   }
 };
 
-// `Direct`: see the KERNEL FISSION / Direct banner above. Direct=false is the parked-helper monolith
+// `Direct`: all 32 lanes execute the body. Direct=false is the historical single-thread monolith
 // (lane 0 alone runs this body); Direct=true means ALL 32 lanes run it, so every allocation and
 // read-modify-write must be inside lane0_serial<Direct> and every `return` must be warp-uniform.
 template <bool Warp = false, bool Direct = false, class FT>
@@ -3194,14 +3986,13 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
   f_t* y = sol.y.data();
   f_t* z = sol.z.data();
 
-  // One-time prologue into the persistent slot. Already-inited slots (a fissioned super-step
+  // One-time prologue into the persistent slot. Already-inited slots (a re-entered
   // re-entering mid-solve) skip straight to the pivot loop.
   if (!st.inited) {
     st.template setup<Warp, Direct>(
       lp, settings, vstatus, basic_list, nonbasic_list, sol, delta_y_steepest_edge, dy_se_empty);
     lane0_serial<Direct>([&] { st.inited = true; });   // RMW on slot state
   }
-  KT_SETUP_DONE();  // [KTIMER] one-time setup (kernel entry → first pivot) done
 
   // Bind the persistent slot members under their original names, so the pivot loop below is
   // unchanged by the state externalization and stays line-diffable against the CPU simplified
@@ -3252,11 +4043,9 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     i_t direction        = 0;
     i_t basic_leaving    = -1;
     f_t max_val;
-    KT_TIC(_kt_pr);
-    const i_t leaving = steepest_edge_pricing_with_infeasibilities(
+    const i_t leaving = steepest_edge_pricing_with_infeasibilities<Warp, Direct>(
       lp, settings, x, delta_y_steepest_edge, basic_mark.data(), squared_infeas, infeas_idx,
       direction, basic_leaving, max_val);
-    KT_TOC(KT_PRICING, _kt_pr);
     if (leaving == -1) {
       finish(iter);
       return dual::status_t::OPTIMAL;
@@ -3267,9 +4056,7 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
       delta_y_sparse.clear();
       UTsol_sparse.clear();
     });
-    KT_TIC(_kt_bt);
     compute_delta_y<Warp, Direct>(ft, basic_leaving, direction, delta_y_sparse, UTsol_sparse);
-    KT_TOC(KT_BTRAN, _kt_bt);
     // Butterfly reduction of ||delta_y||^2 under Direct. Reordered vs the serial sum, and
     // dy_norm_sq feeds the SE norms -> pricing, so this is a deliberate arithmetic change.
     // warp_reduce_add returns the FULL sum on every lane, so dy_norm_sq stays warp-uniform and the
@@ -3290,9 +4077,8 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     // row. If the maintained norm used for pricing has drifted below
     // settings.steepest_edge_ratio of it, the leaving choice was made on a stale norm --
     // reset it and re-price (strict port of the CPU simplified, phase2.cpp:4037).
-    // g_serep_off (host: CUOPT_SEREP_OFF) disables it, matching the CPU driver's switch, so the
-    // monolith can serve as the bit-exact reference for the reprice-free fissioned pipeline.
-    if (!g_serep_off && delta_y_steepest_edge[leaving] < settings.steepest_edge_ratio * dy_norm_sq) {
+    // monolith is the bit-exact reference.
+    if (delta_y_steepest_edge[leaving] < settings.steepest_edge_ratio * dy_norm_sq) {
       lane0_serial<Direct>([&] { delta_y_steepest_edge[leaving] = dy_norm_sq; });
       continue;
     }
@@ -3320,11 +4106,9 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     const f_t delta_y_nz_percentage = delta_y_nz0 / static_cast<f_t>(m) * 100.0;
     const bool used_transpose_dz    = delta_y_nz_percentage <= 30.0;
     if (used_transpose_dz) {
-      KT_TIC(_kt_dz);
       compute_delta_z<Warp, Direct>(ft, Arow, delta_y_sparse, leaving, direction,
                                     nonbasic_end.data(), delta_z_mark.data(), delta_z_indices,
                                     delta_z.data());
-      KT_TOC(KT_DZ, _kt_dz);
     } else {
       // to_dense RESIZES delta_y (header RMW + possible device malloc). warp_to_dense keeps the
       // sizing on lane 0 and warps the O(n) zero-fill + nnz scatter — bit-exact (distinct indices).
@@ -3333,18 +4117,15 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
       } else {
         delta_y_sparse.to_dense(delta_y);
       }
-      KT_TIC(_kt_rcu);
       compute_reduced_cost_update<Warp, Direct>(lp, ft, basic_list, nonbasic_list, delta_y.data(),
                                                 leaving, direction, delta_z_mark.data(),
                                                 delta_z_indices, delta_z.data());
-      KT_TOC(KT_RCU, _kt_rcu);
     }
 
     // 4. Simple ratio test.
     f_t step_length       = 0.0;
     i_t nonbasic_entering = -1;
     i_t entering          = -1;
-    KT_TIC(_kt_rt);
     if constexpr (Direct) {
       // Same body the dispatcher already invokes (warp_dispatch_rt -> warp_rt_body), so this is a
       // pure plumbing change, not a tie-break change. Its outputs are lane-0 pointer writes, so aim
@@ -3361,16 +4142,13 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
       entering = phase2_ratio_test<Warp>(
         lp, settings, ft, vstatus, nonbasic_list, z, delta_z.data(), step_length, nonbasic_entering);
     }
-    KT_TOC(KT_RT, _kt_rt);
     if (entering == -1) {
       finish(iter);
       return dual::status_t::DUAL_UNBOUNDED;
     }
 
-    KT_TIC(_kt_ud);
     update_dual_variables<Warp, Direct>(
       ft, delta_y_sparse, delta_z_indices, delta_z.data(), step_length, leaving, y, z);
-    KT_TOC(KT_UPDDUAL, _kt_ud);
 
     // FTran.
     lane0_serial<Direct>([&] {   // clear() is a header RMW; from_csc_column reserve+push_back mallocs
@@ -3378,32 +4156,24 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
       scaled_dxB_sparse.clear();
       rhs_sparse.from_csc_column(lp.A, entering);
     });
-    KT_TIC(_kt_ft);
     i_t dx_status =
       compute_delta_x<Warp, Direct>(lp, ft, entering, leaving, basic_leaving, direction, basic_list, rhs_sparse,
                       delta_z.data(), x, utilde_sparse, scaled_dxB_sparse, delta_x.data());
-    KT_TOC(KT_FTRAN, _kt_ft);
     if (dx_status == -1) {
       finish(iter);
       return dual::status_t::NUMERICAL;
     }
 
-    KT_TIC(_kt_se);
     update_steepest_edge_norms<Warp, Direct>(settings, basic_list, ft, direction, delta_y_sparse, dy_norm_sq,
                                scaled_dxB_sparse, basic_leaving, entering, v.data(), v_sparse,
                                delta_y_steepest_edge);
-    KT_TOC(KT_SE, _kt_se);
 
-    KT_TIC(_kt_up);
     update_primal_variables<Direct>(scaled_dxB_sparse, basic_list, delta_x.data(), entering, x);
-    KT_TOC(KT_UPDPRIM, _kt_up);
 
     // Incrementally update the objective the SAME way the CPU driver does (phase2.cpp:4259):
     // obj += delta_x·objective over the changed basics + entering, true costs, called with the
     // OLD basic_list (before the swap below), WITHOUT the bound-flip contribution.
-    KT_TIC(_kt_ob);
     update_objective<Direct>(basic_list, scaled_dxB_sparse, lp.objective, delta_x.data(), entering, obj);
-    KT_TOC(KT_OBJ, _kt_ob);
 
     // 5. Basis swap + MPF rank-1 stacking update.
     // Every line here is a read-modify-write on shared state (vstatus/basic_list/basic_mark stores,
@@ -3421,28 +4191,22 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
       basic_mark[entering]             = basic_leaving;
 
       // Keep the CSR nonbasic partition in sync for the next iteration's transpose delta_z.
-      KT_TIC(_kt_ar);
       update_Arow(leaving, entering, lp.A, row_mark, nonbasic_end.data(), Arow);
-      KT_TOC(KT_AROW, _kt_ar);
-
-      KT_TIC(_kt_fu);
-      _fu_status = ft.update(utilde_sparse, UTsol_sparse, basic_leaving);
-      KT_TOC(KT_FTUPD, _kt_fu);
     });
-    // The NUMERICAL exit must be taken UNIFORMLY, so broadcast lane 0's verdict.
+
+    // ft.update is COLLECTIVE now, so it must sit outside the lane-0 region above. It returns the
+    // same status on every lane (its internal lane0_bcast), so the NUMERICAL exit is already
+    // uniform; the broadcast below is kept for the !Warp instantiation.
+    _fu_status = ft.template warp_update<Warp, Direct>(utilde_sparse, UTsol_sparse, basic_leaving);
     _fu_status = lane0_bcast<Direct>(_fu_status);
     if (_fu_status == 1) {
       finish(iter);
       return dual::status_t::NUMERICAL;
     }
 
-    KT_TIC(_kt_pi);
     compute_initial_primal_infeasibilities<Warp, Direct>(
       lp, settings, ft, basic_list, x, squared_infeas, infeas_idx, primal_inf);
-    KT_TOC(KT_PINF, _kt_pi);
-    KT_TIC(_kt_cd);
     clear_delta_z<Direct>(entering, leaving, delta_z_mark.data(), delta_z_indices, delta_z.data());
-    KT_TOC(KT_CLEARDZ, _kt_cd);
 
     // Increment only on a COMPLETED iteration, at the end of the body — matching the CPU
     // simplified driver's iter++ (phase2.cpp:4370). The SE-reset `continue` above jumps
@@ -3495,6 +4259,7 @@ struct kernel_args {
   i_t *row_perm, *inv_row_perm;
   i_t* xi_workspace;
   f_t* x_workspace;
+  unsigned char* reach_mark;
   i_t num_updates;
   i_t refactor_frequency;
   // Per-slot PERSISTENT solve state (slot_state<FT>): host-allocated, ZEROED blob that the kernel
@@ -3504,7 +4269,11 @@ struct kernel_args {
   // host-visible "already constructed" flag (0 = fresh node → construct + run setup).
   void* slot;
   i_t   slot_live;
-  // Kernel fission: contiguous host-visible status array (one i_t per slot, indexed by blockIdx.x).
+  // Per-slot ARENA for the fixed-size gpu_vector payloads (see gpu_arena). Ordinary cudaMalloc VRAM,
+  // so it is NOT subject to the driver's ~16 GB in-kernel malloc cap -- which is what used to set the
+  // batch-size ceiling. Null/0 is legal and simply leaves every buffer on device malloc().
+  void*  arena;
+  size_t arena_bytes;
   // Same base pointer in every item, so the host reads all N terminal states in ONE D2H copy to
   // decide when the super-step loop is done. Null on the monolith path.
   i_t* status_arr;
@@ -3533,7 +4302,7 @@ __device__ gpu_csc_view make_view(
   v.m         = rows;
   v.n         = cols;
   v.nz_max    = nz;
-  v.col_start = gpu_span<i_t>(col_start, cols + 1);
+  v.col_start = gpu_span<const i_t>(col_start, cols + 1);
   v.i         = gpu_span<i_t>(idx, nz);
   v.x         = gpu_span<f_t>(val, nz);
   return v;
@@ -3587,7 +4356,7 @@ __device__ void warp_build_config(const gpu_basis_update_mpf& ft, warp_solve_con
 // kernel's natural 255 regs, ~8 resident blocks/SM on B200), 16 = 128-reg cap (~16 blocks, some
 // spilling), 32 = 64-reg cap (~32 blocks = the HW max, heavier spilling). The batch launcher picks the
 // variant at runtime (CUOPT_GPU_REGCAP) so throughput-vs-register-pressure can be swept in one binary.
-// `Direct`: the fission execution model applied to the monolith. Direct=false is the historical
+// `Direct`: all 32 lanes execute the kernel body. Direct=false is the historical
 // parked-helper form (lane 0 drives, lanes 1-31 wait in warp_helper_loop for cfg_shared requests);
 // Direct=true means all 32 lanes run the driver and every collective is called directly. Only ever
 // meaningful together with Warp.
@@ -3621,7 +4390,6 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args)
   // (Direct). The lanes-1..31 -> warp_helper_loop split was deleted with the dispatcher.
 
   kernel_args& a = args[blockIdx.x];
-  KT_RESET();  // [KTIMER] start-of-solve: zero accumulators + record kernel-entry clock (lane 0)
 
   const i_t m = a.m;
   const i_t n = a.n;
@@ -3655,16 +4423,22 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args)
   // Per-slot PERSISTENT state (see slot_state). The host hands us a zeroed blob sized for
   // slot_state<FT>; construct it in place on first entry, then wire the read-only factorization
   // views into its ft. `slot_live` is the host's per-slot "already constructed" flag: it stays 0
-  // for a fresh node (construct + run setup) and is set to 1 below, so a later fissioned
+  // for a fresh node (construct + run setup) and is set to 1 below, so a later
   // super-step re-entering the same slot reuses the live state (S_, routing stats, workspaces)
   // instead of rebuilding it.
   slot_state<FT>& st = *static_cast<slot_state<FT>*>(a.slot);
   // One-time construction: placement-new, ft wiring and S_.init_empty (which resizes -> mallocs) are
-  // all one-time RMW on shared state, so under Direct they belong to lane 0 alone. gpu_fission_setup
+  // all one-time RMW on shared state, so under Direct they belong to lane 0 alone.
   // does exactly this.
   lane0_serial<Direct>([&] {
   if (a.slot_live == 0) {
     new (&st) slot_state<FT>();  // placement new: host memory is zeroed, NSDMIs must run
+    // Wire the arena BEFORE anything can allocate. Everything below (ft wiring, S_.init_empty, the
+    // whole prologue) resizes buffers, and bind_arena only takes effect on a not-yet-allocated one.
+    st.arena.base = static_cast<char*>(a.arena);
+    st.arena.cap  = static_cast<unsigned long long>(a.arena_bytes);
+    st.arena.used = 0;
+    st.bind_arena_buffers();
     FT& ft                      = st.ft;
     ft.num_updates_             = a.num_updates;
     ft.refactor_frequency_      = a.refactor_frequency;
@@ -3676,6 +4450,7 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args)
     ft.inverse_row_permutation_ = gpu_span<i_t>(a.inv_row_perm, m);
     ft.xi_workspace_            = gpu_span<i_t>(a.xi_workspace, 2 * m);
     ft.x_workspace_             = gpu_span<f_t>(a.x_workspace, m);
+    ft.reach_mark_              = gpu_span<unsigned char>(a.reach_mark, m);
     ft.S_.init_empty(m);
     ft.hypersparse_threshold_ = 0.05;
   }
@@ -3695,7 +4470,7 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args)
   // executes here, and a stack-local gpu_vector would device-malloc PER LANE — 32 private buffers,
   // 31 leaked, and worse: warp_build_config publishes `lvl_*[o].data()` / `sp_*_v.data()` into the
   // config, so every wavefront solve for the rest of the solve would read a lane-private schedule.
-  // slot_state already carries byte-identical members for exactly this reason (the fission Ksetup
+  // slot_state already carries byte-identical members for exactly this reason (the setup
   // uses them), so this is a reuse, not a new allocation.
   if constexpr (Warp) {
     // Serial O(m*nnz) schedule build that resizes the slot's gpu_vectors and writes ~90 config
@@ -3726,8 +4501,6 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args)
     *a.out_user_objective = sol.user_objective;
     *a.out_iterations     = sol.iterations;
   });
-  KT_EMIT(m);  // [KTIMER] print per-function tick totals + scaled_delta_xB density for this solve
-  ST_EMIT();   // [STAT] per-call cycle distribution for the sparse-solve op groups
 }
 
 // ---- entry points -----------------------------------------------------------------------------
@@ -3737,26 +4510,10 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args)
 // (15 -> 10 blocks/SM) — the classic "the bound says there is no occupancy pressure, so ptxas spends
 // registers freely" effect that motivated removing launch bounds in the first place.
 
-// Generic entry: NO launch bound, ptxas's own heuristic. Used by the single-thread path and by the
-// parked-helper warp form.
-template <bool Warp, bool Direct = false, int MinBlocks = 8, class FT = gpu_basis_update_mpf>
-__global__ void gpu_phase2_kernel(kernel_args* args)
-{
-  gpu_phase2_kernel_body<Warp, Direct, FT>(args);
-}
-
 // Direct warp entry, register-capped. ptxas left unconstrained picks 182 regs / 11 blocks/SM, but a
 // cap sweep showed that is a heuristic, not a requirement: 168 regs at ZERO spill, 128 regs at 8 BYTES
 // of spill for 16 blocks/SM (1.45x occupancy). MinBlocks maps to the cap as 65536/(32*MinBlocks):
-// 12 -> 170, 16 -> 128, 32 -> 64. Only instantiated when CUOPT_MONO_DIRECT_MINBLOCKS != 0, because
 // merely ATTACHING a launch bound changes ptxas's behaviour — see the single-thread note below.
-#if CUOPT_MONO_DIRECT_MINBLOCKS
-template <int MinBlocks = CUOPT_MONO_DIRECT_MINBLOCKS, class FT = gpu_basis_update_mpf>
-__global__ void __launch_bounds__(32, MinBlocks) gpu_phase2_kernel_direct(kernel_args* args)
-{
-  gpu_phase2_kernel_body<true, true, FT>(args);
-}
-#else
 // Uncapped Direct warp entry: no attribute at all. NOT the same as __launch_bounds__ with a large
 // MinBlocks — the attribute's mere presence tells ptxas there is no occupancy pressure, and it then
 // spends registers freely (measured: 214 regs with the bound at minBlocks=1-equivalent, vs 182 with
@@ -3766,435 +4523,21 @@ __global__ void gpu_phase2_kernel_direct(kernel_args* args)
 {
   gpu_phase2_kernel_body<true, true, FT>(args);
 }
-#endif
 
 // ===========================================================================================
-// KERNEL FISSION — Phase 1a: the per-pivot pipeline split into 5 kernels + a setup kernel.
-//
-// WHY: gpu_phase2_kernel above carries the register union of EVERY per-pivot primitive (255 regs,
-// register-limited to ~8 blocks/SM). Splitting lets each kernel carry only its own registers, so the
-// light (ELEM) stages reach far higher occupancy, and every block in a launch runs the SAME
-// primitive (less divergence).
-//
-// The monolith is NOT replaced — it stays as the bit-exact reference and the shipping path. These
-// kernels are thin __global__ wrappers that call the SAME __device__ primitives; only the driver's
-// control flow is redistributed (loop body -> 5 kernels, `while` -> host super-step loop).
-//
-// SCOPE (Phase 1a), see gpu_phase2/FISSION_CHALLENGES.md:
-//   * SINGLE-THREAD ONLY (<<<N,1>>>): each block runs its primitive in the same serial op order as
-//     the monolith, which is what makes the bit-exact gate achievable. Warp comes later.
-//   * FIXED BATCH, NO REFILL: N nodes in, super-steps until all terminate, N results out — exactly
-//     the semantics of gpu_simplified_dual_phase2_batch, so the two are directly A/B comparable.
-//     (Slot recycling, and with it the setup-skew and harvest-cadence questions, come in Phase 1b.)
-//   * SE-DRIFT REPRICE OMITTED (#3). It is the worst source of super-step barrier imbalance
-//     (K1 barrier 2761 -> 592 BTran-units; every step becomes uniform). The monolith must therefore
-//     run with CUOPT_SEREP_OFF=1 to serve as the bit-exact reference — see g_serep_off.
-//   * NO DEVICE TIME LIMIT: the host owns it (it bounds the super-step loop), so the driver's
-//     start_ns local is not needed here.
-//
-// TERMINATION: slot_state::status is UNSET while running. Every kernel opens with
-// `if (st.status != UNSET) return;` so a finished slot is a no-op for the rest of the run. The
-// kernel that DETECTS termination must call fission_finish() and return IMMEDIATELY — relying on
-// the next kernel's guard is not enough, because the remainder of the current kernel would keep
-// mutating state the monolith never touched (e.g. update_dual_variables after DUAL_UNBOUNDED).
-// ===========================================================================================
-
-// Rebuild the device views over kernel_args. Identical to gpu_phase2_kernel's prologue; factored so
-// all six fission kernels share one definition instead of copying it.
-__device__ inline void fission_bind(kernel_args& a, gpu_lp& lp, gpu_settings& settings,
-                                    gpu_solution& sol)
-{
-  const i_t m = a.m, n = a.n;
-  lp.num_rows       = m;
-  lp.num_cols       = n;
-  lp.A              = make_view(m, n, a.A_nz, a.A_col_start, a.A_i, a.A_x);
-  lp.Arow_row_start = a.Arow_row_start;
-  lp.Arow_j         = a.Arow_j;
-  lp.Arow_x         = a.Arow_x;
-  lp.rhs            = gpu_span<f_t>(a.rhs, m);
-  lp.lower          = gpu_span<f_t>(a.lower, n);
-  lp.upper          = gpu_span<f_t>(a.upper, n);
-  lp.objective      = gpu_span<f_t>(a.objective, n);
-  lp.obj_scale      = a.obj_scale;
-  lp.obj_constant   = a.obj_constant;
-
-  settings.primal_tol          = a.primal_tol;
-  settings.dual_tol            = a.dual_tol;
-  settings.pivot_tol           = a.pivot_tol;
-  settings.tight_tol           = a.tight_tol;
-  settings.fixed_tol           = a.fixed_tol;
-  settings.zero_tol            = a.zero_tol;
-  settings.time_limit          = a.time_limit;
-  settings.cut_off             = a.cut_off;
-  settings.steepest_edge_ratio = a.steepest_edge_ratio;
-  settings.refactor_frequency  = a.refactor_frequency;
-
-  sol.x = gpu_span<f_t>(a.x, n);
-  sol.y = gpu_span<f_t>(a.y, m);
-  sol.z = gpu_span<f_t>(a.z, n);
-}
-
-// Terminate this slot: write the outputs exactly as the monolith's `return` epilogue does, publish
-// the status (both into the slot and into the host-visible contiguous array), and mark it finished.
-// Direct (warp fission): the epilogue is an O(n) serial objective sum plus a handful of stores —
-// keep it on lane 0. Every caller must `return` immediately afterwards, and does so UNIFORMLY (all
-// terminal conditions are computed identically on every lane), so the trailing __syncwarp is safe.
-template <bool Direct = false, class FT>
-__device__ inline void fission_finish(slot_state<FT>& st, kernel_args& a, dual::status_t s, i_t iters)
-{
-  lane0_serial<Direct>([&] {
-    const gpu_lp& lp  = st.lp;
-    gpu_solution& sol = st.sol;
-    sol.objective         = compute_objective(lp, sol.x.data());
-    sol.user_objective    = compute_user_objective(lp, sol.objective);
-    sol.iterations        = iters;
-    *a.out_status         = static_cast<i_t>(s);
-    *a.out_objective      = sol.objective;
-    *a.out_user_objective = sol.user_objective;
-    *a.out_iterations     = sol.iterations;
-    st.status             = static_cast<i_t>(s);
-    if (a.status_arr) { a.status_arr[blockIdx.x] = static_cast<i_t>(s); }
-  });
-}
-
-// Common opening for K1..K5: fetch the slot; false => skip this block (already terminated).
-// NOTE: it does NOT call fission_bind. The views were built once by Ksetup and live in the slot —
-// rebuilding them per kernel is exactly the register floor we are trying to remove.
-template <bool Warp = false, class FT>
-__device__ inline bool fission_enter(kernel_args& a, slot_state<FT>*& st)
-{
-  // geometry must match the compiled path (same contract as gpu_phase2_kernel)
-  if (blockDim.x != (Warp ? 32u : 1u)) { assert(false); return false; }
-  st = static_cast<slot_state<FT>*>(a.slot);
-  return st->status == static_cast<i_t>(dual::status_t::UNSET);
-}
-
-// ---- Ksetup: construct the slot, wire ft, run the S1-S7 prologue (once per node) --------------
-template <bool Warp = false, class FT = gpu_basis_update_mpf>
-__global__ void gpu_fission_setup(kernel_args* args)
-{
-  kernel_args& a = args[blockIdx.x];
-  const i_t m = a.m;
-  // Fission never uses the parked-helper model: if this kernel is a warp, all 32 lanes are HERE.
-  constexpr bool Direct = Warp;
-  slot_state<FT>& st = *static_cast<slot_state<FT>*>(a.slot);
-  // Placement-new, the status stores and the whole ft wiring are one-time construction on shared
-  // state — lane 0 only, then re-converge before setup() reads any of it.
-  lane0_serial<Direct>([&] {
-  new (&st) slot_state<FT>();                       // host memory is zeroed; NSDMIs must run
-  st.status = static_cast<i_t>(dual::status_t::UNSET);
-  if (a.status_arr) { a.status_arr[blockIdx.x] = static_cast<i_t>(dual::status_t::UNSET); }
-
-  FT& ft                      = st.ft;              // same wiring as gpu_phase2_kernel
-  ft.num_updates_             = a.num_updates;
-  ft.refactor_frequency_      = a.refactor_frequency;
-  ft.L0_                      = make_view(m, m, a.L0_nz, a.L0_col_start, a.L0_i, a.L0_x);
-  ft.U0_                      = make_view(m, m, a.U0_nz, a.U0_col_start, a.U0_i, a.U0_x);
-  ft.L0_transpose_            = make_view(m, m, a.L0t_nz, a.L0t_col_start, a.L0t_i, a.L0t_x);
-  ft.U0_transpose_            = make_view(m, m, a.U0t_nz, a.U0t_col_start, a.U0t_i, a.U0t_x);
-  ft.row_permutation_         = gpu_span<i_t>(a.row_perm, m);
-  ft.inverse_row_permutation_ = gpu_span<i_t>(a.inv_row_perm, m);
-  ft.xi_workspace_            = gpu_span<i_t>(a.xi_workspace, 2 * m);
-  ft.x_workspace_             = gpu_span<f_t>(a.x_workspace, m);
-  ft.S_.init_empty(m);
-  ft.hypersparse_threshold_ = 0.05;
-
-  fission_bind(a, st.lp, st.settings, st.sol);   // built ONCE; K1..K5 read them from the slot
-
-  // Build the fixed L0/U0 elimination-level schedules ONCE, into slot-owned buffers that survive
-  // this kernel, and point ft at the slot's config.
-  //
-  // ⚠ THIS MUST HAPPEN BEFORE setup(). setup() itself now solves through the factors
-  // (compute_primal_variables, and initialize_steepest_edge_norms when the node carries no edge
-  // norms), so on the warp path it dereferences warp_cfg_. Building the config afterwards left it
-  // NULL for the whole prologue -> cudaErrorIllegalAddress. The monolith has always ordered it this
-  // way (warp_build_config, then the driver); fission now matches.
-  if (g_fission_warp) {
-    warp_build_config(st.ft, st.wcfg, st.lvl_lev, st.lvl_ls, st.lvl_co, st.sp_ls_v, st.sp_co_v,
-                      st.sp_pos_v);
-    st.ft.warp_cfg_ = &st.wcfg;
-  }
-  });  // end lane-0 construction
-
-  st.template setup<Warp, Direct>(st.lp, st.settings, a.vstatus, a.basic_list, a.nonbasic_list,
-                                  st.sol, a.dy_se, a.dy_se_empty != 0);
-
-  lane0_serial<Direct>([&] {
-    st.inited   = true;
-    a.slot_live = 1;
-  });
-}
-
-// ---- K1: pricing + BTran  (monolith lines: iter-limit guard, alloc guard, L1, L2) -------------
-// Terminal: NUMERICAL (alloc), ITERATION_LIMIT, OPTIMAL.
-// The SE-drift reprice that followed BTran is OMITTED in Phase 1 (see banner / CHALLENGES #3).
-template <bool Warp = false, class FT = gpu_basis_update_mpf>
-__global__ void gpu_fission_k1(kernel_args* args)
-{
-  kernel_args& a = args[blockIdx.x];
-  slot_state<FT>* stp;
-  if (!fission_enter<Warp, FT>(a, stp)) { return; }
-  slot_state<FT>& st          = *stp;
-  const gpu_lp& lp            = st.lp;
-  const gpu_settings& settings = st.settings;
-  gpu_solution& sol           = st.sol;
-  FT& ft = st.ft;
-  // Fission never uses the parked-helper model: if this kernel is a warp, all 32 lanes are HERE, so
-  // the primitives must take their direct-call arms. See the Direct-mode banner above the MPF class.
-  constexpr bool Direct = Warp;
-
-  if (g_gpu_alloc_failed) { fission_finish<Direct>(st, a, dual::status_t::NUMERICAL, st.iter); return; }
-  const i_t iter_limit = min(500000, max(20000, 20 * (lp.num_rows + lp.num_cols)));
-  if (st.iter >= iter_limit) {
-    fission_finish<Direct>(st, a, dual::status_t::ITERATION_LIMIT, iter_limit); return;
-  }
-
-  // 1. Steepest-edge pricing. PURE READ (no stores), so under Direct every lane just recomputes the
-  // same argmax — no guard, no broadcast, and `leaving == -1` is uniform. Warping the scan is a
-  // later step: it would change the tie-break and so cannot be part of the ladder's step 1.
-  i_t direction = 0, basic_leaving = -1;
-  f_t max_val;
-  const i_t leaving = steepest_edge_pricing_with_infeasibilities(
-    lp, settings, sol.x.data(), a.dy_se, st.basic_mark.data(), st.squared_infeas, st.infeas_idx,
-    direction, basic_leaving, max_val);
-  if (leaving == -1) { fission_finish<Direct>(st, a, dual::status_t::OPTIMAL, st.iter); return; }
-  lane0_serial<Direct>([&] {
-    st.leaving = leaving; st.direction = direction; st.basic_leaving = basic_leaving;
-    // 2. BTran.
-    st.delta_y_sparse.clear();
-    st.UTsol_sparse.clear();
-  });
-  compute_delta_y<Warp, Direct>(ft, basic_leaving, direction, st.delta_y_sparse, st.UTsol_sparse);
-  // Butterfly reduction of ||delta_y||^2. Reordered vs the serial sum, and dy_norm_sq feeds the SE
-  // norms -> pricing, so this is the second deliberate break from monolith bit-identity (§20).
-  if constexpr (Direct) {
-    const int lane = static_cast<int>(threadIdx.x);
-    const f_t* dyx = st.delta_y_sparse.x.data();
-    const i_t nz   = (i_t)st.delta_y_sparse.i.size();   // trip count as in norm2_squared()
-    f_t part = 0.0;
-    for (i_t k = lane; k < nz; k += 32) { part += dyx[k] * dyx[k]; }
-    const f_t total = warp_reduce_add(part);
-    lane0_serial<true>([&] { st.dy_norm_sq = total; });
-  } else {
-    st.dy_norm_sq = st.delta_y_sparse.norm2_squared();
-  }
-}
-
-// ---- K2: delta_z + ratio test + dual update  (monolith L3, L4, L5) ----------------------------
-// Terminal: DUAL_UNBOUNDED — which MUST short-circuit before update_dual_variables.
-template <bool Warp = false, class FT = gpu_basis_update_mpf>
-__global__ void gpu_fission_k2(kernel_args* args)
-{
-  kernel_args& a = args[blockIdx.x];
-  slot_state<FT>* stp;
-  if (!fission_enter<Warp, FT>(a, stp)) { return; }
-  slot_state<FT>& st          = *stp;
-  const gpu_lp& lp            = st.lp;
-  const gpu_settings& settings = st.settings;
-  gpu_solution& sol           = st.sol;
-  FT& ft = st.ft;
-  const i_t m = lp.num_rows;
-  // Fission never uses the parked-helper model: if this kernel is a warp, all 32 lanes are HERE.
-  constexpr bool Direct = Warp;
-
-  // 3. Reduced-cost SpMv: transpose (CSR) when delta_y is sparse (<=30% dense), else dense CSC.
-  i_t delta_y_nz0      = 0;
-  const i_t nz_delta_y = (i_t)st.delta_y_sparse.i.size();
-  if constexpr (Direct) {
-    // INTEGER count, so a ballot/popc reduction is exact — nothing is reordered the way an FP sum
-    // would be. Every lane accumulates the same running total, which keeps delta_y_nz0 (and the
-    // used_transpose_dz branch it gates) warp-uniform. nz_delta_y is warp-uniform, so all lanes
-    // execute the same number of __ballot_sync calls.
-    const int lane = static_cast<int>(threadIdx.x);
-    const f_t* dyx = st.delta_y_sparse.x.data();
-    for (i_t base = 0; base < nz_delta_y; base += 32) {
-      const i_t k    = base + lane;
-      const bool hit = (k < nz_delta_y) && (fabs(dyx[k]) > 1e-12);
-      delta_y_nz0 += __popc(__ballot_sync(0xffffffffu, hit));
-    }
-  } else {
-    for (i_t k = 0; k < nz_delta_y; ++k) {
-      if (fabs(st.delta_y_sparse.x[k]) > 1e-12) { delta_y_nz0++; }
-    }
-  }
-  const f_t delta_y_nz_percentage = delta_y_nz0 / static_cast<f_t>(m) * 100.0;
-  st.used_transpose_dz            = delta_y_nz_percentage <= 30.0;
-  if (st.used_transpose_dz) {
-    // Direct=Warp: on the warp path call the collective body directly (no cfg_shared, no op-code
-    // dispatch) — the whole point of fission. Internally lane-guarded + count broadcast.
-    compute_delta_z<Warp, Warp>(ft, st.Arow, st.delta_y_sparse, st.leaving, st.direction,
-                                st.nonbasic_end.data(), st.delta_z_mark.data(), st.delta_z_indices,
-                                st.delta_z.data());
-  } else {
-    // Dense route. warp_to_dense keeps the sizing (reserve + set_size, a header RMW that may
-    // device-malloc) on lane 0 and warps the O(n) zero-fill + the nnz scatter — bit-exact, since the
-    // sparse indices are distinct. The delta_z update itself is the WARP_DZ collective: one lane per
-    // nonbasic column, gather dots, ordered ballot/popc append -> bit-exact vs the serial scan, so
-    // the push_back that used to force this whole branch onto lane 0 is gone.
-    if constexpr (Warp) {
-      ft.template warp_to_dense<Direct>(st.delta_y_sparse, st.delta_y);
-    } else {
-      st.delta_y_sparse.to_dense(st.delta_y);
-    }
-    compute_reduced_cost_update<Warp, Direct>(lp, ft, a.basic_list, a.nonbasic_list,
-                                              st.delta_y.data(), st.leaving, st.direction,
-                                              st.delta_z_mark.data(), st.delta_z_indices,
-                                              st.delta_z.data());
-  }
-
-  // 4. Ratio test — SERIAL on lane 0 even under Warp, deliberately (port step 1).
-  // The warp band is a DIFFERENT tie-break rule (see phase2_ratio_test) and is NOT bit-identical
-  // to the single-thread scan, so enabling it here would make this kernel's port unverifiable
-  // against the single-thread fission baseline. Keep it serial until the rest of K2 is proven at
-  // exactly 100/100, then switch to warp_rt_body and accept the documented 59/100 signature.
-  if constexpr (Warp) {
-    // PARALLEL band (warp_rt_body) — measured 1.122x faster than the serial walking band on the
-    // MPF/LU path at an identical iteration count (run_rt_band_ab.sh). It is a DIFFERENT tie-break
-    // rule, so this kernel is deliberately NOT bit-identical to the single-thread path from here on
-    // — expect the documented ~59/100 cpu==gpu MPF-warp signature, not 100/100. See phase2_ratio_test.
-    // Outputs are lane-0 writes through pointers; aiming them at slot_state (global) + __syncwarp
-    // publishes them to every lane with no shuffle needed.
-    warp_rt_body(settings.dual_tol / 10, st.delta_z.data(), &st.entering, &st.nonbasic_entering,
-                 lp.num_rows, lp.num_cols, a.nonbasic_list, settings.pivot_tol, &st.step_length,
-                 a.vstatus, sol.z.data(), settings.zero_tol);
-    __syncwarp(0xffffffffu);
-  } else {
-    f_t step_length = 0.0;
-    i_t nonbasic_entering = -1;
-    const i_t entering = phase2_ratio_test<false>(lp, settings, ft, a.vstatus, a.nonbasic_list,
-                                                  sol.z.data(), st.delta_z.data(), step_length,
-                                                  nonbasic_entering);
-    st.entering = entering; st.step_length = step_length; st.nonbasic_entering = nonbasic_entering;
-  }
-  if (st.entering == -1) {
-    // SHORT-CIRCUIT: the monolith returns here, so update_dual_variables below must NOT run.
-    fission_finish(st, a, dual::status_t::DUAL_UNBOUNDED, st.iter);
-    return;
-  }
-
-  update_dual_variables<Warp, Warp>(ft, st.delta_y_sparse, st.delta_z_indices, st.delta_z.data(),
-                                    st.step_length, st.leaving, sol.y.data(), sol.z.data());
-}
-
-// ---- K3: FTran  (monolith: rhs from A(:,entering) + compute_delta_x) --------------------------
-// Terminal: NUMERICAL.
-template <bool Warp = false, class FT = gpu_basis_update_mpf>
-__global__ void gpu_fission_k3(kernel_args* args)
-{
-  kernel_args& a = args[blockIdx.x];
-  slot_state<FT>* stp;
-  if (!fission_enter<Warp, FT>(a, stp)) { return; }
-  slot_state<FT>& st          = *stp;
-  const gpu_lp& lp            = st.lp;
-  const gpu_settings& settings = st.settings;
-  gpu_solution& sol           = st.sol;
-  FT& ft = st.ft;
-  constexpr bool Direct = Warp;
-
-  lane0_serial<Direct>([&] {
-    st.utilde_sparse.clear();
-    st.scaled_dxB_sparse.clear();
-    st.rhs_sparse.from_csc_column(lp.A, st.entering);   // push_back -> may device-malloc
-  });
-  // dx_status is uniform: compute_delta_x broadcasts its NUMERICAL verdict before returning.
-  const i_t dx_status = compute_delta_x<Warp, Direct>(
-    lp, ft, st.entering, st.leaving, st.basic_leaving, st.direction, a.basic_list, st.rhs_sparse,
-    st.delta_z.data(), sol.x.data(), st.utilde_sparse, st.scaled_dxB_sparse, st.delta_x.data());
-  if (dx_status == -1) {
-    fission_finish<Direct>(st, a, dual::status_t::NUMERICAL, st.iter);
-    return;
-  }
-}
-
-// ---- K4: SE-norm update + primal update + objective update  (monolith L9, L10, L11) -----------
-// No terminal state.
-template <bool Warp = false, class FT = gpu_basis_update_mpf>
-__global__ void gpu_fission_k4(kernel_args* args)
-{
-  kernel_args& a = args[blockIdx.x];
-  slot_state<FT>* stp;
-  if (!fission_enter<Warp, FT>(a, stp)) { return; }
-  slot_state<FT>& st          = *stp;
-  const gpu_lp& lp            = st.lp;
-  const gpu_settings& settings = st.settings;
-  gpu_solution& sol           = st.sol;
-  FT& ft = st.ft;
-
-  constexpr bool Direct = Warp;
-
-  update_steepest_edge_norms<Warp, Direct>(settings, a.basic_list, ft, st.direction,
-                                           st.delta_y_sparse, st.dy_norm_sq, st.scaled_dxB_sparse,
-                                           st.basic_leaving, st.entering, st.v.data(), st.v_sparse,
-                                           a.dy_se);
-  // The two used to share one lane-0 region. They are independent (update_objective reads delta_x
-  // and objective, never x), so splitting them is safe.
-  update_primal_variables<Direct>(st.scaled_dxB_sparse, a.basic_list, st.delta_x.data(), st.entering,
-                                  sol.x.data());
-  // Called with the OLD basic_list (before K5's swap), true costs, no bound-flip term.
-  // Under Direct this reduces with a butterfly — a reordered sum into the CUTOFF comparand.
-  update_objective<Direct>(a.basic_list, st.scaled_dxB_sparse, lp.objective, st.delta_x.data(),
-                           st.entering, st.obj);
-}
-
-// ---- K5: basis swap + Arow sync + ft.update + infeasibilities + clear + iter++ + cutoff -------
-// Terminal: NUMERICAL (ft.update), CUTOFF.
-template <bool Warp = false, class FT = gpu_basis_update_mpf>
-__global__ void gpu_fission_k5(kernel_args* args)
-{
-  kernel_args& a = args[blockIdx.x];
-  slot_state<FT>* stp;
-  if (!fission_enter<Warp, FT>(a, stp)) { return; }
-  slot_state<FT>& st          = *stp;
-  const gpu_lp& lp            = st.lp;
-  const gpu_settings& settings = st.settings;
-  gpu_solution& sol           = st.sol;
-  FT& ft = st.ft;
-  const i_t leaving = st.leaving, entering = st.entering;
-  constexpr bool Direct = Warp;
-
-  // 5. Basis swap + MPF rank-1 stacking update. Every line here is a read-modify-write on shared
-  // state (vstatus/basic_list/basic_mark stores, update_Arow's in-place row repartition + row_mark,
-  // ft.update's S_ append + sort + allocations), so it stays on lane 0 — only `pinf` below is
-  // collective-able, which is why K5 is a MIXED kernel rather than a fully warped one.
-  i_t fu_status = 0;
-  lane0_serial<Direct>([&] {
-  a.vstatus[entering] = variable_status_t::BASIC;
-  a.vstatus[leaving]  = (lp.lower[leaving] == lp.upper[leaving])
-                          ? variable_status_t::NONBASIC_FIXED
-                          : static_cast<variable_status_t>(-st.direction);
-  a.basic_list[st.basic_leaving]        = entering;
-  a.nonbasic_list[st.nonbasic_entering] = leaving;
-  st.basic_mark[leaving]                = -1;
-  st.basic_mark[entering]               = st.basic_leaving;
-
-  update_Arow(leaving, entering, lp.A, st.row_mark, st.nonbasic_end.data(), st.Arow);
-
-  fu_status = ft.update(st.utilde_sparse, st.UTsol_sparse, st.basic_leaving);
-  });
-  fu_status = lane0_bcast<Direct>(fu_status);   // the NUMERICAL exit must be taken uniformly
-  if (fu_status == 1) {
-    fission_finish(st, a, dual::status_t::NUMERICAL, st.iter);
-    return;
-  }
-
-  compute_initial_primal_infeasibilities<Warp, Direct>(lp, settings, ft, a.basic_list, sol.x.data(),
-                                                       st.squared_infeas, st.infeas_idx,
-                                                       st.primal_inf);
-  clear_delta_z<Direct>(entering, leaving, st.delta_z_mark.data(), st.delta_z_indices,
-                        st.delta_z.data());
-
-  lane0_serial<Direct>([&] { st.iter++; });   // counts COMPLETED pivots, matching the monolith
-
-  if (isfinite(settings.cut_off) && st.obj >= settings.cut_off) {
-    fission_finish(st, a, dual::status_t::CUTOFF, st.iter);
-    return;
-  }
-}
-
 
 // ---------------------------------------------------------------------------
 // Host-side helpers for marshaling.
 // ---------------------------------------------------------------------------
+// HARDWARE MEMORY COMPRESSION (CU_MEM_ALLOCATION_COMP_GENERIC via the VMM API) was built here and
+// REJECTED, 2026-08-26. B200 supports it and it is transparent (results bit-identical), but the cost
+// scaled with coverage: 9% of the working set compressed cost +9%, 100% cost +47%. It buys DRAM
+// bandwidth, and this kernel is latency-bound, so it pays on the path it is limited by. At 100
+// problems the penalty was only +0.7% -- do not re-derive this from a small run.
+//
+// Unrelated finding left by that work, worth a separate look: this marshaller actually requests
+// 85.6 GiB over 525,500 allocations (~5.85 MB/problem) at 15,000 problems, while the pre-flight
+// reports `static 52.58 GB` (~3.5 MB/problem) -- a 1.75x under-count in the VRAM budget.
 template <typename T>
 static T* upload(const std::vector<T>& v)
 {
@@ -4223,60 +4566,20 @@ static T* alloc_zeroed(size_t count)
   return d;
 }
 
-// Loop condition for the CUDA-graph WHILE node. Evaluates the SAME predicate the host loop used to:
-// "keep going while at least one slot is still UNSET, and the super-step cap is not reached", and
-// writes it to the conditional handle so the loop runs entirely on the device.
-//
-// One block: N is the batch size, so a grid-stride scan by one block is ample, and it keeps the
-// conditional write trivially single-threaded (concurrent writes to a handle are UB).
-__global__ void gpu_fission_cond(cudaGraphConditionalHandle handle,
-                                 const i_t* status,
-                                 i_t n,
-                                 unsigned long long* steps,
-                                 unsigned long long cap)
-{
-  __shared__ int any_unset;
-  if (threadIdx.x == 0) { any_unset = 0; }
-  __syncthreads();
-  for (i_t b = static_cast<i_t>(threadIdx.x); b < n; b += static_cast<i_t>(blockDim.x)) {
-    if (status[b] == static_cast<i_t>(dual::status_t::UNSET)) { atomicOr(&any_unset, 1); }
-  }
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    const unsigned long long s = ++(*steps);   // counts COMPLETED super-steps
-    cudaGraphSetConditional(handle, (any_unset != 0 && s < cap) ? 1u : 0u);
-  }
-}
 
-// ---- reprice switch resolution (ONE place, so every launcher agrees) --------------------------
-// Returns g_serep_off: 0 = reprice ENABLED (the default), 1 = disabled.
-//
-// SEMANTICS ARE THE HISTORICAL ONES and must stay that way: unset/"0" -> reprice ON,
-// CUOPT_SEREP_OFF=1 -> reprice OFF. Every harness in claude_scripts/ and both agents' workflows
-// depend on this meaning.
-//
-// ⚠ DO NOT FLIP THIS DEFAULT. It was briefly flipped to OFF on 2026-08-11 because reprice-off
-// benchmarks faster (2.86 s vs 3.41 s on the 100 v6 nodes). Flipping it silently changed what an
-// existing command line MEANT: "unset" stopped meaning "reprice ON", so harnesses kept running and
-// mislabelled their results. On 2026-08-12 that produced a confident, wrong conclusion -- a run
-// reported "reprice ON 2.878 s vs OFF 3.118 s" when BOTH legs actually had the reprice OFF on the
-// GPU (identical 5148 GPU pivots); only the CPU reference leg differed between them.
-// If the reprice is ever to be off by default, the switch must be RENAMED at the same time so no
-// existing command line can silently change meaning.
-static int resolve_reprice()
+
+static void upload_solve_class_config()
 {
-  const char* e = std::getenv("CUOPT_SEREP_OFF");
-  return (e != nullptr && std::string(e) != "0") ? 1 : 0;
+  const int on = 1;
+  RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_elide_noop, &on, sizeof(int)));
 }
 
 // ---- [CONFIG] self-report -------------------------------------------------------------------
 // Every launch states its own decisive configuration. A measurement that reports its configuration
 // cannot be mislabelled by the operator, the shell history, or another agent reading the output.
-static void report_config(const char* path, bool warp, int serep_off, size_t nprob)
+static void report_config(const char* path, size_t nprob)
 {
-  std::printf("[CONFIG] path=%s geometry=%s reprice=%s problems=%zu\n",
-              path, warp ? "warp<<<N,32>>>" : "single<<<N,1>>>",
-              serep_off ? "OFF" : "ON", nprob);
+  std::printf("[CONFIG] path=%s geometry=warp<<<N,32>>> problems=%zu\n", path, nprob);
 }
 
 // Device heap (in-kernel gpu_vector malloc arena) + stack are per-CONTEXT limits and the heap
@@ -4285,17 +4588,84 @@ static void report_config(const char* path, bool warp, int serep_off, size_t npr
 // benchmark) sizes the heap for N concurrent S_ stacks; the single-problem wrapper uses a
 // generous default. heap_bytes is the requested malloc-arena size (NOT counting the static
 // per-problem buffers, which are separate cudaMallocs).
+// MEASURED LIMITS OF THE IN-KERNEL malloc HEAP (2026-08-14, probe.cu, confirmed on an RTX 3500 Ada
+// with 12 GB and on a B200 with 178 GB):
+//   * cudaDeviceGetLimit saturates at ~16.47 GB however much you ask for. It is the SAME number on
+//     both cards, so it is a fixed driver cap, not a fraction of device memory.
+//   * The arena is reserved LAZILY, at the first malloc-using launch, not by cudaDeviceSetLimit.
+//   * If the granted size does not fit in free VRAM at that moment, the reservation fails and the
+//     usable arena is ZERO. It is a cliff, not a gradual degradation: a 12 GB request on a card with
+//     11.86 GB free gave 0 bytes usable, while an 8 GB request gave 6.56 GB.
+//   * Usable is about 0.82 x granted. The rest is allocator overhead.
+// So the practical ceiling is ~13.5 GB usable on ANY device. Requesting more is not merely wasteful,
+// it is how we crashed: 86.75 GB requested -> capped -> in-kernel malloc returns nullptr ->
+// gpu_vector::grow_to returns no buffer -> the next write raises cudaErrorIllegalAddress.
+// Measured by bisection with a standalone probe kernel: granted tracks the request exactly up
+// to 16.40 GB and saturates at 16.47 GB from 16.50 GB upward. Identical on a 12 GB card and a 178 GB
+// B200. We clamp to a round 16 GB, safely inside the saturation point.
+static constexpr size_t kDeviceHeapDriverCap = static_cast<size_t>(16) << 30;
+static constexpr double kDeviceHeapUsableFrac = 0.82;                          // measured overhead
+// The caller's heap estimate is deliberately pessimistic. Measured on the 100 v6 nodes with
+// -DCUOPT_ALLOC_STATS=1: real demand 1.408 MB/problem against an estimate of 3.874 MB, i.e. 0.363.
+// Rounded UP to 0.45 so the guard errs toward letting a run proceed; a run that then exhausts the
+// arena still reports it, whereas a wrongly refused run wastes a whole benchmark slot.
+static constexpr double kHeapEstimateToActual = 0.45;
+
 static bool g_device_limits_set = false;
-static void ensure_device_limits(size_t heap_bytes)
+static size_t g_device_heap_granted = 0;
+static size_t g_device_heap_requested = 0;
+// Returns the bytes the driver GRANTED, which is what the kernel can actually draw on.
+static size_t ensure_device_limits(size_t heap_bytes)
 {
-  if (g_device_limits_set) return;
+  if (g_device_limits_set) return g_device_heap_granted;
   g_device_limits_set = true;
+
   if (heap_bytes < (static_cast<size_t>(256) << 20)) { heap_bytes = static_cast<size_t>(256) << 20; }
+
+  // CLAMP. Asking for more than the driver grants, or more than fits, is never useful and is exactly
+  // how the arena ends up unusable. Keep a margin below free VRAM for the per-problem cudaMallocs
+  // that follow this call.
+  const double GBd = 1.0 / (1024.0 * 1024.0 * 1024.0);
+  size_t free_b = 0, total_b = 0;
+  if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+    const size_t fit = static_cast<size_t>(0.80 * static_cast<double>(free_b));
+    if (heap_bytes > fit) {
+      std::fprintf(stderr, "[gpu_phase2] clamping malloc arena %.2f -> %.2f GB (80%% of %.2f GB free)\n",
+                   heap_bytes * GBd, fit * GBd, free_b * GBd);
+      heap_bytes = fit;
+    }
+  }
+  if (heap_bytes > kDeviceHeapDriverCap) {
+    std::fprintf(stderr, "[gpu_phase2] clamping malloc arena %.2f -> %.2f GB (driver cap)\n",
+                 heap_bytes * GBd, kDeviceHeapDriverCap * GBd);
+    heap_bytes = kDeviceHeapDriverCap;
+  }
+  // Report the arena. A malloc failure inside the kernel is hard to attribute after the fact, so the
+  // size that was actually requested must be in the log of every run.
+  std::fprintf(stderr, "[gpu_phase2] device malloc arena = %.2f GB (must match the pre-flight heap)\n",
+               static_cast<double>(heap_bytes) / (1024.0 * 1024.0 * 1024.0));
   cudaError_t hp = cudaDeviceSetLimit(cudaLimitMallocHeapSize, heap_bytes);
   if (hp != cudaSuccess) {
     cudaGetLastError();
     std::fprintf(stderr, "[gpu_phase2] warning: could not set device heap size: %s\n",
                  cudaGetErrorString(hp));
+  }
+  // READ THE LIMIT BACK. cudaDeviceSetLimit reports success even when the driver grants less than
+  // was asked for, and nothing here ever checked. A granted value below the request is invisible
+  // until in-kernel malloc starts returning nullptr, which then looks like a solver bug.
+  {
+    size_t granted = 0;
+    if (cudaDeviceGetLimit(&granted, cudaLimitMallocHeapSize) == cudaSuccess) {
+      g_device_heap_granted   = granted;
+      g_device_heap_requested = heap_bytes;
+      std::fprintf(stderr, "[gpu_phase2] malloc arena: requested %.2f GB, granted %.2f GB, "
+                           "usable ~%.2f GB\n",
+                   heap_bytes * GBd, granted * GBd, granted * kDeviceHeapUsableFrac * GBd);
+    } else {
+      cudaGetLastError();
+      g_device_heap_granted   = heap_bytes;
+      g_device_heap_requested = heap_bytes;
+    }
   }
   // The deep (non-recursive) call chain wants more than the ~1 KB default stack.
   cudaError_t stk = cudaDeviceSetLimit(cudaLimitStackSize, static_cast<size_t>(32) << 10);
@@ -4304,6 +4674,50 @@ static void ensure_device_limits(size_t heap_bytes)
     std::fprintf(stderr, "[gpu_phase2] warning: could not raise device stack size: %s\n",
                  cudaGetErrorString(stk));
   }
+  return g_device_heap_granted;
+}
+
+
+// Reject a batch whose in-kernel heap demand cannot fit the arena the driver will grant.
+// WITHOUT this the kernel launches, malloc returns nullptr thousands of times, and the run dies on
+// cudaErrorIllegalAddress -- which looks like a solver bug and costs a whole benchmark slot.
+// Returns true when the caller must abort. `demand` is the caller's own heap estimate.
+static bool heap_demand_rejected(size_t demand, size_t granted, size_t requested,
+                                 size_t n_problems, gpu_batch_timing& timing)
+{
+  const double GBd    = 1.0 / (1024.0 * 1024.0 * 1024.0);
+  const size_t usable = static_cast<size_t>(static_cast<double>(granted) * kDeviceHeapUsableFrac);
+  // Compare PREDICTED ACTUAL demand, not the raw estimate. Using the estimate refused batches that
+  // run perfectly well, because the estimate carries kHeapSafety plus terms that are never allocated.
+  const size_t predicted = static_cast<size_t>(static_cast<double>(demand) * kHeapEstimateToActual);
+  if (predicted <= usable) { return false; }
+  // The estimate is deliberately pessimistic (kHeapSafety, plus terms that may not be allocated at
+  // all), so "estimate > usable" alone is NOT a reason to refuse: 100 problems estimate 0.58 GB,
+  // get a 0.47 GB usable arena, and run perfectly well. Refuse only when the DRIVER CAPPED us --
+  // then the arena cannot be enlarged by any means and the run would fail for a knowable reason.
+  if (granted >= requested) {
+    std::fprintf(stderr,
+                 "[gpu_phase2] note: heap estimate %.2f GB is above the usable arena %.2f GB, but "
+                 "the driver granted everything asked for. Proceeding; the estimate carries a "
+                 "safety factor.\n", demand * GBd, usable * GBd);
+    return false;
+  }
+  const size_t per      = n_problems ? (demand / n_problems) : demand;
+  const size_t per_pred = n_problems ? (predicted / n_problems) : predicted;
+  const size_t max_n    = per_pred ? (usable / per_pred) : 0;
+  char buf[512];
+  std::snprintf(buf, sizeof(buf),
+                "predicted in-kernel heap demand %.2f GB exceeds the usable arena %.2f GB (driver "
+                "granted %.2f GB; the heap is capped at ~%.2f GB on EVERY device, so no setting "
+                "raises it). %zu problems, estimate %.2f MB each, predicted actual %.2f MB each. "
+                "At most ~%zu problems fit. Lower the problem count.",
+                predicted * GBd, usable * GBd, granted * GBd, kDeviceHeapDriverCap * GBd,
+                n_problems, static_cast<double>(per) / (1024.0 * 1024.0),
+                static_cast<double>(per_pred) / (1024.0 * 1024.0), max_n);
+  timing.rejected = true;
+  timing.message  = buf;
+  std::fprintf(stderr, "[gpu_phase2] batch REJECTED: %s\n", buf);
+  return true;
 }
 
 // Marshal one prepared problem into a kernel_args with fresh device buffers. Both the
@@ -4341,6 +4755,37 @@ static void free_ro(const ro_upload& r)
   }
 }
 
+// Bytes of ORDINARY VRAM to give one slot's gpu_arena.
+//
+// Itemised to match slot_state::bind_arena_buffers one-for-one, so the two cannot drift apart. Each
+// buffer is charged at max(m, n) because several are n-sized and n >= m once slacks are added; being
+// exact per buffer would buy nothing, as the whole figure is then scaled.
+//
+// UNDERSIZING IS NOT A FAILURE. gpu_arena::take returns nullptr when exhausted and grow_to falls
+// back to device malloc(), i.e. to the pre-arena behaviour. The scale factor exists because
+// arena-bound buffers that GROW abandon their old slice (bump allocator, no free), and the sparse
+// vectors reach their final size by push_back doubling.
+//
+// No slack factor: the itemised figure below is the size, and an earlier 2x slack was removed after
+// it asked ~152 GB of static VRAM at 15,000 problems and got the batch rejected by the pre-flight.
+static size_t arena_bytes_for(size_t m, size_t n)
+{
+  const size_t mn = (m > n) ? m : n;
+  size_t b = 0;
+  // 11 f_t workspaces: xB_workspace, delta_y, delta_z, delta_x, v, squared_infeas, setup_rhs,
+  //                    se_coeff, ft.dense_scratch_, ft.sort_bucket_, ft.sort_x_
+  b += 11 * mn * sizeof(f_t);
+  // 10 i_t workspaces: basic_mark, delta_z_mark, delta_z_indices, nonbasic_end, row_mark,
+  //                    infeas_idx, se_row_degree, se_mapping, ft.sort_i_, ft.sort_perm_
+  b += 10 * mn * sizeof(i_t);
+  // 11 sparse vectors (idx + val), each <= mn: 6 per-iteration + 3 SE-init + ft's 2 scratch
+  b += 11 * mn * (sizeof(i_t) + sizeof(f_t));
+  // 15 level-schedule arrays: lvl_lev/lvl_ls/lvl_co x 4 ops, plus sp_ls_v/sp_co_v/sp_pos_v
+  b += 15 * (m + 1) * sizeof(i_t);
+
+  return b + (64u << 10);  // floor: 16-byte rounding on ~60 slices, plus small-problem headroom
+}
+
 static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
                                    const simplex_solver_settings_t<i_t, f_t>& settings,
                                    std::vector<variable_status_t>& vstatus,
@@ -4372,13 +4817,24 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   if (ro != nullptr) {
     a.A_col_start = ro->A_col_start; a.A_nz = ro->A_nz; a.A_i = ro->A_i; a.A_x = ro->A_x;
     a.rhs = ro->rhs; a.objective = ro->objective;
-    a.Arow_row_start = nullptr; a.Arow_j = nullptr; a.Arow_x = nullptr;
   } else {
     a.A_col_start = upload(A.col_start); a.A_nz = A.nnz();
     a.A_i = upload_n(A.i.data(), A.nnz()); a.A_x = upload_n(A.x.data(), A.nnz());
     a.rhs = upload(lp.rhs); a.objective = upload(lp.objective);
-    // Host-built Arow (CSR of A) — the kernel views it directly and skips the on-device from_csc
-    // transpose. to_compressed_row orders each row by ascending column, matching from_csc bit-for-bit.
+  }
+  // Arow (host-built CSR of A) is ALWAYS uploaded, sharing or not.
+  //
+  // It used to be skipped on the RO-shared path, leaving the kernel to build it with from_csc — i.e.
+  // out of the in-kernel malloc arena, once per block. That looked like a saving (one shared A rather
+  // than N) but it is the wrong trade by two orders of magnitude: the device heap is capped at ~16 GB
+  // BY THE DRIVER, on every device, while ordinary VRAM here is 177 GB. Measured on the 100 v6 nodes,
+  // building Arow in-kernel costs 1.04 MB of heap per problem — 2.450 MB total against 1.408 MB with
+  // Arow uploaded — which cut the maximum batch from ~9,600 problems to ~5,500 and made a
+  // 10,000-problem run die with cudaErrorIllegalAddress after thousands of failed mallocs.
+  // Arow is per-node regardless (its j/x are partitioned in place by the nonbasic scan), so uploading
+  // it never duplicated anything shareable. to_compressed_row orders each row by ascending column,
+  // matching from_csc bit-for-bit, so results are unchanged.
+  {
     cuopt::mathematical_optimization::csr_matrix_t<i_t, f_t> Arow_host(m, n, A.nnz());
     A.to_compressed_row(Arow_host);
     a.Arow_row_start = upload(Arow_host.row_start);
@@ -4396,27 +4852,11 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   a.L0t_i = upload_n(L0t.i.data(), L0t.nnz()); a.L0t_x = upload_n(L0t.x.data(), L0t.nnz());
   a.U0t_col_start = upload(U0t.col_start); a.U0t_nz = U0t.nnz();
   a.U0t_i = upload_n(U0t.i.data(), U0t.nnz()); a.U0t_x = upload_n(U0t.x.data(), U0t.nnz());
-  // DEBUG dump of the LU FACTORS (L0, U0 scatter form + L0t, U0t gather transposes) per node →
-  // CUOPT_DUMP_LU_DIR/lu_<k>.bin. Four CSC blocks: L0, U0, L0t, U0t (each n, nnz, col_start[n+1], i, x).
-  // Pairs 1:1 (same node order) with inv_<k>.bin for the warp-SpMV-vs-warp-LU microbenchmark.
-  if (const char* _dd = std::getenv("CUOPT_DUMP_LU_DIR")) {
-    static int _c = 0; char _p[600]; std::snprintf(_p, sizeof(_p), "%s/lu_%d.bin", _dd, _c++);
-    auto _w = [](FILE* _f, i_t _n, i_t _nz, const i_t* _cs, const i_t* _i, const f_t* _x) {
-      std::fwrite(&_n, sizeof(i_t), 1, _f); std::fwrite(&_nz, sizeof(i_t), 1, _f);
-      std::fwrite(_cs, sizeof(i_t), static_cast<size_t>(_n) + 1, _f);
-      std::fwrite(_i, sizeof(i_t), _nz, _f); std::fwrite(_x, sizeof(f_t), _nz, _f); };
-    if (FILE* _f = std::fopen(_p, "wb")) {
-      _w(_f, L0.n, L0.nnz(), L0.col_start.data(), L0.i.data(), L0.x.data());
-      _w(_f, U0.n, U0.nnz(), U0.col_start.data(), U0.i.data(), U0.x.data());
-      _w(_f, L0t.n, L0t.nnz(), L0t.col_start.data(), L0t.i.data(), L0t.x.data());
-      _w(_f, U0t.n, U0t.nnz(), U0t.col_start.data(), U0t.i.data(), U0t.x.data());
-      std::fclose(_f);
-    }
-  }
   a.row_perm     = upload(ft.row_permutation());
   a.inv_row_perm = upload(ft.inverse_row_permutation());
   a.xi_workspace = alloc_zeroed<int>(2 * m);
   a.x_workspace  = alloc_zeroed<double>(m);
+  a.reach_mark   = alloc_zeroed<unsigned char>(m);
   a.num_updates  = 0;
   a.refactor_frequency = settings.refactor_frequency;
 
@@ -4452,9 +4892,28 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
 
   // Persistent per-slot solve state. Allocated ZEROED (the kernel's placement-new relies on that
   // for the slot_live==0 "fresh" test) and sized for the concrete device type. One per problem
-  // here; the fissioned rolling pool will allocate one per SLOT and reuse it across nodes.
+  // here.
   a.slot      = alloc_zeroed<char>(sizeof(slot_state<gpu_basis_update_mpf>));
   a.slot_live = 0;
+
+  // Per-slot arena for the fixed-size gpu_vector payloads (see gpu_arena / arena_bytes_for).
+  // Deliberately NOT zeroed: device malloc() hands back uninitialised memory, so zeroing here would
+  // give arena-backed buffers different contents-before-first-write than heap-backed ones. Every
+  // consumer resize/assign-fills before reading, so uninitialised is correct and it also avoids a
+  // multi-GB memset across a large batch.
+  a.arena_bytes = arena_bytes_for(static_cast<size_t>(m), static_cast<size_t>(n));
+  a.arena       = nullptr;
+  if (a.arena_bytes > 0) {
+    void* p = nullptr;
+    // Not RAFT_CUDA_TRY: an arena is an OPTIMISATION. If VRAM is short, clear the error and run with
+    // arena=null, which puts every buffer back on the in-kernel heap -- slower ceiling, same answers.
+    if (cudaMalloc(&p, a.arena_bytes) == cudaSuccess) {
+      a.arena = p;
+    } else {
+      cudaGetLastError();  // swallow the sticky error so the next real call is not misattributed
+      a.arena_bytes = 0;
+    }
+  }
   return a;
 }
 
@@ -4470,11 +4929,12 @@ static void free_kernel_args(const kernel_args& a, bool skip_ro = false)
                   (void*)a.U0t_col_start, (void*)a.U0t_i, (void*)a.U0t_x,
                   (void*)a.row_perm, (void*)a.inv_row_perm,
                   (void*)a.lower, (void*)a.upper,
-                  (void*)a.xi_workspace, (void*)a.x_workspace, (void*)a.vstatus,
+                  (void*)a.xi_workspace, (void*)a.x_workspace, (void*)a.reach_mark,
+                  (void*)a.vstatus,
                   (void*)a.basic_list, (void*)a.nonbasic_list, (void*)a.x, (void*)a.y, (void*)a.z,
                   (void*)a.dy_se, (void*)a.out_status, (void*)a.out_objective,
                   (void*)a.out_user_objective, (void*)a.out_iterations,
-                  (void*)a.slot}) {
+                  (void*)a.slot, (void*)a.arena}) {
     if (p) { cudaFree(p); }
   }
   if (skip_ro) { return; }  // read-only buffers (A CSC + rhs + objective) shared → freed once via free_ro
@@ -4503,19 +4963,26 @@ static size_t problem_static_bytes(const lp_problem_t<i_t, f_t>& lp,
   // A (col_start, i, x) + rhs/lower/upper/objective
   b += bi(lp.A.col_start.size()) + bi(lp.A.nnz()) + bd(lp.A.nnz());
   b += bd(m) + 3 * bd(n);
+  // Arow (CSR): row_start(m+1) + j(nnz) + x(nnz). Always uploaded now, so it is STATIC VRAM and no
+  // longer part of the in-kernel heap demand.
+  b += bi(m + 1) + bi(lp.A.nnz()) + bd(lp.A.nnz());
   // Four factors, each col_start + i + x
   b += bi(L0.col_start.size())  + bi(L0.nnz())  + bd(L0.nnz());
   b += bi(U0.col_start.size())  + bi(U0.nnz())  + bd(U0.nnz());
   b += bi(L0t.col_start.size()) + bi(L0t.nnz()) + bd(L0t.nnz());
   b += bi(U0t.col_start.size()) + bi(U0t.nnz()) + bd(U0t.nnz());
   // perms + workspaces
-  b += bi(m) + bi(m) + bi(2 * m) + bd(m);
+  b += bi(m) + bi(m) + bi(2 * m) + bd(m) + m * sizeof(unsigned char);
   // state: vstatus(n) + basic(m) + nonbasic(<=n) + x(n)+y(m)+z(n) + dy_se(n) + 4 out scalars
   b += n * sizeof(variable_status_t) + bi(m) + bi(n) + bd(n) + bd(m) + bd(n) + bd(n);
   b += 2 * bi(1) + 2 * bd(1);
-  // persistent per-slot solve state (slot_state<FT> header; its gpu_vector payloads come from the
-  // in-kernel device heap, which heap_estimate_bytes covers separately)
+  // persistent per-slot solve state (slot_state<FT> header only -- its gpu_vector payloads live in
+  // the arena below, or on the in-kernel heap for the few buffers left there)
   b += sizeof(slot_state<gpu_basis_update_mpf>);
+  // Per-slot arena: the fixed-size gpu_vector payloads, moved off the driver-capped in-kernel heap
+  // into ordinary VRAM. This is now STATIC VRAM and must be in the pre-flight, or a large batch
+  // passes the check and then fails the cudaMalloc. Zero when CUOPT_GPU_ARENA_SCALE=0.
+  b += arena_bytes_for(m, n);
   return b;
 }
 
@@ -4562,12 +5029,7 @@ dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
     // per-thread local reservation (cudaLimitStackSize x every resident thread) and the per-problem
     // cudaMallocs. On a small-VRAM card those three together can exceed the device and the launch
     // fails with cudaErrorLaunchOutOfResources -- which reads like a kernel-config problem but is not.
-    // CUOPT_GPU_HEAP_MB pins the arena so the margin can be controlled explicitly (4096 works on a
-    // 12 GB card where the 0.7*free default does not).
-    if (const char* e = std::getenv("CUOPT_GPU_HEAP_MB")) {
-      const long long v = std::atoll(e);
-      if (v > 0) { heap = static_cast<size_t>(v) << 20; }
-    }
+    // batch path alike (4096 works on a 12 GB card where 0.7*free does not).
     ensure_device_limits(heap);
   }
 
@@ -4586,39 +5048,15 @@ dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
 
   // Compile-time-selected optimized (warp) vs unoptimized (single-thread) kernel.
   // Both templates are instantiated here so the compiler emits code for both; the
-  // host picks at runtime (env CUOPT_GPU_WARP) which pre-compiled kernel to launch.
-  // CUOPT_GPU_WARP: unset/"0" = single-thread; "1" = plain wavefront; "2" (or higher) = big≥32.
-  const char* warp_env  = std::getenv("CUOPT_GPU_WARP");
-  const bool  warp_mode = (warp_env != nullptr && std::string(warp_env) != "0");
-  // SE-drift reprice: ON by default; CUOPT_SEREP_OFF=1 disables it. report_config() prints which of
-  // the two actually ran, so the resulting log is self-describing — see the g_serep_off banner.
-  const int serep_off = resolve_reprice();
-  report_config("monolith", warp_mode, serep_off, 1);
-  { RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_serep_off, &serep_off, sizeof(int))); }
-  { const char* e = std::getenv("CUOPT_RT_SERIAL");
-    const int rt_serial = (e != nullptr && std::string(e) != "0") ? 1 : 0;
-    RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_rt_serial, &rt_serial, sizeof(int))); }
+  report_config("monolith", 1);
+  upload_solve_class_config();
   const auto  _k0 = std::chrono::steady_clock::now();
-#if !CUOPT_SKIP_MONOLITH_WARP
-  if (warp_mode) {
-    gpu_phase2_kernel_direct<><<<1, 32>>>(d_args);
-  } else
-#endif
-  {
-#if CUOPT_SKIP_MONOLITH_WARP
-    if (warp_mode) {
-      std::fprintf(stderr, "[gpu_phase2] CUOPT_GPU_WARP set but the warp kernel is not compiled "
-                           "(CUOPT_SKIP_MONOLITH_WARP) — running the single-thread kernel.\n");
-    }
-#endif
-    gpu_phase2_kernel<false><<<1, 1>>>(d_args);
-  }
+  gpu_phase2_kernel_direct<><<<1, 32>>>(d_args);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
   RAFT_CUDA_TRY(cudaDeviceSynchronize());
   const double _kms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - _k0).count();
-  std::printf("[GPUKERNEL] warp=%d prof=%d ms=%.3f\n", warp_mode ? 1 : 0,
-              CUOPT_PROF_BUILD, _kms);
+  std::printf("[GPUKERNEL] ms=%.3f\n", _kms);
   cudaFree(d_args);
 
   // Marshal outputs back.
@@ -4647,6 +5085,7 @@ dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
 
   return static_cast<dual::status_t>(h_status);
 }
+
 
 // ---------------------------------------------------------------------------
 // Batch wrapper: solve N independent problems in ONE launch, one block each.
@@ -4710,26 +5149,23 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
   }
 
   // Size the malloc heap for all N concurrent S_ stacks (first GPU kernel this process).
-  ensure_device_limits(heap_estimate_bytes);
+  {
+    const size_t granted = ensure_device_limits(heap_estimate_bytes);
+    if (heap_demand_rejected(heap_estimate_bytes, granted, g_device_heap_requested, N, timing)) { return; }
+  }
 
   // ---- Marshal every problem + upload (host-timed) ----
-  // CUOPT_GPU_SHARE_RO: dedup the problem-invariant read-only device buffers (A CSC + rhs + objective)
+  // Dedup the problem-invariant read-only device buffers (A CSC + rhs + objective)
   // across items with the same `lp` pointer — N same-problem blocks read ONE resident copy of A instead
   // of N (VRAM + L2 reuse). The basis-dependent factor L/U, row perm, and branching bounds stay per-node
-  // (they differ per B&B node). Arow is per-node too but built on-device off the shared A. Default ON (=0 opts out).
-  const char* share_env  = std::getenv("CUOPT_GPU_SHARE_RO");
-  const bool  share_ro   = (share_env == nullptr || std::string(share_env) != "0");  // default ON, opt out =0
   const double up_t0 = tic();
   std::vector<kernel_args> h_args(N);
   std::unordered_map<const void*, ro_upload> ro_cache;
   for (size_t b = 0; b < N; ++b) {
     const auto& it = items[b];
-    const ro_upload* ro = nullptr;
-    if (share_ro) {
-      auto res = ro_cache.try_emplace(static_cast<const void*>(it.lp));
-      if (res.second) { res.first->second = upload_ro(*it.lp); }
-      ro = &res.first->second;
-    }
+    auto res = ro_cache.try_emplace(static_cast<const void*>(it.lp));
+    if (res.second) { res.first->second = upload_ro(*it.lp); }
+    const ro_upload* ro = &res.first->second;
     h_args[b] = marshal_problem(*it.lp, *it.settings, *it.vstatus, *it.ft, *it.basic_list,
                                 *it.nonbasic_list, *it.sol, *it.dy_se, ro);
   }
@@ -4742,27 +5178,9 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
   timing.upload_s = toc(up_t0);
 
   // ---- Launch one block per problem, timed with CUDA events (device compute only) ----
-  // CUOPT_GPU_WARP (unset/"0" = single-thread <<<N,1>>>; else the warp path <<<N,32>>>, one 32-lane
-  // warp per problem — same env mapping as the single-problem launch: "1" plain / "2" big≥32).
-  // Warp results are numeric-equivalent, NOT bit-exact, so the caller must relax its
-  // GPU-vs-reference verification when CUOPT_GPU_WARP is set.
-  const char* warp_env  = std::getenv("CUOPT_GPU_WARP");
-  const bool  warp_mode = (warp_env != nullptr && std::string(warp_env) != "0");
-  // SE-drift reprice: ON by default; CUOPT_SEREP_OFF=1 disables it. report_config() prints which of
-  // the two actually ran, so the resulting log is self-describing — see the g_serep_off banner.
-  const int serep_off = resolve_reprice();
-  report_config("monolith", warp_mode, serep_off, items.size());
-  { RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_serep_off, &serep_off, sizeof(int))); }
-  { const char* e = std::getenv("CUOPT_RT_SERIAL");
-    const int rt_serial = (e != nullptr && std::string(e) != "0") ? 1 : 0;
-    RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_rt_serial, &rt_serial, sizeof(int))); }
-  // CUOPT_GPU_REGCAP: warp-path register/occupancy target (throughput sweep). Maps to the kernel's
-  // __launch_bounds__ MinBlocks so ptxas caps registers → more resident blocks/SM:
-  //   unset / 255  → MinBlocks 8  (255 regs, ~8 blocks/SM   — current default)
-  //   128          → MinBlocks 16 (128-reg cap, ~16 blocks/SM)
-  //   64           → MinBlocks 32 (64-reg cap,  ~32 blocks/SM = HW max)
+  report_config("monolith", items.size());
+  upload_solve_class_config();
   // CUOPT_GPU_REGCAP is gone: it steered __launch_bounds__ MinBlocks on the parked-helper warp
-  // kernel, which no longer exists. The Direct kernel's cap is -DCUOPT_MONO_DIRECT_MINBLOCKS.
   // Fix the shared-memory occupancy ceiling: our per-block static shared (~0.6 KB) + the 1 KB driver
   // reservation is tiny, but the DEFAULT carveout (32 KB on B200) only fits ~19 blocks. Prefer a larger
   // shared carveout so shared stops capping occupancy below 32 blocks/SM (leaves the rest as L1). This is
@@ -4771,30 +5189,17 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
     // 40% of B200's ~228 KB unified cache ≈ 90 KB shared → ~55 blocks worth, well past 32; ~60% stays L1.
     cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, 40);
   };
+
   cudaEvent_t ev_start, ev_stop;
   RAFT_CUDA_TRY(cudaEventCreate(&ev_start));
   RAFT_CUDA_TRY(cudaEventCreate(&ev_stop));
   RAFT_CUDA_TRY(cudaEventRecord(ev_start));
-#if !CUOPT_SKIP_MONOLITH_WARP
-  if (warp_mode) {
+  {
     const unsigned nb = static_cast<unsigned>(N);
-    // The register/occupancy target is now a BUILD-time knob on the Direct kernel
-    // (-DCUOPT_MONO_DIRECT_MINBLOCKS=16 -> 128 regs / 16 blocks/SM); see the note at
-    // gpu_phase2_kernel_direct. The old runtime CUOPT_GPU_REGCAP sweep selected between separate
-    // MinBlocks instantiations of the PARKED-HELPER warp kernel, which no longer exists.
+    // The register/occupancy target is a BUILD-time knob on the Direct kernel
+    // gpu_phase2_kernel_direct.
     raise_carveout(reinterpret_cast<const void*>(&gpu_phase2_kernel_direct<>));
     gpu_phase2_kernel_direct<><<<nb, 32>>>(d_args);
-  } else
-#endif
-  {
-#if CUOPT_SKIP_MONOLITH_WARP
-    (void)raise_carveout;  // warp block compiled out (single-thread-only build)
-    if (warp_mode) {
-      std::fprintf(stderr, "[gpu_phase2] CUOPT_GPU_WARP set but the warp kernel is not compiled "
-                           "(CUOPT_SKIP_MONOLITH_WARP) — running the single-thread kernel.\n");
-    }
-#endif
-    gpu_phase2_kernel<false><<<static_cast<unsigned>(N), 1>>>(d_args);
   }
   RAFT_CUDA_TRY(cudaEventRecord(ev_stop));
   RAFT_CUDA_TRY(cudaPeekAtLastError());
@@ -4804,6 +5209,7 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
   timing.kernel_s = kernel_ms / 1000.0;
   cudaEventDestroy(ev_start);
   cudaEventDestroy(ev_stop);
+
 
   // ---- Copy each problem's result back (host-timed) ----
   const double cb_t0 = tic();
@@ -4836,255 +5242,10 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
     std::fprintf(stderr, "[gpu_phase2] batch WARNING: %s\n", timing.message.c_str());
   }
 
-  for (size_t b = 0; b < N; ++b) { free_kernel_args(h_args[b], share_ro); }
-  if (share_ro) { for (const auto& kv : ro_cache) { free_ro(kv.second); } }
+  for (size_t b = 0; b < N; ++b) { free_kernel_args(h_args[b], /*ro_shared=*/true); }
+  for (const auto& kv : ro_cache) { free_ro(kv.second); }
   cudaFree(d_args);
 }
-
-// ---------------------------------------------------------------------------
-// KERNEL-FISSION batch orchestrator (Phase 1a).
-//
-// Same contract as gpu_simplified_dual_phase2_batch above — N independent problems in, N results
-// out — but instead of ONE monolithic kernel running each problem's whole pivot loop, the host
-// drives a bulk-synchronous super-step loop over five per-primitive kernels:
-//
-//     Ksetup                        (once, all slots)
-//     repeat:  K1 -> K2 -> K3 -> K4 -> K5   (all live slots)   until every slot has terminated
-//
-// Each kernel is a thin wrapper over the SAME __device__ primitives the monolith calls; only the
-// control flow moved. Slots that terminate become no-ops (slot_state::status != UNSET) and the pool
-// drains, exactly as the monolith batch does. Phase 1a: single-thread <<<N,1>>>, fixed batch (no
-// refill), SE-drift reprice omitted, host owns the time limit.
-//
-// The monolith path (gpu_simplified_dual_phase2_batch) is untouched and remains the A/B baseline:
-// run it with CUOPT_SEREP_OFF=1 to get the matching reprice-free reference for the bit-exact gate.
-// ---------------------------------------------------------------------------
-template <typename i_t, typename f_t>
-void gpu_simplified_dual_phase2_batch_fission(const std::vector<gpu_batch_item<i_t, f_t>>& items,
-                                              size_t heap_estimate_bytes,
-                                              std::vector<dual::status_t>& out_status,
-                                              gpu_batch_timing& timing)
-{
-  using namespace gpu_phase2_detail;
-  static_assert(sizeof(i_t) == sizeof(int) && sizeof(f_t) == sizeof(double),
-                "gpu_simplified_dual_phase2_batch_fission is only instantiated for <int, double>");
-
-  const size_t N = items.size();
-  out_status.assign(N, dual::status_t::UNSET);
-  timing = gpu_batch_timing{};
-  if (N == 0) return;
-
-  for (size_t b = 0; b < N; ++b) {
-    if (items[b].ft->num_updates() != 0) {
-      timing.rejected = true;
-      timing.message  = "item " + std::to_string(b) + " has a non-fresh factorization";
-      std::fprintf(stderr, "[gpu_phase2] fission batch ERROR: %s\n", timing.message.c_str());
-      return;
-    }
-  }
-
-  // ---- Pre-flight VRAM check (fail loud, same policy as the monolith batch) ----
-  size_t static_bytes = 0;
-  for (size_t b = 0; b < N; ++b) { static_bytes += problem_static_bytes(*items[b].lp, *items[b].ft); }
-  const size_t args_bytes = N * sizeof(kernel_args) + N * sizeof(i_t);
-  const size_t need = static_bytes + heap_estimate_bytes + args_bytes;
-  size_t free_b = 0, total_b = 0;
-  RAFT_CUDA_TRY(cudaMemGetInfo(&free_b, &total_b));
-  timing.vram_needed_bytes = need;
-  timing.vram_free_bytes   = free_b;
-  const size_t budget = static_cast<size_t>(0.92 * static_cast<double>(free_b));
-  if (need > budget) {
-    const double GB = 1.0 / (1024.0 * 1024.0 * 1024.0);
-    char buf[512];
-    std::snprintf(buf, sizeof(buf),
-                  "fission batch needs ~%.2f GB VRAM, only %.2f GB free (budget %.2f GB) for %zu problems",
-                  need * GB, free_b * GB, budget * GB, N);
-    timing.rejected = true;
-    timing.message  = buf;
-    std::fprintf(stderr, "[gpu_phase2] fission batch REJECTED: %s\n", buf);
-    return;
-  }
-  ensure_device_limits(heap_estimate_bytes);
-
-  // The fissioned pipeline is STRUCTURALLY reprice-free: the SE-drift safeguard is a `continue`
-  // back-edge inside the monolith's pivot loop, and there is no such edge to take when the loop is
-  // a host-driven sequence of super-steps. So this is not a choice the env can make here -- it is
-  // forced, CUOPT_SEREP_OFF is irrelevant on this path, and [CONFIG] reports reprice=OFF because
-  // that is what actually runs. (Uploading 1 also keeps the device symbol consistent with it.)
-  const int serep_off = 1;
-  { RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_serep_off, &serep_off, sizeof(int))); }
-  { const char* e = std::getenv("CUOPT_RT_SERIAL");
-    const int rt_serial = (e != nullptr && std::string(e) != "0") ? 1 : 0;
-    RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_rt_serial, &rt_serial, sizeof(int))); }
-  { const int zero = 0; RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_gpu_alloc_failed, &zero, sizeof(int))); }
-
-  // ---- Warp geometry for the whole fission pipeline ------------------------------------------
-  // Driven by CUOPT_GPU_WARP, exactly like the monolith: every stage is warp or none is. The six
-  // per-stage CUOPT_FISSION_*_WARP switches are gone — they existed to port and verify one stage
-  // at a time, and every stage is now proven node-for-node identical to the monolith warp
-  // (FISSION_CHALLENGES.md §18), so per-stage geometry has no remaining use.
-  // Parsed BEFORE Ksetup launches: g_fission_warp gates the level-schedule build inside it.
-  const char* fiss_warp_env = std::getenv("CUOPT_GPU_WARP");
-  const bool  fiss_warp = (fiss_warp_env != nullptr && std::string(fiss_warp_env) != "0");
-  report_config("fission", fiss_warp, serep_off, static_cast<size_t>(N));
-  // Ksetup builds the elimination-level schedules into the slot only when the solve stages need them.
-  { const int fw = fiss_warp ? 1 : 0;
-    RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_fission_warp, &fw, sizeof(int))); }
-  // Dense-solve schedule variant, same env mapping as the monolith ("2" = big≥32). Set explicitly so
-  // the fission run never inherits a stale value from an earlier monolith launch in this process.
-  if (fiss_warp) {
-    // Print BEFORE trusting any PASS: a stale binary silently ignoring the setting once produced a
-    // meaningless 100/100 here. grep this line in the log.
-    std::printf("[fission] WARP <<<N,32>>> — Ksetup + K1..K5\n");
-    std::fflush(stdout);
-  }
-
-  // ---- Marshal (same as the monolith batch; RO sharing across identical LPs) ----
-  const double up_t0 = tic();
-  const char* share_env = std::getenv("CUOPT_GPU_SHARE_RO");
-  const bool  share_ro  = (share_env == nullptr || std::string(share_env) != "0");
-  std::vector<kernel_args> h_args(N);
-  std::unordered_map<const void*, ro_upload> ro_cache;
-  i_t* d_status = nullptr;
-  RAFT_CUDA_TRY(cudaMalloc(&d_status, N * sizeof(i_t)));
-  for (size_t b = 0; b < N; ++b) {
-    const auto& it = items[b];
-    if (share_ro) {
-      auto res = ro_cache.try_emplace(static_cast<const void*>(it.lp));
-      if (res.second) { res.first->second = upload_ro(*it.lp); }
-    }
-    h_args[b] = marshal_problem(*it.lp, *it.settings, *it.vstatus, *it.ft, *it.basic_list,
-                                *it.nonbasic_list, *it.sol, *it.dy_se,
-                                share_ro ? &ro_cache[static_cast<const void*>(it.lp)] : nullptr);
-    h_args[b].status_arr = d_status;   // shared, indexed by blockIdx.x
-  }
-  kernel_args* d_args = nullptr;
-  RAFT_CUDA_TRY(cudaMalloc(&d_args, N * sizeof(kernel_args)));
-  RAFT_CUDA_TRY(cudaMemcpy(d_args, h_args.data(), N * sizeof(kernel_args), cudaMemcpyHostToDevice));
-  timing.upload_s = toc(up_t0);
-
-  // ---- Super-step loop ----
-  const unsigned nb = static_cast<unsigned>(N);
-
-  // ---- The super-step loop is a CUDA GRAPH WITH A DEVICE-CONTROLLED WHILE NODE ----------------
-  // `manual_cuda_graph_t::run_while` builds a graph whose single conditional node loops on a handle
-  // written from the device by gpu_fission_cond. The whole solve is therefore ONE graph launch: the
-  // host never sees an iteration, so there is no per-super-step D2H, stream sync, or status poll.
-  //
-  // Unconditional — there is no opt-out. It is bit-exact against the old host-polled loop (0/100
-  // differing on the 100 v6 nodes in every geometry) and never slower, so a fallback would only be
-  // dead code. CUDA 12.9+ is a hard requirement of this repo, well above the 12.4 that conditional
-  // nodes need, so there is no version guard either.
-  //
-  // Capture requires a non-default stream, hence the owned stream below.
-  // Device-side super-step counter, read back once at the end. Allocated HERE, before the timed
-  // region and before Ksetup is issued: cudaMalloc implicitly synchronizes the device, so allocating
-  // it later would stall the host on Ksetup and be misattributed to graph capture.
-  unsigned long long* d_steps = alloc_zeroed<unsigned long long>(1);
-
-  rmm::cuda_stream stream_owner;
-  const rmm::cuda_stream_view stream = stream_owner.view();
-
-  // One iteration = K1..K5, issued in order. Host-idempotent: launches only.
-  auto issue_super_step = [&] {
-    cudaStream_t s = stream.value();
-    if (fiss_warp) {
-      gpu_fission_k1<true><<<nb, 32, 0, s>>>(d_args);
-      gpu_fission_k2<true><<<nb, 32, 0, s>>>(d_args);
-      gpu_fission_k3<true><<<nb, 32, 0, s>>>(d_args);
-      gpu_fission_k4<true><<<nb, 32, 0, s>>>(d_args);
-      gpu_fission_k5<true><<<nb, 32, 0, s>>>(d_args);
-    } else {
-      gpu_fission_k1<false><<<nb, 1, 0, s>>>(d_args);
-      gpu_fission_k2<false><<<nb, 1, 0, s>>>(d_args);
-      gpu_fission_k3<false><<<nb, 1, 0, s>>>(d_args);
-      gpu_fission_k4<false><<<nb, 1, 0, s>>>(d_args);
-      gpu_fission_k5<false><<<nb, 1, 0, s>>>(d_args);
-    }
-  };
-  cuopt::manual_cuda_graph_t step_graph;
-
-  cudaEvent_t ev_start, ev_stop;
-  RAFT_CUDA_TRY(cudaEventCreate(&ev_start));
-  RAFT_CUDA_TRY(cudaEventCreate(&ev_stop));
-  RAFT_CUDA_TRY(cudaEventRecord(ev_start, stream.value()));
-
-  // Ksetup geometry. Its prologue is nearly all allocation/RMW (lane 0 either way); the warp form
-  // exists so the collectives inside it (WARP_NBE, WARP_PINF) can run on 32 lanes.
-  // Deliberately OUTSIDE the graph: it runs exactly once, so capturing it would buy nothing, and it
-  // is where the per-slot device allocation happens.
-  if (fiss_warp) { gpu_fission_setup<true><<<nb, 32, 0, stream.value()>>>(d_args); }
-  else            { gpu_fission_setup<false><<<nb, 1, 0, stream.value()>>>(d_args); }
-
-  // Host owns the iteration/wall-clock bound (the device kernels have no time-limit check). The cap
-  // mirrors the device iter_limit so a pathological batch cannot spin forever.
-  size_t max_super_steps = 500000;
-  if (const char* e = std::getenv("CUOPT_FISSION_MAX_STEPS")) { max_super_steps = std::strtoull(e, nullptr, 10); }
-  size_t steps = 0;
-  // The ENTIRE loop runs inside ONE graph launch: a cudaGraphCondTypeWhile node whose body is
-  // K1..K5 + gpu_fission_cond. The condition kernel evaluates the same predicate the host loop used
-  // to ("any slot still UNSET, and under the super-step cap") and writes it to the conditional
-  // handle, so the host does no per-super-step work at all — no D2H, no stream sync, no poll.
-  step_graph.run_while(stream, [&](cudaGraphConditionalHandle handle) {
-    issue_super_step();
-    gpu_fission_cond<<<1, 128, 0, stream.value()>>>(
-      handle, d_status, static_cast<i_t>(N), d_steps, max_super_steps);
-  });
-  RAFT_CUDA_TRY(cudaStreamSynchronize(stream.value()));
-  
-  RAFT_CUDA_TRY(cudaEventRecord(ev_stop, stream.value()));
-  RAFT_CUDA_TRY(cudaPeekAtLastError());
-  RAFT_CUDA_TRY(cudaEventSynchronize(ev_stop));
-  unsigned long long dev_steps = 0;
-  RAFT_CUDA_TRY(cudaMemcpy(&dev_steps, d_steps, sizeof(dev_steps), cudaMemcpyDeviceToHost));
-  steps = static_cast<size_t>(dev_steps);
-  RAFT_CUDA_TRY_NO_THROW(cudaFree(d_steps));
-  float kernel_ms = 0.0f;
-  RAFT_CUDA_TRY(cudaEventElapsedTime(&kernel_ms, ev_start, ev_stop));
-  timing.kernel_s = kernel_ms / 1000.0;
-  cudaEventDestroy(ev_start);
-  cudaEventDestroy(ev_stop);
-
-  if (steps >= max_super_steps) {
-    timing.message = "fission batch hit the super-step cap (" + std::to_string(max_super_steps) +
-                     ") — some problems did not terminate";
-    std::fprintf(stderr, "[gpu_phase2] fission batch WARNING: %s\n", timing.message.c_str());
-  }
-
-  // ---- Copy results back (identical to the monolith batch) ----
-  const double cb_t0 = tic();
-  for (size_t b = 0; b < N; ++b) {
-    const auto& a = h_args[b];
-    auto& sol     = *items[b].sol;
-    int h_st = 0, h_it = 0;
-    double h_obj = 0.0, h_uobj = 0.0;
-    RAFT_CUDA_TRY(cudaMemcpy(&h_st,  a.out_status,         sizeof(int),    cudaMemcpyDeviceToHost));
-    RAFT_CUDA_TRY(cudaMemcpy(&h_obj, a.out_objective,      sizeof(double), cudaMemcpyDeviceToHost));
-    RAFT_CUDA_TRY(cudaMemcpy(&h_uobj,a.out_user_objective, sizeof(double), cudaMemcpyDeviceToHost));
-    RAFT_CUDA_TRY(cudaMemcpy(&h_it,  a.out_iterations,     sizeof(int),    cudaMemcpyDeviceToHost));
-    RAFT_CUDA_TRY(cudaMemcpy(sol.x.data(), a.x, a.n * sizeof(double), cudaMemcpyDeviceToHost));
-    RAFT_CUDA_TRY(cudaMemcpy(sol.y.data(), a.y, a.m * sizeof(double), cudaMemcpyDeviceToHost));
-    RAFT_CUDA_TRY(cudaMemcpy(sol.z.data(), a.z, a.n * sizeof(double), cudaMemcpyDeviceToHost));
-    sol.objective      = h_obj;
-    sol.user_objective = h_uobj;
-    sol.iterations     = h_it;
-    out_status[b]      = static_cast<dual::status_t>(h_st);
-  }
-  timing.copyback_s = toc(cb_t0);
-
-  int alloc_failed = 0;
-  RAFT_CUDA_TRY(cudaMemcpyFromSymbol(&alloc_failed, g_gpu_alloc_failed, sizeof(int)));
-  if (alloc_failed) {
-    timing.message = "a device allocation failed during the fission batch solve (heap too small)";
-    std::fprintf(stderr, "[gpu_phase2] fission batch WARNING: %s\n", timing.message.c_str());
-  }
-
-  for (size_t b = 0; b < N; ++b) { free_kernel_args(h_args[b], share_ro); }
-  if (share_ro) { for (const auto& kv : ro_cache) { free_ro(kv.second); } }
-  cudaFree(d_status);
-  cudaFree(d_args);
-}
-
 
 template dual::status_t gpu_simplified_dual_phase2<int, double>(
   const lp_problem_t<int, double>&,
@@ -5102,10 +5263,5 @@ template void gpu_simplified_dual_phase2_batch<int, double>(
   std::vector<dual::status_t>&,
   gpu_batch_timing&);
 
-template void gpu_simplified_dual_phase2_batch_fission<int, double>(
-  const std::vector<gpu_batch_item<int, double>>&,
-  size_t,
-  std::vector<dual::status_t>&,
-  gpu_batch_timing&);
 
 }  // namespace cuopt::linear_programming::dual_simplex

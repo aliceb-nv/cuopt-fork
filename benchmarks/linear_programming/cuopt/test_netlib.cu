@@ -38,6 +38,8 @@
 #include <cuda_runtime.h>
 #include <omp.h>
 
+#include <unordered_map>   // collapsing duplicate [TRUE MISMATCH] lines across replicas
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -55,7 +57,14 @@
 #include <vector>
 
 #include "benchmark_helper.hpp"
-#include "kargs_dump.hpp"
+
+// `NAME=0` must mean OFF. The older TEST_NETLIB_* switches test only for presence, so `=0` turns
+// them ON; the switches added here use this helper instead, matching the CUOPT_* convention.
+static inline bool env_on(const char* name)
+{
+  const char* e = std::getenv(name);
+  return e != nullptr && std::string(e) != "0";
+}
 
 // The shared simplex primitives were promoted to mathematical_optimization::simplex;
 // tic/toc and the linear-algebra types (csc_matrix_t) live in the parent
@@ -307,38 +316,25 @@ ds::dual::status_t run_phase2_from_basis(const ds::lp_problem_t<int, double>& lp
   out_dual_inf = dual_infeasibility(lp, vstatus, sol.z, settings.dual_tol);
 
   std::vector<double> dy_se;  // empty -> cold-start steepest-edge weights
-  // Diagnostic (TEST_NETLIB_EXACT_SE=1, CPU minimal only): seed dy_se with the EXACT
-  // initial steepest-edge reference norms gamma_k = ||B^{-T} e_k||^2 for basic vars,
-  // instead of the minimal driver's crude slack-basis init (basic=1.0). Tests whether
-  // the SE-norm initialization is what makes pilot/woodw land on a suboptimal vertex.
-  if (mode == 1 && std::getenv("TEST_NETLIB_EXACT_SE") != nullptr) {
-    dy_se.assign(n, 1e-4);  // nonbasic default (unused until a var enters)
-    std::vector<double> ek(m, 0.0), y(m, 0.0);
-    for (int k = 0; k < m; ++k) {
-      ek[k] = 1.0;
-      ft.b_transpose_solve(ek, y);
-      double g = 0.0;
-      for (int i = 0; i < m; ++i) g += y[i] * y[i];
-      dy_se[basic_list[k]] = g;
-      ek[k] = 0.0;
-    }
-  }
   // Exact replay: feed the B&B's carried steepest-edge norms verbatim (the driver
   // uses a non-empty dy_se as-is instead of reinitializing).
   if (!dy_se_override.empty()) { dy_se = dy_se_override; }
-  // KF fixture dump (CUOPT_DUMP_KARGS): freeze this node's marshaled inputs (pre-solve, fresh
-  // factorization) for a Kernel Factory warp-kernel campaign. See kargs_dump.hpp / DATA_CONTRACT.md.
-  if (mode == 1 && !kf::g_dump_dir.empty()) {
-    kf::dump_inputs(kf::g_dump_dir, lp, settings, vstatus, ft, basic_list, nonbasic_list, sol, dy_se);
-  }
   ds::dual::status_t status;
+  int out_num_updates_adv = -1;  // set by mode 0 (full driver on its own ft)
   // [SESTAT] SE debug counters were removed from basis_update_mpf_t; reset is a no-op now.
+
+  // NOTE: this tree is MPF/LU ONLY. The explicit-inverse + Sherman-Morrison basis update
+  // (`basis_update_inverse_add_t`, driven by CUOPT_SIMPLIFIED_INVERSE / CUOPT_FULL_MPF=0) does not
+  // exist here — `basis_updates.hpp` never declares it — because the kernel-fission effort targets
+  // the LU path only. Both the minimal and the advanced driver therefore run on the MPF `ft`
+  // refactored above, outside the driver timer.
+
   // Time JUST the phase-2 driver call (the refactor_basis setup above is identical for both
   // the advanced and the minimal driver, so isolating the driver is the fair time comparison).
   const double driver_t0 = mo::tic();
   if (mode == 1) {
-    status =
-      ds::simplified_dual_phase2(lp, settings, vstatus, ft, basic_list, nonbasic_list, sol, dy_se);
+    status = ds::simplified_dual_phase2(
+      lp, settings, vstatus, ft, basic_list, nonbasic_list, sol, dy_se);
     out_iters = sol.iterations;
   } else if (mode == 2) {
     status = gds::gpu_simplified_dual_phase2(
@@ -346,20 +342,13 @@ ds::dual::status_t run_phase2_from_basis(const ds::lp_problem_t<int, double>& lp
     out_iters = sol.iterations;
   } else {
     int iter = 0;
-    status   = ds::dual_phase2_with_advanced_basis(2,
-                                                 0,
-                                                 initialize_basis,
-                                                 start_time,
-                                                 lp,
-                                                 settings,
-                                                 vstatus,
-                                                 ft,
-                                                 basic_list,
-                                                 nonbasic_list,
-                                                 sol,
-                                                 iter,
-                                                 dy_se,
-                                                 nullptr);
+    // MPF/LU only in this tree (see the note above): the advanced driver reuses the mpf `ft`
+    // already refactored outside the driver timer. CUOPT_FULL_MPF / CUOPT_FULL_SPARSE selected the
+    // inverse-add form and are inert here.
+    status = ds::dual_phase2_with_advanced_basis(2, 0, initialize_basis, start_time, lp, settings,
+                                                 vstatus, ft, basic_list, nonbasic_list, sol, iter,
+                                                 dy_se, nullptr);
+    out_num_updates_adv = ft.num_updates();
     out_iters = iter;
   }
   if (out_seconds != nullptr) { *out_seconds = mo::toc(driver_t0); }
@@ -376,11 +365,7 @@ ds::dual::status_t run_phase2_from_basis(const ds::lp_problem_t<int, double>& lp
     out_se->numupd  = 0;
   }
   out_obj         = ds::compute_user_objective<int, double>(lp, sol.x);
-  out_num_updates = ft.num_updates();
-  // KF fixture dump: freeze the CPU-simplified golden (status/user_obj/iters) — the oracle.
-  if (mode == 1 && !kf::g_dump_dir.empty()) {
-    kf::dump_golden(kf::g_dump_dir, static_cast<int>(status), out_obj, out_iters);
-  }
+  out_num_updates = (mode == 0) ? out_num_updates_adv : ft.num_updates();
   return status;
 }
 
@@ -845,13 +830,6 @@ void verify_nodes_mode(const raft::handle_t& handle, const std::string& dir, dou
 
       // Run advanced (mode 0) and simplified (mode 1) on the child from the
       // warm-start basis, with the recorded objective cutoff + settings + edge norms.
-      // KF fixture dump (CUOPT_DUMP_KARGS): aim the dumper at this node's dir before the
-      // CPU-simplified (mode 1) solve below; the input+golden dump fires inside it.
-      if (const char* kf_base = std::getenv("CUOPT_DUMP_KARGS")) {
-        kf::g_dump_dir = std::string(kf_base) + "/" + name;
-      } else {
-        kf::g_dump_dir.clear();
-      }
       double adv_obj = kNaN, sim_obj = kNaN, dinf = 0.0;
       int adv_it = 0, sim_it = 0, upd = 0;
       double adv_sec = 0.0, sim_sec = 0.0;
@@ -859,8 +837,6 @@ void verify_nodes_mode(const raft::handle_t& handle, const std::string& dir, dou
       // [SESTAT] TEMP debug (remove after diagnosis): per-node marker so the interleaved CPU
       // [SESTAT] lines (full/min, below) and the GPU device [SEPROF] line (emitted during the
       // mode-2 kernel when CUOPT_GPU_PROFILE=1) can be grouped by node.
-      const bool se_stats = std::getenv("TEST_NETLIB_SE_STATS") != nullptr;
-      if (se_stats) { std::printf("[SENODE] %s\n", name.c_str()); std::fflush(stdout); }
       // TEST_NETLIB_VERBOSE=1 turns on both drivers' per-iteration bit traces
       // ([ADV] from advanced, [CMP] from simplified) so the exact iteration where the
       // two pivot sequences diverge can be located. Use on a single-node dir.
@@ -877,21 +853,6 @@ void verify_nodes_mode(const raft::handle_t& handle, const std::string& dir, dou
       const ds::dual::status_t sim_st = run_phase2_from_basis(
         child_lp, vstatus_warm, s_sim, /*simplified*/ 1, sim_obj, sim_it, dinf, upd, false,
         edge_norms, &sim_sec, &se_sim);
-      // [SESTAT] TEMP debug: print the SE-context b_solve profile for full (mode 0) and minimal
-      // (mode 1). hyperL/hyperU = #calls that took the hypersparse L/U path (dense = calls - that).
-      if (se_stats) {
-        auto pr = [&](const char* tag, const se_dbg_t& s) {
-          const double c = s.calls ? static_cast<double>(s.calls) : 1.0;
-          std::printf("[SESTAT] %-20s %-4s se_calls=%ld hyperL=%ld/%ld hyperU=%ld/%ld "
-                      "avg_nupd=%.1f avg_nz_in=%.1f avg_nz_l=%.1f avg_nz_u=%.1f\n",
-                      name.c_str(), tag, s.calls, s.hyper_l, s.calls, s.hyper_u, s.calls,
-                      s.numupd / c, s.nz_in / c, s.nz_l / c, s.nz_u / c);
-        };
-        pr("full", se_adv);
-        pr("min", se_sim);
-        std::fflush(stdout);
-      }
-
       // GPU parity check (TEST_NETLIB_GPU=1): run the GPU simplified driver (mode 2) from
       // the identical warm start and compare status/iters/objective against the CPU
       // simplified driver. With every CPU opt-in feature OFF (no CUOPT_SIMPLIFIED_* flags)
@@ -969,6 +930,14 @@ void verify_nodes_mode(const raft::handle_t& handle, const std::string& dir, dou
                     gpu_it,
                     gpu_sec,
                     gpu_match ? "cpu==gpu" : "CPU!=GPU");
+      }
+      // Full-precision per-node GPU result, for comparing the SEQUENTIAL <<<1,32>>> path against
+      // the BATCH <<<N,32>>> path node-for-node. The table above prints %10.6g, far too coarse to
+      // detect a batching-induced divergence. %.17g round-trips a double exactly, so a text diff
+      // of two [NODEDUMP] streams IS a bitwise comparison. TEST_NETLIB_NODE_DUMP=1.
+      if (run_gpu && env_on("TEST_NETLIB_NODE_DUMP")) {
+        std::printf("\n[NODEDUMP] %-44s %-16s it=%-6d obj=%.17g",
+                    name.c_str(), ds::dual_status_to_string(gpu_st).c_str(), gpu_it, gpu_obj);
       }
       std::printf("\n");
       std::fflush(stdout);
@@ -1088,11 +1057,12 @@ size_t estimate_static_bytes(const ds::lp_problem_t<int, double>& lp,
   size_t b = 0;
   b += bi(lp.A.col_start.size()) + bi(lp.A.nnz()) + bd(lp.A.nnz());
   b += bd(m) + 3 * bd(n);
+  b += bi(m + 1) + bi(lp.A.nnz()) + bd(lp.A.nnz());  // Arow CSR: always uploaded now
   b += bi(L0.col_start.size())  + bi(L0.nnz())  + bd(L0.nnz());
   b += bi(U0.col_start.size())  + bi(U0.nnz())  + bd(U0.nnz());
   b += bi(L0t.col_start.size()) + bi(L0t.nnz()) + bd(L0t.nnz());
   b += bi(U0t.col_start.size()) + bi(U0t.nnz()) + bd(U0t.nnz());
-  b += bi(m) + bi(m) + bi(2 * m) + bd(m);
+  b += bi(m) + bi(m) + bi(2 * m) + bd(m) + m * sizeof(unsigned char);  // reach marks
   b += n * sizeof(ds::variable_status_t) + bi(m) + bi(n) + bd(n) + bd(m) + bd(n) + bd(n);
   return b;
 }
@@ -1120,7 +1090,23 @@ void benchmark_parallel_mode(const raft::handle_t& handle, const std::string& di
   namespace fs = std::filesystem;
   constexpr double GB          = 1.0 / (1024.0 * 1024.0 * 1024.0);
   constexpr double kSparsity   = 0.30;  // per-update S_ fill (fraction of m) from the sparsity study
-  constexpr double kHeapSafety = 2.0;   // gpu_vector doubles capacity on growth + fragmentation
+  // Safety factor on the analytic heap estimate. 2.0 was NOT enough: a 15,000-problem B200 run at
+  // 2.0 exhausted the arena and crashed with cudaErrorIllegalAddress. Three reasons the analytic
+  // figure runs low: the device malloc heap fragments (grow_to allocates the new buffer before it
+  // frees the old); `iters` below is the CPU pivot count, and the GPU takes more (5148 vs 3939 on the
+  // 100 v6 nodes); and the per-thread stack reservation is not counted at all.
+  // MEASURED 2026-08-14 with -DCUOPT_ALLOC_STATS=1 on the 100 v6 nodes: real in-kernel demand is
+  // 2.45 MB per problem (warp) and 2.23 MB (single thread), against a raw formula value of ~2.96 MB.
+  // So the formula itself is good to about 20%; the 2.0 factor makes the whole estimate ~2.4x
+  // pessimistic. That matters because the estimate sizes the arena request AND the VRAM pre-flight.
+  // ⚠ The in-kernel heap is capped by the driver at ~16.47 GB on EVERY device (usable ~13.5 GB), so
+  // the real ceiling is ~5,600 problems no matter what this factor is set to.
+  const double kHeapSafety = 2.0;
+
+  // The per-slot arena is always on, so the fixed-size m/n-length workspaces come from ordinary
+  // VRAM and are NOT heap. They must therefore stay OUT of the heap estimate below, or it doubles
+  // its own size and the VRAM pre-flight counts them twice (they are already in
+  // problem_static_bytes).
 
   // One prepared, replicated problem instance.
   struct unique_node_t {
@@ -1134,6 +1120,11 @@ void benchmark_parallel_mode(const raft::handle_t& handle, const std::string& di
     double ref_obj                = kNaN;
     int m                         = 0;
     int depth                     = -1;
+    // Iteration count recorded in verify.log by the ORIGINAL B&B dump. Used ONLY as the heavy-first
+    // ordering key. It is a file on disk, so unlike ref_iters (which is measured by this run's CPU
+    // driver) no env var, driver config or reprice setting can change it -- the block layout is
+    // therefore identical across every configuration being compared. See the sort below.
+    int verify_iters              = 0;
     size_t static_bytes           = 0;
     size_t heap_bytes             = 0;
     explicit unique_node_t(ds::lp_problem_t<int, double>&& lp_in) : lp(std::move(lp_in)) {}
@@ -1196,6 +1187,7 @@ void benchmark_parallel_mode(const raft::handle_t& handle, const std::string& di
       un->settings   = settings;
       un->m          = un->lp.num_rows;
       un->depth      = info.depth;
+      un->verify_iters = info.iterations;
       nodes.push_back(std::move(un));
     } catch (const std::exception& ex) {
       std::printf("  skip %s (exception: %s)\n", name.c_str(), ex.what());
@@ -1226,28 +1218,45 @@ void benchmark_parallel_mode(const raft::handle_t& handle, const std::string& di
     un->ref_obj   = obj;
     // Two heap contributors per block:
     //  (a) the iteration-driven S_ MPF stack: ~iters updates x kSparsity*m fill x 12 B (int+double);
-    //  (b) an ITERATION-INDEPENDENT floor that exists even for a 0-iter node — chiefly the on-device
-    //      Arow built by from_csc (row_start (m+1) ints + j (nnz) ints + x (nnz) doubles) when
-    //      CUOPT_GPU_HOST_AROW is off (the default), plus the handful of dense m-length solve
-    //      workspaces. Without (b), warm-start few-iter collections (v6) underestimate the heap and the
-    //      malloc arena is set too small -> in-kernel device malloc fails -> illegal address. gpu_vector
-    //      doubles capacity on growth, so carry the 2x headroom (kHeapSafety) on the floor too.
-    const size_t nnz        = un->lp.A.nnz();
-    const size_t arow_bytes = nnz * (sizeof(int) + sizeof(double)) + (size_t)(un->m + 1) * sizeof(int);
-    const size_t work_bytes = (size_t)un->m * sizeof(double) * 32;  // ~dense m-length solve workspaces
+    //  (b) an ITERATION-INDEPENDENT floor that exists even for a 0-iter node — the dense m-length
+    //      solve workspaces and the sparse/dense scratch.
+    //  Arow is NOT counted here any more: it is always uploaded from the host (see marshal_problem),
+    //  so it is static VRAM, not heap. It used to be built in-kernel on the RO-shared path and cost
+    //  1.04 MB of HEAP per problem (2.450 -> 1.408 MB measured), which halved the maximum batch,
+    //  because the device heap is driver-capped at ~16 GB while ordinary VRAM is not.
+    //  With the arena ON, (b) is no longer heap at all: those workspaces are bound to the per-slot
+    //  arena in ordinary VRAM (slot_state::bind_arena_buffers) and are budgeted by
+    //  problem_static_bytes instead. Counting them in both places would reject batches that fit.
+    //  The arena-on value is a FLOOR, not zero: S_.init_empty still allocates, and any buffer that
+    //  outgrows its arena slice falls back to malloc(). A zero here would also make a batch of
+    //  0-iteration nodes request a zero-byte heap.
+    const size_t work_bytes = 4096;
     const size_t iter_heap  = static_cast<size_t>(static_cast<double>(iters) * kSparsity *
                                                   static_cast<double>(un->m) * 12.0);
     un->heap_bytes = static_cast<size_t>((static_cast<double>(iter_heap) +
-                                          static_cast<double>(arow_bytes + work_bytes)) * kHeapSafety);
+                                          static_cast<double>(work_bytes)) * kHeapSafety);
   }
 
-  // ---- Heavy-first order (anti-tailing): sort unique by measured iters desc; each unique's
+  // ---- Heavy-first order (anti-tailing): sort unique by verify.log iters desc; each unique's
   //      `replicas` copies are consecutive, so the heaviest problems get the low blockIdx /
-  //      earliest OpenMP grab (LPT). Depth does NOT predict iters, so sort by measured iters. ----
+  //      earliest OpenMP grab (LPT). Depth does NOT predict iters (r = -0.29 over this collection),
+  //      so a measured iteration count is the right key.
+  //
+  //      The key is verify_iters (recorded in verify.log by the B&B dump), NOT ref_iters (measured
+  //      by THIS run's CPU driver). That distinction is load-bearing: ref_iters changes with the CPU
+  //      reprice setting, which reordered the sort, which moved nodes to different blockIdx. With
+  //      ~100 co-resident single-warp blocks the kernel time is the makespan of one straggler, so
+  //      relocating it against a different set of co-residents moved the reported kernel time by up
+  //      to 8% with ZERO change in GPU work (per-node results byte-identical, same clocks). A
+  //      GPU-only A/B was therefore silently comparing two different block layouts. verify_iters is
+  //      a file on disk and cannot vary with any run-time setting.
+  //
+  //      Ties keep the original discovery order (std::stable_sort), so the layout is reproducible
+  //      even when several nodes share an iteration count.
   std::vector<int> order(uc);
   for (int i = 0; i < uc; ++i) { order[i] = i; }
-  std::sort(order.begin(), order.end(),
-            [&](int a, int b) { return nodes[a]->ref_iters > nodes[b]->ref_iters; });
+  std::stable_sort(order.begin(), order.end(),
+                   [&](int a, int b) { return nodes[a]->verify_iters > nodes[b]->verify_iters; });
   std::vector<int> list;
   list.reserve(static_cast<size_t>(uc) * replicas);
   for (int rank = 0; rank < uc; ++rank) {
@@ -1267,6 +1276,7 @@ void benchmark_parallel_mode(const raft::handle_t& handle, const std::string& di
   cudaMemGetInfo(&free_vram, &total_vram);
   const size_t free_ram = host_mem_available_bytes();
   std::printf("Memory estimate for %zu problems:\n", Ntot);
+  std::printf("  heap safety factor : %.2f\n", kHeapSafety);
   std::printf("  VRAM  needed ~%.2f GB (static %.2f + heap %.2f) | free %.2f GB\n",
               vram_need * GB, vram_static * GB, vram_heap * GB, free_vram * GB);
   std::printf("  Host  needed ~%.2f GB | available %.2f GB\n\n", host_need * GB, free_ram * GB);
@@ -1293,6 +1303,9 @@ void benchmark_parallel_mode(const raft::handle_t& handle, const std::string& di
   std::vector<int> cpu_iters(Ntot, 0);
   std::vector<double> cpu_obj(Ntot, kNaN);
   std::vector<double> cpu_driver_s(Ntot, 0.0);
+  // Self-report the CPU leg, mirroring the GPU's [CONFIG] line. A run that states its own
+  // configuration cannot be mislabeled afterwards, which is the whole point.
+  std::printf("[CONFIG] leg=CPU(reference) problems=%zu\n", Ntot);
   const double cpu_t0 = omp_get_wtime();
 #pragma omp parallel for schedule(dynamic)
   for (size_t k = 0; k < Ntot; ++k) {
@@ -1318,6 +1331,7 @@ void benchmark_parallel_mode(const raft::handle_t& handle, const std::string& di
       cpu_mismatch++;
     }
   }
+
 
   // ---- GPU benchmark: host-setup all N (OpenMP), then ONE multi-block launch ----
   std::vector<std::unique_ptr<prepared_problem_t>> prepared(Ntot);
@@ -1356,9 +1370,20 @@ void benchmark_parallel_mode(const raft::handle_t& handle, const std::string& di
   // batching corruption, and is counted separately (its result is wall-clock-dependent, so it
   // cannot be bit-compared). Any other divergence is a true mismatch (a real bug).
   int gpu_exact = 0, gpu_timeout = 0, gpu_true_mismatch = 0;
+  // Distinct [TRUE MISMATCH] lines, in first-seen order, with how many problems produced each.
+  std::vector<std::pair<std::string, int>> mismatch_lines;
+  std::unordered_map<std::string, size_t>  mismatch_index;
   for (size_t k = 0; k < Ntot; ++k) {
     const int u       = list[k];
     const double gobj = ds::compute_user_objective<int, double>(nodes[u]->lp, prepared[k]->sol.x);
+    // Same full-precision dump as the sequential path so the two streams diff bitwise. NOTE: the
+    // built-in "bit-exact vs ref" counter compares against the CPU SIMPLIFIED reference, not against
+    // the sequential GPU -- so it cannot answer "does batching change the GPU result".
+    if (env_on("TEST_NETLIB_NODE_DUMP")) {
+      std::printf("[NODEDUMP] %-44s %-16s it=%-6d obj=%.17g\n",
+                  nodes[u]->name.c_str(), ds::dual_status_to_string(gpu_status[k]).c_str(),
+                  prepared[k]->sol.iterations, gobj);
+    }
     const bool exact  = reproduces_ref(gpu_status[k], prepared[k]->sol.iterations, gobj,
                                       nodes[u]->ref_status, nodes[u]->ref_iters, nodes[u]->ref_obj);
     if (exact) {
@@ -1368,12 +1393,44 @@ void benchmark_parallel_mode(const raft::handle_t& handle, const std::string& di
       gpu_timeout++;
     } else {
       gpu_true_mismatch++;
-      std::printf("  [TRUE MISMATCH] %-30s ref{%s it=%d obj=%.10g} gpu{%s it=%d obj=%.10g}\n",
-                  nodes[u]->name.c_str(), ds::dual_status_to_string(nodes[u]->ref_status).c_str(),
-                  nodes[u]->ref_iters, nodes[u]->ref_obj,
-                  ds::dual_status_to_string(gpu_status[k]).c_str(), prepared[k]->sol.iterations,
-                  gobj);
+      // COLLAPSE IDENTICAL LINES instead of printing one per problem. With --replicas 100 every
+      // mismatching node would otherwise emit 100 byte-identical lines, burying the ~50 distinct
+      // findings in thousands of rows.
+      //
+      // The key is the WHOLE line, not the node name: replicas of one node are not guaranteed to
+      // agree with each other (the GPU result for one node can depend on the batch it was launched
+      // in), so two different outcomes for the same node must both survive and be
+      // counted separately. Only truly identical results merge.
+      char buf[256];
+      std::snprintf(buf, sizeof(buf),
+                    "  [TRUE MISMATCH] %-30s ref{%s it=%d obj=%.10g} gpu{%s it=%d obj=%.10g}",
+                    nodes[u]->name.c_str(), ds::dual_status_to_string(nodes[u]->ref_status).c_str(),
+                    nodes[u]->ref_iters, nodes[u]->ref_obj,
+                    ds::dual_status_to_string(gpu_status[k]).c_str(), prepared[k]->sol.iterations,
+                    gobj);
+      const std::string line(buf);
+      auto it = mismatch_index.find(line);
+      if (it == mismatch_index.end()) {
+        mismatch_index.emplace(line, mismatch_lines.size());
+        mismatch_lines.emplace_back(line, 1);
+      } else {
+        mismatch_lines[it->second].second++;
+      }
     }
+  }
+  // Emitted in first-seen order (which is block order, i.e. heavy-first), each with the number of
+  // problems that produced it. The "(xN)" suffix is appended AFTER the closing gpu{...} brace so a
+  // log parser keyed on that brace still matches unchanged.
+  for (const auto& ml : mismatch_lines) {
+    if (ml.second > 1) {
+      std::printf("%s  (x%d identical problems)\n", ml.first.c_str(), ml.second);
+    } else {
+      std::printf("%s\n", ml.first.c_str());
+    }
+  }
+  if (!mismatch_lines.empty()) {
+    std::printf("  [TRUE MISMATCH] %zu distinct result(s) over %d mismatching problem(s).\n",
+                mismatch_lines.size(), gpu_true_mismatch);
   }
   const double gpu_e2e_s = gpu_setup_s + timing.upload_s + timing.kernel_s + timing.copyback_s;
 
@@ -1384,9 +1441,25 @@ void benchmark_parallel_mode(const raft::handle_t& handle, const std::string& di
     total_iters += nodes[u]->ref_iters;
     max_iters = std::max(max_iters, nodes[u]->ref_iters);
   }
+  // The GPU's OWN pivot count. This must be reported separately from the CPU reference total above:
+  // the reference is produced by the CPU driver, so it does NOT move when a GPU-side switch changes
+  // (reprice, driver, launch-bound regime). Reading the CPU line during a GPU A/B makes two genuinely
+  // different configurations look identical, and reading it as "pivots" makes any ms/pivot figure
+  // wrong on both sides. That mistake produced a confidently inverted performance conclusion on
+  // 2026-08-12; the two lines are now labelled so it cannot recur.
+  size_t gpu_total_iters = 0;
+  int gpu_max_iters      = 0;
+  for (size_t k = 0; k < Ntot; ++k) {
+    const int it = prepared[k]->sol.iterations;
+    gpu_total_iters += static_cast<size_t>(it);
+    gpu_max_iters = std::max(gpu_max_iters, it);
+  }
   std::printf("\n==== parallel throughput: %zu problems (%d unique x%d) ====\n", Ntot, uc, replicas);
-  std::printf("total simplex iterations : %zu   (max single node %d, mean %.0f)\n", total_iters,
-              max_iters, static_cast<double>(total_iters) / static_cast<double>(Ntot));
+  std::printf("total simplex iterations (CPU reference) : %zu   (max single node %d, mean %.0f)\n",
+              total_iters, max_iters, static_cast<double>(total_iters) / static_cast<double>(Ntot));
+  std::printf("total simplex iterations (GPU actual)    : %zu   (max single node %d, mean %.0f)\n",
+              gpu_total_iters, gpu_max_iters,
+              static_cast<double>(gpu_total_iters) / static_cast<double>(Ntot));
 
   // Heaviest unique nodes (the tail that dominates the single-thread GPU kernel). Depth is shown
   // to confirm it does NOT predict iterations (heavy nodes are shallow) — hence the iters-based sort.
