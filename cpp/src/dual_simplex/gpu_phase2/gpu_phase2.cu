@@ -37,6 +37,8 @@
 #include <utilities/manual_cuda_graph.cuh>   // run_while: the device-controlled super-step loop
 
 #include <rmm/cuda_stream.hpp>
+#include <cub/device/device_memcpy.cuh>
+#include <rmm/device_buffer.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cuda/std/limits>
@@ -1486,6 +1488,12 @@ __device__ int warp_build_levels(const gpu_csc_view& mat, bool diag_first, bool 
   level_start.assign(nlev + 1, 0);
   for (i_t j = 0; j < m; ++j) { if (!is_noop(j)) { level_start[level[j]]++; } }
   for (i_t k = 1; k <= nlev; ++k) { level_start[k] += level_start[k - 1]; }
+  // MEASURED, do not "optimize" this away: hoisting `pos` into a reused slot buffer to avoid the
+  // per-call device malloc is bit-exact but worth ~0.7% of block time even on the 1-2 iteration
+  // nodes, and it was NOT the cost of this counting sort (the six O(m) passes below are). It also
+  // needs either a 16th (m+1) arena array -- which grew static VRAM enough to break the lazily
+  // reserved malloc heap at 1,200 problems, cudaErrorLaunchOutOfResources -- or aliasing sp_pos_v,
+  // which silently couples this to the sparse solve's scratch.
   gpu_vector<i_t> pos(nlev + 1);
   for (i_t lv = 1; lv <= nlev; ++lv) { pos[lv] = level_start[lv - 1]; }
   for (i_t j = 0; j < m; ++j) {
@@ -3599,7 +3607,8 @@ __device__ void warp_build_config(const gpu_basis_update_mpf& ft, warp_solve_con
     // are separate specialized functions that encode their own direction, so building the schedule
     // is the only thing that still needs them. op_* are constexpr FUNCTIONS, hence callable here
     // with a runtime `o` -- no materialized flag array required.
-    cfg.nlev[o]  = warp_build_levels(*mats[o], op_diag_first(o), op_ascending(o), lev[o], ls[o], co[o]);
+    cfg.nlev[o]  = warp_build_levels(*mats[o], op_diag_first(o), op_ascending(o), lev[o], ls[o],
+                                     co[o]);
     cfg.lstart[o]     = ls[o].data();
     cfg.corder[o]     = co[o].data();
     cfg.level[o]      = lev[o].data();  // per-column level, retained for the reach-restricted sparse solve
@@ -3792,32 +3801,49 @@ __global__ void __launch_bounds__(32, MinBlocks) gpu_phase2_kernel_direct(kernel
 // Unrelated finding left by that work, worth a separate look: this marshaller actually requests
 // 85.6 GiB over 525,500 allocations (~5.85 MB/problem) at 15,000 problems, while the pre-flight
 // reports `static 52.58 GB` (~3.5 MB/problem) -- a 1.75x under-count in the VRAM budget.
+// Marshalling storage. Every per-problem input buffer is an rmm::device_buffer allocated from the
+// CURRENT device resource -- the same convention as the rest of cuOpt. Installing and sizing the
+// pool is the APPLICATION's job (rmm::mr::set_current_device_resource; see cuopt's grpc_worker, and
+// test_netlib for the benchmark). This file deliberately does not install a resource of its own.
+//
+// Why it matters: the raw path cost 41,300 cudaMallocs (0.234 s) plus ~42,000 cudaFrees per
+// 1,200-problem batch -- call-count bound, not bytes bound. device_buffer is also what makes pooling
+// possible at all, since RMM's deallocate needs the original size a bare pointer does not carry.
+// Owns every device_buffer handed out for one problem. Destroying it returns the memory to the pool,
+// so free_kernel_args no longer frees these pointers.
+struct marshal_storage {
+  std::vector<rmm::device_buffer> bufs;
+  // The CSR transpose is built here and its host storage must outlive marshal_problem.
+  std::vector<cuopt::mathematical_optimization::csr_matrix_t<i_t, f_t>> arow_keep;
+  marshal_storage() { bufs.reserve(40); }   // ~34 buffers per problem; avoid vector churn
+};
+
 template <typename T>
-static T* upload(const std::vector<T>& v)
+static T* upload(const std::vector<T>& v, marshal_storage& st)
 {
-  T* d = nullptr;
   const size_t bytes = (v.empty() ? 1 : v.size()) * sizeof(T);
-  RAFT_CUDA_TRY(cudaMalloc(&d, bytes));
-  if (!v.empty()) { RAFT_CUDA_TRY(cudaMemcpy(d, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice)); }
-  return d;
+  if (v.empty()) { st.bufs.emplace_back(bytes, rmm::cuda_stream_default); }
+  else { st.bufs.emplace_back(v.data(), bytes, rmm::cuda_stream_default); }
+  return static_cast<T*>(st.bufs.back().data());
 }
 
 template <typename T>
-static T* upload_n(const T* p, size_t count)
+static T* upload_n(const T* p, size_t count, marshal_storage& st)
 {
-  T* d = nullptr;
-  RAFT_CUDA_TRY(cudaMalloc(&d, (count == 0 ? 1 : count) * sizeof(T)));
-  if (count > 0) { RAFT_CUDA_TRY(cudaMemcpy(d, p, count * sizeof(T), cudaMemcpyHostToDevice)); }
-  return d;
+  const size_t bytes = (count == 0 ? 1 : count) * sizeof(T);
+  if (count == 0) { st.bufs.emplace_back(bytes, rmm::cuda_stream_default); }
+  else { st.bufs.emplace_back(p, bytes, rmm::cuda_stream_default); }
+  return static_cast<T*>(st.bufs.back().data());
 }
 
 template <typename T>
-static T* alloc_zeroed(size_t count)
+static T* alloc_zeroed(size_t count, marshal_storage& st)
 {
-  T* d = nullptr;
-  RAFT_CUDA_TRY(cudaMalloc(&d, (count == 0 ? 1 : count) * sizeof(T)));
-  RAFT_CUDA_TRY(cudaMemset(d, 0, (count == 0 ? 1 : count) * sizeof(T)));
-  return d;
+  const size_t bytes = (count == 0 ? 1 : count) * sizeof(T);
+  st.bufs.emplace_back(bytes, rmm::cuda_stream_default);
+  void* d = st.bufs.back().data();
+  RAFT_CUDA_TRY(cudaMemsetAsync(d, 0, bytes, rmm::cuda_stream_default.value()));
+  return static_cast<T*>(d);
 }
 
 
@@ -3990,24 +4016,67 @@ static bool heap_demand_rejected(size_t demand, size_t granted, size_t requested
 struct ro_upload {
   i_t *A_col_start{}, *A_i{}; f_t* A_x{}; i_t A_nz{};
   f_t *rhs{}, *objective{};
+  // MASTER CSR transpose, uploaded once per distinct A. Each block still needs its OWN mutable Arow
+  // (the nonbasic scan permutes j/x in place), but that copy is made DEVICE-side. Arow was 43% of
+  // all uploaded bytes -- 1.200 GB of 2.813 GB at 1,200 problems -- and every node of a B&B tree
+  // re-sent byte-identical data over PCIe at ~5 GB/s, against ~200 GB/s device-to-device.
+  i_t *Arow_row_start{}, *Arow_j{}; f_t* Arow_x{};
+  size_t Arow_rs_bytes{}, Arow_j_bytes{}, Arow_x_bytes{};
 };
 
-static ro_upload upload_ro(const lp_problem_t<i_t, f_t>& lp)
+// Device-side fan-out of the master Arow into each block's private copy: one cub batched memcpy.
+struct arow_fanout {
+  std::vector<void*> dsts, srcs;
+  std::vector<size_t> sizes;
+};
+
+// Run the fan-out. cub::DeviceMemcpy::Batched dereferences the buffer pointers ON THE DEVICE, so
+// both sides must be device memory -- which is exactly the case here (master and per-block copies
+// are both device allocations). That is also why it is used for D2D and NOT for the host uploads:
+// a host->device copy belongs on the DMA copy engines, not in a kernel reading over PCIe.
+static void run_arow_fanout(const arow_fanout& fan, marshal_storage& st, cudaStream_t stream)
+{
+  const size_t n = fan.dsts.size();
+  if (n == 0) { return; }
+  // The three descriptor arrays must themselves live on the device.
+  st.bufs.emplace_back(fan.srcs.data(),  n * sizeof(void*),  rmm::cuda_stream_default);
+  void** d_src = static_cast<void**>(st.bufs.back().data());
+  st.bufs.emplace_back(fan.dsts.data(),  n * sizeof(void*),  rmm::cuda_stream_default);
+  void** d_dst = static_cast<void**>(st.bufs.back().data());
+  st.bufs.emplace_back(fan.sizes.data(), n * sizeof(size_t), rmm::cuda_stream_default);
+  size_t* d_sz = static_cast<size_t*>(st.bufs.back().data());
+
+  size_t temp_bytes = 0;
+  RAFT_CUDA_TRY(cub::DeviceMemcpy::Batched(nullptr, temp_bytes, d_src, d_dst, d_sz,
+                                           static_cast<::cuda::std::int64_t>(n), stream));
+  st.bufs.emplace_back(temp_bytes ? temp_bytes : 1, rmm::cuda_stream_default);
+  RAFT_CUDA_TRY(cub::DeviceMemcpy::Batched(st.bufs.back().data(), temp_bytes, d_src, d_dst, d_sz,
+                                           static_cast<::cuda::std::int64_t>(n), stream));
+}
+
+static ro_upload upload_ro(const lp_problem_t<i_t, f_t>& lp, marshal_storage& st)
 {
   const auto& A = lp.A;
   ro_upload r{};
-  r.A_col_start = upload(A.col_start); r.A_nz = A.nnz();
-  r.A_i = upload_n(A.i.data(), A.nnz()); r.A_x = upload_n(A.x.data(), A.nnz());
-  r.rhs = upload(lp.rhs); r.objective = upload(lp.objective);
+  // Build the CSR transpose ONCE per distinct A and upload it as the fan-out master.
+  st.arow_keep.emplace_back(lp.num_rows, lp.num_cols, A.nnz());
+  auto& Arow_host = st.arow_keep.back();
+  A.to_compressed_row(Arow_host);
+  r.Arow_row_start = upload(Arow_host.row_start, st);
+  r.Arow_j         = upload(Arow_host.j, st);
+  r.Arow_x         = upload(Arow_host.x, st);
+  r.Arow_rs_bytes  = Arow_host.row_start.size() * sizeof(i_t);
+  r.Arow_j_bytes   = Arow_host.j.size() * sizeof(i_t);
+  r.Arow_x_bytes   = Arow_host.x.size() * sizeof(f_t);
+  r.A_col_start = upload(A.col_start, st); r.A_nz = A.nnz();
+  r.A_i = upload_n(A.i.data(), A.nnz(), st); r.A_x = upload_n(A.x.data(), A.nnz(), st);
+  r.rhs = upload(lp.rhs, st); r.objective = upload(lp.objective, st);
   return r;
 }
 
-static void free_ro(const ro_upload& r)
-{
-  for (void* p : {(void*)r.A_col_start, (void*)r.A_i, (void*)r.A_x, (void*)r.rhs, (void*)r.objective}) {
-    if (p) { cudaFree(p); }
-  }
-}
+// Nothing to free: upload_ro's buffers are rmm::device_buffers owned by the caller's
+// marshal_storage, returned to the pool when that is destroyed.
+static void free_ro(const ro_upload&) {}
 
 // Bytes of ORDINARY VRAM to give one slot's gpu_arena.
 //
@@ -4048,7 +4117,9 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
                                    std::vector<i_t>& nonbasic_list,
                                    lp_solution_t<i_t, f_t>& sol,
                                    std::vector<f_t>& delta_y_steepest_edge,
-                                   const ro_upload* ro = nullptr)
+                                   const ro_upload* ro,
+                                   marshal_storage& st,
+                                   arow_fanout* fan = nullptr)
 {
   const int m = lp.num_rows;
   const int n = lp.num_cols;
@@ -4072,9 +4143,9 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
     a.A_col_start = ro->A_col_start; a.A_nz = ro->A_nz; a.A_i = ro->A_i; a.A_x = ro->A_x;
     a.rhs = ro->rhs; a.objective = ro->objective;
   } else {
-    a.A_col_start = upload(A.col_start); a.A_nz = A.nnz();
-    a.A_i = upload_n(A.i.data(), A.nnz()); a.A_x = upload_n(A.x.data(), A.nnz());
-    a.rhs = upload(lp.rhs); a.objective = upload(lp.objective);
+    a.A_col_start = upload(A.col_start, st); a.A_nz = A.nnz();
+    a.A_i = upload_n(A.i.data(), A.nnz(), st); a.A_x = upload_n(A.x.data(), A.nnz(), st);
+    a.rhs = upload(lp.rhs, st); a.objective = upload(lp.objective, st);
   }
   // Arow (host-built CSR of A) is ALWAYS uploaded, sharing or not.
   //
@@ -4088,43 +4159,57 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   // Arow is per-node regardless (its j/x are partitioned in place by the nonbasic scan), so uploading
   // it never duplicated anything shareable. to_compressed_row orders each row by ascending column,
   // matching from_csc bit-for-bit, so results are unchanged.
-  {
-    cuopt::mathematical_optimization::csr_matrix_t<i_t, f_t> Arow_host(m, n, A.nnz());
+  if (ro != nullptr && fan != nullptr && ro->Arow_row_start != nullptr) {
+    // Allocate this block's private Arow and queue a DEVICE-side copy from the shared master, so
+    // 43% of what this function used to send over PCIe becomes a D2D fan-out.
+    auto alloc_from = [&](size_t bytes, void* src) {
+      st.bufs.emplace_back(bytes, rmm::cuda_stream_default);
+      void* d = st.bufs.back().data();
+      fan->dsts.push_back(d); fan->srcs.push_back(src); fan->sizes.push_back(bytes);
+      return d;
+    };
+    a.Arow_row_start = static_cast<i_t*>(alloc_from(ro->Arow_rs_bytes, ro->Arow_row_start));
+    a.Arow_j         = static_cast<i_t*>(alloc_from(ro->Arow_j_bytes,  ro->Arow_j));
+    a.Arow_x         = static_cast<f_t*>(alloc_from(ro->Arow_x_bytes,  ro->Arow_x));
+  } else {
+    // No shared master (single-problem path): build and upload per node, as before.
+    st.arow_keep.emplace_back(m, n, A.nnz());
+    auto& Arow_host = st.arow_keep.back();
     A.to_compressed_row(Arow_host);
-    a.Arow_row_start = upload(Arow_host.row_start);
-    a.Arow_j         = upload(Arow_host.j);
-    a.Arow_x         = upload(Arow_host.x);
+    a.Arow_row_start = upload(Arow_host.row_start, st);
+    a.Arow_j         = upload(Arow_host.j, st);
+    a.Arow_x         = upload(Arow_host.x, st);
   }
   // Per-node (basis- or branch-dependent), always uploaded per item: bounds, the LU factor, row perm.
-  a.lower       = upload(lp.lower);
-  a.upper       = upload(lp.upper);
-  a.L0_col_start = upload(L0.col_start); a.L0_nz = L0.nnz();
-  a.L0_i = upload_n(L0.i.data(), L0.nnz()); a.L0_x = upload_n(L0.x.data(), L0.nnz());
-  a.U0_col_start = upload(U0.col_start); a.U0_nz = U0.nnz();
-  a.U0_i = upload_n(U0.i.data(), U0.nnz()); a.U0_x = upload_n(U0.x.data(), U0.nnz());
-  a.L0t_col_start = upload(L0t.col_start); a.L0t_nz = L0t.nnz();
-  a.L0t_i = upload_n(L0t.i.data(), L0t.nnz()); a.L0t_x = upload_n(L0t.x.data(), L0t.nnz());
-  a.U0t_col_start = upload(U0t.col_start); a.U0t_nz = U0t.nnz();
-  a.U0t_i = upload_n(U0t.i.data(), U0t.nnz()); a.U0t_x = upload_n(U0t.x.data(), U0t.nnz());
-  a.row_perm     = upload(ft.row_permutation());
-  a.inv_row_perm = upload(ft.inverse_row_permutation());
-  a.xi_workspace = alloc_zeroed<int>(2 * m);
-  a.x_workspace  = alloc_zeroed<double>(m);
-  a.reach_mark   = alloc_zeroed<unsigned char>(m);
+  a.lower       = upload(lp.lower, st);
+  a.upper       = upload(lp.upper, st);
+  a.L0_col_start = upload(L0.col_start, st); a.L0_nz = L0.nnz();
+  a.L0_i = upload_n(L0.i.data(), L0.nnz(), st); a.L0_x = upload_n(L0.x.data(), L0.nnz(), st);
+  a.U0_col_start = upload(U0.col_start, st); a.U0_nz = U0.nnz();
+  a.U0_i = upload_n(U0.i.data(), U0.nnz(), st); a.U0_x = upload_n(U0.x.data(), U0.nnz(), st);
+  a.L0t_col_start = upload(L0t.col_start, st); a.L0t_nz = L0t.nnz();
+  a.L0t_i = upload_n(L0t.i.data(), L0t.nnz(), st); a.L0t_x = upload_n(L0t.x.data(), L0t.nnz(), st);
+  a.U0t_col_start = upload(U0t.col_start, st); a.U0t_nz = U0t.nnz();
+  a.U0t_i = upload_n(U0t.i.data(), U0t.nnz(), st); a.U0t_x = upload_n(U0t.x.data(), U0t.nnz(), st);
+  a.row_perm     = upload(ft.row_permutation(), st);
+  a.inv_row_perm = upload(ft.inverse_row_permutation(), st);
+  a.xi_workspace = alloc_zeroed<int>(2 * m, st);
+  a.x_workspace  = alloc_zeroed<double>(m, st);
+  a.reach_mark   = alloc_zeroed<unsigned char>(m, st);
   a.num_updates  = 0;
   a.refactor_frequency = settings.refactor_frequency;
 
-  a.vstatus       = upload(vstatus);
-  a.basic_list    = upload(basic_list);
-  a.nonbasic_list = upload(nonbasic_list);
-  a.x             = upload(sol.x);
-  a.y             = upload(sol.y);
-  a.z             = upload(sol.z);
+  a.vstatus       = upload(vstatus, st);
+  a.basic_list    = upload(basic_list, st);
+  a.nonbasic_list = upload(nonbasic_list, st);
+  a.x             = upload(sol.x, st);
+  a.y             = upload(sol.y, st);
+  a.z             = upload(sol.z, st);
   if (delta_y_steepest_edge.empty()) {
-    a.dy_se       = alloc_zeroed<double>(n);
+    a.dy_se       = alloc_zeroed<double>(n, st);
     a.dy_se_empty = 1;
   } else {
-    a.dy_se       = upload(delta_y_steepest_edge);
+    a.dy_se       = upload(delta_y_steepest_edge, st);
     a.dy_se_empty = 0;
   }
 
@@ -4139,15 +4224,15 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   a.steepest_edge_ratio = settings.steepest_edge_ratio;
   a.start_time          = tic();
 
-  a.out_status         = alloc_zeroed<int>(1);
-  a.out_objective      = alloc_zeroed<double>(1);
-  a.out_user_objective = alloc_zeroed<double>(1);
-  a.out_iterations     = alloc_zeroed<int>(1);
+  a.out_status         = alloc_zeroed<int>(1, st);
+  a.out_objective      = alloc_zeroed<double>(1, st);
+  a.out_user_objective = alloc_zeroed<double>(1, st);
+  a.out_iterations     = alloc_zeroed<int>(1, st);
 
   // Persistent per-slot solve state. Allocated ZEROED (the kernel's placement-new relies on that
   // for the slot_live==0 "fresh" test) and sized for the concrete device type. One per problem
   // here.
-  a.slot      = alloc_zeroed<char>(sizeof(slot_state<gpu_basis_update_mpf>));
+  a.slot      = alloc_zeroed<char>(sizeof(slot_state<gpu_basis_update_mpf>), st);
   a.slot_live = 0;
 
   // Per-slot arena for the fixed-size gpu_vector payloads (see gpu_arena / arena_bytes_for).
@@ -4171,31 +4256,11 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   return a;
 }
 
-static void free_kernel_args(const kernel_args& a, bool skip_ro = false)
+// Only `arena` is still a raw cudaMalloc (it is sized from arena_bytes_for and deliberately not
+// zeroed); every other per-problem buffer is an rmm::device_buffer owned by a marshal_storage.
+static void free_kernel_args(const kernel_args& a, bool = false)
 {
-  // Per-item buffers (always owned by this kernel_args). Arow_* are null when RO-shared (no-op frees).
-  // Everything basis-/branch-dependent — the full LU factor (col_start + i + x), row perm, and the
-  // branching bounds — is per-node and freed here even when RO-shared.
-  for (void* p : {(void*)a.Arow_row_start, (void*)a.Arow_j, (void*)a.Arow_x,
-                  (void*)a.L0_col_start, (void*)a.L0_i, (void*)a.L0_x,
-                  (void*)a.U0_col_start, (void*)a.U0_i, (void*)a.U0_x,
-                  (void*)a.L0t_col_start, (void*)a.L0t_i, (void*)a.L0t_x,
-                  (void*)a.U0t_col_start, (void*)a.U0t_i, (void*)a.U0t_x,
-                  (void*)a.row_perm, (void*)a.inv_row_perm,
-                  (void*)a.lower, (void*)a.upper,
-                  (void*)a.xi_workspace, (void*)a.x_workspace, (void*)a.reach_mark,
-                  (void*)a.vstatus,
-                  (void*)a.basic_list, (void*)a.nonbasic_list, (void*)a.x, (void*)a.y, (void*)a.z,
-                  (void*)a.dy_se, (void*)a.out_status, (void*)a.out_objective,
-                  (void*)a.out_user_objective, (void*)a.out_iterations,
-                  (void*)a.slot, (void*)a.arena}) {
-    if (p) { cudaFree(p); }
-  }
-  if (skip_ro) { return; }  // read-only buffers (A CSC + rhs + objective) shared → freed once via free_ro
-  for (void* p : {(void*)a.A_col_start, (void*)a.A_i, (void*)a.A_x,
-                  (void*)a.rhs, (void*)a.objective}) {
-    if (p) { cudaFree(p); }
-  }
+  if (a.arena) { cudaFree(a.arena); }
 }
 
 // Exact device bytes marshal_problem cudaMallocs for one problem's STATIC buffers (read-only
@@ -4287,8 +4352,10 @@ dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
     ensure_device_limits(heap);
   }
 
+  // Owns every uploaded buffer for this solve; destroyed at scope exit, returning them to the pool.
+  marshal_storage store;
   kernel_args a = marshal_problem(lp, settings, vstatus, ft, basic_list, nonbasic_list, sol,
-                                  delta_y_steepest_edge);
+                                  delta_y_steepest_edge, nullptr, store);
 
   // Reset the shared alloc-failed flag from the host (the kernel no longer does it).
   const int zero_flag = 0;
@@ -4415,14 +4482,23 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
   const double up_t0 = tic();
   std::vector<kernel_args> h_args(N);
   std::unordered_map<const void*, ro_upload> ro_cache;
+  // One storage per problem, plus one for the deduped read-only uploads. These own every
+  // device_buffer for the batch and MUST outlive the kernel launch below.
+  std::vector<marshal_storage> store(N);
+  marshal_storage ro_store;
+  arow_fanout fan;
   for (size_t b = 0; b < N; ++b) {
     const auto& it = items[b];
-    auto res = ro_cache.try_emplace(static_cast<const void*>(it.lp));
-    if (res.second) { res.first->second = upload_ro(*it.lp); }
+    // Key on A's storage, not on the lp object. Every node of a branch-and-bound tree shares the
+    // SAME constraint matrix while carrying its own bounds and LU, so each node is a distinct
+    // lp_problem_t -- keying on `it.lp` would miss the sharing that actually exists.
+    auto res = ro_cache.try_emplace(static_cast<const void*>(it.lp->A.col_start.data()));
+    if (res.second) { res.first->second = upload_ro(*it.lp, ro_store); }
     const ro_upload* ro = &res.first->second;
     h_args[b] = marshal_problem(*it.lp, *it.settings, *it.vstatus, *it.ft, *it.basic_list,
-                                *it.nonbasic_list, *it.sol, *it.dy_se, ro);
+                                *it.nonbasic_list, *it.sol, *it.dy_se, ro, store[b], &fan);
   }
+  run_arow_fanout(fan, ro_store, rmm::cuda_stream_default.value());
   kernel_args* d_args = nullptr;
   RAFT_CUDA_TRY(cudaMalloc(&d_args, N * sizeof(kernel_args)));
   RAFT_CUDA_TRY(cudaMemcpy(d_args, h_args.data(), N * sizeof(kernel_args), cudaMemcpyHostToDevice));

@@ -1632,6 +1632,17 @@ int main(int argc, char* argv[])
   cuopt::init_logger_t logger("", true);
   cuopt::default_logger().set_pattern("%v");
 
+  // Set up the RMM memory pool, exactly as run_pdlp.cu does. Installing the device resource is the
+  // APPLICATION's job, not the solver's: gpu_phase2 allocates rmm::device_buffers from whatever
+  // resource is current, so without a pool here every marshalled buffer is its own cudaMalloc
+  // (measured: 41,300 cudaMallocs, 0.234 s, on a 1,200-problem batch).
+  //
+  // NOTE make_pool() reserves 40% of FREE VRAM up front. The batch pre-flight then sizes the
+  // in-kernel malloc heap from what is left, so on a card already at its ceiling (12 replicas here)
+  // the two compete -- see the heap note in gpu_phase2's ensure_device_limits.
+  auto memory_resource = make_pool();
+  rmm::mr::set_current_device_resource(memory_resource);
+
   const raft::handle_t handle{};
 
   // --verify-nodes mode: replay dumped B&B node samples and exit.
