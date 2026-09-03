@@ -641,41 +641,24 @@ __device__ f_t sparse_dot(const i_t* xind, const f_t* xval, i_t nx, const i_t* y
 //   Lᵀ-solve -> L0_              first  ascending     deps>j, process desc
 //   Uᵀ-solve -> U0_              last   ascending     deps<j, process asc
 // ---------------------------------------------------------------------------
-// The four dense triangular-solve operators the warp path parallelizes. Their values
-// are the indices into every per-operator array in warp_solve_config (and the order in
-// which warp_build_config fills them). WARP_TLOOP is a non-solve collective (the MPF
-// rank-1 replay) handled via the tl_* fields, so it never indexes a per-operator array.
-// WARP_DONE is the "no work left" sentinel, placed one past every real op.
-static constexpr int kNumWarpSolveOps = 4;  // L, U, Lᵀ, Uᵀ
-// Per-operator gather flags for warp_solve_op {L, U, Lᵀ, Uᵀ} = {0, 1, 2, 3}. SINGLE SOURCE OF TRUTH:
-// warp_build_config fills cfg.diag_first/descending/incremental from these, the big-path body reads
-// them, and dense_triangle_solve.cuh's four named entry points hard-code the SAME triples. Changing
-// one without the others silently changes which solve is computed.
-//   df  {false, true,  true,  false}
-//   dsc {false, true,  false, false}
-//   inc {true,  true,  false, false}
-// constexpr FUNCTIONS, not arrays: a namespace-scope constexpr array has no device storage, so
-// device code cannot index it. These are usable from host and device and inside constant expressions.
+// The four dense triangular-solve operators the warp path parallelizes, {L, U, Lt, Ut} = {0,1,2,3}.
+// Their values are the indices into every per-operator array in warp_solve_config, and the order in
+// which warp_build_config fills them. They are compile-time template arguments
+// (warp_dispatch<Op> -> dts::wavefront_solve_op<Op>), never runtime values.
+//
+// These were part of a 16-entry `enum warp_solve_op` naming every collective, because the
+// parked-helper model posted an OP CODE to the waiting lanes. That dispatch is gone -- each
+// collective is now called directly -- so the other twelve enumerators had no use left anywhere.
+static constexpr int kNumWarpSolveOps = 4;
+static constexpr int WARP_L_SOLVE = 0, WARP_U_SOLVE = 1, WARP_LT_SOLVE = 2, WARP_UT_SOLVE = 3;
+
 // The two schedule flags warp_build_levels needs, for op {L, U, Lt, Ut} = {0, 1, 2, 3}.
 // diag_first: the column's diagonal is the FIRST entry of its CSC column rather than the last.
 // ascending : the level pull walks columns j = 0..m-1 rather than m-1..0.
+// constexpr FUNCTIONS, not arrays: a namespace-scope constexpr array has no device storage, so
+// device code cannot index it. These are usable from host and device and in constant expressions.
 __host__ __device__ constexpr bool op_diag_first(int op) { return op == 1 || op == 2; }
 __host__ __device__ constexpr bool op_ascending(int op) { return op == 0 || op == 3; }
-enum warp_solve_op {
-  WARP_L_SOLVE = 0, WARP_U_SOLVE = 1, WARP_LT_SOLVE = 2, WARP_UT_SOLVE = 3,
-  WARP_TLOOP     = kNumWarpSolveOps,     // 4: MPF rank-1 T-loop (uses tl_* fields, not cs[op]/nlev[op])
-  WARP_DZ        = kNumWarpSolveOps + 1, // 5: reduced-cost SpMv δz = -A_N'·δy (uses dz_* fields)
-  WARP_TODENSE   = kNumWarpSolveOps + 2, // 6: sparse→dense scatter (td_* fields)
-  WARP_FROMDENSE = kNumWarpSolveOps + 3, // 7: dense→sparse compaction (fd_* fields)
-  WARP_RT        = kNumWarpSolveOps + 4, // 8: dual ratio test min-argmin (rt_* fields)
-  WARP_SEUPD     = kNumWarpSolveOps + 5, // 9: SE-norm update loop over scaled_delta_xB (su_* fields)
-  WARP_PINF      = kNumWarpSolveOps + 6, // 10: primal infeasibility scan over m (pi_* fields)
-  WARP_UPDDUAL   = kNumWarpSolveOps + 7, // 11: update_dual_variables y/z update (ud_* fields)
-  WARP_DZSCAT    = kNumWarpSolveOps + 8, // 12: scatter δz (CSR row-wise, inner span warp-parallel; dzs_*)
-  WARP_SPTRSV    = kNumWarpSolveOps + 9, // 13: reach-restricted sparse gather solve (sp_* fields)
-  WARP_NBE       = kNumWarpSolveOps + 10,// 14: compute_initial_nonbasic_end row partition (nbe_* fields)
-  WARP_DONE      = kNumWarpSolveOps + 11 // 15: sentinel — never indexes a per-op array
-};
 
 // Trivially constructible (no member initializers) so it can be a __shared__
 // variable. Lane 0 fills every field (warp_build_config + warp_dispatch) before
@@ -2026,7 +2009,6 @@ struct gpu_basis_update_mpf {
     const i_t m         = L0_.m;
     const i_t col_start = S.col_start[col];
     const i_t col_end   = S.col_start[col + 1];
-    i_t nz_start        = nz;
     for (i_t p = col_start; p < col_end; ++p) {
       const i_t i = S.i[p];
       if (!mark[i]) {
@@ -3037,7 +3019,6 @@ __device__ void set_primal_variables_on_bounds(const gpu_lp& lp,
 // ---------------------------------------------------------------------------
 template <class FT>
 struct slot_state {
-  bool inited{false};
   // Stored as i_t so the host can read it back as a plain int array.
   i_t status{static_cast<i_t>(dual::status_t::UNSET)};
 
@@ -3272,13 +3253,11 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
   f_t* y = sol.y.data();
   f_t* z = sol.z.data();
 
-  // One-time prologue into the persistent slot. Already-inited slots (a re-entered
-  // re-entering mid-solve) skip straight to the pivot loop.
-  if (!st.inited) {
-    st.setup(
-      lp, settings, vstatus, basic_list, nonbasic_list, sol, delta_y_steepest_edge, dy_se_empty);
-    lane0_serial([&] { st.inited = true; });   // RMW on slot state
-  }
+  // Prologue into the slot. Unconditional: one launch is one solve, so this always runs. It used to
+  // be guarded by st.inited so a re-entering fission super-step could skip it and reuse the live
+  // state; there are no super-steps any more.
+  st.setup(
+    lp, settings, vstatus, basic_list, nonbasic_list, sol, delta_y_steepest_edge, dy_se_empty);
 
   // Bind the persistent slot members under their original names, so the pivot loop below is
   // unchanged by the state externalization and stays line-diffable against the CPU simplified
@@ -3536,10 +3515,8 @@ struct kernel_args {
   // Per-slot PERSISTENT solve state (slot_state<FT>): host-allocated, ZEROED blob that the kernel
   // placement-news into on first entry and reuses thereafter. This is what lets the per-pivot
   // workspaces + ft's mutable state (S_, routing stats, scratch) outlive a single kernel launch —
-  // the precondition for splitting the driver into per-primitive kernels. `slot_live` is the
   // host-visible "already constructed" flag (0 = fresh node → construct + run setup).
   void* slot;
-  i_t   slot_live;
   // Per-slot ARENA for the fixed-size gpu_vector payloads (see gpu_arena). Ordinary cudaMalloc VRAM,
   // so it is NOT subject to the driver's ~16 GB in-kernel malloc cap -- which is what used to set the
   // batch-size ceiling. Null/0 is legal and simply leaves every buffer on device malloc().
@@ -3596,8 +3573,7 @@ __device__ void warp_build_config(const gpu_basis_update_mpf& ft, warp_solve_con
   cfg.sp_co  = sp_co_v.data();
   cfg.sp_ls  = sp_ls_v.data();
   cfg.sp_pos = sp_pos_v.data();
-  // op order: L, U, Lᵀ, Uᵀ (see warp_solve_op). Gather matrix + flags per op.
-  // Indexed by warp_solve_op: {L, U, Lᵀ, Uᵀ}.
+  // op order: L, U, Lᵀ, Uᵀ. Gather matrix + flags per op.
   const gpu_csc_view* mats[kNumWarpSolveOps] = {&ft.L0_transpose_, &ft.U0_transpose_, &ft.L0_, &ft.U0_};
   for (int o = 0; o < kNumWarpSolveOps; ++o) {
     cfg.cs[o]         = mats[o]->col_start.data();
@@ -3670,18 +3646,14 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args)
   settings.steepest_edge_ratio = a.steepest_edge_ratio;
   settings.refactor_frequency  = a.refactor_frequency;
 
-  // Per-slot PERSISTENT state (see slot_state). The host hands us a zeroed blob sized for
-  // slot_state<FT>; construct it in place on first entry, then wire the read-only factorization
-  // views into its ft. `slot_live` is the host's per-slot "already constructed" flag: it stays 0
-  // for a fresh node (construct + run setup) and is set to 1 below, so a later
-  // super-step re-entering the same slot reuses the live state (S_, routing stats, workspaces)
-  // instead of rebuilding it.
+  // Per-slot state (see slot_state). The host hands us a zeroed blob sized for slot_state<FT>;
+  // construct it in place and wire the read-only factorization views into its ft. This is
+  // unconditional -- the blob is freshly zeroed per launch. It used to be guarded by the host's
+  // that flag to 1 once the super-steps were removed.
   slot_state<FT>& st = *static_cast<slot_state<FT>*>(a.slot);
-  // One-time construction: placement-new, ft wiring and S_.init_empty (which resizes -> mallocs) are
-  // all one-time RMW on shared state, so under Direct they belong to lane 0 alone.
-  // does exactly this.
+  // placement-new, ft wiring and S_.init_empty (which resizes -> mallocs) are all RMW on shared
+  // state, so under Direct they belong to lane 0 alone.
   lane0_serial([&] {
-  if (a.slot_live == 0) {
     new (&st) slot_state<FT>();  // placement new: host memory is zeroed, NSDMIs must run
     // Wire the arena BEFORE anything can allocate. Everything below (ft wiring, S_.init_empty, the
     // whole prologue) resizes buffers, and bind_arena only takes effect on a not-yet-allocated one.
@@ -3703,8 +3675,7 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args)
     ft.reach_mark_              = gpu_span<unsigned char>(a.reach_mark, m);
     ft.S_.init_empty(m);
     ft.hypersparse_threshold_ = 0.05;
-  }
-  });   // end one-time lane-0 construction
+  });   // end lane-0 construction
   FT& ft = st.ft;
 
   gpu_solution sol;
@@ -4230,10 +4201,8 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   a.out_iterations     = alloc_zeroed<int>(1, st);
 
   // Persistent per-slot solve state. Allocated ZEROED (the kernel's placement-new relies on that
-  // for the slot_live==0 "fresh" test) and sized for the concrete device type. One per problem
   // here.
   a.slot      = alloc_zeroed<char>(sizeof(slot_state<gpu_basis_update_mpf>), st);
-  a.slot_live = 0;
 
   // Per-slot arena for the fixed-size gpu_vector payloads (see gpu_arena / arena_bytes_for).
   // Deliberately NOT zeroed: device malloc() hands back uninitialised memory, so zeroing here would
