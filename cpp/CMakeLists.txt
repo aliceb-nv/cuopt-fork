@@ -774,49 +774,64 @@ target_link_libraries(cuopt_objs
 )
 
 # ##################################################################################################
+# - cuopt_static ----------------------------------------------------------------------------------
+#
+# Deliberately OUTSIDE `if (BUILD_TESTS)`. It is a thin archive of objects that are compiled anyway
+# for libcuopt.so ($<TARGET_OBJECTS:cuopt_objs>), so defining it unconditionally costs one `ar`
+# invocation and no extra compilation.
+#
+# It has to be unconditional because `test_netlib` links it, and that target is built with
+# `build.sh libcuopt --skip-tests-build` (BUILD_TESTS=OFF). When cuopt_static is not a CMake target,
+# `target_link_libraries(test_netlib PUBLIC cuopt_static)` does NOT fail -- CMake silently treats the
+# name as a plain `-lcuopt_static` link flag, propagating none of the PUBLIC include directories.
+# The build then dies far away with `cuopt/mathematical_optimization/io/parser.hpp: No such file or
+# directory`, which looks like a missing header rather than a missing target.
+
+add_library(cuopt_static STATIC $<TARGET_OBJECTS:cuopt_objs>)
+target_link_libraries(cuopt_static
+        PUBLIC
+        CUDA::cublas
+        CUDA::cusparse
+        rmm::rmm
+        rapids_logger::rapids_logger
+        CCCL::CCCL
+        raft::raft
+        ${CUDSS_LIB_FILE}
+        OpenMP::OpenMP_CXX
+        PRIVATE
+        ${CUOPT_PRIVATE_CUDA_LIBS}
+        nccl_external
+        $<$<BOOL:${CUOPT_ENABLE_GRPC}>:protobuf::libprotobuf>
+        $<$<BOOL:${CUOPT_ENABLE_GRPC}>:gRPC::grpc++>
+)
+# Internal test sources include OMP-dependent headers (omp_helpers.hpp, omp_atomic_t).
+# Propagate -fopenmp for CUDA TUs since OpenMP::OpenMP_CXX only covers CXX.
+target_compile_options(cuopt_static INTERFACE
+        "$<$<COMPILE_LANGUAGE:CUDA>:-fopenmp>"
+)
+target_include_directories(cuopt_static
+        PUBLIC
+        "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+        "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>"
+        "$<INSTALL_INTERFACE:include>"
+)
+target_compile_definitions(cuopt_static PUBLIC
+        CUOPT_CUDA_ARCHITECTURES="${JOINED_CUDA_ARCHITECTURES}"
+        CUOPT_CPU_ARCHITECTURE="${CMAKE_SYSTEM_PROCESSOR}"
+        "CUOPT_LOG_ACTIVE_LEVEL=RAPIDS_LOGGER_LOG_LEVEL_${LIBCUOPT_LOGGING_LEVEL}"
+        CUSPARSE_ENABLE_EXPERIMENTAL_API
+)
+target_link_libraries(cuopt_static PRIVATE $<TARGET_FILE:PSLP>)
+add_dependencies(cuopt_static PSLP)
+target_link_libraries(cuopt_static PRIVATE $<TARGET_FILE:KaMinPar::KaMinPar>)
+if (TARGET KaMinPar)
+    add_dependencies(cuopt_static KaMinPar)
+endif ()
+
+# ##################################################################################################
 # - generate tests --------------------------------------------------------------------------------
 if (BUILD_TESTS)
     include(CTest)
-    add_library(cuopt_static STATIC $<TARGET_OBJECTS:cuopt_objs>)
-    target_link_libraries(cuopt_static
-            PUBLIC
-            CUDA::cublas
-            CUDA::cusparse
-            rmm::rmm
-            rapids_logger::rapids_logger
-            CCCL::CCCL
-            raft::raft
-            ${CUDSS_LIB_FILE}
-            OpenMP::OpenMP_CXX
-            PRIVATE
-            ${CUOPT_PRIVATE_CUDA_LIBS}
-            nccl_external
-            $<$<BOOL:${CUOPT_ENABLE_GRPC}>:protobuf::libprotobuf>
-            $<$<BOOL:${CUOPT_ENABLE_GRPC}>:gRPC::grpc++>
-    )
-    # Internal test sources include OMP-dependent headers (omp_helpers.hpp, omp_atomic_t).
-    # Propagate -fopenmp for CUDA TUs since OpenMP::OpenMP_CXX only covers CXX.
-    target_compile_options(cuopt_static INTERFACE
-            "$<$<COMPILE_LANGUAGE:CUDA>:-fopenmp>"
-    )
-    target_include_directories(cuopt_static
-            PUBLIC
-            "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
-            "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>"
-            "$<INSTALL_INTERFACE:include>"
-    )
-    target_compile_definitions(cuopt_static PUBLIC
-            CUOPT_CUDA_ARCHITECTURES="${JOINED_CUDA_ARCHITECTURES}"
-            CUOPT_CPU_ARCHITECTURE="${CMAKE_SYSTEM_PROCESSOR}"
-            "CUOPT_LOG_ACTIVE_LEVEL=RAPIDS_LOGGER_LOG_LEVEL_${LIBCUOPT_LOGGING_LEVEL}"
-            CUSPARSE_ENABLE_EXPERIMENTAL_API
-    )
-    target_link_libraries(cuopt_static PRIVATE $<TARGET_FILE:PSLP>)
-    add_dependencies(cuopt_static PSLP)
-    target_link_libraries(cuopt_static PRIVATE $<TARGET_FILE:KaMinPar::KaMinPar>)
-    if (TARGET KaMinPar)
-        add_dependencies(cuopt_static KaMinPar)
-    endif ()
     add_subdirectory(tests)
 endif (BUILD_TESTS)
 
@@ -1090,6 +1105,53 @@ if (BUILD_LP_BENCHMARKS)
         target_link_options(solve_LP PRIVATE -Wl,--enable-new-dtags)
     endif ()
 endif ()
+
+# ##################################################################################################
+# - test_netlib - dual-simplex NETLIB + node-verify / GPU throughput harness (local dev/benchmark) -
+#
+# Restored for the Hiverge GPU dual-simplex campaign. The evaluator drives exactly one mode of it,
+# `--benchmark-parallel <nodes-dir> --replicas N --time-limit S`, and scores the "kernel (device
+# compute)" line. Declared OUTSIDE the BUILD_LP_BENCHMARKS guard on purpose: that option is OFF by
+# default and the campaign must not depend on remembering to pass it.
+#
+# gpu_phase2.cu is compiled ONLY into this target, which is what lets the two source properties
+# below be set per-file instead of via CMAKE_CUDA_FLAGS (global, and would rebuild every CUDA TU in
+# libcuopt for a change that reaches exactly one file).
+add_executable(test_netlib
+    ../benchmarks/linear_programming/cuopt/test_netlib.cu
+    src/dual_simplex/gpu_phase2/gpu_phase2.cu)
+
+# --fmad=false: no FMA contraction, so the device arithmetic matches the CPU
+#   simplified_dual_phase2 reference bit-for-bit. Every triangular-solve inner loop is
+#   `sum += val[p] * x[ri[p]]`; FFMA rounds a*b+c once where the CPU rounds twice, and the dot
+#   products then drift in the last bits. nvcc's DEFAULT IS --fmad=true, so leaving this unset is
+#   not neutral -- it silently gives up the CPU-vs-GPU cross-check that the harness's correctness
+#   gate leans on. It is also what the previous campaign measured at, so scores stay comparable.
+#
+# --split-compile=1: overrides the global --split-compile=0 (enabled whenever PARALLEL_LEVEL is
+#   set, i.e. by build.sh). --split-compile=0 makes CUDA codegen NON-DETERMINISTIC on sm_100:
+#   five compiles of identical source produced five different register allocations for this TU
+#   (128/130/130/178/180 registers = 8 or 16 blocks/SM, a 2x occupancy swing decided by nothing
+#   anyone controls). With =1 the same five compiles are byte-identical. sm_89/L4 is stable either
+#   way, but a campaign whose fitness is wall-clock must not have codegen roulette in it.
+#
+# -Xptxas=-v is a reporting flag only; it changes no code generation.
+set_source_files_properties(src/dual_simplex/gpu_phase2/gpu_phase2.cu PROPERTIES
+    COMPILE_OPTIONS "--fmad=false;--split-compile=1;-Xptxas=-v")
+
+set_target_properties(test_netlib PROPERTIES CXX_SCAN_FOR_MODULES OFF)
+target_include_directories(test_netlib PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_compile_options(test_netlib
+    PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>"
+    "$<$<COMPILE_LANGUAGE:CUDA>:${CUOPT_CUDA_FLAGS}>")
+# solution.hpp's omp_atomic_t<> is only defined under _OPENMP; pass -fopenmp to the CUDA host
+# compiler (flag only, so we do NOT add OpenMP's include dir).
+target_compile_options(test_netlib PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fopenmp>")
+target_link_libraries(test_netlib PUBLIC cuopt_static OpenMP::OpenMP_CXX PRIVATE)
+if (NOT DEFINED INSTALL_TARGET OR "${INSTALL_TARGET}" STREQUAL "")
+    target_link_options(test_netlib PRIVATE -Wl,--enable-new-dtags)
+endif ()
+
 
 # ##################################################################################################
 # - cuopt_grpc_server - gRPC-based remote server --------------------------------------------------
