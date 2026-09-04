@@ -15,8 +15,8 @@ namespace dense_triangle_solve {
 // L/U are scatter (column) form; Lᵀ/Uᵀ are gather form. Arithmetic is unchanged, so results stay
 // bit-for-bit identical.
 
-template <typename i_t, typename f_t>
-__device__ inline void lower_solve(const i_t* cs, const i_t* ri, const f_t* val, f_t* x, i_t n)
+template <typename i_t, typename ri_t, typename f_t>
+__device__ inline void lower_solve(const i_t* cs, const ri_t* ri, const f_t* val, f_t* x, i_t n)
 {
   for (i_t j = 0; j < n; ++j) {
     const i_t c0 = cs[j], c1 = cs[j + 1];
@@ -28,8 +28,8 @@ __device__ inline void lower_solve(const i_t* cs, const i_t* ri, const f_t* val,
   }
 }
 
-template <typename i_t, typename f_t>
-__device__ inline void upper_solve(const i_t* cs, const i_t* ri, const f_t* val, f_t* x, i_t n)
+template <typename i_t, typename ri_t, typename f_t>
+__device__ inline void upper_solve(const i_t* cs, const ri_t* ri, const f_t* val, f_t* x, i_t n)
 {
   for (i_t j = n - 1; j >= 0; --j) {
     const i_t c0 = cs[j], ce = cs[j + 1] - 1;
@@ -41,8 +41,8 @@ __device__ inline void upper_solve(const i_t* cs, const i_t* ri, const f_t* val,
   }
 }
 
-template <typename i_t, typename f_t>
-__device__ inline void lower_transpose_solve(const i_t* cs, const i_t* ri, const f_t* val, f_t* x,
+template <typename i_t, typename ri_t, typename f_t>
+__device__ inline void lower_transpose_solve(const i_t* cs, const ri_t* ri, const f_t* val, f_t* x,
                                              i_t n)
 {
   for (i_t j = n - 1; j >= 0; --j) {
@@ -52,8 +52,8 @@ __device__ inline void lower_transpose_solve(const i_t* cs, const i_t* ri, const
   }
 }
 
-template <typename i_t, typename f_t>
-__device__ inline void upper_transpose_solve(const i_t* cs, const i_t* ri, const f_t* val, f_t* x,
+template <typename i_t, typename ri_t, typename f_t>
+__device__ inline void upper_transpose_solve(const i_t* cs, const ri_t* ri, const f_t* val, f_t* x,
                                              i_t n)
 {
   for (i_t j = 0; j < n; ++j) {
@@ -79,8 +79,8 @@ __device__ inline void upper_transpose_solve(const i_t* cs, const i_t* ri, const
 // specializing/unrolling either one. As template parameters each operator compiles to straight-line
 // code with its own inner loop and no branch. The fission `Direct` path knows its operator as a
 // literal at every call site, so the whole chain down to here is compile-time.
-template <bool DiagFirst, bool Descending, bool Incremental, typename i_t, typename f_t>
-__device__ inline void wavefront_gather_solve_t(const i_t* cs, const i_t* ri, const f_t* val, f_t* x,
+template <bool DiagFirst, bool Descending, bool Incremental, typename i_t, typename ri_t, typename f_t>
+__device__ inline void wavefront_gather_solve_t(const i_t* cs, const ri_t* ri, const f_t* val, f_t* x,
                                                 const i_t* lstart, const i_t* corder, int nlev)
 {
   const int lane = threadIdx.x;
@@ -91,16 +91,17 @@ __device__ inline void wavefront_gather_solve_t(const i_t* cs, const i_t* ri, co
       const i_t dp = DiagFirst ? c0 : (c1 - 1);
       const i_t lo = DiagFirst ? c0 + 1 : c0;
       const i_t hi = DiagFirst ? c1 : (c1 - 1);
+      const f_t diagonal_reciprocal = f_t{1.0} / val[dp];
       if constexpr (Incremental) {
         f_t xi = x[j];
         if constexpr (!Descending) { for (i_t p = lo; p < hi; ++p) { xi -= val[p] * x[ri[p]]; } }
         else                       { for (i_t p = hi - 1; p >= lo; --p) { xi -= val[p] * x[ri[p]]; } }
-        x[j] = xi / val[dp];
+        x[j] = xi * diagonal_reciprocal;
       } else {
         f_t sum = 0.0;
         if constexpr (!Descending) { for (i_t p = lo; p < hi; ++p) { sum += val[p] * x[ri[p]]; } }
         else                       { for (i_t p = hi - 1; p >= lo; --p) { sum += val[p] * x[ri[p]]; } }
-        x[j] = (x[j] - sum) / val[dp];
+        x[j] = (x[j] - sum) * diagonal_reciprocal;
       }
     }
     __syncwarp(0xffffffffu);
@@ -110,8 +111,8 @@ __device__ inline void wavefront_gather_solve_t(const i_t* cs, const i_t* ri, co
 // The four operators as named entry points. Flag triples MUST match the df/dsc/inc tables in
 // gpu_phase2.cu's kOpDiagFirst/kOpDescending/kOpIncremental (which warp_build_config also uses).
 #define DTS_WF_OP(name, DF, DESC, INC)                                                            \
-  template <typename i_t, typename f_t>                                                           \
-  __device__ inline void name(const i_t* cs, const i_t* ri, const f_t* val, f_t* x,               \
+  template <typename i_t, typename ri_t, typename f_t>                                                           \
+  __device__ inline void name(const i_t* cs, const ri_t* ri, const f_t* val, f_t* x,               \
                               const i_t* lstart, const i_t* corder, int nlev)                     \
   {                                                                                               \
     wavefront_gather_solve_t<DF, DESC, INC>(cs, ri, val, x, lstart, corder, nlev);                 \
@@ -124,8 +125,8 @@ DTS_WF_OP(wavefront_UT_solve, false, false, false)  // Uᵀ-solve over U
 
 // Compile-time operator dispatch. `Op` mirrors warp_solve_op {L,U,Lᵀ,Uᵀ} = {0,1,2,3} and is a
 // literal at every fission call site, so this collapses to one direct call — no branch at all.
-template <int Op, typename i_t, typename f_t>
-__device__ inline void wavefront_solve_op(const i_t* cs, const i_t* ri, const f_t* val, f_t* x,
+template <int Op, typename i_t, typename ri_t, typename f_t>
+__device__ inline void wavefront_solve_op(const i_t* cs, const ri_t* ri, const f_t* val, f_t* x,
                                           const i_t* lstart, const i_t* corder, int nlev)
 {
   static_assert(Op >= 0 && Op < 4, "Op must be one of {L,U,Lt,Ut} = {0,1,2,3}");
