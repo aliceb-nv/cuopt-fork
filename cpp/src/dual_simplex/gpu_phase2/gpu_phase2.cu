@@ -39,6 +39,8 @@
 #include <rmm/cuda_stream.hpp>
 #include <cub/device/device_memcpy.cuh>
 #include <rmm/device_buffer.hpp>
+#include <rmm/mr/per_device_resource.hpp>
+#include <rmm/mr/pool_memory_resource.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cuda/std/limits>
@@ -47,9 +49,12 @@
 #include <new>  // placement new: construct the per-slot persistent state in host-allocated memory
 
 #include <chrono>
+#include <cstdint>
+#include <limits>
 #include <unordered_map>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <vector>
 
 namespace cuopt::linear_programming::dual_simplex {
@@ -72,9 +77,8 @@ using gpu_span = cuda::std::span<T>;
 // the host before each launch; set with atomicOr so concurrent blocks don't tear.
 __device__ int g_gpu_alloc_failed;
 
-
 // MEASURED AND REJECTED (2026-08-18): making the hypersparse-vs-dense routing threshold tunable
-// per solve entry point. The KTIMER solve table appears to say the single hard-coded 0.05 is badly
+// per solve entry point. An earlier per-phase profile appeared to say the hard-coded 0.05 is badly
 // mistuned (hypersparse l_solve mean 4.88M cycles against dense's 1.80M), but a sweep over four
 // independent runtime thresholds says otherwise: all-dense 9.125 s and all-hypersparse 13.816 s
 // against 0.759 s at 0.05, and every per-entry-point forcing was neutral-to-worse. Re-swept after
@@ -121,6 +125,7 @@ __device__ int g_elide_noop;
 
 
 static constexpr i_t kColNoop = static_cast<i_t>(0x80000000u);  // level[] sign bit
+static constexpr i_t kSparseReachDenseFallbackDivisor = 20;     // dense at >= 5% reach
 __device__ __forceinline__ i_t  factor_level(i_t lv) { return lv & 0x7fffffff; }
 __device__ __forceinline__ bool level_is_noop(i_t lv) { return lv < 0; }
 
@@ -142,9 +147,6 @@ __device__ __forceinline__ bool level_is_noop(i_t lv) { return lv < 0; }
 // Consequence: `MinBlocks` is now an inert template parameter, and `CUOPT_GPU_REGCAP` (which only
 // ever steered it through the launch bound) no longer caps anything. Both are kept so the sweep
 // scaffolding can be restored in one line if a cap is ever wanted again.
-
-// ================= Per-function kernel timers (COMPILE-TIME GATED) ================================
-
 
 
 __device__ __forceinline__ f_t dev_inf() { return cuda::std::numeric_limits<f_t>::infinity(); }
@@ -379,13 +381,20 @@ __device__ void gpu_sort(T* first, T* last, Cmp cmp)
 // transposes. col_start is read-only because reach()/DFS keeps visited state in a private byte-mark
 // workspace instead of temporarily modifying the factor.
 // ---------------------------------------------------------------------------
-struct gpu_csc_view {
+// RI is the row-index storage type. A and S_ retain full-width indices; only the four immutable LU
+// factors use uint16_t. Factor dimensions and every uploaded row index are checked before narrowing.
+template <typename RI = i_t>
+struct gpu_csc_view_t {
   i_t m{0}, n{0}, nz_max{0};
   gpu_span<const i_t> col_start;
-  gpu_span<i_t> i;
+  gpu_span<RI> i;
   gpu_span<f_t> x;
   __device__ i_t nnz() const { return col_start[n]; }
 };
+
+using gpu_csc_view = gpu_csc_view_t<i_t>;
+template <typename FactorIndex>
+using gpu_factor_view_t = gpu_csc_view_t<FactorIndex>;
 
 // Owning sparse-matrix (CSC). Used only for S_ (the MPF rank-1 update store),
 // which grows one (u,v) column-pair per iteration.
@@ -459,8 +468,8 @@ struct gpu_csr_matrix {
   }
 
   // Zero-copy: adopt a host-built CSR already in device memory as non-owning views. row_start stays
-  // read-only; j/x are mutated in place by the nonbasic partition, so the passed buffer must be a
-  // fresh per-solve mutable copy (true for the single-problem path — one upload per solve).
+  // read-only and may be shared; j/x are mutated in place by the nonbasic partition, so those two
+  // buffers must be fresh per-solve mutable copies.
   __device__ void view_device(const i_t* rs, const i_t* jj, const f_t* xx, i_t m_, i_t n_, i_t nz)
   {
     m = m_;
@@ -472,7 +481,8 @@ struct gpu_csr_matrix {
 };
 
 // Forward decl.
-struct gpu_basis_update_mpf;
+template <typename FactorIndex>
+struct gpu_basis_update_mpf_t;
 
 // ---------------------------------------------------------------------------
 // gpu_sparse_vector : owning sparse vector (created/grown inside the kernel).
@@ -663,7 +673,8 @@ __host__ __device__ constexpr bool op_ascending(int op) { return op == 0 || op =
 // Trivially constructible (no member initializers) so it can be a __shared__
 // variable. Lane 0 fills every field (warp_build_config + warp_dispatch) before
 // any lane reads it, ordered by the first __syncwarp.
-struct warp_solve_config {
+template <typename FactorIndex>
+struct warp_solve_config_t {
   // ONLY the elimination-level SCHEDULE survives. Every per-dispatch REQUEST field (x/op and the
   // tl_/dz_/dzs_/td_/fd_/rt_/su_/pi_/ud_/nbe_/sp_op/sp_nlev groups, ~95 fields, ~700 of 928 bytes)
   // was staging for the parked-helper dispatch and was deleted with it on 2026-08-11: the Direct
@@ -672,7 +683,7 @@ struct warp_solve_config {
   // read — the four wavefront bodies encode their own direction, so nothing consumes them.
   // Built once (by the kernel prologue on lane 0), read-only after.
   const i_t* cs[kNumWarpSolveOps];      // gather CSC col_start
-  const i_t* ridx[kNumWarpSolveOps];    // gather CSC row indices
+  const FactorIndex* ridx[kNumWarpSolveOps];    // gather CSC row indices
   const f_t* val[kNumWarpSolveOps];     // gather CSC values
   const i_t* lstart[kNumWarpSolveOps];  // level offsets [nlev+1]
   const i_t* corder[kNumWarpSolveOps];  // columns by level [m]
@@ -711,10 +722,11 @@ __device__ __forceinline__ f_t warp_reduce_min(f_t v);
 // COMPILE-TIME operator variant, for the `Direct` path where the op is a literal at the call
 // site. Nothing about the solve is decided at runtime: no op code, no flag loads, no per-column
 // branches — ptxas emits one specialized wavefront body per call site.
-template <int Op>
+template <int Op, typename FactorIndex>
 __device__ __forceinline__ void warp_solve_body_op(const i_t* a_corder, const i_t* a_cs,
                                                    const i_t* a_lstart, i_t a_nlev,
-                                                   const i_t* a_ridx, const f_t* a_val, f_t* a_x)
+                                                   const FactorIndex* a_ridx,
+                                                   const f_t* a_val, f_t* a_x)
 {
   dts::wavefront_solve_op<Op>(a_cs, a_ridx, a_val, a_x, a_lstart, a_corder, a_nlev);
 }
@@ -872,7 +884,9 @@ __device__ __forceinline__ void warp_fromdense_body(i_t* a_fd_count, i_t* a_fd_i
   __syncwarp(0xffffffffu);
 }
 
-__device__ __forceinline__ void warp_rt_body(f_t a_rt_dual_tol, const f_t* a_rt_dz, i_t* a_rt_entering, i_t* a_rt_k, i_t a_rt_m, i_t a_rt_n, const i_t* a_rt_nonbasic, f_t a_rt_pivot_tol, f_t* a_rt_step, const variable_status_t* a_rt_vstatus, const f_t* a_rt_z, f_t a_rt_zero_tol)
+// `a_rt_ratio` caches pass-1 ratios for pass 2; identical lane strides make every entry
+// write-before-read by the same lane.
+__device__ __forceinline__ void warp_rt_body(f_t a_rt_dual_tol, const f_t* a_rt_dz, i_t* a_rt_entering, i_t* a_rt_k, i_t a_rt_m, i_t a_rt_n, const i_t* a_rt_nonbasic, f_t a_rt_pivot_tol, f_t* a_rt_ratio, f_t* a_rt_step, const variable_status_t* a_rt_vstatus, const f_t* a_rt_z, f_t a_rt_zero_tol)
 {
   const int lane   = static_cast<int>(threadIdx.x);
   const i_t num_nb = a_rt_n - a_rt_m;
@@ -890,6 +904,7 @@ __device__ __forceinline__ void warp_rt_body(f_t a_rt_dual_tol, const f_t* a_rt_
     } else if (s == variable_status_t::NONBASIC_UPPER && a_rt_dz[j] > ptol) {
       ratio = (dtol - a_rt_z[j]) / a_rt_dz[j];
     }
+    a_rt_ratio[k] = ratio;
     if (ratio < lmin) { lmin = ratio; }
   }
   const f_t gmin = warp_reduce_min(lmin);
@@ -911,14 +926,8 @@ __device__ __forceinline__ void warp_rt_body(f_t a_rt_dual_tol, const f_t* a_rt_
   // Pass 2: among ratio < gmin+ztol, pick max |z[j]| (tie → smaller k).
   f_t best_absz = -1.0; i_t best_k = 0x7fffffff; i_t best_j = -1; f_t best_r = INF;
   for (i_t k = lane; k < num_nb; k += 32) {
-    const i_t j             = a_rt_nonbasic[k];
-    const variable_status_t s = a_rt_vstatus[j];
-    f_t ratio = INF;
-    if (s == variable_status_t::NONBASIC_LOWER && a_rt_dz[j] < -ptol) {
-      ratio = (-dtol - a_rt_z[j]) / a_rt_dz[j];
-    } else if (s == variable_status_t::NONBASIC_UPPER && a_rt_dz[j] > ptol) {
-      ratio = (dtol - a_rt_z[j]) / a_rt_dz[j];
-    }
+    const i_t j     = a_rt_nonbasic[k];
+    const f_t ratio = a_rt_ratio[k];
     // Candidate = the argmin (always, so entering can't be spuriously -1) plus near-ties within
     // zero_tol. Use the difference (ratio - gmin) not (ratio < gmin + ztol): the latter drops the
     // argmin when gmin is large (gmin+ztol rounds back to gmin) or zero_tol == 0 → false DUAL_UNBOUNDED.
@@ -1381,8 +1390,9 @@ __device__ __forceinline__ i_t warp_sptrsv_maxlevel_body(const i_t* a_level, i_t
 }
 
 // COMPILE-TIME operator variant of the reach-restricted gather (`Direct` path).
-template <int Op>
-__device__ __forceinline__ void warp_sptrsv_body_op(const i_t* a_cs, const i_t* a_ridx,
+template <int Op, typename FactorIndex>
+__device__ __forceinline__ void warp_sptrsv_body_op(const i_t* a_cs,
+                                                    const FactorIndex* a_ridx,
                                                     const f_t* a_val, i_t* a_sp_co, i_t* a_sp_ls,
                                                     int a_sp_nlev, f_t* a_x)
 {
@@ -1438,7 +1448,8 @@ __device__ __forceinline__ f_t warp_reduce_min(f_t v)
 // Build the elimination-level schedule of one gather operator (lane 0, once).
 // `mat` is the gather CSC (its columns are the solve's output rows). Fills
 // level_start[nlev+1] and col_order[m]; returns nlev. `level` is m-sized scratch.
-__device__ int warp_build_levels(const gpu_csc_view& mat, bool diag_first, bool asc_process,
+template <typename RI>
+__device__ int warp_build_levels(const gpu_csc_view_t<RI>& mat, bool diag_first, bool asc_process,
                                   gpu_vector<i_t>& level, gpu_vector<i_t>& level_start,
                                   gpu_vector<i_t>& col_order)
 {
@@ -1498,8 +1509,9 @@ __device__ int warp_build_levels(const gpu_csc_view& mat, bool diag_first, bool 
 // of sweeping all m rows per solve.
 
 // pinv == nullptr means no permutation.
+template <typename RI>
 __device__ i_t depth_first_search(
-  i_t j, const i_t* pinv, const gpu_csc_view& G, unsigned char* marked, i_t top, i_t* xi,
+  i_t j, const i_t* pinv, const gpu_csc_view_t<RI>& G, unsigned char* marked, i_t top, i_t* xi,
   i_t* pstack)
 {
   i_t head = 0;
@@ -1553,8 +1565,9 @@ __device__ __forceinline__ void reach_bit_clear(reach_mark_word* marked, i_t row
 
 // General global-stack fallback for a bit-packed reach whose active depth exceeds the shared hot
 // stack. Lane 0 is the only accessor, so ordinary word read-modify-write operations are sufficient.
+template <typename RI>
 __device__ i_t depth_first_search_bits(
-  i_t root, const gpu_csc_view& G, reach_mark_word* marked, i_t top, i_t* xi, i_t* pstack)
+  i_t root, const gpu_csc_view_t<RI>& G, reach_mark_word* marked, i_t top, i_t* xi, i_t* pstack)
 {
   i_t head = 0;
   xi[0]    = root;
@@ -1583,8 +1596,9 @@ __device__ i_t depth_first_search_bits(
 // 64-entry hot stack (shared memory in the monolith), cache both CSC bounds once per discovered
 // vertex, and resume at p+1 instead of reloading the edge that led to the child. If an unusually
 // deep factor exceeds the hot stack, the general bitset DFS handles that subtree in xi/xi+m.
+template <typename RI>
 __device__ i_t depth_first_search_hot(
-  i_t root, const gpu_csc_view& G, reach_mark_word* marked, i_t top, i_t* xi,
+  i_t root, const gpu_csc_view_t<RI>& G, reach_mark_word* marked, i_t top, i_t* xi,
   i_t* dfs_node, i_t* dfs_next, i_t* dfs_end)
 {
   constexpr i_t hot_depth = 64;
@@ -1618,8 +1632,9 @@ __device__ i_t depth_first_search_hot(
   return top;
 }
 
+template <typename RI>
 __device__ i_t reach_hot(
-  const gpu_sparse_vector& b, const gpu_csc_view& G, reach_mark_word* marked, i_t* xi,
+  const gpu_sparse_vector& b, const gpu_csc_view_t<RI>& G, reach_mark_word* marked, i_t* xi,
   i_t* dfs_node, i_t* dfs_next, i_t* dfs_end)
 {
   const i_t m   = G.m;
@@ -1635,8 +1650,9 @@ __device__ i_t reach_hot(
   return top;
 }
 
+template <typename RI>
 __device__ i_t reach(
-  const gpu_sparse_vector& b, const i_t* pinv, const gpu_csc_view& G, unsigned char* marked,
+  const gpu_sparse_vector& b, const i_t* pinv, const gpu_csc_view_t<RI>& G, unsigned char* marked,
   i_t* xi)
 {
   const i_t m   = G.m;
@@ -1703,13 +1719,18 @@ __device__ __forceinline__ T lane0_bcast(T v)
 // L0_/U0_ (+ transposes) and permutations are fixed views uploaded from the
 // host; S_/mu_values_ grow in-kernel as rank-1 updates are stacked.
 // ---------------------------------------------------------------------------
-struct gpu_basis_update_mpf {
+template <typename FactorIndex>
+struct gpu_basis_update_mpf_t {
   // Compile-time tag for the BU switch in the templated driver/kernel (mirrors the CPU
   // `is_mpf = std::is_same<BU, basis_update_mpf_t>` dispatch in simplified_dual_phase2).
   static constexpr bool is_mpf_bu = true;
   i_t num_updates_{0};
   i_t refactor_frequency_{100};
-  gpu_csc_view L0_, U0_, L0_transpose_, U0_transpose_;
+  using factor_index_type = FactorIndex;
+  using factor_view_type  = gpu_factor_view_t<FactorIndex>;
+  using warp_config_type  = warp_solve_config_t<FactorIndex>;
+
+  factor_view_type L0_, U0_, L0_transpose_, U0_transpose_;
   gpu_span<i_t> row_permutation_, inverse_row_permutation_;
   gpu_csc_matrix S_;
   gpu_vector<f_t> mu_values_;
@@ -1737,11 +1758,13 @@ struct gpu_basis_update_mpf {
   // Statistics that drive the hypersparse-vs-dense path choice.
   mutable i_t num_calls_L_{0}, num_calls_U_{0}, num_calls_L_transpose_{0}, num_calls_U_transpose_{0};
   mutable f_t sum_L_{0.0}, sum_U_{0.0}, sum_L_transpose_{0.0}, sum_U_transpose_{0.0};
+  // Blend each average with its observed tail so routing misses favor the bounded dense path.
+  mutable f_t max_L_{1.0}, max_U_{1.0}, max_L_transpose_{1.0}, max_U_transpose_{1.0};
   f_t hypersparse_threshold_{0.05};
   // When non-null (warp-optimized kernel), the 4 dense triangular solves are
   // dispatched to the whole warp via this shared config instead of running on
   // one lane. Set by lane 0 before the driver runs.
-  warp_solve_config* warp_cfg_ = nullptr;
+  warp_config_type* warp_cfg_ = nullptr;
 
   // Route the REUSED scratch through the block's arena. Each of these grows to m or n once and is
   // then reused for the whole solve, so it is exactly what the arena is for.
@@ -1760,10 +1783,10 @@ struct gpu_basis_update_mpf {
     sort_perm_.bind_arena(a);
   }
 
-  __device__ gpu_basis_update_mpf() {}
-  gpu_basis_update_mpf(const gpu_basis_update_mpf&)            = delete;
-  gpu_basis_update_mpf& operator=(const gpu_basis_update_mpf&) = delete;
-  __device__ ~gpu_basis_update_mpf()                          = default;
+  __device__ gpu_basis_update_mpf_t() {}
+  gpu_basis_update_mpf_t(const gpu_basis_update_mpf_t&)            = delete;
+  gpu_basis_update_mpf_t& operator=(const gpu_basis_update_mpf_t&) = delete;
+  __device__ ~gpu_basis_update_mpf_t()                             = default;
 
   __device__ i_t num_updates() const { return num_updates_; }
 
@@ -1778,7 +1801,7 @@ struct gpu_basis_update_mpf {
   template <int Op>
   __device__ void warp_dispatch(f_t* rhs) const
   {
-    const warp_solve_config* c = warp_cfg_;
+    const warp_config_type* c = warp_cfg_;
     warp_solve_body_op<Op>(c->corder[Op], c->cs[Op], c->lstart[Op], c->nlev[Op], c->ridx[Op],
                            c->val[Op], rhs);
   }
@@ -1806,11 +1829,11 @@ struct gpu_basis_update_mpf {
   // the T-loop that follow read the same xi_workspace_/x_workspace_ state.
 
   template <int Op>
-  __device__ i_t warp_dispatch_sptrsv(const gpu_sparse_vector& b, const gpu_csc_view& G,
+  __device__ i_t warp_dispatch_sptrsv(const gpu_sparse_vector& b, const factor_view_type& G,
                                       f_t* x) const
   {
     constexpr int op = Op;
-    warp_solve_config* c = warp_cfg_;
+    warp_config_type* c = warp_cfg_;
     const i_t  m  = G.m;
     i_t* const xi = xi_workspace_.data();
 
@@ -1832,6 +1855,16 @@ struct gpu_basis_update_mpf {
 
     // (2) zero x over the reach, then scatter the rhs — collective, barrier-separated.
     warp_sptrsv_preload_body(b.i.data(), static_cast<i_t>(b.i.size()), b.x.data(), m, top, xi, x);
+
+    // Once the reach exceeds the routing budget, skip the serial level bucketing and use the fixed
+    // dense schedule. The reach closure guarantees entries outside the preloaded pattern stay zero.
+    const i_t dense_fallback_reach =
+      (m + kSparseReachDenseFallbackDivisor - 1) / kSparseReachDenseFallbackDivisor;
+    if (m - top >= dense_fallback_reach) {
+      warp_solve_body_op<Op>(c->corder[op], c->cs[op], c->lstart[op], c->nlev[op], c->ridx[op],
+                             c->val[op], x);
+      return top;
+    }
 
     // (3) level bucketing. EVERY lane needs nlevR: it is the wavefront's internal __syncwarp count,
     // so a lane that disagreed would desynchronize the whole warp. The max-reduce already leaves it
@@ -1907,11 +1940,13 @@ struct gpu_basis_update_mpf {
   __device__ f_t estimate_solution_density(f_t rhs_nz,
                                            f_t sum,
                                            i_t& num_calls,
+                                           f_t max_growth,
                                            bool& use_hypersparse) const
   {
     num_calls++;
     const f_t average_growth    = fmax(1.0, sum / static_cast<f_t>(num_calls));
-    const f_t predicted_nz      = rhs_nz * average_growth;
+    const f_t blended_growth    = 0.75 * average_growth + 0.25 * fmax(average_growth, max_growth);
+    const f_t predicted_nz      = rhs_nz * blended_growth;
     const f_t predicted_density = predicted_nz / static_cast<f_t>(L0_.m);
     use_hypersparse             = predicted_density < hypersparse_threshold_;
     return predicted_nz;
@@ -2153,7 +2188,7 @@ struct gpu_basis_update_mpf {
     warp_permute_idx_body(solution.i.data(), static_cast<i_t>(solution.i.size()),
                           inverse_row_permutation_.data());
     lane0_serial([&] {
-      estimate_solution_density(input_size, sum_L_, num_calls_L_, use_hypersparse);
+      estimate_solution_density(input_size, sum_L_, num_calls_L_, max_L_, use_hypersparse);
     });
     use_hypersparse = lane0_bcast(static_cast<int>(use_hypersparse)) != 0;
     // TRIED AND REVERTED: eliding the U leg's warp_to_dense when the L leg already routed dense.
@@ -2172,11 +2207,16 @@ struct gpu_basis_update_mpf {
       warp_from_dense(solution_dense, solution);
     }
     if (need_Lsol) { warp_sv_copy(solution, Lsol); }
-    lane0_serial([&] { sum_L_ += static_cast<f_t>(solution.i.size()) / input_size; });
+    lane0_serial([&] {
+      const f_t growth = static_cast<f_t>(solution.i.size()) / input_size;
+      sum_L_ += growth;
+      max_L_ = fmax(max_L_, growth);
+    });
 
     const f_t rhs_size = static_cast<f_t>(solution.i.size());
-    lane0_serial(
-      [&] { estimate_solution_density(rhs_size, sum_U_, num_calls_U_, use_hypersparse); });
+    lane0_serial([&] {
+      estimate_solution_density(rhs_size, sum_U_, num_calls_U_, max_U_, use_hypersparse);
+    });
     use_hypersparse = lane0_bcast(static_cast<int>(use_hypersparse)) != 0;
     if (use_hypersparse) {
       u_solve(solution);
@@ -2186,7 +2226,11 @@ struct gpu_basis_update_mpf {
       u_solve(solution_dense.data());
       warp_from_dense(solution_dense, solution);
     }
-    lane0_serial([&] { sum_U_ += static_cast<f_t>(solution.i.size()) / rhs_size; });
+    lane0_serial([&] {
+      const f_t growth = static_cast<f_t>(solution.i.size()) / rhs_size;
+      sum_U_ += growth;
+      max_U_ = fmax(max_U_, growth);
+    });
     return 0;
   }
 
@@ -2206,7 +2250,7 @@ struct gpu_basis_update_mpf {
     const f_t input_size = static_cast<f_t>(rhs.i.size());
     lane0_serial([&] {
       estimate_solution_density(
-        input_size, sum_U_transpose_, num_calls_U_transpose_, use_hypersparse);
+        input_size, sum_U_transpose_, num_calls_U_transpose_, max_U_transpose_, use_hypersparse);
     });
     use_hypersparse = lane0_bcast(static_cast<int>(use_hypersparse)) != 0;
     // NO redundant-to_dense elision here, unlike b_solve. It is valid, but u_transpose_solve routes
@@ -2223,13 +2267,16 @@ struct gpu_basis_update_mpf {
       warp_from_dense(solution_dense, solution);
     }
     warp_sv_copy(solution, UTsol);
-    lane0_serial(
-      [&] { sum_U_transpose_ += static_cast<f_t>(solution.i.size()) / input_size; });
+    lane0_serial([&] {
+      const f_t growth = static_cast<f_t>(solution.i.size()) / input_size;
+      sum_U_transpose_ += growth;
+      max_U_transpose_ = fmax(max_U_transpose_, growth);
+    });
 
     const f_t rhs_size = static_cast<f_t>(solution.i.size());
     lane0_serial([&] {
       estimate_solution_density(
-        rhs_size, sum_L_transpose_, num_calls_L_transpose_, use_hypersparse);
+        rhs_size, sum_L_transpose_, num_calls_L_transpose_, max_L_transpose_, use_hypersparse);
     });
     use_hypersparse = lane0_bcast(static_cast<int>(use_hypersparse)) != 0;
     if (use_hypersparse) {
@@ -2240,7 +2287,11 @@ struct gpu_basis_update_mpf {
       l_transpose_solve(solution_dense.data());
       warp_from_dense(solution_dense, solution);
     }
-    lane0_serial([&] { sum_L_transpose_ += static_cast<f_t>(solution.i.size()) / rhs_size; });
+    lane0_serial([&] {
+      const f_t growth = static_cast<f_t>(solution.i.size()) / rhs_size;
+      sum_L_transpose_ += growth;
+      max_L_transpose_ = fmax(max_L_transpose_, growth);
+    });
     warp_permute_idx_body(solution.i.data(), static_cast<i_t>(solution.i.size()),
                           row_permutation_.data());
     return 0;
@@ -2315,6 +2366,9 @@ struct gpu_basis_update_mpf {
   }
 
 };
+
+using gpu_basis_update_mpf_u16 = gpu_basis_update_mpf_t<std::uint16_t>;
+using gpu_basis_update_mpf_i32 = gpu_basis_update_mpf_t<i_t>;
 
 // ---------------------------------------------------------------------------
 // LP / settings / solution device structs (non-owning views over uploaded data)
@@ -3033,6 +3087,7 @@ struct slot_state {
   // Dense per-iteration workspaces.
   gpu_vector<f_t> xB_workspace, delta_y, delta_z, delta_x, v, squared_infeas;
   gpu_vector<i_t> basic_mark, delta_z_mark, delta_z_indices, nonbasic_end, row_mark, infeas_idx;
+  gpu_vector<f_t> rt_ratio;
 
   // Sparse per-iteration workspaces.
   gpu_sparse_vector delta_y_sparse, UTsol_sparse, utilde_sparse, scaled_dxB_sparse, rhs_sparse,
@@ -3042,7 +3097,7 @@ struct slot_state {
   gpu_csr_matrix Arow;
 
   // In the monolith these are gpu_phase2_kernel STACK LOCALS (lvl_* + a __shared__ cfg), so they die
-  warp_solve_config wcfg;
+  typename FT::warp_config_type wcfg;
   gpu_vector<i_t>      lvl_lev[kNumWarpSolveOps];   // per-column level (drives the sparse reach solve)
   gpu_vector<i_t>      lvl_ls[kNumWarpSolveOps];    // level offsets
   gpu_vector<i_t>      lvl_co[kNumWarpSolveOps];    // columns in level order
@@ -3081,6 +3136,7 @@ struct slot_state {
 
     xB_workspace.bind_arena(a);   delta_y.bind_arena(a);        delta_z.bind_arena(a);
     delta_x.bind_arena(a);        v.bind_arena(a);              squared_infeas.bind_arena(a);
+    rt_ratio.bind_arena(a);
 
     basic_mark.bind_arena(a);     delta_z_mark.bind_arena(a);   delta_z_indices.bind_arena(a);
     nonbasic_end.bind_arena(a);   row_mark.bind_arena(a);       infeas_idx.bind_arena(a);
@@ -3170,6 +3226,7 @@ struct slot_state {
     delta_x.assign(n, 0.0);
     v.assign(m, 0.0);
     basic_mark.assign(n, -1);
+    rt_ratio.reserve(n);
     });
 
     // basic_list holds m DISTINCT column indices, so no two lanes write the same slot — bit-exact.
@@ -3268,6 +3325,7 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
   gpu_vector<f_t>& delta_x        = st.delta_x;
   gpu_vector<f_t>& v              = st.v;
   gpu_vector<f_t>& squared_infeas = st.squared_infeas;
+  gpu_vector<f_t>& rt_ratio       = st.rt_ratio;
   gpu_vector<i_t>& basic_mark     = st.basic_mark;
   gpu_vector<i_t>& delta_z_mark   = st.delta_z_mark;
   gpu_vector<i_t>& delta_z_indices = st.delta_z_indices;
@@ -3386,8 +3444,8 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     // them at slot_state (global) and let the __syncwarp publish them to every lane — locals would
     // only ever be set on lane 0.
     warp_rt_body(settings.dual_tol / 10, delta_z.data(), &st.entering, &st.nonbasic_entering,
-                 lp.num_rows, lp.num_cols, nonbasic_list, settings.pivot_tol, &st.step_length,
-                 vstatus, z, settings.zero_tol);
+                 lp.num_rows, lp.num_cols, nonbasic_list, settings.pivot_tol, rt_ratio.data(),
+                 &st.step_length, vstatus, z, settings.zero_tol);
     __syncwarp(0xffffffffu);
     entering          = st.entering;
     nonbasic_entering = st.nonbasic_entering;
@@ -3489,21 +3547,26 @@ struct kernel_args {
   f_t* A_x;
   i_t A_nz;
   // Host-built CSR of A (Arow); null when not provided (device builds it via from_csc).
-  i_t *Arow_row_start, *Arow_j;
+  const i_t* Arow_row_start;
+  i_t* Arow_j;
   f_t* Arow_x;
   f_t *rhs, *lower, *upper, *objective;
   f_t obj_scale, obj_constant;
-  // factorization
-  i_t *L0_col_start, *L0_i;
+  // Fixed-factor row-index width is selected once per launch.
+  i_t* L0_col_start;
+  void* L0_i;
   f_t* L0_x;
   i_t L0_nz;
-  i_t *U0_col_start, *U0_i;
+  i_t* U0_col_start;
+  void* U0_i;
   f_t* U0_x;
   i_t U0_nz;
-  i_t *L0t_col_start, *L0t_i;
+  i_t* L0t_col_start;
+  void* L0t_i;
   f_t* L0t_x;
   i_t L0t_nz;
-  i_t *U0t_col_start, *U0t_i;
+  i_t* U0t_col_start;
+  void* U0t_i;
   f_t* U0t_x;
   i_t U0t_nz;
   i_t *row_perm, *inv_row_perm;
@@ -3556,11 +3619,27 @@ __device__ gpu_csc_view make_view(
   return v;
 }
 
+template <typename FactorIndex>
+__device__ gpu_factor_view_t<FactorIndex> make_factor_view(
+  i_t rows, i_t cols, i_t nz, i_t* col_start, FactorIndex* idx, f_t* val)
+{
+  gpu_factor_view_t<FactorIndex> v;
+  v.m         = rows;
+  v.n         = cols;
+  v.nz_max    = nz;
+  v.col_start = gpu_span<const i_t>(col_start, cols + 1);
+  v.i         = gpu_span<FactorIndex>(idx, nz);
+  v.x         = gpu_span<f_t>(val, nz);
+  return v;
+}
+
 
 // Fill the warp-solve config for all 4 operators (lane 0, once at start). The
 // level schedules are written into the caller-owned gpu_vectors ls[o]/co[o]
 // (kept alive for the whole kernel); `lvlscratch` is reused m-sized workspace.
-__device__ void warp_build_config(const gpu_basis_update_mpf& ft, warp_solve_config& cfg,
+template <typename FactorIndex>
+__device__ void warp_build_config(const gpu_basis_update_mpf_t<FactorIndex>& ft,
+                                  warp_solve_config_t<FactorIndex>& cfg,
                                    gpu_vector<i_t>* lev, gpu_vector<i_t>* ls, gpu_vector<i_t>* co,
                                    gpu_vector<i_t>& sp_ls_v, gpu_vector<i_t>& sp_co_v,
                                    gpu_vector<i_t>& sp_pos_v)
@@ -3574,7 +3653,8 @@ __device__ void warp_build_config(const gpu_basis_update_mpf& ft, warp_solve_con
   cfg.sp_ls  = sp_ls_v.data();
   cfg.sp_pos = sp_pos_v.data();
   // op order: L, U, Lᵀ, Uᵀ. Gather matrix + flags per op.
-  const gpu_csc_view* mats[kNumWarpSolveOps] = {&ft.L0_transpose_, &ft.U0_transpose_, &ft.L0_, &ft.U0_};
+  const gpu_factor_view_t<FactorIndex>* mats[kNumWarpSolveOps] = {
+    &ft.L0_transpose_, &ft.U0_transpose_, &ft.L0_, &ft.U0_};
   for (int o = 0; o < kNumWarpSolveOps; ++o) {
     cfg.cs[o]         = mats[o]->col_start.data();
     cfg.ridx[o]       = mats[o]->i.data();
@@ -3599,6 +3679,8 @@ __device__ void warp_build_config(const gpu_basis_update_mpf& ft, warp_solve_con
 template <class FT>
 __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args)
 {
+  using factor_index_type = typename FT::factor_index_type;
+  using warp_config_type  = typename FT::warp_config_type;
   // NOTE: the CUDA 13 `.pragma "enable_smem_spilling"` (spill regs to shared instead of local) is
   // INCOMPATIBLE here — ptxas fails with "(C7800) Smem spilling should not be enabled when functions
   // use abi": this kernel makes ABI (non-inlined) device calls into the whole driver, and the pragma
@@ -3610,7 +3692,7 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args)
   // Shared config. Under Direct it is READ-ONLY after the one-time build below: the Direct arms
   // still fetch the elimination-level schedule through ft.warp_cfg_, only the per-dispatch REQUEST
   // fields are unused. Unused entirely when Warp==false.
-  __shared__ warp_solve_config cfg_shared;
+  __shared__ warp_config_type cfg_shared;
 
   // No parked-helper model any more: on the warp path all 32 lanes fall through and run the driver
   // (Direct). The lanes-1..31 -> warp_helper_loop split was deleted with the dispatcher.
@@ -3664,10 +3746,10 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args)
     FT& ft                      = st.ft;
     ft.num_updates_             = a.num_updates;
     ft.refactor_frequency_      = a.refactor_frequency;
-    ft.L0_                      = make_view(m, m, a.L0_nz, a.L0_col_start, a.L0_i, a.L0_x);
-    ft.U0_                      = make_view(m, m, a.U0_nz, a.U0_col_start, a.U0_i, a.U0_x);
-    ft.L0_transpose_            = make_view(m, m, a.L0t_nz, a.L0t_col_start, a.L0t_i, a.L0t_x);
-    ft.U0_transpose_            = make_view(m, m, a.U0t_nz, a.U0t_col_start, a.U0t_i, a.U0t_x);
+    ft.L0_                      = make_factor_view(m, m, a.L0_nz, a.L0_col_start, static_cast<factor_index_type*>(a.L0_i), a.L0_x);
+    ft.U0_                      = make_factor_view(m, m, a.U0_nz, a.U0_col_start, static_cast<factor_index_type*>(a.U0_i), a.U0_x);
+    ft.L0_transpose_            = make_factor_view(m, m, a.L0t_nz, a.L0t_col_start, static_cast<factor_index_type*>(a.L0t_i), a.L0t_x);
+    ft.U0_transpose_            = make_factor_view(m, m, a.U0t_nz, a.U0t_col_start, static_cast<factor_index_type*>(a.U0t_i), a.U0t_x);
     ft.row_permutation_         = gpu_span<i_t>(a.row_perm, m);
     ft.inverse_row_permutation_ = gpu_span<i_t>(a.inv_row_perm, m);
     ft.xi_workspace_            = gpu_span<i_t>(a.xi_workspace, 2 * m);
@@ -3693,9 +3775,9 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args)
   // config, so every wavefront solve for the rest of the solve would read a lane-private schedule.
   // slot_state already carries byte-identical members for exactly this reason (the setup
   // uses them), so this is a reuse, not a new allocation.
-  // Serial O(m*nnz) schedule build that resizes the slot's gpu_vectors and writes ~90 config
-  // fields, plus an RMW on ft.warp_cfg_ — one lane. Every lane reads the result afterwards, which
-  // the lane0_serial __syncwarp publishes.
+
+  // Serial O(m*nnz) schedule build that resizes the slot's gpu_vectors and writes the config.
+  // The trailing warp sync publishes the completed schedule and ft.warp_cfg_ to every lane.
   lane0_serial([&] {
     warp_build_config(
       ft, cfg_shared, st.lvl_lev, st.lvl_ls, st.lvl_co, st.sp_ls_v, st.sp_co_v, st.sp_pos_v);
@@ -3737,23 +3819,9 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args)
 // MinBlocks — the attribute's mere presence tells ptxas there is no occupancy pressure, and it then
 // spends registers freely (measured: 214 regs with the bound at minBlocks=1-equivalent, vs 182 with
 // no attribute; and 129 -> 188 on the single-thread kernel, which is why the two entry points exist).
-// __launch_bounds__(32, 16) pins ptxas to 65536/(32*16) = 128 registers, i.e. 16 blocks/SM on the
-// sub-partition model min(32, 4*floor(16384/(32*roundup8(regs)))). Without it ptxas lands on 129,
-// which rounds to 136 and drops to 12 blocks/SM -- a 25% occupancy loss for one register.
-//
-// That one register is bought by the COLD NaN-recovery branch in compute_delta_x: inlined, its live
-// state counts toward the allocation even though 0 of the 100 v6 nodes ever reach it. Isolated by
-// bisection -- rewriting the recovery as a collective moved 128 -> 129 with the Warp parameter still
-// in place, and removing Warp afterwards was byte-identical in every ptxas field.
-//
-// TRIED AND REJECTED: hoisting the recovery into a __noinline__ helper. It also reaches 128
-// registers, but the ABI call costs more than the inlined cold code -- 2.688 s vs 2.673 s at 1,200
-// problems, consistently across 4 runs -- and adds 32 bytes of stack frame.
-//
-// The bound is deliberately TIGHT: a loose one (large MinBlocks) tells ptxas there is no occupancy
-// pressure and it spends registers up to the cap instead.
-template <int MinBlocks = 16, class FT = gpu_basis_update_mpf>
-__global__ void __launch_bounds__(32, MinBlocks) gpu_phase2_kernel_direct(kernel_args* args)
+// Keep the cleanup's measured 128-register occupancy target for both factor-index specializations.
+template <class FT = gpu_basis_update_mpf_u16>
+__global__ void __launch_bounds__(32, 16) gpu_phase2_kernel_direct(kernel_args* args)
 {
   gpu_phase2_kernel_body<FT>(args);
 }
@@ -3807,6 +3875,32 @@ static T* upload_n(const T* p, size_t count, marshal_storage& st)
   return static_cast<T*>(st.bufs.back().data());
 }
 
+static constexpr size_t kUint16FactorRowCapacity =
+  static_cast<size_t>(std::numeric_limits<std::uint16_t>::max()) + 1;
+
+static bool factors_fit_uint16(i_t rows)
+{
+  return rows >= 0 && static_cast<size_t>(rows) <= kUint16FactorRowCapacity;
+}
+
+template <typename FactorIndex>
+static FactorIndex* upload_factor_indices(
+  const i_t* idx, size_t count, i_t rows, marshal_storage& st)
+{
+  std::vector<FactorIndex> converted(count);
+  for (size_t k = 0; k < count; ++k) {
+    if (idx[k] < 0 || idx[k] >= rows) {
+      throw std::runtime_error("gpu_phase2: factor row index is outside [0, m)");
+    }
+    if (static_cast<size_t>(idx[k]) >
+        static_cast<size_t>(std::numeric_limits<FactorIndex>::max())) {
+      throw std::runtime_error("gpu_phase2: selected factor-index type cannot represent row index");
+    }
+    converted[k] = static_cast<FactorIndex>(idx[k]);
+  }
+  return upload_n(converted.data(), converted.size(), st);
+}
+
 template <typename T>
 static T* alloc_zeroed(size_t count, marshal_storage& st)
 {
@@ -3828,9 +3922,10 @@ static void upload_solve_class_config()
 // ---- [CONFIG] self-report -------------------------------------------------------------------
 // Every launch states its own decisive configuration. A measurement that reports its configuration
 // cannot be mislabelled by the operator, the shell history, or another agent reading the output.
-static void report_config(const char* path, size_t nprob)
+static void report_config(const char* path, size_t nprob, int factor_index_bits)
 {
-  std::printf("[CONFIG] path=%s geometry=warp<<<N,32>>> problems=%zu\n", path, nprob);
+  std::printf("[CONFIG] path=%s geometry=warp<<<N,32>>> problems=%zu factor_index_bits=%d\n",
+              path, nprob, factor_index_bits);
 }
 
 // Device heap (in-kernel gpu_vector malloc arena) + stack are per-CONTEXT limits and the heap
@@ -3978,24 +4073,25 @@ static bool heap_demand_rejected(size_t demand, size_t granted, size_t requested
 // Read-only device buffers shared across all batch items with the same problem+factor (same `lp`
 // pointer). These are never written by the kernel (A CSC, the base LU factor, rhs/bounds/objective,
 // row permutation), so N same-problem blocks read ONE resident copy instead of N (VRAM + L2 reuse).
-// Arow is intentionally NOT here: its j/x are permuted per node, so each block builds it via from_csc
-// off the shared CSC.
-// Only the PROBLEM-INVARIANT read-only data is shared across a problem's nodes: the constraint matrix
-// A (CSC) plus rhs and objective. Everything basis-dependent (the LU factor L0/U0/L0t/U0t, row_perm),
-// the branching bounds (lower/upper), and the per-node-permuted Arow stay PER-NODE — they legitimately
-// differ from node to node. (A's col_start is safe to share: unlike the factor, A is never reach-marked.)
+// Share the problem-invariant read-only data across a problem's nodes: A (CSC), rhs, objective, and
+// Arow.row_start. A master Arow j/x is also uploaded once, but only as the source for each node's
+// private mutable copy. Everything basis-dependent (the LU factor L0/U0/L0t/U0t and row_perm), the
+// branching bounds (lower/upper), and the permuted Arow j/x stay per-node because they legitimately
+// differ. A.col_start is safe to share: unlike the factor, A is never reach-marked.
 struct ro_upload {
   i_t *A_col_start{}, *A_i{}; f_t* A_x{}; i_t A_nz{};
   f_t *rhs{}, *objective{};
-  // MASTER CSR transpose, uploaded once per distinct A. Each block still needs its OWN mutable Arow
-  // (the nonbasic scan permutes j/x in place), but that copy is made DEVICE-side. Arow was 43% of
-  // all uploaded bytes -- 1.200 GB of 2.813 GB at 1,200 problems -- and every node of a B&B tree
-  // re-sent byte-identical data over PCIe at ~5 GB/s, against ~200 GB/s device-to-device.
-  i_t *Arow_row_start{}, *Arow_j{}; f_t* Arow_x{};
-  size_t Arow_rs_bytes{}, Arow_j_bytes{}, Arow_x_bytes{};
+  // MASTER CSR transpose, uploaded once per distinct A. row_start is immutable and shared directly;
+  // each block gets its own device-side copy of j/x because the nonbasic scan permutes them in place.
+  // Arow was 43% of all uploaded bytes -- 1.200 GB of 2.813 GB at 1,200 problems -- and every node
+  // of a B&B tree re-sent byte-identical data over PCIe at ~5 GB/s, against ~200 GB/s D2D bandwidth.
+  const i_t* Arow_row_start{};
+  i_t* Arow_j{}; f_t* Arow_x{};
+  size_t Arow_j_bytes{}, Arow_x_bytes{};
 };
 
-// Device-side fan-out of the master Arow into each block's private copy: one cub batched memcpy.
+// Device-side fan-out of the mutable master Arow j/x into each block's private copy: one batched
+// memcpy. The immutable row_start is shared directly and needs no fan-out entry.
 struct arow_fanout {
   std::vector<void*> dsts, srcs;
   std::vector<size_t> sizes;
@@ -4036,7 +4132,6 @@ static ro_upload upload_ro(const lp_problem_t<i_t, f_t>& lp, marshal_storage& st
   r.Arow_row_start = upload(Arow_host.row_start, st);
   r.Arow_j         = upload(Arow_host.j, st);
   r.Arow_x         = upload(Arow_host.x, st);
-  r.Arow_rs_bytes  = Arow_host.row_start.size() * sizeof(i_t);
   r.Arow_j_bytes   = Arow_host.j.size() * sizeof(i_t);
   r.Arow_x_bytes   = Arow_host.x.size() * sizeof(f_t);
   r.A_col_start = upload(A.col_start, st); r.A_nz = A.nnz();
@@ -4066,9 +4161,9 @@ static size_t arena_bytes_for(size_t m, size_t n)
 {
   const size_t mn = (m > n) ? m : n;
   size_t b = 0;
-  // 11 f_t workspaces: xB_workspace, delta_y, delta_z, delta_x, v, squared_infeas, setup_rhs,
-  //                    se_coeff, ft.dense_scratch_, ft.sort_bucket_, ft.sort_x_
-  b += 11 * mn * sizeof(f_t);
+  // 12 f_t workspaces: xB_workspace, delta_y, delta_z, delta_x, v, squared_infeas, rt_ratio,
+  //                    setup_rhs, se_coeff, ft.dense_scratch_, ft.sort_bucket_, ft.sort_x_
+  b += 12 * mn * sizeof(f_t);
   // 10 i_t workspaces: basic_mark, delta_z_mark, delta_z_indices, nonbasic_end, row_mark,
   //                    infeas_idx, se_row_degree, se_mapping, ft.sort_i_, ft.sort_perm_
   b += 10 * mn * sizeof(i_t);
@@ -4080,6 +4175,7 @@ static size_t arena_bytes_for(size_t m, size_t n)
   return b + (64u << 10);  // floor: 16-byte rounding on ~60 slices, plus small-problem headroom
 }
 
+template <typename FactorIndex>
 static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
                                    const simplex_solver_settings_t<i_t, f_t>& settings,
                                    std::vector<variable_status_t>& vstatus,
@@ -4127,19 +4223,19 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   // building Arow in-kernel costs 1.04 MB of heap per problem — 2.450 MB total against 1.408 MB with
   // Arow uploaded — which cut the maximum batch from ~9,600 problems to ~5,500 and made a
   // 10,000-problem run die with cudaErrorIllegalAddress after thousands of failed mallocs.
-  // Arow is per-node regardless (its j/x are partitioned in place by the nonbasic scan), so uploading
-  // it never duplicated anything shareable. to_compressed_row orders each row by ascending column,
-  // matching from_csc bit-for-bit, so results are unchanged.
+  // Arow j/x are per-node because the nonbasic scan partitions them in place. row_start is immutable,
+  // so all nodes view the shared master offsets directly. to_compressed_row orders each row by
+  // ascending column, matching from_csc bit-for-bit, so results are unchanged.
   if (ro != nullptr && fan != nullptr && ro->Arow_row_start != nullptr) {
-    // Allocate this block's private Arow and queue a DEVICE-side copy from the shared master, so
-    // 43% of what this function used to send over PCIe becomes a D2D fan-out.
+    // Share the immutable row offsets. Allocate this block's private mutable j/x and queue a
+    // DEVICE-side copy from the shared master.
     auto alloc_from = [&](size_t bytes, void* src) {
       st.bufs.emplace_back(bytes, rmm::cuda_stream_default);
       void* d = st.bufs.back().data();
       fan->dsts.push_back(d); fan->srcs.push_back(src); fan->sizes.push_back(bytes);
       return d;
     };
-    a.Arow_row_start = static_cast<i_t*>(alloc_from(ro->Arow_rs_bytes, ro->Arow_row_start));
+    a.Arow_row_start = ro->Arow_row_start;
     a.Arow_j         = static_cast<i_t*>(alloc_from(ro->Arow_j_bytes,  ro->Arow_j));
     a.Arow_x         = static_cast<f_t*>(alloc_from(ro->Arow_x_bytes,  ro->Arow_x));
   } else {
@@ -4155,13 +4251,17 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   a.lower       = upload(lp.lower, st);
   a.upper       = upload(lp.upper, st);
   a.L0_col_start = upload(L0.col_start, st); a.L0_nz = L0.nnz();
-  a.L0_i = upload_n(L0.i.data(), L0.nnz(), st); a.L0_x = upload_n(L0.x.data(), L0.nnz(), st);
+  a.L0_i = upload_factor_indices<FactorIndex>(L0.i.data(), L0.nnz(), m, st);
+  a.L0_x = upload_n(L0.x.data(), L0.nnz(), st);
   a.U0_col_start = upload(U0.col_start, st); a.U0_nz = U0.nnz();
-  a.U0_i = upload_n(U0.i.data(), U0.nnz(), st); a.U0_x = upload_n(U0.x.data(), U0.nnz(), st);
+  a.U0_i = upload_factor_indices<FactorIndex>(U0.i.data(), U0.nnz(), m, st);
+  a.U0_x = upload_n(U0.x.data(), U0.nnz(), st);
   a.L0t_col_start = upload(L0t.col_start, st); a.L0t_nz = L0t.nnz();
-  a.L0t_i = upload_n(L0t.i.data(), L0t.nnz(), st); a.L0t_x = upload_n(L0t.x.data(), L0t.nnz(), st);
+  a.L0t_i = upload_factor_indices<FactorIndex>(L0t.i.data(), L0t.nnz(), m, st);
+  a.L0t_x = upload_n(L0t.x.data(), L0t.nnz(), st);
   a.U0t_col_start = upload(U0t.col_start, st); a.U0t_nz = U0t.nnz();
-  a.U0t_i = upload_n(U0t.i.data(), U0t.nnz(), st); a.U0t_x = upload_n(U0t.x.data(), U0t.nnz(), st);
+  a.U0t_i = upload_factor_indices<FactorIndex>(U0t.i.data(), U0t.nnz(), m, st);
+  a.U0t_x = upload_n(U0t.x.data(), U0t.nnz(), st);
   a.row_perm     = upload(ft.row_permutation(), st);
   a.inv_row_perm = upload(ft.inverse_row_permutation(), st);
   a.xi_workspace = alloc_zeroed<int>(2 * m, st);
@@ -4202,7 +4302,7 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
 
   // Persistent per-slot solve state. Allocated ZEROED (the kernel's placement-new relies on that
   // here.
-  a.slot      = alloc_zeroed<char>(sizeof(slot_state<gpu_basis_update_mpf>), st);
+  a.slot = alloc_zeroed<char>(sizeof(slot_state<gpu_basis_update_mpf_t<FactorIndex>>), st);
 
   // Per-slot arena for the fixed-size gpu_vector payloads (see gpu_arena / arena_bytes_for).
   // Deliberately NOT zeroed: device malloc() hands back uninitialised memory, so zeroing here would
@@ -4236,6 +4336,7 @@ static void free_kernel_args(const kernel_args& a, bool = false)
 // factors/matrix + mutable state), EXCLUDING the in-kernel gpu_vector heap (S_ growth). Used by
 // the batch pre-flight VRAM estimate; mirrors the upload/alloc sizes 1:1 (empty vectors still
 // take 1 element, matching upload/alloc_zeroed). Slightly conservative on the small state vectors.
+template <typename FactorIndex>
 static size_t problem_static_bytes(const lp_problem_t<i_t, f_t>& lp,
                                    const basis_update_mpf_t<i_t, f_t>& ft)
 {
@@ -4247,6 +4348,7 @@ static size_t problem_static_bytes(const lp_problem_t<i_t, f_t>& lp,
   const auto& U0t = ft.U0_transpose();
   auto bi = [](size_t c) { return (c == 0 ? 1 : c) * sizeof(i_t); };
   auto bd = [](size_t c) { return (c == 0 ? 1 : c) * sizeof(f_t); };
+  auto bf = [](size_t c) { return (c == 0 ? 1 : c) * sizeof(FactorIndex); };
   size_t b = 0;
   // A (col_start, i, x) + rhs/lower/upper/objective
   b += bi(lp.A.col_start.size()) + bi(lp.A.nnz()) + bd(lp.A.nnz());
@@ -4255,10 +4357,10 @@ static size_t problem_static_bytes(const lp_problem_t<i_t, f_t>& lp,
   // longer part of the in-kernel heap demand.
   b += bi(m + 1) + bi(lp.A.nnz()) + bd(lp.A.nnz());
   // Four factors, each col_start + i + x
-  b += bi(L0.col_start.size())  + bi(L0.nnz())  + bd(L0.nnz());
-  b += bi(U0.col_start.size())  + bi(U0.nnz())  + bd(U0.nnz());
-  b += bi(L0t.col_start.size()) + bi(L0t.nnz()) + bd(L0t.nnz());
-  b += bi(U0t.col_start.size()) + bi(U0t.nnz()) + bd(U0t.nnz());
+  b += bi(L0.col_start.size())  + bf(L0.nnz())  + bd(L0.nnz());
+  b += bi(U0.col_start.size())  + bf(U0.nnz())  + bd(U0.nnz());
+  b += bi(L0t.col_start.size()) + bf(L0t.nnz()) + bd(L0t.nnz());
+  b += bi(U0t.col_start.size()) + bf(U0t.nnz()) + bd(U0t.nnz());
   // perms + workspaces
   b += bi(m) + bi(m) + bi(2 * m) + bd(m) + m * sizeof(unsigned char);
   // state: vstatus(n) + basic(m) + nonbasic(<=n) + x(n)+y(m)+z(n) + dy_se(n) + 4 out scalars
@@ -4266,13 +4368,14 @@ static size_t problem_static_bytes(const lp_problem_t<i_t, f_t>& lp,
   b += 2 * bi(1) + 2 * bd(1);
   // persistent per-slot solve state (slot_state<FT> header only -- its gpu_vector payloads live in
   // the arena below, or on the in-kernel heap for the few buffers left there)
-  b += sizeof(slot_state<gpu_basis_update_mpf>);
+  b += sizeof(slot_state<gpu_basis_update_mpf_t<FactorIndex>>);
   // Per-slot arena: the fixed-size gpu_vector payloads, moved off the driver-capped in-kernel heap
   // into ordinary VRAM. This is now STATIC VRAM and must be in the pre-flight, or a large batch
   // passes the check and then fails the cudaMalloc. Zero when CUOPT_GPU_ARENA_SCALE=0.
   b += arena_bytes_for(m, n);
   return b;
 }
+
 
 }  // namespace gpu_phase2_detail
 
@@ -4323,8 +4426,18 @@ dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
 
   // Owns every uploaded buffer for this solve; destroyed at scope exit, returning them to the pool.
   marshal_storage store;
-  kernel_args a = marshal_problem(lp, settings, vstatus, ft, basic_list, nonbasic_list, sol,
-                                  delta_y_steepest_edge, nullptr, store);
+  const bool use_uint16_factors = factors_fit_uint16(m);
+  if (!use_uint16_factors) {
+    throw std::runtime_error(
+      "gpu_phase2: int32 factor-index kernel is temporarily disabled for faster compilation");
+  }
+  kernel_args a = use_uint16_factors
+                    ? marshal_problem<std::uint16_t>(
+                        lp, settings, vstatus, ft, basic_list, nonbasic_list, sol,
+                        delta_y_steepest_edge, nullptr, store)
+                    : marshal_problem<i_t>(
+                        lp, settings, vstatus, ft, basic_list, nonbasic_list, sol,
+                        delta_y_steepest_edge, nullptr, store);
 
   // Reset the shared alloc-failed flag from the host (the kernel no longer does it).
   const int zero_flag = 0;
@@ -4338,10 +4451,16 @@ dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
 
   // Compile-time-selected optimized (warp) vs unoptimized (single-thread) kernel.
   // Both templates are instantiated here so the compiler emits code for both; the
-  report_config("monolith", 1);
+  report_config("monolith", 1, use_uint16_factors ? 16 : 32);
   upload_solve_class_config();
-  const auto  _k0 = std::chrono::steady_clock::now();
-  gpu_phase2_kernel_direct<><<<1, 32>>>(d_args);
+  const auto _k0 = std::chrono::steady_clock::now();
+  if (use_uint16_factors) {
+    gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16><<<1, 32>>>(d_args);
+  } else {
+    // TEMPORARY: omit the validated int32 fallback from this profiling build to reduce ptxas time.
+    // Re-enable after host-setup optimization work.
+    // gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32><<<1, 32>>>(d_args);
+  }
   RAFT_CUDA_TRY(cudaPeekAtLastError());
   RAFT_CUDA_TRY(cudaDeviceSynchronize());
   const double _kms = std::chrono::duration<double, std::milli>(
@@ -4400,8 +4519,13 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
   timing = gpu_batch_timing{};
   if (N == 0) return;
 
+  // A launch has one compile-time factor-index type. If any node exceeds uint16 capacity,
+  // use the int32 specialization for the entire batch.
+  bool use_uint16_factors = true;
   // Every ft must be a fresh factorization (pure MPF stacking port, no on-device refactor).
   for (size_t b = 0; b < N; ++b) {
+    use_uint16_factors =
+      use_uint16_factors && factors_fit_uint16(items[b].lp->num_rows);
     if (items[b].ft->num_updates() != 0) {
       timing.rejected = true;
       timing.message  = "item " + std::to_string(b) + " has a non-fresh factorization (num_updates=" +
@@ -4410,28 +4534,52 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
       return;
     }
   }
+  if (!use_uint16_factors) {
+    timing.rejected = true;
+    timing.message  =
+      "int32 factor-index kernel is temporarily disabled for faster compilation";
+    std::fprintf(stderr, "[gpu_phase2] batch REJECTED: %s\n", timing.message.c_str());
+    return;
+  }
 
   // ---- Pre-flight VRAM check (fail loud, before any device allocation) ----
   size_t static_bytes = 0;
   for (size_t b = 0; b < N; ++b) {
-    static_bytes += problem_static_bytes(*items[b].lp, *items[b].ft);
+    static_bytes += use_uint16_factors
+                      ? problem_static_bytes<std::uint16_t>(*items[b].lp, *items[b].ft)
+                      : problem_static_bytes<int>(*items[b].lp, *items[b].ft);
   }
   const size_t args_bytes = N * sizeof(kernel_args);
   const size_t need = static_bytes + heap_estimate_bytes + args_bytes;
   size_t free_b = 0, total_b = 0;
   RAFT_CUDA_TRY(cudaMemGetInfo(&free_b, &total_b));
+
+  // cudaMemGetInfo excludes memory already reserved by the current RMM pool, even though this
+  // function's device_buffers allocate from that pool. Counting only free_b therefore rejects a
+  // batch merely because the application installed a pool (test_netlib reserves 40% up front).
+  // Add that reusable capacity back for this gate. Clamp to total_b so context/driver accounting
+  // cannot make the effective figure exceed physical VRAM.
+  size_t pool_b = 0;
+  auto current_mr = rmm::mr::get_current_device_resource_ref();
+  if (auto* pool = ::cuda::mr::resource_cast<rmm::mr::pool_memory_resource>(&current_mr)) {
+    pool_b = pool->pool_size();
+  }
+  size_t available_b = free_b + pool_b;
+  if (available_b < free_b || available_b > total_b) { available_b = total_b; }
+
   timing.vram_needed_bytes = need;
-  timing.vram_free_bytes   = free_b;
+  timing.vram_free_bytes   = available_b;
   // Keep an 8% safety margin for CUDA context/allocator overhead + fragmentation.
-  const size_t budget = static_cast<size_t>(0.92 * static_cast<double>(free_b));
+  const size_t budget = static_cast<size_t>(0.92 * static_cast<double>(available_b));
   const double GB = 1.0 / (1024.0 * 1024.0 * 1024.0);
   if (need > budget) {
     char buf[512];
     std::snprintf(buf, sizeof(buf),
                   "batch needs ~%.2f GB VRAM (static %.2f + heap %.2f + args %.2f), only %.2f GB "
-                  "free (usable budget %.2f GB) for %zu problems — reduce --replicas or use a larger GPU",
+                  "available (%.2f free + %.2f current RMM pool; usable budget %.2f GB) for %zu "
+                  "problems — reduce --replicas or use a larger GPU",
                   need * GB, static_bytes * GB, heap_estimate_bytes * GB, args_bytes * GB,
-                  free_b * GB, budget * GB, N);
+                  available_b * GB, free_b * GB, pool_b * GB, budget * GB, N);
     timing.rejected = true;
     timing.message  = buf;
     std::fprintf(stderr, "[gpu_phase2] batch REJECTED: %s\n", buf);
@@ -4456,6 +4604,7 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
   std::vector<marshal_storage> store(N);
   marshal_storage ro_store;
   arow_fanout fan;
+
   for (size_t b = 0; b < N; ++b) {
     const auto& it = items[b];
     // Key on A's storage, not on the lp object. Every node of a branch-and-bound tree shares the
@@ -4464,10 +4613,17 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
     auto res = ro_cache.try_emplace(static_cast<const void*>(it.lp->A.col_start.data()));
     if (res.second) { res.first->second = upload_ro(*it.lp, ro_store); }
     const ro_upload* ro = &res.first->second;
-    h_args[b] = marshal_problem(*it.lp, *it.settings, *it.vstatus, *it.ft, *it.basic_list,
-                                *it.nonbasic_list, *it.sol, *it.dy_se, ro, store[b], &fan);
+    h_args[b] = use_uint16_factors
+                  ? marshal_problem<std::uint16_t>(
+                      *it.lp, *it.settings, *it.vstatus, *it.ft, *it.basic_list,
+                      *it.nonbasic_list, *it.sol, *it.dy_se, ro, store[b], &fan)
+                  : marshal_problem<i_t>(
+                      *it.lp, *it.settings, *it.vstatus, *it.ft, *it.basic_list,
+                      *it.nonbasic_list, *it.sol, *it.dy_se, ro, store[b], &fan);
   }
+
   run_arow_fanout(fan, ro_store, rmm::cuda_stream_default.value());
+
   kernel_args* d_args = nullptr;
   RAFT_CUDA_TRY(cudaMalloc(&d_args, N * sizeof(kernel_args)));
   RAFT_CUDA_TRY(cudaMemcpy(d_args, h_args.data(), N * sizeof(kernel_args), cudaMemcpyHostToDevice));
@@ -4477,18 +4633,8 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
   timing.upload_s = toc(up_t0);
 
   // ---- Launch one block per problem, timed with CUDA events (device compute only) ----
-  report_config("monolith", items.size());
+  report_config("monolith", items.size(), use_uint16_factors ? 16 : 32);
   upload_solve_class_config();
-  // CUOPT_GPU_REGCAP is gone: it steered __launch_bounds__ MinBlocks on the parked-helper warp
-  // Fix the shared-memory occupancy ceiling: our per-block static shared (~0.6 KB) + the 1 KB driver
-  // reservation is tiny, but the DEFAULT carveout (32 KB on B200) only fits ~19 blocks. Prefer a larger
-  // shared carveout so shared stops capping occupancy below 32 blocks/SM (leaves the rest as L1). This is
-  // a hint the driver rounds to a supported bucket; harmless when occupancy is register-limited.
-  auto raise_carveout = [](const void* fn) {
-    // 40% of B200's ~228 KB unified cache ≈ 90 KB shared → ~55 blocks worth, well past 32; ~60% stays L1.
-    cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, 40);
-  };
-
   cudaEvent_t ev_start, ev_stop;
   RAFT_CUDA_TRY(cudaEventCreate(&ev_start));
   RAFT_CUDA_TRY(cudaEventCreate(&ev_stop));
@@ -4497,8 +4643,12 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
     const unsigned nb = static_cast<unsigned>(N);
     // The register/occupancy target is a BUILD-time knob on the Direct kernel
     // gpu_phase2_kernel_direct.
-    raise_carveout(reinterpret_cast<const void*>(&gpu_phase2_kernel_direct<>));
-    gpu_phase2_kernel_direct<><<<nb, 32>>>(d_args);
+    if (use_uint16_factors) {
+      gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16><<<nb, 32>>>(d_args);
+    } else {
+      // TEMPORARY: see the preflight rejection above.
+      // gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32><<<nb, 32>>>(d_args);
+    }
   }
   RAFT_CUDA_TRY(cudaEventRecord(ev_stop));
   RAFT_CUDA_TRY(cudaPeekAtLastError());
@@ -4508,7 +4658,6 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
   timing.kernel_s = kernel_ms / 1000.0;
   cudaEventDestroy(ev_start);
   cudaEventDestroy(ev_stop);
-
 
   // ---- Copy each problem's result back (host-timed) ----
   const double cb_t0 = tic();
