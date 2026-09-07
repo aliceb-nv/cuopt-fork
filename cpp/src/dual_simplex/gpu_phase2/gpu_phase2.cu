@@ -782,16 +782,16 @@ __device__ __forceinline__ void warp_tloop_body(bool a_tl_asc, i_t a_tl_axpyoff,
   }
 }
 
-__device__ __forceinline__ void warp_dz_body(const i_t* a_dz_Acs, const i_t* a_dz_Ari, const f_t* a_dz_Aval, const i_t* a_dz_basic, i_t* a_dz_count, i_t a_dz_dir, const f_t* a_dz_dy, i_t* a_dz_indices, i_t a_dz_leaving, i_t a_dz_m, i_t* a_dz_mark, i_t a_dz_n, const i_t* a_dz_nonbasic, f_t* a_dz_out)
+// `dz` stays zero for every basic column between pivots: setup zeroes the whole vector, and
+// clear_delta_z zeroes both columns whose basic/nonbasic status changes. Every other basic column
+// is untouched by the nonbasic loop below, so sweeping all m basics here only rewrites zeros.
+__device__ __forceinline__ void warp_dz_body(const i_t* a_dz_Acs, const i_t* a_dz_Ari, const f_t* a_dz_Aval, i_t* a_dz_count, i_t a_dz_dir, const f_t* a_dz_dy, i_t* a_dz_indices, i_t a_dz_leaving, i_t a_dz_m, i_t* a_dz_mark, i_t a_dz_n, const i_t* a_dz_nonbasic, f_t* a_dz_out)
 {
   const int lane = static_cast<int>(threadIdx.x);
   const i_t m = a_dz_m, n = a_dz_n;
   f_t* dz = a_dz_out;
-  for (i_t k = lane; k < m; k += 32) { dz[a_dz_basic[k]] = 0.0; }  // clear basic entries
-  __syncwarp(0xffffffffu);                                           // clears done before leaving set
-  // No barrier needed straight after this single-lane store: `leaving` is a BASIC column and the
-  // loop below writes only NONBASIC ones, so no other lane touches this slot. The trailing
-  // __syncwarp at the end of the body is what publishes it to the caller.
+  // `leaving` is the only basic column touched here and no other lane accesses it before the
+  // trailing __syncwarp publishes the store.
   if (lane == 0) { dz[a_dz_leaving] = static_cast<f_t>(a_dz_dir); }
   const i_t num_nb = n - m;
   i_t count      = 0;    // running #appended (identical on all lanes)
@@ -977,12 +977,13 @@ __device__ __forceinline__ void warp_seupd_body(const i_t* a_su_basic, f_t a_su_
   __syncwarp(0xffffffffu);
 }
 
-__device__ __forceinline__ void warp_pinf_body(const i_t* a_pi_basic, i_t* a_pi_count, i_t* a_pi_idx, const f_t* a_pi_lower, i_t a_pi_m, i_t a_pi_n, f_t* a_pi_pinf, f_t* a_pi_pinf_sq, f_t* a_pi_sqinf, f_t a_pi_tol, const f_t* a_pi_upper, const f_t* a_pi_x)
+// Only slots written below are appended to a_pi_idx, and pricing reads a_pi_sqinf only through that
+// freshly rebuilt list. Values left from an earlier pivot are therefore unreachable, so the old
+// n-wide zero-fill was dead work.
+__device__ __forceinline__ void warp_pinf_body(const i_t* a_pi_basic, i_t* a_pi_count, i_t* a_pi_idx, const f_t* a_pi_lower, i_t a_pi_m, f_t* a_pi_pinf, f_t* a_pi_pinf_sq, f_t* a_pi_sqinf, f_t a_pi_tol, const f_t* a_pi_upper, const f_t* a_pi_x)
 {
   const int lane = static_cast<int>(threadIdx.x);
-  const i_t n = a_pi_n, m = a_pi_m;
-  for (i_t k = lane; k < n; k += 32) { a_pi_sqinf[k] = 0.0; }
-  __syncwarp(0xffffffffu);
+  const i_t m = a_pi_m;
   i_t count = 0; f_t lpinf = 0.0, lpinf_sq = 0.0;
   for (i_t base = 0; base < m; base += 32) {
     const i_t k = base + lane;
@@ -2448,10 +2449,7 @@ __device__ void update_objective(const i_t* basic_list,
 // directly (no cfg_shared / op-code dispatch) and the lane-0-only *dz_count must be broadcast before
 // the global-memory set_size. Direct=false (monolith): only lane 0 is here — a __shfl_sync would
 // deadlock against the lanes parked in warp_helper_loop. Same contract as compute_delta_z.
-template <class FT>
 __device__ void compute_reduced_cost_update(const gpu_lp& lp,
-                                            const FT& ft,
-                                            const i_t* basic_list,
                                             const i_t* nonbasic_list,
                                             const f_t* delta_y,
                                             i_t leaving_index,
@@ -2467,8 +2465,8 @@ __device__ void compute_reduced_cost_update(const gpu_lp& lp,
   // append of the nonzero columns. delta_z_indices is empty here (cleared each iter) and reserved
   // to n, so the collective raw-writes [0,count) and we set the size back on return.
   i_t dz_count = 0;
-  warp_dz_body(lp.A.col_start.data(), lp.A.i.data(), lp.A.x.data(), basic_list, &dz_count,
-               direction, delta_y, delta_z_indices.data(), leaving_index, m, delta_z_mark, n,
+  warp_dz_body(lp.A.col_start.data(), lp.A.i.data(), lp.A.x.data(), &dz_count, direction,
+               delta_y, delta_z_indices.data(), leaving_index, m, delta_z_mark, n,
                nonbasic_list, delta_z);
   // No broadcast: the body writes *dz_count on EVERY lane (the count is warp-uniform), and
   // &dz_count is this lane's own local. The body also ends with __syncwarp, so the global
@@ -2729,12 +2727,13 @@ __device__ f_t compute_initial_primal_infeasibilities(const gpu_lp& lp,
   f_t pi_pinf = 0.0, pi_pinf_sq = 0.0;
   // reserve/set_size are header RMW (+ possible device malloc) -> lane 0; the __syncwarp inside
   // lane0_serial also publishes the (possibly relocated) data_ pointers before the collective.
+  // No fill is needed: warp_pinf_body writes every slot exposed through infeasibility_indices.
   lane0_serial([&] {
     squared_infeasibilities.reserve(n);
-    squared_infeasibilities.set_size(n);  // no serial zero; the collective zeros [0,n)
+    squared_infeasibilities.set_size(n);
     infeasibility_indices.reserve(n);
   });
-  warp_pinf_body(basic_list, &pi_count, infeasibility_indices.data(), lp.lower.data(), m, n,
+  warp_pinf_body(basic_list, &pi_count, infeasibility_indices.data(), lp.lower.data(), m,
                  &pi_pinf, &pi_pinf_sq, squared_infeasibilities.data(), settings.primal_tol,
                  lp.upper.data(), x);
   // No broadcast: the body writes all three scalars on EVERY lane (all three are warp-uniform),
@@ -3267,8 +3266,8 @@ struct slot_state {
       infeas_idx.clear();
       primal_inf = 0.0;
     });
-    // WARP_PINF: zero squared_infeas[0,n), scan the m basics one lane per k, ordered ballot/popc
-    // compaction of the infeasible indices -> bit-exact on both consumed outputs.
+    // WARP_PINF: scan the m basics one lane per k and compact the infeasible indices in order.
+    // squared_infeas is read only through that freshly written index list.
     compute_initial_primal_infeasibilities(
       lp, settings, ft, basic_list, x, squared_infeas, infeas_idx, primal_inf);
 
@@ -3430,9 +3429,8 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
       // to_dense RESIZES delta_y (header RMW + possible device malloc). warp_to_dense keeps the
       // sizing on lane 0 and warps the O(n) zero-fill + nnz scatter — bit-exact (distinct indices).
       ft.warp_to_dense(delta_y_sparse, delta_y);
-      compute_reduced_cost_update(lp, ft, basic_list, nonbasic_list, delta_y.data(),
-                                                leaving, direction, delta_z_mark.data(),
-                                                delta_z_indices, delta_z.data());
+      compute_reduced_cost_update(lp, nonbasic_list, delta_y.data(), leaving, direction,
+                                  delta_z_mark.data(), delta_z_indices, delta_z.data());
     }
 
     // 4. Simple ratio test.
