@@ -3173,7 +3173,7 @@ struct slot_state {
   // read-modify-write (assign/reserve/clear, sparse-vector construction, Arow build) so it stays on
   // lane 0; the collectives are opted in one at a time. The serial parts deliberately call the
   // <false> variants so porting one collective cannot silently move any other computation.
-  __device__ void setup(const gpu_lp& lp,
+  __device__ __noinline__ void setup(const gpu_lp& lp,
                         const gpu_settings& settings,
                         variable_status_t* vstatus,
                         i_t* basic_list,
@@ -3638,7 +3638,7 @@ __device__ gpu_factor_view_t<FactorIndex> make_factor_view(
 // level schedules are written into the caller-owned gpu_vectors ls[o]/co[o]
 // (kept alive for the whole kernel); `lvlscratch` is reused m-sized workspace.
 template <typename FactorIndex>
-__device__ void warp_build_config(const gpu_basis_update_mpf_t<FactorIndex>& ft,
+__device__ __noinline__ void warp_build_config(const gpu_basis_update_mpf_t<FactorIndex>& ft,
                                   warp_solve_config_t<FactorIndex>& cfg,
                                    gpu_vector<i_t>* lev, gpu_vector<i_t>* ls, gpu_vector<i_t>* co,
                                    gpu_vector<i_t>& sp_ls_v, gpu_vector<i_t>& sp_co_v,
