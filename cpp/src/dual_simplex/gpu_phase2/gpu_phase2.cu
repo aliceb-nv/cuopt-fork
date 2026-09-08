@@ -78,6 +78,10 @@ namespace dts = dense_triangle_solve;  // shared dense-solve cores
 // the host before each launch; set with atomicOr so concurrent blocks don't tear.
 __device__ int g_gpu_capacity_exceeded;
 
+// Next independent problem claimed by the persistent work-stealing grid. Reset by the host before
+// every launch; only lane 0 of each block updates it, then publishes the claimed index to its warp.
+__device__ unsigned int g_next_problem;
+
 // MEASURED AND REJECTED (2026-08-18): making the hypersparse-vs-dense routing threshold tunable
 // per solve entry point. An earlier per-phase profile appeared to say the hard-coded 0.05 is badly
 // mistuned (hypersparse l_solve mean 4.88M cycles against dense's 1.80M), but a sweep over four
@@ -3717,13 +3721,12 @@ __device__ __noinline__ void warp_build_config(const gpu_basis_update_mpf_t<Fact
   }
 }
 
-// One block == one problem. args points to an N-entry device array; block b solves
-// args[blockIdx.x] entirely on its own device buffers. Launched <<<N,32>>>: all 32 lanes execute
-// this body and every collective is called directly.
-// g_gpu_capacity_exceeded is reset by the HOST before launch (not here) so a late block
-// can't clear a failure flag an earlier block already set.
+// Solve one problem selected by idx. A persistent block can call this repeatedly, but each call
+// reads and writes only that problem's independently marshalled buffers in args[idx].
+// g_gpu_capacity_exceeded is reset by the HOST before launch (not here) so a late block cannot
+// clear a failure flag an earlier block already set.
 template <class FT>
-__device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args)
+__device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args, i_t idx)
 {
   using factor_index_type = typename FT::factor_index_type;
   using warp_config_type  = typename FT::warp_config_type;
@@ -3743,7 +3746,7 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args)
   // No parked-helper model any more: on the warp path all 32 lanes fall through and run the driver
   // (Direct). The lanes-1..31 -> warp_helper_loop split was deleted with the dispatcher.
 
-  kernel_args& a = args[blockIdx.x];
+  kernel_args& a = args[idx];
 
   const i_t m = a.m;
   const i_t n = a.n;
@@ -3868,10 +3871,21 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args)
 // spends registers freely (measured: 214 regs with the bound at minBlocks=1-equivalent, vs 182 with
 // no attribute; and 129 -> 188 on the single-thread kernel, which is why the two entry points exist).
 // Keep the cleanup's measured 128-register occupancy target for both factor-index specializations.
+// Keep only the resident-block budget in flight. Each block dequeues another independent problem
+// after finishing its current one, reducing tail imbalance without sharing any per-problem state.
 template <class FT = gpu_basis_update_mpf_u16>
-__global__ void __launch_bounds__(32, 16) gpu_phase2_kernel_direct(kernel_args* args)
+__global__ void __launch_bounds__(32, 16)
+gpu_phase2_kernel_direct(kernel_args* args, i_t n_problems)
 {
-  gpu_phase2_kernel_body<FT>(args);
+  __shared__ i_t problem_idx;
+  while (true) {
+    if (threadIdx.x == 0) {
+      problem_idx = static_cast<i_t>(atomicAdd(&g_next_problem, 1u));
+    }
+    __syncwarp(0xffffffffu);
+    if (problem_idx >= n_problems) { break; }
+    gpu_phase2_kernel_body<FT>(args, problem_idx);
+  }
 }
 
 // ===========================================================================================
@@ -3982,7 +3996,7 @@ static void upload_solve_class_config()
 // cannot be mislabelled by the operator, the shell history, or another agent reading the output.
 static void report_config(const char* path, size_t nprob, int factor_index_bits)
 {
-  std::printf("[CONFIG] path=%s geometry=warp<<<N,32>>> problems=%zu factor_index_bits=%d\n",
+  std::printf("[CONFIG] path=%s geometry=persistent-warp<<<resident,32>>> problems=%zu factor_index_bits=%d\n",
               path, nprob, factor_index_bits);
 }
 
@@ -4591,8 +4605,10 @@ dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
   // Reset the shared alloc-failed flag from the host (the kernel no longer does it).
   const int zero_flag = 0;
   RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_gpu_capacity_exceeded, &zero_flag, sizeof(int)));
+  const unsigned int zero_counter = 0;
+  RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_next_problem, &zero_counter, sizeof(unsigned int)));
 
-  // The kernel takes a device pointer to an array of kernel_args (one per block);
+  // The kernel takes a device pointer to an array of kernel_args (one per problem);
   // the single-problem path is just N == 1.
   kernel_args* d_args = nullptr;
   RAFT_CUDA_TRY(cudaMalloc(&d_args, sizeof(kernel_args)));
@@ -4604,11 +4620,11 @@ dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
   upload_solve_class_config();
   const auto _k0 = std::chrono::steady_clock::now();
   if (use_uint16_factors) {
-    gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16><<<1, 32>>>(d_args);
+    gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16><<<1, 32>>>(d_args, i_t{1});
   } else {
     // TEMPORARY: omit the validated int32 fallback from this profiling build to reduce ptxas time.
     // Re-enable after host-setup optimization work.
-    // gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32><<<1, 32>>>(d_args);
+    // gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32><<<1, 32>>>(d_args, i_t{1});
   }
   RAFT_CUDA_TRY(cudaPeekAtLastError());
   RAFT_CUDA_TRY(cudaDeviceSynchronize());
@@ -4776,25 +4792,37 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
   RAFT_CUDA_TRY(cudaMemcpy(d_args, h_args.data(), N * sizeof(kernel_args), cudaMemcpyHostToDevice));
   const int zero_flag = 0;
   RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_gpu_capacity_exceeded, &zero_flag, sizeof(int)));
+  const unsigned int zero_counter = 0;
+  RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_next_problem, &zero_counter, sizeof(unsigned int)));
   RAFT_CUDA_TRY(cudaDeviceSynchronize());
   timing.upload_s = toc(up_t0);
 
-  // ---- Launch one block per problem, timed with CUDA events (device compute only) ----
+  // ---- Launch a resident work-stealing grid, timed with CUDA events (device compute only) ----
   report_config("monolith", items.size(), use_uint16_factors ? 16 : 32);
   upload_solve_class_config();
+  int device = 0;
+  RAFT_CUDA_TRY(cudaGetDevice(&device));
+  int sm_count = 1;
+  RAFT_CUDA_TRY(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
+  int blocks_per_sm = 1;
+  RAFT_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+    &blocks_per_sm, gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16>, 32, 0));
+  unsigned int nb = static_cast<unsigned int>(blocks_per_sm) * static_cast<unsigned int>(sm_count);
+  if (nb == 0 || nb > N) { nb = static_cast<unsigned int>(N); }
   cudaEvent_t ev_start, ev_stop;
   RAFT_CUDA_TRY(cudaEventCreate(&ev_start));
   RAFT_CUDA_TRY(cudaEventCreate(&ev_stop));
   RAFT_CUDA_TRY(cudaEventRecord(ev_start));
   {
-    const unsigned nb = static_cast<unsigned>(N);
     // The register/occupancy target is a BUILD-time knob on the Direct kernel
     // gpu_phase2_kernel_direct.
     if (use_uint16_factors) {
-      gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16><<<nb, 32>>>(d_args);
+      gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16><<<nb, 32>>>(
+        d_args, static_cast<i_t>(N));
     } else {
       // TEMPORARY: see the preflight rejection above.
-      // gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32><<<nb, 32>>>(d_args);
+      // gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32><<<nb, 32>>>(
+      //   d_args, static_cast<i_t>(N));
     }
   }
   RAFT_CUDA_TRY(cudaEventRecord(ev_stop));
