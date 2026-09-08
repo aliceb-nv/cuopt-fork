@@ -11,7 +11,7 @@
 // This is a faithful, line-for-line port of the CPU dual-simplex driver and its
 // entire (pure-MPF-stacking) call tree. The algorithm is UNCHANGED; only the
 // data structures differ:
-//   * std::vector<T> created inside the kernel        -> gpu_vector<T> (owning,
+//   * std::vector<T> created inside the kernel        -> gpu_span<T> (owning,
 //     device-side malloc/free with size/capacity tracking and geometric growth)
 //   * data that exists before the kernel (LP, the LU  -> cuda::std::span views
 //     factors, permutations, the solution/state)         (non-owning), uploaded
@@ -68,14 +68,15 @@ using i_t = int;
 using f_t = double;
 namespace dts = dense_triangle_solve;  // shared dense-solve cores
 
-template <typename T>
-using gpu_span = cuda::std::span<T>;
 
-// Set if any device-side allocation fails; the driver bails with NUMERICAL.
+
+// Set when a span is asked to exceed the capacity the host layout reserved for it, or when
+// the host and device slot walks disagree. Nothing allocates any more, so this is a LAYOUT
+// bug, not a resource shortage; the driver bails with NUMERICAL and the host reports it.
 // Shared across all blocks in a batch launch (a single failing block poisons the
 // whole batch by design → surfaces as a loud verification mismatch). Reset from
 // the host before each launch; set with atomicOr so concurrent blocks don't tear.
-__device__ int g_gpu_alloc_failed;
+__device__ int g_gpu_capacity_exceeded;
 
 // MEASURED AND REJECTED (2026-08-18): making the hypersparse-vs-dense routing threshold tunable
 // per solve entry point. An earlier per-phase profile appeared to say the hard-coded 0.05 is badly
@@ -152,9 +153,6 @@ __device__ __forceinline__ bool level_is_noop(i_t lv) { return lv < 0; }
 __device__ __forceinline__ f_t dev_inf() { return cuda::std::numeric_limits<f_t>::infinity(); }
 __device__ __forceinline__ f_t dev_nan() { return cuda::std::numeric_limits<f_t>::quiet_NaN(); }
 
-// ---------------------------------------------------------------------------
-// gpu_arena : per-block bump allocator over ORDINARY, HOST-ALLOCATED VRAM.
-//
 // WHY THIS EXISTS. Everything a solve allocates used to come from the in-kernel malloc() heap.
 // That heap is a fixed arena the driver caps at ~16 GB on EVERY device (measured by bisection on a
 // 12 GB RTX 3500 Ada and on a 178 GB B200; usable is ~0.82x granted, so ~13.1 GB). It is not a
@@ -164,204 +162,95 @@ __device__ __forceinline__ f_t dev_nan() { return cuda::std::numeric_limits<f_t>
 //
 // Most of what a solve allocates is FIXED SIZE -- m-, n- or nz-sized workspaces the host already
 // knows the dimensions of, because it computes exactly those sizes for its own VRAM pre-flight.
-// Those now come from here. What stays on malloc() is only what is genuinely dynamic: S_/mu_values_
-// (the MPF rank-1 update store, one column per pivot, reset at refactor) and function-local vectors.
-//
-// Bump, never free: a block's arena is handed out once and reclaimed wholesale when the batch ends.
-// A gpu_vector that GROWS while arena-bound abandons its old slice, so the arena is sized with
-// slack (see arena_bytes_for). Running out is NOT a failure -- take() returns nullptr and
-// gpu_vector::grow_to falls back to device malloc(), i.e. to exactly today's behaviour.
-//
-// take() uses atomicAdd on `used`: gpu_vector::grow_to is normally reached inside a lane0_serial
-// region, but ALLOC_STATS' g_alloc_multilane counter proves multi-lane allocation does occur, and a
-// racing bump would hand two lanes the same bytes. The atomic makes each caller's slice private.
 // ---------------------------------------------------------------------------
-struct gpu_arena {
-  char* base{nullptr};
-  unsigned long long cap{0};
-  unsigned long long used{0};
-
-  // Returns a 16-byte-aligned slice, or nullptr when the arena is unset or exhausted.
-  __device__ void* take(size_t bytes)
-  {
-    if (base == nullptr || bytes == 0) { return nullptr; }
-    // Round the REQUEST up, then bump: every slice is a multiple of 16 and `base` is cudaMalloc'd
-    // (256-byte aligned), so every returned pointer is 16-aligned without a separate align step.
-    const unsigned long long need = (static_cast<unsigned long long>(bytes) + 15ull) & ~15ull;
-    const unsigned long long off  = atomicAdd(&used, need);
-    if (off + need > cap) { return nullptr; }  // exhausted -> caller falls back to malloc()
-    return base + off;
-  }
-};
-
-// ---------------------------------------------------------------------------
-// gpu_vector<T> : owning device container, mirrors the std::vector ops used by
-// the CPU code. Allocates with device malloc(), frees with free(). Used only
-// for data created dynamically inside the kernel.
+// gpu_span<T> : a NON-OWNING, FIXED-CAPACITY device buffer with a mutable length.
+//
+// This is the only buffer type in the kernel and it NEVER allocates. Storage comes from exactly
+// two places:
+//   * attach(ptr, capacity) -- a slice of the slot memory the host preallocated
+//     (one rmm allocation per buffer; slot_state::attach_all_buffers wires them). Length starts
+//     at 0 and is moved by
+//     resize / assign / push_back / clear.
+//   * view(ptr, n)          -- a zero-copy view over a host-uploaded array; length == capacity.
+//
+// It is deliberately NOT called a vector and has no sizing constructor. Its predecessor looked
+// exactly like std::vector, and `x = gpu_span<T>(n)` -- an utterly ordinary-looking whole-object
+// assignment -- silently discarded a preallocated buffer and sent it back to growing from zero.
+// There is no allocator left to absorb that, so exceeding cap_ is a hard, loud error rather than a
+// quiet regrow: it means the buffer was allocated too small.
 // ---------------------------------------------------------------------------
 template <typename T>
-struct gpu_vector {
-  T* data_       = nullptr;
-  size_t size_   = 0;
-  size_t cap_    = 0;
-  bool owns_     = true;   // false => memory belongs to someone else (a view, or an arena slice)
-  // When set, grow_to() takes from this per-block arena before it falls back to device malloc().
-  // Bound once at slot construction (slot_state::bind_arena_buffers) and never cleared, so a
-  // regrow also comes from the arena. Null on every function-local vector.
-  gpu_arena* arena_ = nullptr;
+struct gpu_span {
+  T* data_     = nullptr;
+  size_t size_ = 0;
+  size_t cap_  = 0;
 
-  // Adopt external device memory as a fixed-size, mutable, non-owning view (zero-copy). The caller
-  // owns/frees the buffer; resize/reserve must not be called on a view.
-  __device__ void view(T* ptr, size_t n)
-  {
-    if (owns_ && data_ != nullptr) { free(data_); }
-    data_ = ptr; size_ = n; cap_ = n; owns_ = false;
-  }
+  __host__ __device__ gpu_span() = default;
+  // View: length == capacity. Every host-uploaded array arrives through this.
+  __host__ __device__ gpu_span(T* ptr, size_t n) : data_(ptr), size_(n), cap_(n) {}
 
-  // Route this vector's allocations through a per-block arena. Must be called BEFORE the first
-  // resize/reserve — an already-allocated buffer keeps its malloc'd storage until it next grows.
-  __device__ void bind_arena(gpu_arena* a) { arena_ = a; }
+  __device__ void view(T* ptr, size_t n) { data_ = ptr; size_ = n; cap_ = n; }
+  __device__ void attach(T* ptr, size_t capacity) { data_ = ptr; size_ = 0; cap_ = capacity; }
 
-  __device__ gpu_vector() {}
-  __device__ explicit gpu_vector(size_t n) { resize(n); }
-  __device__ gpu_vector(size_t n, T val) { resize(n, val); }
-  __device__ gpu_vector(const gpu_vector& o)
-  {
-    reserve(o.size_);
-    for (size_t k = 0; k < o.size_; ++k) { data_[k] = o.data_[k]; }
-    size_ = o.size_;
-  }
-  __device__ gpu_vector(gpu_vector&& o)
-    : data_(o.data_), size_(o.size_), cap_(o.cap_), owns_(o.owns_), arena_(o.arena_)
-  {
-    o.data_  = nullptr;
-    o.size_  = 0;
-    o.cap_   = 0;
-    o.owns_  = true;
-    o.arena_ = nullptr;
-  }
-  __device__ gpu_vector& operator=(const gpu_vector& o)
-  {
-    if (this == &o) { return *this; }
-    size_ = 0;
-    reserve(o.size_);
-    for (size_t k = 0; k < o.size_; ++k) { data_[k] = o.data_[k]; }
-    size_ = o.size_;
-    return *this;
-  }
-  __device__ gpu_vector& operator=(gpu_vector&& o)
-  {
-    if (this == &o) { return *this; }
-    if (owns_ && data_ != nullptr) { free(data_); }
-    data_   = o.data_;
-    size_   = o.size_;
-    cap_    = o.cap_;
-    owns_   = o.owns_;
-    // arena_ is NOT taken from `o`: it says where THIS vector should allocate in future, which is a
-    // property of the destination slot, not of the buffer being moved in. Taking a function-local's
-    // null binding here would silently unbind a slot member for the rest of the solve.
-    o.data_  = nullptr;
-    o.size_  = 0;
-    o.cap_   = 0;
-    o.owns_  = true;
-    o.arena_ = nullptr;
-    return *this;
-  }
-  __device__ ~gpu_vector()
-  {
-    if (owns_ && data_ != nullptr) { free(data_); }
-  }
+  // SHALLOW const, exactly like std::span: a const span is a const HANDLE, not a handle to const
+  // elements. Constness of the view does not propagate to what it views, which is what lets the
+  // const solve helpers write through their scratch spans. Element constness is spelled in T
+  // (gpu_span<const i_t>), not on the span.
+  __host__ __device__ T* data() const { return data_; }
+  __host__ __device__ size_t size() const { return size_; }
+  __host__ __device__ size_t capacity() const { return cap_; }
+  __host__ __device__ bool empty() const { return size_ == 0; }
+  __host__ __device__ T& operator[](size_t k) const { return data_[k]; }
+  __host__ __device__ T* begin() const { return data_; }
+  __host__ __device__ T* end() const { return data_ + size_; }
+  __device__ T& back() const { return data_[size_ - 1]; }
 
-  __device__ size_t size() const { return size_; }
-  __device__ bool empty() const { return size_ == 0; }
-  __device__ T* data() { return data_; }
-  __device__ const T* data() const { return data_; }
-  __device__ T& operator[](size_t k) { return data_[k]; }
-  __device__ const T& operator[](size_t k) const { return data_[k]; }
-  __device__ T* begin() { return data_; }
-  __device__ T* end() { return data_ + size_; }
   __device__ void clear() { size_ = 0; }
-  // Set the logical size directly after a raw write through data() (warp collective ops that fill
-  // [0, n) in-place). Caller must ensure capacity >= n (reserve first).
   __device__ void set_size(size_t n) { size_ = n; }
-  // Swap buffers with another gpu_vector (preserves both allocations — used by sort() to
-  // reuse scratch without move-stealing its buffer).
-  __device__ void swap(gpu_vector& o)
-  {
-    T* d = data_; data_ = o.data_; o.data_ = d;
-    size_t s = size_; size_ = o.size_; o.size_ = s;
-    size_t c = cap_; cap_ = o.cap_; o.cap_ = c;
-    // owns_ follows the BUFFER, so it must swap with it. Previously it did not. That was benign
-    // only while every swapped pair was malloc-owning; with arena slices in play, leaving owns_
-    // behind would hand an arena pointer to a vector that frees it -- heap corruption. arena_ does
-    // NOT swap: it says where each vector allocates next, which stays with the vector.
-    bool w = owns_; owns_ = o.owns_; o.owns_ = w;
-  }
 
-  __device__ void grow_to(size_t newcap)
+  // Capacity is fixed at allocation; these only move the LENGTH. Needing more than was allocated is
+  // a sizing bug, not a condition to recover from: it raises the flag and the write is skipped.
+  __device__ void require_capacity(size_t n) const
   {
-    if (newcap <= cap_) { return; }
-    const size_t want = newcap * sizeof(T);
-    // Arena first (ordinary VRAM, no driver cap). Null arena, or an exhausted one, falls straight
-    // through to malloc() -- i.e. to the behaviour this had before the arena existed.
-    T*   p          = (arena_ != nullptr) ? static_cast<T*>(arena_->take(want)) : nullptr;
-    bool from_arena = (p != nullptr);
-    if (!from_arena) {
-      p = static_cast<T*>(malloc(want));
-    }
-    if (p == nullptr) {
-      printf("[gpu_phase2] device malloc FAILED for %llu bytes (cap %llu -> %llu)\n",
-             (unsigned long long)want,
-             (unsigned long long)cap_,
-             (unsigned long long)newcap);
-      atomicOr(&g_gpu_alloc_failed, 1);
-      return;
-    }
-    for (size_t k = 0; k < size_; ++k) { p[k] = data_[k]; }
-    // Free ONLY a buffer we malloc'd. An arena slice is bump-allocated and reclaimed with the whole
-    // arena; a view() buffer belongs to the host. Passing either to free() corrupts the heap.
-    // (This used to free unconditionally, which was safe only by the convention that views are
-    // never resized.)
-    if (owns_ && data_ != nullptr) { free(data_); }
-    data_ = p;
-    cap_  = newcap;
-    owns_ = !from_arena;
+    if (n > cap_) { atomicOr(&g_gpu_capacity_exceeded, 1); }
   }
-  __device__ void reserve(size_t n) { grow_to(n); }
+  __device__ void reserve(size_t n) { require_capacity(n); }
   __device__ void resize(size_t n)
   {
-    grow_to(n);
-    if (g_gpu_alloc_failed) { return; }
+    if (n > cap_) { require_capacity(n); return; }
+    // TODO: is this necessary?
     for (size_t k = size_; k < n; ++k) { data_[k] = T(); }
     size_ = n;
   }
   __device__ void resize(size_t n, T val)
   {
-    grow_to(n);
-    if (g_gpu_alloc_failed) { return; }
+    if (n > cap_) { require_capacity(n); return; }
     for (size_t k = size_; k < n; ++k) { data_[k] = val; }
     size_ = n;
   }
   __device__ void assign(size_t n, T val)
   {
-    size_ = 0;
-    grow_to(n);
-    if (g_gpu_alloc_failed) { return; }
+    // TODO: all those n > cap should be debug only
+    if (n > cap_) { require_capacity(n); return; }
     for (size_t k = 0; k < n; ++k) { data_[k] = val; }
     size_ = n;
   }
   __device__ void push_back(const T& v)
   {
-    if (size_ == cap_) {
-      grow_to(cap_ == 0 ? 4 : 2 * cap_);
-      if (g_gpu_alloc_failed) { return; }
-    }
+    if (size_ + 1 > cap_) { require_capacity(size_ + 1); return; }
     data_[size_++] = v;
+  }
+  // Exchange storage with another span (the sparse-vector sort swaps a vector with its scratch).
+  // Nothing owns memory, so this just moves pointers.
+  __device__ void swap(gpu_span& o)
+  {
+    T* d = data_;     data_ = o.data_; o.data_ = d;
+    size_t z = size_; size_ = o.size_; o.size_ = z;
+    size_t c = cap_;  cap_  = o.cap_;  o.cap_  = c;
   }
 };
 
-// Insertion sort over [first, last) with comparator. Replaces std::sort; the
-// arrays sorted here (sparse-vector index lists) are short.
+// TODO: not SoL but needs dynamic size sort
 template <typename T, typename Cmp>
 __device__ void gpu_sort(T* first, T* last, Cmp cmp)
 {
@@ -400,14 +289,15 @@ using gpu_factor_view_t = gpu_csc_view_t<FactorIndex>;
 // which grows one (u,v) column-pair per iteration.
 struct gpu_csc_matrix {
   i_t m{0}, n{0}, nz_max{0};
-  gpu_vector<i_t> col_start;
-  gpu_vector<i_t> i;
-  gpu_vector<f_t> x;
+  gpu_span<i_t> col_start;
+  gpu_span<i_t> i;
+  gpu_span<f_t> x;
 
   __device__ gpu_csc_matrix() {}
   __device__ gpu_csc_matrix(const gpu_csc_matrix&)            = delete;
   __device__ gpu_csc_matrix& operator=(const gpu_csc_matrix&) = delete;
   __device__ ~gpu_csc_matrix()                                = default;
+
 
   // Initialize as an m x 0 matrix with col_start = {0}.
   __device__ void init_empty(i_t rows)
@@ -428,9 +318,9 @@ struct gpu_csc_matrix {
 // owning/mutable, not a span.
 struct gpu_csr_matrix {
   i_t m{0}, n{0};
-  gpu_vector<i_t> row_start;
-  gpu_vector<i_t> j;
-  gpu_vector<f_t> x;
+  gpu_span<i_t> row_start;
+  gpu_span<i_t> j;
+  gpu_span<f_t> x;
 
   __device__ gpu_csr_matrix() {}
   __device__ gpu_csr_matrix(const gpu_csr_matrix&)            = delete;
@@ -439,34 +329,6 @@ struct gpu_csr_matrix {
   // Build the CSR copy of a CSC matrix. Mirrors csc_matrix_t::to_compressed_row
   // exactly (row entries end up ordered by ascending column index), so the delta_z
   // accumulation order matches the CPU bit-for-bit.
-  __device__ void from_csc(const gpu_csc_view& A)
-  {
-    m            = A.m;
-    n            = A.n;
-    const i_t nz = A.col_start[n];
-    row_start.resize(m + 1);
-    j.resize(nz);
-    x.resize(nz);
-    gpu_vector<i_t> workspace(m, 0);
-    for (i_t p = 0; p < nz; ++p) { workspace[A.i[p]]++; }
-    i_t sum = 0;  // cumulative_sum: row_start = prefix sums, workspace reset to starts
-    for (i_t i = 0; i < m; ++i) {
-      row_start[i] = sum;
-      sum += workspace[i];
-      workspace[i] = row_start[i];
-    }
-    row_start[m] = sum;
-    for (i_t col = 0; col < n; ++col) {
-      const i_t cs = A.col_start[col];
-      const i_t ce = A.col_start[col + 1];
-      for (i_t p = cs; p < ce; ++p) {
-        const i_t q = workspace[A.i[p]]++;
-        j[q]        = col;
-        x[q]        = A.x[p];
-      }
-    }
-  }
-
   // Zero-copy: adopt a host-built CSR already in device memory as non-owning views. row_start stays
   // read-only and may be shared; j/x are mutated in place by the nonbasic partition, so those two
   // buffers must be fresh per-solve mutable copies.
@@ -490,14 +352,17 @@ struct gpu_basis_update_mpf_t;
 // ---------------------------------------------------------------------------
 struct gpu_sparse_vector {
   i_t n{0};
-  gpu_vector<i_t> i;
-  gpu_vector<f_t> x;
+  gpu_span<i_t> i;
+  gpu_span<f_t> x;
 
-  // Route both payloads through a per-block arena (see gpu_arena / slot_state::bind_arena_buffers).
-  __device__ void bind_arena(gpu_arena* a) { i.bind_arena(a); x.bind_arena(a); }
+  __device__ void attach(i_t* pi, f_t* px, size_t capacity)
+  {
+    i.attach(pi, capacity); x.attach(px, capacity);
+  }
 
   __device__ gpu_sparse_vector() {}
-  __device__ gpu_sparse_vector(i_t n_, i_t nz) : n(n_), i(nz), x(nz) {}
+  // Dimension only. Storage is never allocated here -- it arrives via attach().
+  __device__ gpu_sparse_vector(i_t n_, i_t /*nz*/) : n(n_) {}
   __device__ gpu_sparse_vector(const gpu_sparse_vector&)            = default;
   __device__ gpu_sparse_vector& operator=(const gpu_sparse_vector&) = default;
   __device__ gpu_sparse_vector(gpu_sparse_vector&&)                 = default;
@@ -530,13 +395,14 @@ struct gpu_sparse_vector {
   // an O(n) bucket sort when dense (>30% nnz), else an n·log·n sort of a permutation then a gather.
   // The reused bucket is re-zeroed via assign (owning buffer, no realloc); the n·log·n path gathers
   // into scratch and swaps (preserving both buffers).
-  __device__ void sort(gpu_vector<f_t>& bucket, gpu_vector<i_t>& i_scr,
-                       gpu_vector<f_t>& x_scr, gpu_vector<i_t>& perm)
+  // TODO: not SoL but needs dynamic size sort
+  __device__ void sort(gpu_span<f_t>& bucket, gpu_span<i_t>& i_scr,
+                       gpu_span<f_t>& x_scr, gpu_span<i_t>& perm)
   {
     if (i.size() == 1) { return; }
     const i_t nz = i.size();
     if (i.size() > 0.3 * n) {
-      bucket.assign(n, 0.0);  // reused (was gpu_vector<f_t> bucket(n,0.0)); O(n) re-zero, no malloc
+      bucket.assign(n, 0.0);  // reused (was gpu_span<f_t> bucket(n,0.0)); O(n) re-zero, no malloc
       for (i_t k = 0; k < nz; ++k) { bucket[i[k]] = x[k]; }
       i.clear();
       i.reserve(nz);
@@ -1451,8 +1317,8 @@ __device__ __forceinline__ f_t warp_reduce_min(f_t v)
 // level_start[nlev+1] and col_order[m]; returns nlev. `level` is m-sized scratch.
 template <typename RI>
 __device__ int warp_build_levels(const gpu_csc_view_t<RI>& mat, bool diag_first, bool asc_process,
-                                  gpu_vector<i_t>& level, gpu_vector<i_t>& level_start,
-                                  gpu_vector<i_t>& col_order)
+                                  gpu_span<i_t>& level, gpu_span<i_t>& level_start,
+                                  gpu_span<i_t>& col_order, gpu_span<i_t>& pos)
 {
   const i_t m = mat.n;
   level.assign(m, 0);
@@ -1483,13 +1349,16 @@ __device__ int warp_build_levels(const gpu_csc_view_t<RI>& mat, bool diag_first,
   level_start.assign(nlev + 1, 0);
   for (i_t j = 0; j < m; ++j) { if (!is_noop(j)) { level_start[level[j]]++; } }
   for (i_t k = 1; k <= nlev; ++k) { level_start[k] += level_start[k - 1]; }
-  // MEASURED, do not "optimize" this away: hoisting `pos` into a reused slot buffer to avoid the
-  // per-call device malloc is bit-exact but worth ~0.7% of block time even on the 1-2 iteration
-  // nodes, and it was NOT the cost of this counting sort (the six O(m) passes below are). It also
-  // needs either a 16th (m+1) arena array -- which grew static VRAM enough to break the lazily
-  // reserved malloc heap at 1,200 problems, cudaErrorLaunchOutOfResources -- or aliasing sp_pos_v,
-  // which silently couples this to the sparse solve's scratch.
-  gpu_vector<i_t> pos(nlev + 1);
+  // `pos` IS now the 16th (m+1) arena array the note below warned about. History, so the reversal is
+  // legible: hoisting it out of a per-call device malloc was measured bit-exact and worth ~0.7% of
+  // block time, and was rejected ONLY because the extra static VRAM broke the lazily reserved malloc
+  // heap at 1,200 problems (cudaErrorLaunchOutOfResources). Two things changed. It is now the LAST
+  // device malloc in the kernel -- measured at exactly 4 per problem, one per solve op, ~105 B each
+  // -- so removing it retires the whole malloc path and g_gpu_capacity_exceeded with it. And the VRAM
+  // objection is gone: one (m+1) array shared by all four ops costs 4(m+1) B/slot against the
+  // iteration-driven S_ heap term it replaces, which is ~36 MB/slot at 200 iterations.
+  // Deliberately NOT aliased onto sp_pos_v, which is live for the whole solve as cfg.sp_pos.
+  pos.assign(nlev + 1, 0);
   for (i_t lv = 1; lv <= nlev; ++lv) { pos[lv] = level_start[lv - 1]; }
   for (i_t j = 0; j < m; ++j) {
     if (is_noop(j)) { continue; }
@@ -1726,7 +1595,19 @@ struct gpu_basis_update_mpf_t {
   // `is_mpf = std::is_same<BU, basis_update_mpf_t>` dispatch in simplified_dual_phase2).
   static constexpr bool is_mpf_bu = true;
   i_t num_updates_{0};
+  // TODO: should that value really be 100 and not 200/300?
   i_t refactor_frequency_{100};
+  // Caps on the rank-1 store, so it can be PREALLOCATED instead of grown in-kernel (which is what
+  // made a slot un-reusable across launches, and what kept device malloc() alive). Both are set by
+  // the host.
+  //   update_cap_  : how many rank-1 updates the store holds.
+  //   eta_nnz_cap_ : capacity of S_.i / S_.x in entries. A budget rather than a worst case: sizing
+  //                  every column densely at m costs 58 MB/seat on the v6 set against a measured
+  //                  median of 0.27% of m. Defaults clear every measured node. See PHASE0_SIZING.md.
+  i_t update_cap_{0};
+  i_t eta_nnz_cap_{0};
+  // Set by grow_storage when the store cannot take another update. Sticky until the next reset.
+  bool store_exhausted_{false};
   using factor_index_type = FactorIndex;
   using factor_view_type  = gpu_factor_view_t<FactorIndex>;
   using warp_config_type  = warp_solve_config_t<FactorIndex>;
@@ -1734,28 +1615,28 @@ struct gpu_basis_update_mpf_t {
   factor_view_type L0_, U0_, L0_transpose_, U0_transpose_;
   gpu_span<i_t> row_permutation_, inverse_row_permutation_;
   gpu_csc_matrix S_;
-  gpu_vector<f_t> mu_values_;
+  gpu_span<f_t> mu_values_;
   gpu_span<i_t> xi_workspace_;  // size 2*m (scratch)
   gpu_span<f_t> x_workspace_;   // size m   (scratch)
   gpu_span<unsigned char> reach_mark_;  // size m, private visited bytes for immutable factor DFS
   // Reused solve scratch (owning; grows to m once, then reused every call) so the b_solve /
   // b_transpose_solve dense↔sparse conversions and the sparse-Lᵀ gather no longer device-malloc a
   // fresh temporary per solve. Bit-identical to the per-call locals (same values, same order).
-  mutable gpu_vector<f_t> dense_scratch_;    // solution_dense in the dense b_solve/b_transpose branches
+  mutable gpu_span<f_t> dense_scratch_;    // solution_dense in the dense b_solve/b_transpose branches
   mutable gpu_sparse_vector sparse_scratch_; // gathered `b` (sparse Lᵀ) + throwaway Lsol
   mutable gpu_sparse_vector ei_scratch_;     // unit RHS for compute_delta_y (separate — b_transpose_solve
                                              // uses sparse_scratch_ internally, so ei can't share it)
-  mutable gpu_vector<f_t> sort_bucket_;      // reused scratch for etilde.sort() (per-pivot sort
-  mutable gpu_vector<i_t> sort_i_;           // in update(): the O(n) bucket + the n·log·n index/value/perm
-  mutable gpu_vector<f_t> sort_x_;           // buffers, all reused instead of malloc'd each pivot.
-  mutable gpu_vector<i_t> sort_perm_;
+  mutable gpu_span<f_t> sort_bucket_;      // reused scratch for etilde.sort() (per-pivot sort
+  mutable gpu_span<i_t> sort_i_;           // in update(): the O(n) bucket + the n·log·n index/value/perm
+  mutable gpu_span<f_t> sort_x_;           // buffers, all reused instead of malloc'd each pivot.
+  mutable gpu_span<i_t> sort_perm_;
   // NaN-recovery dense re-solve in compute_delta_x. Deliberately NOT arena-bound and never
   // pre-sized: the branch is rare (0 of the 100 v6 nodes reach it), so these stay empty and cost
   // nothing until the first time it fires. They exist because the recovery must be a WARP
-  // collective -- stack-local gpu_vectors would give each of the 32 lanes a private malloc, and
+  // collective -- stack-local gpu_spans would give each of the 32 lanes a private malloc, and
   // the collective would then write 32 different buffers.
-  mutable gpu_vector<f_t> recover_rhs_;
-  mutable gpu_vector<f_t> recover_sol_;
+  mutable gpu_span<f_t> recover_rhs_;
+  mutable gpu_span<f_t> recover_sol_;
   // Statistics that drive the hypersparse-vs-dense path choice.
   mutable i_t num_calls_L_{0}, num_calls_U_{0}, num_calls_L_transpose_{0}, num_calls_U_transpose_{0};
   mutable f_t sum_L_{0.0}, sum_U_{0.0}, sum_L_transpose_{0.0}, sum_U_transpose_{0.0};
@@ -1767,22 +1648,13 @@ struct gpu_basis_update_mpf_t {
   // one lane. Set by lane 0 before the driver runs.
   warp_config_type* warp_cfg_ = nullptr;
 
-  // Route the REUSED scratch through the block's arena. Each of these grows to m or n once and is
-  // then reused for the whole solve, so it is exactly what the arena is for.
+  // All of these are slices of the slot memory, wired once by attach_all_buffers.
   //
-  // S_ and mu_values_ are deliberately NOT bound. They grow by one column per pivot and are only
-  // reset at refactor, so their size is data-dependent and unbounded within a refactor window --
-  // the one allocation here that genuinely belongs on the dynamic heap.
-  __device__ void bind_arena(gpu_arena* a)
-  {
-    dense_scratch_.bind_arena(a);
-    sparse_scratch_.bind_arena(a);
-    ei_scratch_.bind_arena(a);
-    sort_bucket_.bind_arena(a);
-    sort_i_.bind_arena(a);
-    sort_x_.bind_arena(a);
-    sort_perm_.bind_arena(a);
-  }
+  // S_ and mu_values_ are preallocated too. They used to be the one genuinely dynamic allocation --
+  // one column per pivot, unbounded within a refactor window -- which is what forced device
+  // malloc() to stay alive and what made a slot impossible to reuse across launches. With
+  // update_cap_/eta_nnz_cap_ set they are preallocated once by reserve_store() and never grow, so
+  // they are now fixed-size preallocated buffers; overflow is reported, never allocated.
 
   __device__ gpu_basis_update_mpf_t() {}
   gpu_basis_update_mpf_t(const gpu_basis_update_mpf_t&)            = delete;
@@ -1911,7 +1783,7 @@ struct gpu_basis_update_mpf_t {
   // Warp-parallel gpu_sparse_vector::to_dense — lane 0 sizes the dense buffer (no zero-fill), the warp
   // zeros [0,n) + scatters the nnz. Bit-exact (distinct sparse indices). Replaces the O(n) serial tail
   // before each dense solve.
-  __device__ void warp_to_dense(const gpu_sparse_vector& sv, gpu_vector<f_t>& dense) const
+  __device__ void warp_to_dense(const gpu_sparse_vector& sv, gpu_span<f_t>& dense) const
   {
     const i_t n = sv.n;
     // reserve() may device-malloc and set_size() is a header RMW → lane 0 only. The __syncwarp
@@ -1923,7 +1795,7 @@ struct gpu_basis_update_mpf_t {
 
   // Warp-parallel gpu_sparse_vector::from_dense — lane 0 reserves the sparse buffers, the warp compacts
   // the nonzeros of `dense` in increasing index order, lane 0 sets the final size. Bit-exact.
-  __device__ void warp_from_dense(const gpu_vector<f_t>& dense, gpu_sparse_vector& sv) const
+  __device__ void warp_from_dense(const gpu_span<f_t>& dense, gpu_sparse_vector& sv) const
   {
     const i_t n = static_cast<i_t>(dense.size());
     lane0_serial([&] { sv.n = n; sv.i.reserve(n); sv.x.reserve(n); });
@@ -1954,7 +1826,7 @@ struct gpu_basis_update_mpf_t {
   }
 
   // Warp-parallel `dst = src` for a sparse vector. Same result as the defaulted copy-assign
-  // (memberwise gpu_vector::operator=, which is size_=0; reserve; copy; size_=n).
+  // (memberwise gpu_span::operator=, which is size_=0; reserve; copy; size_=n).
   // Callers never self-assign or alias here; both call sites copy between distinct vectors.
   __device__ void warp_sv_copy(const gpu_sparse_vector& src, gpu_sparse_vector& dst) const
   {
@@ -2009,20 +1881,61 @@ struct gpu_basis_update_mpf_t {
     return nz;
   }
 
-  __device__ void grow_storage(i_t nz, i_t& S_start, i_t& S_nz)
+  // Reserve the rank-1 store to its caps. Called once per slot, after attach_all_buffers and before any
+  // update. Nothing here allocates: the spans already point at their slot slices.
+  // `col_start` needs 2 entries per update plus the leading 0: the update appends TWO columns.
+  __device__ void reserve_store(i_t m)
+  {
+    if (update_cap_ > 0 && eta_nnz_cap_ > 0) {
+      // Capacity FIRST, so init_empty's resize(1) fits inside it and never reallocates (a realloc
+      // capacity is fixed by the slot layout, so this only publishes the length).
+      S_.col_start.reserve(2 * update_cap_ + 1);
+      S_.i.reserve(eta_nnz_cap_);
+      S_.x.reserve(eta_nnz_cap_);
+      mu_values_.reserve(update_cap_);   // push_back only; capacity is enough to stop it doubling
+      S_.init_empty(m);
+      // grow_storage compares against size(), not capacity, so publish the caps as the size. Same
+      // reserve()+set_size() idiom as warp_to_dense; the capacity is already in place above, so
+      // set_size only moves size_. NOT resize(), which would value-fill ~10^5 entries on one lane
+      // per slot for entries that are only ever reached through S_.col_start, i.e. only where an
+      // append already wrote.
+      // col_start needs 2 entries per update plus the leading 0; that exact length is what makes
+      // the bounds check fire on update index == update_cap_ and not before.
+      S_.col_start.set_size(2 * update_cap_ + 1);
+      S_.i.set_size(eta_nnz_cap_);
+      S_.x.set_size(eta_nnz_cap_);
+      S_.col_start[0] = 0;   // init_empty set this, but the size bump above must not lose it
+    } else {
+      S_.init_empty(m);
+    }
+    store_exhausted_ = false;
+  }
+
+  // Bounds-check the store for one more update. Returns false (and sets store_exhausted_) when the
+  // update would not fit; the caller must then stop and hand the node back for refactorization.
+  //
+  // This used to resize S_ by doubling, which is exactly the dynamic allocation that made a slot
+  // un-reusable across launches. With the caps set it only checks; with them unset it falls back to
+  // the old growth so an uncapped caller behaves as before.
+  __device__ bool grow_storage(i_t nz, i_t& S_start, i_t& S_nz)
   {
     const i_t last_S_col     = num_updates_ * 2;
     const i_t new_last_S_col = last_S_col + 2;
+    const bool capped        = (update_cap_ > 0 && eta_nnz_cap_ > 0);
+
     if (new_last_S_col >= static_cast<i_t>(S_.col_start.size())) {
+      if (capped) { store_exhausted_ = true; return false; }
       S_.col_start.resize(new_last_S_col + refactor_frequency_);
     }
     S_nz = S_.col_start[last_S_col];
     if (S_nz + nz > static_cast<i_t>(S_.i.size())) {
+      if (capped) { store_exhausted_ = true; return false; }
       const i_t newsz = (2 * S_nz > S_nz + nz) ? 2 * S_nz : S_nz + nz;
       S_.i.resize(newsz);
       S_.x.resize(newsz);
     }
     S_start = last_S_col;
+    return true;
   }
 
   // x <- x + theta * Mat(:, col)   (dense x). Mat is S_ (owning) or a view.
@@ -2170,7 +2083,7 @@ struct gpu_basis_update_mpf_t {
   // estimate_solution_density MUTATES the routing statistics (num_calls_/sum_), so it must run
   // exactly once — on lane 0 — and the resulting route must then be broadcast. If a lane disagreed
   // about the route it would call a different body and the warp would desynchronize.
-  __device__ i_t b_solve(const gpu_vector<f_t>& rhs, gpu_vector<f_t>& solution) const
+  __device__ i_t b_solve(const gpu_span<f_t>& rhs, gpu_span<f_t>& solution) const
   {
     warp_permute_dense_body(rhs.data(), L0_.m, row_permutation_.data(), solution.data());
     l_solve(solution.data());
@@ -2202,7 +2115,7 @@ struct gpu_basis_update_mpf_t {
     if (use_hypersparse) {
       l_solve(solution);
     } else {
-      gpu_vector<f_t>& solution_dense = dense_scratch_;  // reused (was a per-solve device malloc)
+      gpu_span<f_t>& solution_dense = dense_scratch_;  // reused (was a per-solve device malloc)
       warp_to_dense(solution, solution_dense);
       l_solve(solution_dense.data());
       warp_from_dense(solution_dense, solution);
@@ -2222,7 +2135,7 @@ struct gpu_basis_update_mpf_t {
     if (use_hypersparse) {
       u_solve(solution);
     } else {
-      gpu_vector<f_t>& solution_dense = dense_scratch_;  // reused (was a per-solve device malloc)
+      gpu_span<f_t>& solution_dense = dense_scratch_;  // reused (was a per-solve device malloc)
       warp_to_dense(solution, solution_dense);
       u_solve(solution_dense.data());
       warp_from_dense(solution_dense, solution);
@@ -2262,7 +2175,7 @@ struct gpu_basis_update_mpf_t {
       warp_sv_copy(rhs, solution);
       u_transpose_solve(solution);
     } else {
-      gpu_vector<f_t>& solution_dense = dense_scratch_;  // reused (was a per-solve device malloc)
+      gpu_span<f_t>& solution_dense = dense_scratch_;  // reused (was a per-solve device malloc)
       warp_to_dense(rhs, solution_dense);
       u_transpose_solve(solution_dense.data());
       warp_from_dense(solution_dense, solution);
@@ -2283,7 +2196,7 @@ struct gpu_basis_update_mpf_t {
     if (use_hypersparse) {
       l_transpose_solve(solution);
     } else {
-      gpu_vector<f_t>& solution_dense = dense_scratch_;  // reused (was a per-solve device malloc)
+      gpu_span<f_t>& solution_dense = dense_scratch_;  // reused (was a per-solve device malloc)
       warp_to_dense(solution, solution_dense);
       l_transpose_solve(solution_dense.data());
       warp_from_dense(solution_dense, solution);
@@ -2319,9 +2232,14 @@ struct gpu_basis_update_mpf_t {
       gpu_sort(xi_workspace_.data() + m, xi_workspace_.data() + m + nz,
                [] __device__(i_t a, i_t b) { return a < b; });
       i_t S_start_l = 0, S_nz_l = 0;
-      grow_storage(nz + static_cast<i_t>(etilde.i.size()), S_start_l, S_nz_l);
-      base = S_.col_start[S_.n];
+      if (grow_storage(nz + static_cast<i_t>(etilde.i.size()), S_start_l, S_nz_l)) {
+        base = S_.col_start[S_.n];
+      }
     });
+    // The store is full: stop before touching S_, so the stack stays exactly as it was and the host
+    // can refactor from the CURRENT basis. Mirrors the bail-out below -- workspace not cleared,
+    // num_updates_ not bumped.
+    if (lane0_bcast(store_exhausted_ ? 1 : 0)) { return 2; }
     nz   = lane0_bcast(nz);     // add_sparse_column grew it on lane 0 only
     base = lane0_bcast(base);
     // S_.i/S_.x may have been relocated by grow_storage — data() is read here, after the barrier.
@@ -2379,7 +2297,7 @@ struct gpu_lp {
   gpu_csc_view A;
   gpu_span<f_t> rhs, lower, upper, objective;
   f_t obj_scale{1.0}, obj_constant{0.0};
-  // Optional host-built CSR of A (Arow). Null => build on device via from_csc.
+  // Host-built CSR of A (Arow). Always uploaded.
   const i_t* Arow_row_start{nullptr};
   const i_t* Arow_j{nullptr};
   const f_t* Arow_x{nullptr};
@@ -2455,7 +2373,7 @@ __device__ void compute_reduced_cost_update(const gpu_lp& lp,
                                             i_t leaving_index,
                                             i_t direction,
                                             i_t* delta_z_mark,
-                                            gpu_vector<i_t>& delta_z_indices,
+                                            gpu_span<i_t>& delta_z_indices,
                                             f_t* delta_z)
 {
   const i_t m = lp.num_rows;
@@ -2489,7 +2407,7 @@ __device__ void compute_delta_z(const FT& ft,
                                 i_t direction,
                                 const i_t* nonbasic_end,
                                 i_t* delta_z_mark,
-                                gpu_vector<i_t>& delta_z_indices,
+                                gpu_span<i_t>& delta_z_indices,
                                 f_t* delta_z)
 {
   // Collectively scatter (inner span per row split across the warp). delta_z_indices is empty here
@@ -2526,7 +2444,7 @@ __device__ void compute_initial_nonbasic_end(const FT& ft,
 __device__ void update_Arow(i_t leaving,
                             i_t entering,
                             const gpu_csc_view& A,
-                            gpu_vector<i_t>& row_mark,
+                            gpu_span<i_t>& row_mark,
                             i_t* nonbasic_end,
                             gpu_csr_matrix& Arow)
 {
@@ -2573,7 +2491,7 @@ __device__ void update_Arow(i_t leaving,
 // singleton-row fast path (1/alpha^2) or a b_transpose_solve. Mirrors the CPU
 // initialize_steepest_edge_norms (the simplified always uses the non-slack/exact path).
 // All scratch is CALLER-OWNED (slot-resident). Under Direct every lane executes this, so a
-// stack-local gpu_vector would device-malloc PER LANE — 32 private buffers, and the collective
+// stack-local gpu_span would device-malloc PER LANE — 32 private buffers, and the collective
 // b_transpose_solve below would then operate on lane-private memory. The original even allocated a
 // fresh `sparse_ei` inside the per-column loop.
 template <class FT>
@@ -2581,9 +2499,9 @@ __device__ i_t initialize_steepest_edge_norms(const gpu_lp& lp,
                                               const i_t* basic_list,
                                               FT& ft,
                                               f_t* delta_y_steepest_edge,
-                                              gpu_vector<i_t>& row_degree,
-                                              gpu_vector<i_t>& mapping,
-                                              gpu_vector<f_t>& coeff,
+                                              gpu_span<i_t>& row_degree,
+                                              gpu_span<i_t>& mapping,
+                                              gpu_span<f_t>& coeff,
                                               gpu_sparse_vector& sparse_dy,
                                               gpu_sparse_vector& UTsol_scratch,
                                               gpu_sparse_vector& sparse_ei)
@@ -2646,8 +2564,8 @@ __device__ void compute_primal_variables(const FT& ft,
                                          const i_t* nonbasic_list,
                                          f_t tight_tol,
                                          f_t* x,
-                                         gpu_vector<f_t>& xB_workspace,
-                                         gpu_vector<f_t>& rhs)
+                                         gpu_span<f_t>& xB_workspace,
+                                         gpu_span<f_t>& rhs)
 {
   const i_t m = A.m;
   const i_t n = A.n;
@@ -2690,7 +2608,7 @@ __device__ void compute_primal_variables(const FT& ft,
 }
 
 __device__ void clear_delta_z(
-  i_t entering_index, i_t leaving_index, i_t* delta_z_mark, gpu_vector<i_t>& delta_z_indices, f_t* delta_z)
+  i_t entering_index, i_t leaving_index, i_t* delta_z_mark, gpu_span<i_t>& delta_z_indices, f_t* delta_z)
 {
   const i_t nz = delta_z_indices.size();
   // delta_z_indices is a mark-guarded append list, so each column appears at most once -> the
@@ -2717,8 +2635,8 @@ __device__ f_t compute_initial_primal_infeasibilities(const gpu_lp& lp,
                                                       const FT& ft,
                                                       const i_t* basic_list,
                                                       const f_t* x,
-                                                      gpu_vector<f_t>& squared_infeasibilities,
-                                                      gpu_vector<i_t>& infeasibility_indices,
+                                                      gpu_span<f_t>& squared_infeasibilities,
+                                                      gpu_span<i_t>& infeasibility_indices,
                                                       f_t& primal_inf)
 {
   const i_t m = lp.num_rows;
@@ -2763,8 +2681,8 @@ __device__ i_t steepest_edge_pricing_with_infeasibilities(const gpu_lp& lp,
                                                           const f_t* x,
                                                           const f_t* dy_steepest_edge,
                                                           const i_t* basic_mark,
-                                                          gpu_vector<f_t>& squared_infeasibilities,
-                                                          gpu_vector<i_t>& infeasibility_indices,
+                                                          gpu_span<f_t>& squared_infeasibilities,
+                                                          gpu_span<i_t>& infeasibility_indices,
                                                           i_t& direction,
                                                           i_t& basic_leaving,
                                                           f_t& max_val)
@@ -2828,7 +2746,7 @@ __device__ void compute_delta_y(const FT& ft,
 template <class FT>
 __device__ void update_dual_variables(const FT& ft,
                                      const gpu_sparse_vector& delta_y_sparse,
-                                     const gpu_vector<i_t>& delta_z_indices,
+                                     const gpu_span<i_t>& delta_z_indices,
                                      const f_t* delta_z,
                                      f_t step_length,
                                      i_t leaving_index,
@@ -2876,7 +2794,7 @@ __device__ i_t compute_delta_x(const gpu_lp& lp,
     // Switch to a regular dense solve and try to recover -- mirrors the CPU compute_delta_x.
     //
     // Fully collective. ft.recover_rhs_ / ft.recover_sol_ are members, so all 32 lanes name the
-    // SAME buffer; stack-local gpu_vectors would give each lane a private malloc and the warp
+    // SAME buffer; stack-local gpu_spans would give each lane a private malloc and the warp
     // would write 32 different ones. They are lazily allocated, so this costs nothing until the
     // branch first fires.
     const i_t m = lp.num_rows;
@@ -3070,23 +2988,84 @@ __device__ void set_primal_variables_on_bounds(const gpu_lp& lp,
 // setup() is the one-time S1-S7 prologue, kept as its own method so a persistent slot can
 // later run it as a dedicated setup kernel for a freshly refilled slot.
 // ---------------------------------------------------------------------------
+// ---- Per-slot buffers -----------------------------------------------------------------------
+// Every buffer the kernel uses is its own allocation, exactly like every other array the marshal
+// uploads. No slab and no offsets: the pointer IS the buffer.
+//
+// This replaced a single slab that the host sized and the device re-walked to compute offsets, an
+// arrangement that required the two walks to agree in order AND in alignment -- and when they did
+// not, the device ran off the end of the slot. Here a miscount can only make the VRAM pre-flight
+// estimate slightly wrong, which is an estimate, not memory corruption.
+struct slot_buffers {
+  f_t* xB_workspace;
+  f_t* delta_y;
+  f_t* delta_z;
+  f_t* delta_x;
+  f_t* v;
+  f_t* squared_infeas;
+  f_t* rt_ratio;
+  f_t* setup_rhs;
+  f_t* se_coeff;
+  i_t* basic_mark;
+  i_t* delta_z_mark;
+  i_t* delta_z_indices;
+  i_t* nonbasic_end;
+  i_t* row_mark;
+  i_t* infeas_idx;
+  i_t* se_row_degree;
+  i_t* se_mapping;
+  f_t* ft_dense_scratch;
+  f_t* ft_sort_bucket;
+  f_t* ft_sort_x;
+  i_t* ft_sort_i;
+  i_t* ft_sort_perm;
+  i_t* lvl_lev0;
+  i_t* lvl_ls0;
+  i_t* lvl_co0;
+  i_t* lvl_lev1;
+  i_t* lvl_ls1;
+  i_t* lvl_co1;
+  i_t* lvl_lev2;
+  i_t* lvl_ls2;
+  i_t* lvl_co2;
+  i_t* lvl_lev3;
+  i_t* lvl_ls3;
+  i_t* lvl_co3;
+  i_t* sp_ls_v;
+  i_t* sp_co_v;
+  i_t* sp_pos_v;
+  i_t* lvl_pos_v;
+  f_t* ft_recover_rhs;
+  f_t* ft_recover_sol;
+  i_t* S_col_start;
+  i_t* S_i;
+  f_t* S_x;
+  f_t* mu_values;
+  i_t* delta_y_sparse_i; f_t* delta_y_sparse_x;
+  i_t* UTsol_sparse_i; f_t* UTsol_sparse_x;
+  i_t* utilde_sparse_i; f_t* utilde_sparse_x;
+  i_t* scaled_dxB_sparse_i; f_t* scaled_dxB_sparse_x;
+  i_t* rhs_sparse_i; f_t* rhs_sparse_x;
+  i_t* v_sparse_i; f_t* v_sparse_x;
+  i_t* se_dy_i; f_t* se_dy_x;
+  i_t* se_UTsol_i; f_t* se_UTsol_x;
+  i_t* se_ei_i; f_t* se_ei_x;
+  i_t* ft_sparse_scratch_i; f_t* ft_sparse_scratch_x;
+  i_t* ft_ei_scratch_i; f_t* ft_ei_scratch_x;
+};
+
 template <class FT>
 struct slot_state {
   // Stored as i_t so the host can read it back as a plain int array.
   i_t status{static_cast<i_t>(dual::status_t::UNSET)};
 
-  // This slot's slice of the host-allocated arena (ordinary VRAM). Wired by the kernel on first
-  // entry from kernel_args::arena/arena_bytes, then handed to every fixed-size buffer below by
-  // bind_arena_buffers(). Zero-initialised, so a slot whose host never allocated an arena simply
-  // keeps using device malloc().
-  gpu_arena arena;
 
   FT ft;  // basis update: S_/mu_values_, num_updates_, routing stats, reused scratch
 
   // Dense per-iteration workspaces.
-  gpu_vector<f_t> xB_workspace, delta_y, delta_z, delta_x, v, squared_infeas;
-  gpu_vector<i_t> basic_mark, delta_z_mark, delta_z_indices, nonbasic_end, row_mark, infeas_idx;
-  gpu_vector<f_t> rt_ratio;
+  gpu_span<f_t> xB_workspace, delta_y, delta_z, delta_x, v, squared_infeas;
+  gpu_span<i_t> basic_mark, delta_z_mark, delta_z_indices, nonbasic_end, row_mark, infeas_idx;
+  gpu_span<f_t> rt_ratio;
 
   // Sparse per-iteration workspaces.
   gpu_sparse_vector delta_y_sparse, UTsol_sparse, utilde_sparse, scaled_dxB_sparse, rhs_sparse,
@@ -3097,10 +3076,11 @@ struct slot_state {
 
   // In the monolith these are gpu_phase2_kernel STACK LOCALS (lvl_* + a __shared__ cfg), so they die
   typename FT::warp_config_type wcfg;
-  gpu_vector<i_t>      lvl_lev[kNumWarpSolveOps];   // per-column level (drives the sparse reach solve)
-  gpu_vector<i_t>      lvl_ls[kNumWarpSolveOps];    // level offsets
-  gpu_vector<i_t>      lvl_co[kNumWarpSolveOps];    // columns in level order
-  gpu_vector<i_t>      sp_ls_v, sp_co_v, sp_pos_v;  // reach-restricted sparse-solve schedule scratch
+  gpu_span<i_t>      lvl_lev[kNumWarpSolveOps];   // per-column level (drives the sparse reach solve)
+  gpu_span<i_t>      lvl_ls[kNumWarpSolveOps];    // level offsets
+  gpu_span<i_t>      lvl_co[kNumWarpSolveOps];    // columns in level order
+  gpu_span<i_t>      sp_ls_v, sp_co_v, sp_pos_v;  // reach-restricted sparse-solve schedule scratch
+  gpu_span<i_t>      lvl_pos_v;                  // warp_build_levels counting-sort cursor (m+1)
 
   // registers' worth of pointers/spans/doubles live for the kernel's whole duration before any work
   // — the suspected floor under the measured 96-120. Living in the slot they are read lazily
@@ -3110,49 +3090,76 @@ struct slot_state {
   gpu_settings settings;
   gpu_solution sol;
 
-  // SETUP-ONLY scratch, slot-resident because under Direct a stack-local gpu_vector allocates PER
+  // SETUP-ONLY scratch, slot-resident because under Direct a stack-local gpu_span allocates PER
   // LANE. All start empty, so they cost nothing until the path that uses them actually runs (the
   // SE-init group only runs when the node carries no edge norms, i.e. dy_se_empty).
-  gpu_vector<f_t>   setup_rhs;                       // compute_primal_variables
-  gpu_vector<i_t>   se_row_degree, se_mapping;       // initialize_steepest_edge_norms
-  gpu_vector<f_t>   se_coeff;
+  gpu_span<f_t>   setup_rhs;                       // compute_primal_variables
+  gpu_span<i_t>   se_row_degree, se_mapping;       // initialize_steepest_edge_norms
+  gpu_span<f_t>   se_coeff;
   gpu_sparse_vector se_dy, se_UTsol, se_ei;
 
-  // ---- Arena binding -----------------------------------------------------------------------
-  // Point every FIXED-SIZE per-problem buffer at this slot's arena. Called ONCE, immediately after
-  // the placement-new and before any resize/reserve runs, so nothing has malloc'd yet.
-  //
-  // Everything listed here is sized from m or n, which the host already knows (it computes the same
-  // sizes for its VRAM pre-flight). What is deliberately absent:
-  //   * ft.S_ / ft.mu_values_ -- dynamic, one column per pivot (see gpu_basis_update_mpf::bind_arena)
-  //   * Arow -- normally a zero-copy view over the host-uploaded CSR (view_device), so it costs no
-  //     heap at all; only the rare from_csc fallback allocates, and binding it would force the
-  //     arena to carry an nz-sized term for a path that does not normally run.
-  //   * every function-local gpu_vector -- short-lived, and some are per-LANE under Direct.
-  __device__ void bind_arena_buffers()
+
+  // Wire every span to its own buffer. No offsets to get wrong.
+  // TODO: find a more efficient way to do this
+  __device__ void attach_all_buffers(const slot_buffers& b, i_t m, i_t n, i_t ucap, i_t eta)
   {
-    gpu_arena* a = &arena;
-
-    xB_workspace.bind_arena(a);   delta_y.bind_arena(a);        delta_z.bind_arena(a);
-    delta_x.bind_arena(a);        v.bind_arena(a);              squared_infeas.bind_arena(a);
-    rt_ratio.bind_arena(a);
-
-    basic_mark.bind_arena(a);     delta_z_mark.bind_arena(a);   delta_z_indices.bind_arena(a);
-    nonbasic_end.bind_arena(a);   row_mark.bind_arena(a);       infeas_idx.bind_arena(a);
-
-    delta_y_sparse.bind_arena(a); UTsol_sparse.bind_arena(a);   utilde_sparse.bind_arena(a);
-    scaled_dxB_sparse.bind_arena(a); rhs_sparse.bind_arena(a);  v_sparse.bind_arena(a);
-
-    for (int o = 0; o < kNumWarpSolveOps; ++o) {
-      lvl_lev[o].bind_arena(a);   lvl_ls[o].bind_arena(a);      lvl_co[o].bind_arena(a);
-    }
-    sp_ls_v.bind_arena(a);        sp_co_v.bind_arena(a);        sp_pos_v.bind_arena(a);
-
-    setup_rhs.bind_arena(a);      se_coeff.bind_arena(a);
-    se_row_degree.bind_arena(a);  se_mapping.bind_arena(a);
-    se_dy.bind_arena(a);          se_UTsol.bind_arena(a);       se_ei.bind_arena(a);
-
-    ft.bind_arena(a);
+    const size_t mn = (m > n) ? (size_t)m : (size_t)n;
+    const size_t m1 = (size_t)m + 1;
+    xB_workspace.attach(b.xB_workspace, mn);
+    delta_y.attach(b.delta_y, mn);
+    delta_z.attach(b.delta_z, mn);
+    delta_x.attach(b.delta_x, mn);
+    v.attach(b.v, mn);
+    squared_infeas.attach(b.squared_infeas, mn);
+    rt_ratio.attach(b.rt_ratio, mn);
+    setup_rhs.attach(b.setup_rhs, mn);
+    se_coeff.attach(b.se_coeff, mn);
+    basic_mark.attach(b.basic_mark, mn);
+    delta_z_mark.attach(b.delta_z_mark, mn);
+    delta_z_indices.attach(b.delta_z_indices, mn);
+    nonbasic_end.attach(b.nonbasic_end, mn);
+    row_mark.attach(b.row_mark, mn);
+    infeas_idx.attach(b.infeas_idx, mn);
+    se_row_degree.attach(b.se_row_degree, mn);
+    se_mapping.attach(b.se_mapping, mn);
+    ft.dense_scratch_.attach(b.ft_dense_scratch, mn);
+    ft.sort_bucket_.attach(b.ft_sort_bucket, mn);
+    ft.sort_x_.attach(b.ft_sort_x, mn);
+    ft.sort_i_.attach(b.ft_sort_i, mn);
+    ft.sort_perm_.attach(b.ft_sort_perm, mn);
+    lvl_lev[0].attach(b.lvl_lev0, m1);
+    lvl_ls[0].attach(b.lvl_ls0, m1);
+    lvl_co[0].attach(b.lvl_co0, m1);
+    lvl_lev[1].attach(b.lvl_lev1, m1);
+    lvl_ls[1].attach(b.lvl_ls1, m1);
+    lvl_co[1].attach(b.lvl_co1, m1);
+    lvl_lev[2].attach(b.lvl_lev2, m1);
+    lvl_ls[2].attach(b.lvl_ls2, m1);
+    lvl_co[2].attach(b.lvl_co2, m1);
+    lvl_lev[3].attach(b.lvl_lev3, m1);
+    lvl_ls[3].attach(b.lvl_ls3, m1);
+    lvl_co[3].attach(b.lvl_co3, m1);
+    sp_ls_v.attach(b.sp_ls_v, m1);
+    sp_co_v.attach(b.sp_co_v, m1);
+    sp_pos_v.attach(b.sp_pos_v, m1);
+    lvl_pos_v.attach(b.lvl_pos_v, m1);
+    ft.recover_rhs_.attach(b.ft_recover_rhs, m);
+    ft.recover_sol_.attach(b.ft_recover_sol, m);
+    ft.S_.col_start.attach(b.S_col_start, 2 * ucap + 1);
+    ft.S_.i.attach(b.S_i, eta);
+    ft.S_.x.attach(b.S_x, eta);
+    ft.mu_values_.attach(b.mu_values, ucap);
+    delta_y_sparse.attach(b.delta_y_sparse_i, b.delta_y_sparse_x, mn);
+    UTsol_sparse.attach(b.UTsol_sparse_i, b.UTsol_sparse_x, mn);
+    utilde_sparse.attach(b.utilde_sparse_i, b.utilde_sparse_x, mn);
+    scaled_dxB_sparse.attach(b.scaled_dxB_sparse_i, b.scaled_dxB_sparse_x, mn);
+    rhs_sparse.attach(b.rhs_sparse_i, b.rhs_sparse_x, mn);
+    v_sparse.attach(b.v_sparse_i, b.v_sparse_x, mn);
+    se_dy.attach(b.se_dy_i, b.se_dy_x, mn);
+    se_UTsol.attach(b.se_UTsol_i, b.se_UTsol_x, mn);
+    se_ei.attach(b.se_ei_i, b.se_ei_x, mn);
+    ft.sparse_scratch_.attach(b.ft_sparse_scratch_i, b.ft_sparse_scratch_x, mn);
+    ft.ei_scratch_.attach(b.ft_ei_scratch_i, b.ft_ei_scratch_x, mn);
   }
 
   // Loop-carried scalars.
@@ -3245,14 +3252,9 @@ struct slot_state {
     // Transpose delta_z state (Arow CSR copy of A + per-row nonbasic partition). Built
     // once here; nonbasic_end is maintained per pivot by update_Arow (no refactor rebuild
     // needed — the GPU is pure MPF stacking).
-    if (lp.Arow_row_start != nullptr) {
-      // Zero-copy view over the host-built Arow (uploaded per-solve, mutable) — skips the on-device
-      // from_csc transpose. Always used when present (was CUOPT_GPU_HOST_AROW, now default).
-      Arow.view_device(lp.Arow_row_start, lp.Arow_j, lp.Arow_x, m, n, lp.A.col_start[n]);
-    } else {
-      // Arow not uploaded (the RO-shared batch path leaves it null) → build on device off the shared A.
-      Arow.from_csc(lp.A);
-    }
+    // Zero-copy view over the host-built Arow (uploaded per-solve, mutable). Every marshal path
+    // uploads it; the kernel has no CSR transpose of its own.
+    Arow.view_device(lp.Arow_row_start, lp.Arow_j, lp.Arow_x, m, n, lp.A.col_start[n]);
     nonbasic_end.assign(m, 0);
     row_mark.clear();
     row_mark.reserve(m);
@@ -3272,12 +3274,17 @@ struct slot_state {
       lp, settings, ft, basic_list, x, squared_infeas, infeas_idx, primal_inf);
 
     lane0_serial([&] {
-    delta_y_sparse    = gpu_sparse_vector(m, 0);
-    UTsol_sparse      = gpu_sparse_vector(m, 0);  // MPF-only: Uᵀ intermediate from compute_delta_y
-    utilde_sparse     = gpu_sparse_vector(m, 0);  // MPF-only: b_solve intermediate from compute_delta_x
-    scaled_dxB_sparse = gpu_sparse_vector(m, 0);
-    rhs_sparse        = gpu_sparse_vector(m, 0);
-    v_sparse          = gpu_sparse_vector(m, 0);
+    // Set the dimension and empty them IN PLACE. These used to be whole-object assignments
+    // (`= gpu_sparse_vector(m, 0)`), which move-assigned a fresh cap_=0 temporary over the buffer
+    // and so DISCARDED its preallocated storage -- the vector then grew again from zero by
+    // push_back doubling, and `sort()` swapped the empty buffer into ft.sort_i_/sort_x_ as well.
+    // Anything that replaces a whole buffer object undoes its attachment; only clear() is safe.
+    delta_y_sparse.n    = m; delta_y_sparse.clear();
+    UTsol_sparse.n      = m; UTsol_sparse.clear();     // MPF-only: Uᵀ from compute_delta_y
+    utilde_sparse.n     = m; utilde_sparse.clear();    // MPF-only: b_solve from compute_delta_x
+    scaled_dxB_sparse.n = m; scaled_dxB_sparse.clear();
+    rhs_sparse.n        = m; rhs_sparse.clear();
+    v_sparse.n          = m; v_sparse.clear();
 
     // Incrementally-tracked objective for the cutoff, mirroring the CPU simplified (and
     // advanced) driver: init fresh once, then update_objective per pivot. Using the true
@@ -3319,18 +3326,18 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
   // unchanged by the state externalization and stays line-diffable against the CPU simplified
   // driver (dual_simplex/CLAUDE.md rule 2).
   FT& ft                          = st.ft;
-  gpu_vector<f_t>& delta_y        = st.delta_y;
-  gpu_vector<f_t>& delta_z        = st.delta_z;
-  gpu_vector<f_t>& delta_x        = st.delta_x;
-  gpu_vector<f_t>& v              = st.v;
-  gpu_vector<f_t>& squared_infeas = st.squared_infeas;
-  gpu_vector<f_t>& rt_ratio       = st.rt_ratio;
-  gpu_vector<i_t>& basic_mark     = st.basic_mark;
-  gpu_vector<i_t>& delta_z_mark   = st.delta_z_mark;
-  gpu_vector<i_t>& delta_z_indices = st.delta_z_indices;
-  gpu_vector<i_t>& nonbasic_end   = st.nonbasic_end;
-  gpu_vector<i_t>& row_mark       = st.row_mark;
-  gpu_vector<i_t>& infeas_idx     = st.infeas_idx;
+  gpu_span<f_t>& delta_y        = st.delta_y;
+  gpu_span<f_t>& delta_z        = st.delta_z;
+  gpu_span<f_t>& delta_x        = st.delta_x;
+  gpu_span<f_t>& v              = st.v;
+  gpu_span<f_t>& squared_infeas = st.squared_infeas;
+  gpu_span<f_t>& rt_ratio       = st.rt_ratio;
+  gpu_span<i_t>& basic_mark     = st.basic_mark;
+  gpu_span<i_t>& delta_z_mark   = st.delta_z_mark;
+  gpu_span<i_t>& delta_z_indices = st.delta_z_indices;
+  gpu_span<i_t>& nonbasic_end   = st.nonbasic_end;
+  gpu_span<i_t>& row_mark       = st.row_mark;
+  gpu_span<i_t>& infeas_idx     = st.infeas_idx;
   gpu_sparse_vector& delta_y_sparse    = st.delta_y_sparse;
   gpu_sparse_vector& UTsol_sparse      = st.UTsol_sparse;
   gpu_sparse_vector& utilde_sparse     = st.utilde_sparse;
@@ -3350,12 +3357,13 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
       sol.objective      = compute_objective(lp, x);
       sol.user_objective = compute_user_objective(lp, sol.objective);
       sol.iterations     = iters;
+
     });
   };
 
   const i_t iter_limit = min(500000, max(20000, 20 * (m + n)));
   while (iter < iter_limit) {
-    if (g_gpu_alloc_failed) {
+    if (g_gpu_capacity_exceeded) {
       finish(iter);
       return dual::status_t::NUMERICAL;
     }
@@ -3505,7 +3513,14 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     // uniform; the broadcast below is kept for the !Warp instantiation.
     _fu_status = ft.warp_update(utilde_sparse, UTsol_sparse, basic_leaving);
     _fu_status = lane0_bcast(_fu_status);
-    if (_fu_status == 1) {
+    if (_fu_status != 0) {
+      // Unchanged from before the store was preallocated: 1 = the rank-1 update is unsafe
+      // (|mu| outside [1e-8, 1e8]); 2 = the preallocated store is full. Both are terminal here.
+      //
+      // The CPU full driver treats the first as `should_refactor` and rebuilds the factorization in
+      // place rather than giving up, and the second is really the same condition. Surfacing that to
+      // the caller so it can refactor and resume needs a non-terminal status and a resume contract,
+      // which belongs with the branch-and-bound integration, not with this memory change.
       finish(iter);
       return dual::status_t::NUMERICAL;
     }
@@ -3538,13 +3553,14 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
 // ---------------------------------------------------------------------------
 // Kernel argument bundle (all raw device pointers + scalars, passed by value).
 // ---------------------------------------------------------------------------
+
 struct kernel_args {
   i_t m, n;
   // LP
   i_t *A_col_start, *A_i;
   f_t* A_x;
   i_t A_nz;
-  // Host-built CSR of A (Arow); null when not provided (device builds it via from_csc).
+  // Host-built CSR of A (Arow). Always uploaded; the kernel has no transpose of its own.
   const i_t* Arow_row_start;
   i_t* Arow_j;
   f_t* Arow_x;
@@ -3573,16 +3589,19 @@ struct kernel_args {
   unsigned char* reach_mark;
   i_t num_updates;
   i_t refactor_frequency;
+  // Caps on the preallocated MPF rank-1 store (see gpu_basis_update_mpf_t). 0/0 = uncapped, i.e.
+  // the historical grow-in-kernel behaviour. Sized by mpf_store_caps().
+  i_t mpf_update_cap;
+  i_t mpf_eta_nnz_cap;
   // Per-slot PERSISTENT solve state (slot_state<FT>): host-allocated, ZEROED blob that the kernel
   // placement-news into on first entry and reuses thereafter. This is what lets the per-pivot
   // workspaces + ft's mutable state (S_, routing stats, scratch) outlive a single kernel launch —
   // host-visible "already constructed" flag (0 = fresh node → construct + run setup).
   void* slot;
-  // Per-slot ARENA for the fixed-size gpu_vector payloads (see gpu_arena). Ordinary cudaMalloc VRAM,
+  // Per-slot flat buffer for every gpu_span payload. Ordinary VRAM,
   // so it is NOT subject to the driver's ~16 GB in-kernel malloc cap -- which is what used to set the
   // batch-size ceiling. Null/0 is legal and simply leaves every buffer on device malloc().
-  void*  arena;
-  size_t arena_bytes;
+  slot_buffers buf;
   // Same base pointer in every item, so the host reads all N terminal states in ONE D2H copy to
   // decide when the super-step loop is done. Null on the monolith path.
   i_t* status_arr;
@@ -3633,20 +3652,23 @@ __device__ gpu_factor_view_t<FactorIndex> make_factor_view(
 
 
 // Fill the warp-solve config for all 4 operators (lane 0, once at start). The
-// level schedules are written into the caller-owned gpu_vectors ls[o]/co[o]
+// level schedules are written into the caller-owned gpu_spans ls[o]/co[o]
 // (kept alive for the whole kernel); `lvlscratch` is reused m-sized workspace.
 template <typename FactorIndex>
 __device__ __noinline__ void warp_build_config(const gpu_basis_update_mpf_t<FactorIndex>& ft,
                                   warp_solve_config_t<FactorIndex>& cfg,
-                                   gpu_vector<i_t>* lev, gpu_vector<i_t>* ls, gpu_vector<i_t>* co,
-                                   gpu_vector<i_t>& sp_ls_v, gpu_vector<i_t>& sp_co_v,
-                                   gpu_vector<i_t>& sp_pos_v)
+                                   gpu_span<i_t>* lev, gpu_span<i_t>* ls, gpu_span<i_t>* co,
+                                   gpu_span<i_t>& sp_ls_v, gpu_span<i_t>& sp_co_v,
+                                   gpu_span<i_t>& sp_pos_v, gpu_span<i_t>& lvl_pos_v)
 {
   // Reach-restricted sparse-solve scratch (built fresh per solve in warp_dispatch_sptrsv): m(+1)-sized.
   const i_t m = ft.L0_.m;
   sp_co_v.resize(m);
   sp_ls_v.resize(m + 1);
   sp_pos_v.resize(m + 1);
+  // Counting-sort cursor for warp_build_levels, shared by all four ops (they run in sequence).
+  // Sized once at the bound so the per-op assign() inside never reallocates.
+  lvl_pos_v.resize(m + 1);
   cfg.sp_co  = sp_co_v.data();
   cfg.sp_ls  = sp_ls_v.data();
   cfg.sp_pos = sp_pos_v.data();
@@ -3662,7 +3684,7 @@ __device__ __noinline__ void warp_build_config(const gpu_basis_update_mpf_t<Fact
     // is the only thing that still needs them. op_* are constexpr FUNCTIONS, hence callable here
     // with a runtime `o` -- no materialized flag array required.
     cfg.nlev[o]  = warp_build_levels(*mats[o], op_diag_first(o), op_ascending(o), lev[o], ls[o],
-                                     co[o]);
+                                     co[o], lvl_pos_v);
     cfg.lstart[o]     = ls[o].data();
     cfg.corder[o]     = co[o].data();
     cfg.level[o]      = lev[o].data();  // per-column level, retained for the reach-restricted sparse solve
@@ -3672,7 +3694,7 @@ __device__ __noinline__ void warp_build_config(const gpu_basis_update_mpf_t<Fact
 // One block == one problem. args points to an N-entry device array; block b solves
 // args[blockIdx.x] entirely on its own device buffers. Launched <<<N,32>>>: all 32 lanes execute
 // this body and every collective is called directly.
-// g_gpu_alloc_failed is reset by the HOST before launch (not here) so a late block
+// g_gpu_capacity_exceeded is reset by the HOST before launch (not here) so a late block
 // can't clear a failure flag an earlier block already set.
 template <class FT>
 __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args)
@@ -3735,12 +3757,11 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args)
   // state, so under Direct they belong to lane 0 alone.
   lane0_serial([&] {
     new (&st) slot_state<FT>();  // placement new: host memory is zeroed, NSDMIs must run
-    // Wire the arena BEFORE anything can allocate. Everything below (ft wiring, S_.init_empty, the
-    // whole prologue) resizes buffers, and bind_arena only takes effect on a not-yet-allocated one.
-    st.arena.base = static_cast<char*>(a.arena);
-    st.arena.cap  = static_cast<unsigned long long>(a.arena_bytes);
-    st.arena.used = 0;
-    st.bind_arena_buffers();
+    // Wire every buffer into the host-provided slot memory. Nothing allocates: a buffer that
+    // outgrows its layout slot is a layout bug and is reported, not silently regrown.
+    // Exceeding a span's reserved capacity is reported through g_gpu_capacity_exceeded rather than
+    // silently regrowing -- there is no allocator left to regrow with.
+    st.attach_all_buffers(a.buf, m, n, a.mpf_update_cap, a.mpf_eta_nnz_cap);
     FT& ft                      = st.ft;
     ft.num_updates_             = a.num_updates;
     ft.refactor_frequency_      = a.refactor_frequency;
@@ -3753,7 +3774,9 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args)
     ft.xi_workspace_            = gpu_span<i_t>(a.xi_workspace, 2 * m);
     ft.x_workspace_             = gpu_span<f_t>(a.x_workspace, m);
     ft.reach_mark_              = gpu_span<unsigned char>(a.reach_mark, m);
-    ft.S_.init_empty(m);
+    ft.update_cap_  = a.mpf_update_cap;
+    ft.eta_nnz_cap_ = a.mpf_eta_nnz_cap;
+    ft.reserve_store(m);
     ft.hypersparse_threshold_ = 0.05;
   });   // end lane-0 construction
   FT& ft = st.ft;
@@ -3768,17 +3791,18 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args)
   //
   // The schedule buffers live in `st` (slot_state), NOT on the kernel stack. They used to be stack
   // locals, which was safe only because just lane 0 ran this code. Under the Direct model every lane
-  // executes here, and a stack-local gpu_vector would device-malloc PER LANE — 32 private buffers,
+  // executes here, and a stack-local gpu_span would device-malloc PER LANE — 32 private buffers,
   // 31 leaked, and worse: warp_build_config publishes `lvl_*[o].data()` / `sp_*_v.data()` into the
   // config, so every wavefront solve for the rest of the solve would read a lane-private schedule.
   // slot_state already carries byte-identical members for exactly this reason (the setup
   // uses them), so this is a reuse, not a new allocation.
 
-  // Serial O(m*nnz) schedule build that resizes the slot's gpu_vectors and writes the config.
+  // Serial O(m*nnz) schedule build that resizes the slot's gpu_spans and writes the config.
   // The trailing warp sync publishes the completed schedule and ft.warp_cfg_ to every lane.
   lane0_serial([&] {
     warp_build_config(
-      ft, cfg_shared, st.lvl_lev, st.lvl_ls, st.lvl_co, st.sp_ls_v, st.sp_co_v, st.sp_pos_v);
+      ft, cfg_shared, st.lvl_lev, st.lvl_ls, st.lvl_co, st.sp_ls_v, st.sp_co_v, st.sp_pos_v,
+      st.lvl_pos_v);
     ft.warp_cfg_ = &cfg_shared;
   });
 
@@ -3852,7 +3876,7 @@ struct marshal_storage {
   std::vector<rmm::device_buffer> bufs;
   // The CSR transpose is built here and its host storage must outlive marshal_problem.
   std::vector<cuopt::mathematical_optimization::csr_matrix_t<i_t, f_t>> arow_keep;
-  marshal_storage() { bufs.reserve(40); }   // ~34 buffers per problem; avoid vector churn
+  marshal_storage() { bufs.reserve(110); }  // ~34 uploads + 66 slot buffers; avoid vector churn
 };
 
 template <typename T>
@@ -3899,6 +3923,16 @@ static FactorIndex* upload_factor_indices(
   return upload_n(converted.data(), converted.size(), st);
 }
 
+// Uninitialised: every per-slot buffer is resize/assign-filled before it is read, and zeroing all
+// 66 of them per problem would be a multi-GB memset across a large batch.
+template <typename T>
+static T* alloc_uninit(size_t count, marshal_storage& st)
+{
+  const size_t bytes = (count == 0 ? 1 : count) * sizeof(T);
+  st.bufs.emplace_back(bytes, rmm::cuda_stream_default);
+  return static_cast<T*>(st.bufs.back().data());
+}
+
 template <typename T>
 static T* alloc_zeroed(size_t count, marshal_storage& st)
 {
@@ -3926,7 +3960,7 @@ static void report_config(const char* path, size_t nprob, int factor_index_bits)
               path, nprob, factor_index_bits);
 }
 
-// Device heap (in-kernel gpu_vector malloc arena) + stack are per-CONTEXT limits and the heap
+// Device heap (in-kernel gpu_span malloc arena) + stack are per-CONTEXT limits and the heap
 // can ONLY be set before the first malloc-using kernel launch, so set them exactly once per
 // process. First caller wins: the batch wrapper (the only/first GPU kernel in the throughput
 // benchmark) sizes the heap for N concurrent S_ stacks; the single-problem wrapper uses a
@@ -3943,7 +3977,7 @@ static void report_config(const char* path, size_t nprob, int factor_index_bits)
 //   * Usable is about 0.82 x granted. The rest is allocator overhead.
 // So the practical ceiling is ~13.5 GB usable on ANY device. Requesting more is not merely wasteful,
 // it is how we crashed: 86.75 GB requested -> capped -> in-kernel malloc returns nullptr ->
-// gpu_vector::grow_to returns no buffer -> the next write raises cudaErrorIllegalAddress.
+// gpu_span::grow_to returns no buffer -> the next write raises cudaErrorIllegalAddress.
 // Measured by bisection with a standalone probe kernel: granted tracks the request exactly up
 // to 16.40 GB and saturates at 16.47 GB from 16.50 GB upward. Identical on a 12 GB card and a 178 GB
 // B200. We clamp to a round 16 GB, safely inside the saturation point.
@@ -4142,35 +4176,81 @@ static ro_upload upload_ro(const lp_problem_t<i_t, f_t>& lp, marshal_storage& st
 // marshal_storage, returned to the pool when that is destroyed.
 static void free_ro(const ro_upload&) {}
 
-// Bytes of ORDINARY VRAM to give one slot's gpu_arena.
-//
-// Itemised to match slot_state::bind_arena_buffers one-for-one, so the two cannot drift apart. Each
-// buffer is charged at max(m, n) because several are n-sized and n >= m once slacks are added; being
-// exact per buffer would buy nothing, as the whole figure is then scaled.
-//
-// UNDERSIZING IS NOT A FAILURE. gpu_arena::take returns nullptr when exhausted and grow_to falls
-// back to device malloc(), i.e. to the pre-arena behaviour. The scale factor exists because
-// arena-bound buffers that GROW abandon their old slice (bump allocator, no free), and the sparse
-// vectors reach their final size by push_back doubling.
-//
-// No slack factor: the itemised figure below is the size, and an earlier 2x slack was removed after
-// it asked ~152 GB of static VRAM at 15,000 problems and got the batch rejected by the pre-flight.
-static size_t arena_bytes_for(size_t m, size_t n)
+static i_t mpf_update_cap()
+{
+  if (const char* e = std::getenv("CUOPT_GPU_MPF_UPDATE_CAP")) { return std::atoi(e); }
+  return 256;   // measured max on the v6 nodes is 208 updates; this clears it with margin
+}
+static i_t mpf_eta_col_budget()
+{
+  if (const char* e = std::getenv("CUOPT_GPU_MPF_ETA_COL")) { return std::atoi(e); }
+  return 256;   // measured max nnz/update is 532; 2*256*256 entries clears every v6 node
+}
+static i_t mpf_eta_nnz_cap() { return 2 * mpf_update_cap() * mpf_eta_col_budget(); }
+
+
+// Bytes of per-slot buffer VRAM. Pre-flight estimate only -- nothing depends on it being exact.
+static size_t slot_buffer_bytes(size_t m, size_t n, size_t ucap, size_t eta)
 {
   const size_t mn = (m > n) ? m : n;
-  size_t b = 0;
-  // 12 f_t workspaces: xB_workspace, delta_y, delta_z, delta_x, v, squared_infeas, rt_ratio,
-  //                    setup_rhs, se_coeff, ft.dense_scratch_, ft.sort_bucket_, ft.sort_x_
-  b += 12 * mn * sizeof(f_t);
-  // 10 i_t workspaces: basic_mark, delta_z_mark, delta_z_indices, nonbasic_end, row_mark,
-  //                    infeas_idx, se_row_degree, se_mapping, ft.sort_i_, ft.sort_perm_
-  b += 10 * mn * sizeof(i_t);
-  // 11 sparse vectors (idx + val), each <= mn: 6 per-iteration + 3 SE-init + ft's 2 scratch
-  b += 11 * mn * (sizeof(i_t) + sizeof(f_t));
-  // 15 level-schedule arrays: lvl_lev/lvl_ls/lvl_co x 4 ops, plus sp_ls_v/sp_co_v/sp_pos_v
-  b += 15 * (m + 1) * sizeof(i_t);
-
-  return b + (64u << 10);  // floor: 16-byte rounding on ~60 slices, plus small-problem headroom
+  const size_t m1 = m + 1;
+  size_t t = 0;
+  t += (mn) * sizeof(f_t);
+  t += (mn) * sizeof(f_t);
+  t += (mn) * sizeof(f_t);
+  t += (mn) * sizeof(f_t);
+  t += (mn) * sizeof(f_t);
+  t += (mn) * sizeof(f_t);
+  t += (mn) * sizeof(f_t);
+  t += (mn) * sizeof(f_t);
+  t += (mn) * sizeof(f_t);
+  t += (mn) * sizeof(i_t);
+  t += (mn) * sizeof(i_t);
+  t += (mn) * sizeof(i_t);
+  t += (mn) * sizeof(i_t);
+  t += (mn) * sizeof(i_t);
+  t += (mn) * sizeof(i_t);
+  t += (mn) * sizeof(i_t);
+  t += (mn) * sizeof(i_t);
+  t += (mn) * sizeof(f_t);
+  t += (mn) * sizeof(f_t);
+  t += (mn) * sizeof(f_t);
+  t += (mn) * sizeof(i_t);
+  t += (mn) * sizeof(i_t);
+  t += (m1) * sizeof(i_t);
+  t += (m1) * sizeof(i_t);
+  t += (m1) * sizeof(i_t);
+  t += (m1) * sizeof(i_t);
+  t += (m1) * sizeof(i_t);
+  t += (m1) * sizeof(i_t);
+  t += (m1) * sizeof(i_t);
+  t += (m1) * sizeof(i_t);
+  t += (m1) * sizeof(i_t);
+  t += (m1) * sizeof(i_t);
+  t += (m1) * sizeof(i_t);
+  t += (m1) * sizeof(i_t);
+  t += (m1) * sizeof(i_t);
+  t += (m1) * sizeof(i_t);
+  t += (m1) * sizeof(i_t);
+  t += (m1) * sizeof(i_t);
+  t += (m) * sizeof(f_t);
+  t += (m) * sizeof(f_t);
+  t += (2 * ucap + 1) * sizeof(i_t);
+  t += (eta) * sizeof(i_t);
+  t += (eta) * sizeof(f_t);
+  t += (ucap) * sizeof(f_t);
+  t += mn * (sizeof(i_t) + sizeof(f_t));
+  t += mn * (sizeof(i_t) + sizeof(f_t));
+  t += mn * (sizeof(i_t) + sizeof(f_t));
+  t += mn * (sizeof(i_t) + sizeof(f_t));
+  t += mn * (sizeof(i_t) + sizeof(f_t));
+  t += mn * (sizeof(i_t) + sizeof(f_t));
+  t += mn * (sizeof(i_t) + sizeof(f_t));
+  t += mn * (sizeof(i_t) + sizeof(f_t));
+  t += mn * (sizeof(i_t) + sizeof(f_t));
+  t += mn * (sizeof(i_t) + sizeof(f_t));
+  t += mn * (sizeof(i_t) + sizeof(f_t));
+  return t;
 }
 
 template <typename FactorIndex>
@@ -4267,6 +4347,8 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   a.reach_mark   = alloc_zeroed<unsigned char>(m, st);
   a.num_updates  = 0;
   a.refactor_frequency = settings.refactor_frequency;
+  a.mpf_update_cap     = mpf_update_cap();
+  a.mpf_eta_nnz_cap    = mpf_eta_nnz_cap();
 
   a.vstatus       = upload(vstatus, st);
   a.basic_list    = upload(basic_list, st);
@@ -4302,43 +4384,77 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   // here.
   a.slot = alloc_zeroed<char>(sizeof(slot_state<gpu_basis_update_mpf_t<FactorIndex>>), st);
 
-  // Per-slot arena for the fixed-size gpu_vector payloads (see gpu_arena / arena_bytes_for).
-  // Deliberately NOT zeroed: device malloc() hands back uninitialised memory, so zeroing here would
-  // give arena-backed buffers different contents-before-first-write than heap-backed ones. Every
-  // consumer resize/assign-fills before reading, so uninitialised is correct and it also avoids a
-  // multi-GB memset across a large batch.
-  a.arena_bytes = arena_bytes_for(static_cast<size_t>(m), static_cast<size_t>(n));
-  a.arena       = nullptr;
-  if (a.arena_bytes > 0) {
-    // From the RMM pool like every other per-problem buffer, so a batch costs ZERO extra cudaMallocs
-    // instead of one per problem (measured: 801 cudaMalloc + 801 cudaFree, 133 ms, at 800 problems;
-    // H2D upload 0.232 -> 0.205 s at 600 problems).
-    //
-    // WARNING: this makes the arena compete for the POOL's fixed reservation rather than for free
-    // VRAM, which LOWERS the maximum batch on a small card (measured here: 8 -> 6 replicas before
-    // cudaErrorLaunchOutOfResources). device_buffer throws where cudaMalloc returned a code, so the
-    // fallback is kept explicitly -- but note the heap pre-flight assumes the arena EXISTS, so a
-    // silent fallback under-sizes the in-kernel heap. Raise the pool fraction if this bites.
-    try {
-      st.bufs.emplace_back(a.arena_bytes, rmm::cuda_stream_default);
-      a.arena = st.bufs.back().data();
-    } catch (const std::exception&) {
-      a.arena_bytes = 0;
-    }
+  // The slot's flat buffer: every gpu_span in the kernel is a slice of this, wired at a fixed
+  // offset by attach_all_buffers. Deliberately NOT zeroed -- every consumer resize/assign-fills
+  // before reading, and zeroing would cost a multi-GB memset across a large batch.
+  // One allocation per buffer, from the RMM pool, like every other array uploaded above.
+  {
+    const size_t mn   = (static_cast<size_t>(m) > static_cast<size_t>(n)) ? m : n;
+    const size_t m1   = static_cast<size_t>(m) + 1;
+    const size_t ucap = static_cast<size_t>(mpf_update_cap());
+    const size_t eta  = static_cast<size_t>(mpf_eta_nnz_cap());
+    slot_buffers& b   = a.buf;
+    b.xB_workspace = alloc_uninit<f_t>(mn, st);
+    b.delta_y = alloc_uninit<f_t>(mn, st);
+    b.delta_z = alloc_uninit<f_t>(mn, st);
+    b.delta_x = alloc_uninit<f_t>(mn, st);
+    b.v = alloc_uninit<f_t>(mn, st);
+    b.squared_infeas = alloc_uninit<f_t>(mn, st);
+    b.rt_ratio = alloc_uninit<f_t>(mn, st);
+    b.setup_rhs = alloc_uninit<f_t>(mn, st);
+    b.se_coeff = alloc_uninit<f_t>(mn, st);
+    b.basic_mark = alloc_uninit<i_t>(mn, st);
+    b.delta_z_mark = alloc_uninit<i_t>(mn, st);
+    b.delta_z_indices = alloc_uninit<i_t>(mn, st);
+    b.nonbasic_end = alloc_uninit<i_t>(mn, st);
+    b.row_mark = alloc_uninit<i_t>(mn, st);
+    b.infeas_idx = alloc_uninit<i_t>(mn, st);
+    b.se_row_degree = alloc_uninit<i_t>(mn, st);
+    b.se_mapping = alloc_uninit<i_t>(mn, st);
+    b.ft_dense_scratch = alloc_uninit<f_t>(mn, st);
+    b.ft_sort_bucket = alloc_uninit<f_t>(mn, st);
+    b.ft_sort_x = alloc_uninit<f_t>(mn, st);
+    b.ft_sort_i = alloc_uninit<i_t>(mn, st);
+    b.ft_sort_perm = alloc_uninit<i_t>(mn, st);
+    b.lvl_lev0 = alloc_uninit<i_t>(m1, st);
+    b.lvl_ls0 = alloc_uninit<i_t>(m1, st);
+    b.lvl_co0 = alloc_uninit<i_t>(m1, st);
+    b.lvl_lev1 = alloc_uninit<i_t>(m1, st);
+    b.lvl_ls1 = alloc_uninit<i_t>(m1, st);
+    b.lvl_co1 = alloc_uninit<i_t>(m1, st);
+    b.lvl_lev2 = alloc_uninit<i_t>(m1, st);
+    b.lvl_ls2 = alloc_uninit<i_t>(m1, st);
+    b.lvl_co2 = alloc_uninit<i_t>(m1, st);
+    b.lvl_lev3 = alloc_uninit<i_t>(m1, st);
+    b.lvl_ls3 = alloc_uninit<i_t>(m1, st);
+    b.lvl_co3 = alloc_uninit<i_t>(m1, st);
+    b.sp_ls_v = alloc_uninit<i_t>(m1, st);
+    b.sp_co_v = alloc_uninit<i_t>(m1, st);
+    b.sp_pos_v = alloc_uninit<i_t>(m1, st);
+    b.lvl_pos_v = alloc_uninit<i_t>(m1, st);
+    b.ft_recover_rhs = alloc_uninit<f_t>(m, st);
+    b.ft_recover_sol = alloc_uninit<f_t>(m, st);
+    b.S_col_start = alloc_uninit<i_t>(2 * ucap + 1, st);
+    b.S_i = alloc_uninit<i_t>(eta, st);
+    b.S_x = alloc_uninit<f_t>(eta, st);
+    b.mu_values = alloc_uninit<f_t>(ucap, st);
+    b.delta_y_sparse_i = alloc_uninit<i_t>(mn, st); b.delta_y_sparse_x = alloc_uninit<f_t>(mn, st);
+    b.UTsol_sparse_i = alloc_uninit<i_t>(mn, st); b.UTsol_sparse_x = alloc_uninit<f_t>(mn, st);
+    b.utilde_sparse_i = alloc_uninit<i_t>(mn, st); b.utilde_sparse_x = alloc_uninit<f_t>(mn, st);
+    b.scaled_dxB_sparse_i = alloc_uninit<i_t>(mn, st); b.scaled_dxB_sparse_x = alloc_uninit<f_t>(mn, st);
+    b.rhs_sparse_i = alloc_uninit<i_t>(mn, st); b.rhs_sparse_x = alloc_uninit<f_t>(mn, st);
+    b.v_sparse_i = alloc_uninit<i_t>(mn, st); b.v_sparse_x = alloc_uninit<f_t>(mn, st);
+    b.se_dy_i = alloc_uninit<i_t>(mn, st); b.se_dy_x = alloc_uninit<f_t>(mn, st);
+    b.se_UTsol_i = alloc_uninit<i_t>(mn, st); b.se_UTsol_x = alloc_uninit<f_t>(mn, st);
+    b.se_ei_i = alloc_uninit<i_t>(mn, st); b.se_ei_x = alloc_uninit<f_t>(mn, st);
+    b.ft_sparse_scratch_i = alloc_uninit<i_t>(mn, st); b.ft_sparse_scratch_x = alloc_uninit<f_t>(mn, st);
+    b.ft_ei_scratch_i = alloc_uninit<i_t>(mn, st); b.ft_ei_scratch_x = alloc_uninit<f_t>(mn, st);
   }
   return a;
 }
 
-// Only `arena` is still a raw cudaMalloc (it is sized from arena_bytes_for and deliberately not
-// zeroed); every other per-problem buffer is an rmm::device_buffer owned by a marshal_storage.
-static void free_kernel_args(const kernel_args&, bool = false)
-{
-  // Nothing to do: the arena is now an rmm::device_buffer owned by the caller's marshal_storage,
-  // like every other per-problem buffer, and is released when that storage goes out of scope.
-}
-
 // Exact device bytes marshal_problem cudaMallocs for one problem's STATIC buffers (read-only
-// factors/matrix + mutable state), EXCLUDING the in-kernel gpu_vector heap (S_ growth). Used by
+// factors/matrix + mutable state), EXCLUDING the in-kernel gpu_span heap (S_ growth). Used by
 // the batch pre-flight VRAM estimate; mirrors the upload/alloc sizes 1:1 (empty vectors still
 // take 1 element, matching upload/alloc_zeroed). Slightly conservative on the small state vectors.
 template <typename FactorIndex>
@@ -4371,13 +4487,13 @@ static size_t problem_static_bytes(const lp_problem_t<i_t, f_t>& lp,
   // state: vstatus(n) + basic(m) + nonbasic(<=n) + x(n)+y(m)+z(n) + dy_se(n) + 4 out scalars
   b += n * sizeof(variable_status_t) + bi(m) + bi(n) + bd(n) + bd(m) + bd(n) + bd(n);
   b += 2 * bi(1) + 2 * bd(1);
-  // persistent per-slot solve state (slot_state<FT> header only -- its gpu_vector payloads live in
+  // persistent per-slot solve state (slot_state<FT> header only -- its gpu_span payloads live in
   // the arena below, or on the in-kernel heap for the few buffers left there)
   b += sizeof(slot_state<gpu_basis_update_mpf_t<FactorIndex>>);
-  // Per-slot arena: the fixed-size gpu_vector payloads, moved off the driver-capped in-kernel heap
-  // into ordinary VRAM. This is now STATIC VRAM and must be in the pre-flight, or a large batch
-  // passes the check and then fails the cudaMalloc. Zero when CUOPT_GPU_ARENA_SCALE=0.
-  b += arena_bytes_for(m, n);
+  // The per-slot buffers. Static VRAM, so it must be in the pre-flight or a large batch passes the
+  // check and then fails to allocate.
+  b += slot_buffer_bytes(m, n, static_cast<size_t>(mpf_update_cap()),
+                         static_cast<size_t>(mpf_eta_nnz_cap()));
   return b;
 }
 
@@ -4446,7 +4562,7 @@ dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
 
   // Reset the shared alloc-failed flag from the host (the kernel no longer does it).
   const int zero_flag = 0;
-  RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_gpu_alloc_failed, &zero_flag, sizeof(int)));
+  RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_gpu_capacity_exceeded, &zero_flag, sizeof(int)));
 
   // The kernel takes a device pointer to an array of kernel_args (one per block);
   // the single-problem path is just N == 1.
@@ -4490,12 +4606,10 @@ dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
   sol.iterations     = h_iters;
 
   int alloc_failed = 0;
-  RAFT_CUDA_TRY(cudaMemcpyFromSymbol(&alloc_failed, g_gpu_alloc_failed, sizeof(int)));
+  RAFT_CUDA_TRY(cudaMemcpyFromSymbol(&alloc_failed, g_gpu_capacity_exceeded, sizeof(int)));
   if (alloc_failed) {
     std::fprintf(stderr, "[gpu_phase2] device allocation failed during solve.\n");
   }
-
-  free_kernel_args(a);
 
   return static_cast<dual::status_t>(h_status);
 }
@@ -4633,7 +4747,7 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
   RAFT_CUDA_TRY(cudaMalloc(&d_args, N * sizeof(kernel_args)));
   RAFT_CUDA_TRY(cudaMemcpy(d_args, h_args.data(), N * sizeof(kernel_args), cudaMemcpyHostToDevice));
   const int zero_flag = 0;
-  RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_gpu_alloc_failed, &zero_flag, sizeof(int)));
+  RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_gpu_capacity_exceeded, &zero_flag, sizeof(int)));
   RAFT_CUDA_TRY(cudaDeviceSynchronize());
   timing.upload_s = toc(up_t0);
 
@@ -4687,15 +4801,15 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
   }
   timing.copyback_s = toc(cb_t0);
 
+
   int alloc_failed = 0;
-  RAFT_CUDA_TRY(cudaMemcpyFromSymbol(&alloc_failed, g_gpu_alloc_failed, sizeof(int)));
+  RAFT_CUDA_TRY(cudaMemcpyFromSymbol(&alloc_failed, g_gpu_capacity_exceeded, sizeof(int)));
   if (alloc_failed) {
-    timing.message = "a device allocation failed during the batch solve (heap too small) — results "
-                     "are unreliable and will show up as verification mismatches";
+    timing.message = "a device span exceeded the capacity the slot layout reserved for it — the "
+                     "layout is wrong, and results are unreliable";
     std::fprintf(stderr, "[gpu_phase2] batch WARNING: %s\n", timing.message.c_str());
   }
 
-  for (size_t b = 0; b < N; ++b) { free_kernel_args(h_args[b], /*ro_shared=*/true); }
   for (const auto& kv : ro_cache) { free_ro(kv.second); }
   cudaFree(d_args);
 }
