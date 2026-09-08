@@ -1,0 +1,570 @@
+Hiverge GPU dual-simplex kernel experiment summary
+==================================================
+
+Input
+-----
+Source export: hiverge_results/seconds/cuopt-dualsimplex-gpu-kernel-xs3bi6a-contents-with-source.jsonl
+Analysis tool: hiverge_results/analyze_hiverge_jsonl.py
+Generated: 2026-09-07
+
+Executive summary
+-----------------
+The export contains 7,925 experiment records and 2.19 GB of embedded source snapshots. It forms a single-parent experiment tree: one root, 7,924 non-root records, 5,692 leaves, 7,110 gate-passing timed records, and 7,916 distinct source snapshots. The parser indexes only the metadata prefix of each JSONL record and seeks back to decode source snapshots only for requested LOC comparisons.
+
+All timings below are Hiverge kernel-only measurements on an NVIDIA L4. They are not end-to-end times and must not be compared directly with the earlier local B200 campaign. The reported time for a record is the median of all gate-passing timing samples for that source snapshot, not the best sample. LOC means additions plus deletions across the embedded source files relative to the named parent or pre-lineage baseline.
+
+The first runnable L4 point measured 2.822 s median for 76,580 pivots. The fastest leaf measured 1.671 s median for 74,500 pivots: 1.689x raw cumulative speedup, or about 1.643x after normalizing by pivot count. This cumulative number combines many changes and is not an independently measured speedup for one patch. A much better stability anchor near the end is the unit-weight cold-start point at 1.677 s over 57 samples; the final 1.671 s leaf has only two samples and its last several micro-changes are within noise.
+
+The correctness gate is strong on status, objective, determinism, and block isolation, but it is not a bitwise-identity gate. The first runnable point was 940/2,000 bit-exact against the CPU reference; the fastest leaf was 900/2,000 bit-exact. All remaining divergences were accepted because status and objective agreed while the pivot path differed. Therefore the report says “gate passed,” not “fully bitwise identical.”
+
+Current B200 baseline after the span-only allocation cleanup
+------------------------------------------------------------
+Measured 2026-09-08 at commit ab54d01c ("only spans, no gpu vectors anymore"). The
+gpu_phase2.cu source SHA-256 is 3128c0ac16e2fbbfd9a6871a610db25b64627920313c3e27902668079ca2e582.
+The Hiverge work was isolated in a GPU-only stash before this build, so this baseline contains the
+new span-only storage changes plus the previously retained ranks, but none of the pending candidates.
+
+B200 kernel samples were 3.001, 3.008, and 3.008 s; the new comparison median is 3.008 s. This is
+1.0033x versus the previous retained-rank-6 median of 3.018 s, or 0.33% lower kernel time. All three
+full 15,000-case gates passed and reproduced 574,350 GPU pivots and 7,050/15,000 bit-exact results,
+with zero disallowed status, objective, or cutoff changes. Configuration remained
+warp<<<N,32>>> with 16-bit factor indices.
+
+B200 compiler resources (sm_100a): 128 registers/thread, zero spills, 352-byte stack, and 1,008
+bytes static shared memory. Relative to the pre-cleanup retained baseline, this is +2 registers,
+-16 stack bytes, unchanged spill traffic, and unchanged shared memory. Use 3.008 s and these resource
+figures as the baseline for every subsequent individual Hiverge A/B test.
+
+Ranking policy
+--------------
+Entries are ordered by implementation priority, not merely by the largest raw ratio. Priority favors repeatable speedup, small LOC, unchanged pivot work, a clear mechanism, and applicability to real heterogeneous branch-and-bound batches. Linked variants are collapsed into the most complete useful form. Raw changes that alter pivot count also show pivot-normalized throughput. A result is labeled reward hacking when the claimed kernel gain comes from benchmark duplication, moving material work to unmeasured CPU setup, comparing against a deliberately damaged parent, or a semantically inert edit.
+
+Ranked findings
+===============
+
+1.
+Title: Isolate setup/configuration from the hot pivot loop with noinline
+Short description: Mark the setup and warp-build configuration helpers noinline so their temporaries do not remain live in the large phase-2 kernel. This is a small, well-isolated register-lifetime optimization.
+LOC: 4 (+2/-2), f0040451 versus d154501d.
+Speedup amount: 1.0173x; 2.114 s to 2.078 s, 27 samples, identical 74,580-pivot work.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: It changes generated-code boundaries only and does not use duplicate nodes, CPU precomputation, or altered solver work. The high sample count and four-line patch make it the first implementation candidate.
+B200 result (2026-09-07, current cleaned source): KEEP.
+B200 kernel A/B: baseline median 3.370 s (runs 3.370, 3.401, 3.363); rank-1 median 3.317 s (runs 3.317, 3.310, 3.351); 1.0160x speedup, or 1.57% lower kernel time.
+B200 correctness: all three candidate full 15,000-case gates passed with zero disallowed status, objective, or cutoff changes; baseline and candidate both produced 574,350 GPU pivots and 7,050/15,000 bit-exact results.
+B200 compiler resources (sm_100a): monolith 128 to 126 registers/thread, 8 to 0 spill bytes, unchanged 16-block/SM register ceiling, stack 96 to 368 bytes, and static shared memory 1,004 to 1,008 bytes; both out-of-line helpers report zero stack and zero spills.
+B200 launch-bound follow-up: the current rank-1 source also compiled and passed all three full gates with no launch bound. Unbounded resources were 128 registers/thread, zero spills, 368-byte stack, 1,008-byte shared memory, and the same 16-block/SM ceiling.
+B200 launch-bound timing: capped A/B/A medians were 3.317 s, then unbounded 3.339 s, then capped 3.353 s. The pooled six-run capped median was 3.334 s, only 0.15% faster than unbounded; this is a statistical tie. Removing the bound brought no measured win, so the capped declaration was retained.
+
+2.
+Title: Replace full delta-z mark clears with generation tags
+Short description: Carry a generation byte for delta-z membership, lazily reset entries, and remove obsolete marking arguments. This eliminates an O(n) clear from every pivot while preserving per-node state.
+LOC: 87 (+44/-43), terminal 68dd929e versus pre-feature b979187c.
+Speedup amount: 1.0442x; 2.054 s to 1.967 s, terminal measured over 17 samples, identical pivot work.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: The saved work occurs inside every real node and relies only on local generation state. It neither shares solved data between nodes nor shifts work to the host.
+B200 result (2026-09-07, current cleaned source): REJECT; not kept.
+B200 porting finding: the literal Hiverge endpoint is incompatible with the cleaned full-nonbasic ratio test, which reads delta-z entries outside delta_z_indices. Its stale values caused 11,400/15,000 disallowed mismatches and only 199,200 GPU pivots. The cleanup-compatible port specialized the ratio test: sparse delta-z treats entries outside the current generation as exact zero, while dense delta-z has no tag load.
+B200 kernel A/B: surrounding rank-1 baseline samples were 3.308, 3.353, 3.355, and 3.344 s (median 3.3485 s); corrected rank-2 samples were 3.360, 3.355, and 3.346 s (median 3.355 s). That is 0.9981x, or 0.19% slower, hence no demonstrated B200 win.
+B200 correctness: all three corrected full 15,000-case gates passed with zero disallowed status, objective, or cutoff changes and reproduced 574,350 GPU pivots plus 7,050/15,000 bit-exact results.
+B200 compiler resources (sm_100a): unchanged from rank 1 at 126 registers/thread, zero spills, 368-byte stack, 1,008-byte static shared memory, and the same 16-block/SM register ceiling.
+B200 conclusion: Hiverge saved both the value clear and mark clear because its sparse ratio test consumed only delta_z_indices. The cleaned kernel scans every nonbasic column; preserving that behavior requires either a generation lookup during the scan or retaining the value clear. The lookup offset the saved clear traffic on this workload, so rank 2 is obsolete after the cleanup.
+B200 post-rank-6 re-test (2026-09-07): REJECT again; not kept. With rank 6 providing a sparse-only ratio consumer, the direct generation-tag port was valid but measured 3.063 s median (runs 3.063, 3.050, 3.108) versus the 3.018 s rank-6 baseline: 0.9853x, or 1.49% slower. All three gates reproduced 574,350 pivots and 7,050/15,000 bit-exact results with zero disallowed changes; resources remained 126 registers, zero spills, 368-byte stack, and 1,008-byte shared memory. The candidate was 80 current-source LOC (+38/-42) and was reverted.
+
+3.
+Title: Remove redundant per-pivot clears
+Short description: Eliminate the squared-infeasibility zero fill and the basic-column delta-z clear when later writes or status filtering already establish the required values.
+LOC: 37 (+26/-11), combined terminal e73e5712 versus 037fac55.
+Speedup amount: 1.0152x; 2.745 s to 2.704 s, 15 terminal samples, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: These are proven dead writes in the real algorithm. The gain is repeatable and no computation is exported outside the kernel.
+B200 result (2026-09-07, current cleaned source): KEEP.
+B200 implementation: removed the n-wide squared-infeasibility zero-fill and the m-wide dense delta-z basic-column sweep. The cleanup-era end-of-pivot clear_delta_z remains and preserves the basic-column zero invariant. Current-source diff: 26 LOC (+15/-11).
+B200 kernel A/B: baseline median 3.353 s (runs 3.337, 3.353, 3.354); rank-3 median 3.313 s (runs 3.318, 3.313, 3.312); 1.0121x speedup, or 1.19% lower kernel time.
+B200 correctness: all three candidate full 15,000-case gates passed with zero disallowed status, objective, or cutoff changes; baseline and candidate both produced 574,350 GPU pivots and 7,050/15,000 bit-exact results.
+B200 compiler resources (sm_100a): unchanged from rank 1 at 126 registers/thread, zero spills, 368-byte stack, 1,008-byte static shared memory, and the same 16-block/SM register ceiling.
+
+4.
+Title: Parallelize the delta-x update
+Short description: Convert the serial delta-x update loop into lane-distributed warp work with the required synchronization.
+LOC: 27 (+19/-8), fe0ab7df versus 4b7bae88.
+Speedup amount: 1.0162x; 2.705 s to 2.662 s, 18 samples, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: It parallelizes required per-node arithmetic without changing solver decisions or relying on batch duplication.
+B200 result (2026-09-07, current cleaned source): KEEP.
+B200 implementation: distributed the independent sparse basic-variable writes across the warp, then synchronized before the ordered leaving/entering overwrites. Current-source diff: 21 LOC (+13/-8).
+B200 kernel A/B: rank-3 baseline median 3.313 s (runs 3.318, 3.313, 3.312); rank-4 median 3.242 s (runs 3.260, 3.242, 3.220); 1.0219x speedup, or 2.14% lower kernel time.
+B200 correctness: all three candidate full 15,000-case gates passed with zero disallowed status, objective, or cutoff changes and reproduced 574,350 GPU pivots plus 7,050/15,000 bit-exact results.
+B200 compiler resources (sm_100a): unchanged at 126 registers/thread, zero spills, 368-byte stack, and 1,008-byte static shared memory.
+
+5.
+Title: Arena-bind and pre-reserve common rank-update storage
+Short description: Bind S and mu storage to the existing per-slot arena and reserve the common-case update capacity, avoiding repeated device-side vector allocation/growth.
+LOC: 27 (+24/-3), 4d9e2343 versus 68d2cddd.
+Speedup amount: 1.0128x; 2.6495 s to 2.616 s, 53 samples, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: The allocation work is genuinely removed from the device kernel and remains per slot. It does not add host setup or share mutable state across nodes.
+B200 result (2026-09-07, current cleaned source): KEEP.
+B200 implementation: arena-bound S_/mu_values_ and pre-reserved space for 150 updates; longer solves retain the original device-malloc fallback. Current-source incremental diff: 18 LOC (+15/-3).
+B200 kernel A/B: rank-4 median 3.242 s (runs 3.260, 3.242, 3.220); rank-5 median 3.123 s (runs 3.118, 3.123, 3.128); 1.0381x speedup, or 3.67% lower kernel time.
+B200 correctness: all three candidate full 15,000-case gates passed with zero disallowed status, objective, or cutoff changes and reproduced 574,350 GPU pivots plus 7,050/15,000 bit-exact results.
+B200 compiler resources (sm_100a): unchanged at 126 registers/thread, zero spills, 368-byte stack, and 1,008-byte static shared memory.
+
+6.
+Title: Restrict the ratio test to the sparse delta-z candidate list
+Short description: Scan delta_z_indices rather than every nonbasic column and maintain nonbasic_pos to preserve the original smaller-k tie break.
+LOC: 46 (+37/-9), complete compile-fixed point c5a2e017 versus 57ba536e.
+Speedup amount: 1.0101x; 2.3415 s to 2.318 s, 86 samples, identical 75,380-pivot work. An independent earlier branch measured 1.0156x over 35 samples.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: A zero delta-z cannot pass the eligibility test, so the sparse list is an exact per-iteration work restriction. The inverse position map preserves deterministic tie ordering; no cross-node reuse is involved.
+B200 result (2026-09-07, current cleaned source): KEEP.
+B200 implementation: added a per-slot inverse nonbasic-position map, maintained it on each basis swap, and scanned delta_z_indices in both ratio-test passes. Current-source incremental diff: 38 LOC (+25/-13).
+B200 kernel A/B: rank-5 median 3.123 s (runs 3.118, 3.123, 3.128); rank-6 median 3.018 s (runs 3.018, 3.013, 3.024); 1.0348x speedup, or 3.36% lower kernel time.
+B200 correctness: all three candidate full 15,000-case gates passed with zero disallowed status, objective, or cutoff changes and reproduced 574,350 GPU pivots plus 7,050/15,000 bit-exact results.
+B200 compiler resources (sm_100a): unchanged at 126 registers/thread, zero spills, 368-byte stack, and 1,008-byte static shared memory.
+B200 cumulative ranks 4-6: 77 LOC (+53/-24), 3.313 s to 3.018 s median; 1.0977x speedup, or 8.90% lower kernel time.
+
+7.
+Title: Use exact integer arithmetic for density routing
+Short description: Replace a floating-point density comparison with an equivalent integer cross-comparison.
+LOC: 4 (+2/-2), 52987bb9 versus a9a9edaa.
+Speedup amount: 1.0072x; 1.966 s to 1.952 s, five samples, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: The route predicate is mathematically equivalent and removes conversion/arithmetic overhead. It is tiny and easy to validate, although the sample count is modest.
+B200 result (2026-09-07, current cleaned source): REJECT; not kept.
+B200 implementation: adapted the historical 25% comparison to the cleanup current 30% threshold as delta_y_nz0 <= (3 * m) / 10. Current-source diff: 4 LOC (+2/-2).
+B200 kernel A/B: rank-6 baseline median 3.018 s (runs 3.018, 3.013, 3.024); rank-7 median 3.051 s (runs 3.037, 3.051, 3.055); 0.9892x, or 1.09% slower.
+B200 correctness/resources: all three full gates reproduced 574,350 pivots and 7,050/15,000 bit-exact with zero disallowed changes; resources stayed at 126 registers, zero spills, 368-byte stack, and 1,008-byte shared memory. The candidate was reverted.
+
+8.
+Title: Delete the dlen <= 4 sparse T-loop fast path
+Short description: Remove a branchy tiny-length special case whose instruction and register cost exceeds its savings on this workload.
+LOC: 9 deletions, cb687829 versus 0dd0756e.
+Speedup amount: 1.0062x; 2.2645 s to 2.2505 s, 14 samples, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: This is a direct simplification of the same computation with repeatable measurements.
+B200 result (2026-09-07, current cleaned source): ALREADY PRESENT / SUPERSEDED; no edit or timing candidate.
+B200 finding: the targeted dlen <= 4 branch is already absent. The current sparse T-loop has only a separate dlen <= 2 fast path, whose arithmetic order is bit-identical and whose removal would not reproduce rank 8. Batch impact: zero changes and zero LOC.
+
+9.
+Title: Add restrict qualifiers to hot kernel pointer interfaces
+Short description: Tell the compiler that selected kernel and helper pointer arguments do not alias, enabling better load scheduling and common-subexpression handling.
+LOC: 34 (+17/-17), 09c9f191 versus 6327cbc4.
+Speedup amount: 1.0122x; 1.7065 s to 1.686 s, 14 samples, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: The qualifiers encode true ownership/aliasing properties and perform no benchmark-specific work. Each assertion must still be audited before incorporation because a false restrict promise is undefined behavior.
+B200 result (2026-09-07, current cleaned source): REJECT; not kept.
+B200 implementation: audited and annotated the eight historical hot interfaces; all asserted buffers are distinct by the existing function contracts. Current-source diff: 26 LOC (+13/-13).
+B200 kernel A/B: rank-6 baseline median 3.018 s (runs 3.018, 3.013, 3.024); rank-9 median 3.022 s (runs 3.016, 3.027, 3.022); 0.9987x, or 0.13% slower.
+B200 correctness/resources: all three full gates reproduced 574,350 pivots and 7,050/15,000 bit-exact with zero disallowed changes; resources stayed at 126 registers, zero spills, 368-byte stack, and 1,008-byte shared memory. The candidate was reverted.
+
+10.
+Title: Select cooperative width for narrow wavefront levels
+Short description: Allow the triangular-solve code to use a narrower cooperative group for paired RHS/narrow-level cases instead of forcing all 32 lanes through every level.
+LOC: 32 (+22/-10), 6128859d versus 472d05e7.
+Speedup amount: 1.0202x; 1.949 s to 1.9105 s, 22 samples, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: It changes how one node’s required solve is parallelized. It is not the failed strategy that assigns independent LPs to subwarps.
+
+11.
+Title: Use a persistent work-stealing problem queue
+Short description: Let blocks dequeue another LP after completing a short one, reducing the tail from heterogeneous node solve lengths.
+LOC: 72 (+57/-15), de7dc48e versus 89cc1b8a.
+Speedup amount: 1.0121x; 1.8845 s to 1.862 s, 55 samples, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: Real branch-and-bound batches are heterogeneous, and feedback explicitly checked that a block only reads args[idx] for its current job. It balances independent nodes without reusing their solutions.
+
+12.
+Title: Fuse the two RHS FTran path and product-form replay
+Short description: Solve the two related right-hand sides with a shared level traversal, reuse dense L buffers, defer conversion until the U route is known, apply the direction during norm updates, and count dense nonzeros without materializing an extra sparse vector.
+LOC: 329 (+310/-19), terminal 73d820d6 versus pre-feature 65bf3d4d.
+Speedup amount: 1.0689x; 2.575 s to 2.409 s with unchanged pivots. The exact lineage endpoints have one sample each, but independent fused-two-RHS branches repeatedly measured about 1.02x to 1.06x.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: The two RHS operations arise within the same real pivot, so sharing their traversal is intrinsic reuse, not duplicate-node reuse. The size and low endpoint sample count require staged A/B reconstruction rather than landing all 329 LOC at once.
+
+13.
+Title: Longest-processing-time batch ordering
+Short description: Estimate per-problem work and order the launch list so long jobs start first, reducing the final tail.
+LOC: 29 (+26/-3), 968cce09 versus 76e78a5b.
+Speedup amount: 1.0201x; 2.8125 s to 2.757 s, 14 samples, unchanged pivots.
+Is reward hacking: No, conditional on end-to-end validation.
+Why it is (or is not) reward hacking: Heterogeneous B&B nodes are real, so LPT scheduling is applicable. However, Hiverge did not score the host-side estimate/sort cost; the implementation should be accepted only if the complete batch time improves.
+
+14.
+Title: Cache ratio-test and pricing loop intermediates
+Short description: Hoist repeated array reads and expressions into local values in the two hot selection loops.
+LOC: 23 (+15/-8), 36e62f06 versus b1d2ec8d.
+Speedup amount: 1.0118x; 2.142 s to 2.117 s, 19 samples, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: It reduces redundant device loads for required calculations. Register count must be checked because additional locals can reverse the gain in another compiled configuration.
+
+15.
+Title: Hoist the Harris pass-2 boundary
+Short description: Precompute the Harris-window comparison boundary rather than repeating FP64 arithmetic for every pass-2 candidate.
+LOC: 7 (+4/-3), 43acc5b5 versus 80e15857.
+Speedup amount: 1.0046x; 1.733 s to 1.725 s, two samples, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: The calculation is algebraically reused within the same ratio test. It is a good tiny patch, but the two-sample gain needs local confirmation.
+
+16.
+Title: Fast-path a fully active delta-z ballot
+Short description: Avoid unnecessary ballot/prefix handling when every lane appends a valid entry.
+LOC: 13 (+10/-3), 77784901 versus 3849d8e4.
+Speedup amount: 1.0055x; 1.7365 s to 1.727 s, three samples, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: It recognizes a real warp-uniform case and preserves the emitted ordering.
+
+17.
+Title: Compress factor/schedule row-index storage
+Short description: Template row-index types so fixed factor structures that fit can use a narrower representation.
+LOC: 28 (+17/-11), 037fac55 versus 11890961.
+Speedup amount: 1.0040x; 2.756 s to 2.745 s, 33 samples, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: It reduces actual device memory traffic with a size-checked wider fallback. It applies independently to every real node.
+
+18.
+Title: Keep Arow immutable and filter basic columns at use time
+Short description: Remove per-pivot mutation of the CSR row partition and use basic_mark when consuming Arow. This permits all nodes from the same original problem to share every immutable A/Arow field.
+LOC: 278 (+68/-210), 816bfd00 versus 1976992e; later compact variants measured the same idea.
+Speedup amount: 1.0179x; 2.271 s to 2.231 s, three samples, unchanged pivots. A later branch measured 1.0108x.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: In real B&B, nodes from one original model legitimately share immutable A. Basis membership remains node-local through basic_mark; no pivot result or mutable basis state is shared.
+
+19.
+Title: Pre-invert gather diagonals in the device prologue
+Short description: Compute reciprocals once per fixed factor in the device setup/prologue and multiply in non-transpose gather solves.
+LOC: 30 (+29/-1), 6ab1850b versus fbae5ab7.
+Speedup amount: 1.0101x; 2.706 s to 2.679 s, four samples, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: The precomputation remains on the GPU and is amortized by real repeated solves. This specific result should not be conflated with the many slower global/host reciprocal-array variants listed below.
+
+20.
+Title: Use a serial triangular-solve path for very small reaches
+Short description: Let lane 0 execute tiny, shallow reach closures without paying warp reductions and synchronization.
+LOC: 30 (+29/-1), aabd6182 versus 6b9258c0.
+Speedup amount: 1.0114x; 1.871 s to 1.850 s, two samples, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: It selects a lower-overhead implementation for the same per-node solve. The threshold needs a sweep and more samples.
+
+21.
+Title: Targeted loop unrolling in wavefront and delta-z dot loops
+Short description: Raise the wavefront gather unroll from four to eight and unroll the delta-z inner dot loop by four.
+LOC: 62 (+57/-5), terminal 951dc72e versus c7f651b6.
+Speedup amount: 1.0227x combined; 1.8435 s to 1.8025 s, two samples at each terminal step, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: It changes instruction scheduling for real arithmetic only. Results elsewhere show that unroll 16 or unroll 2 is usually slower, so compile resources and the exact factor layout must be rechecked.
+
+22.
+Title: Stop DFS once dense fallback is inevitable
+Short description: Track a reach budget and terminate serial graph traversal as soon as the final route must be dense.
+LOC: 56 (+46/-10), c5855541 versus e953ce95.
+Speedup amount: 1.0059x; 1.869 s to 1.858 s, 31 samples, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: The skipped traversal cannot affect the chosen computation after the dense threshold is crossed. It is a real early-exit certificate, not an approximate solve.
+
+23.
+Title: Pre-size stacked factor vectors
+Short description: Reserve and set the expected stacked-factor storage before updates to avoid growth work in the pivot loop.
+LOC: 14 (+11/-3), 1d05539e versus fb64191b.
+Speedup amount: 1.0100x; 1.7215 s to 1.7045 s, two samples, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: It removes device allocation/growth overhead and does not move it to the CPU. Confidence is limited by the small sample count.
+
+24.
+Title: Replace pricing division with cross multiplication
+Short description: Compare squared infeasibility and steepest-edge weights by cross multiplication instead of dividing each candidate.
+LOC: 17 (+12/-5), f5227b1d versus 044476f9.
+Speedup amount: 1.0032x; 1.8525 s to 1.8465 s, ten samples, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: It evaluates the same ordering on-device. Overflow, NaN, and tie behavior need explicit numerical review before incorporation.
+
+25.
+Title: Replace shared-memory lane-0 broadcasts with warp shuffles
+Short description: Publish lane-0 scalar results through shuffle operations where all consumers are in one warp.
+LOC: 11 (+5/-6), bc5806a9 versus d4b869ca.
+Speedup amount: 1.0037x; 2.4445 s to 2.4355 s, 18 samples, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: It removes barriers/shared traffic within a real node while preserving warp synchronization semantics.
+
+26.
+Title: Tune sparse/dense routing as one workload-specific bundle
+Short description: Adjust the GPU hypersparse cutoff, count-sort cutoff, sparse-reach fallback, and delta-y transpose threshold. Keep this as one tuned configuration rather than crediting every one-line sweep branch independently.
+LOC: 8 (+4/-4), terminal 57ba536e versus 73d820d6.
+Speedup amount: 1.0288x raw; 2.409 s and 76,760 pivots to 2.3415 s and 75,380 pivots. Pivot-normalized throughput gain is only 1.0103x; terminal has 14 samples.
+Is reward hacking: No, but it is benchmark-tuning risk.
+Why it is (or is not) reward hacking: Routing changes are legitimate, but much of the raw gain is a different pivot path and the optimum is architecture/dataset dependent. The many single-sample 4–5% threshold “wins” are not separate evidence.
+
+27.
+Title: Simplify dense solves and add compiler assumptions as a mixed bundle
+Short description: Remove manual small-loop branches, introduce index assumptions, and simultaneously retune several sparse thresholds and DFS depth.
+LOC: 282 (+104/-178), 8cfcba4f versus 5c3a1a76.
+Speedup amount: 1.0327x raw; 2.370 s to 2.295 s over 15 samples. Pivot-normalized gain is 1.0256x.
+Is reward hacking: No, but the attribution is unusable as-is.
+Why it is (or is not) reward hacking: The changes are plausible real optimizations, but compiler simplification, assumptions, routing, and pivot count are bundled. Recreate them as separate A/B patches; do not land the bundle based on this number.
+
+28.
+Title: Extract the basis-update phase to reduce hot-loop register pressure
+Short description: Move a large basis-update section behind a function boundary so its temporary state does not inflate the main loop live range.
+LOC: 100 (+71/-29), c8d6a193 versus 4ed4b2ef.
+Speedup amount: 1.0088x; 2.6825 s to 2.659 s, 23 samples, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: It is a real compiler/register-lifetime change. It is ranked below the four-line noinline result because it is larger and may duplicate that mechanism.
+
+29.
+Title: Use FP32 only for Harris ratio filtering, retain FP64 final step
+Short description: Perform the coarse ratio candidate filter in FP32 and recompute the selected step in FP64.
+LOC: 46 (+21/-25), 6327cbc4 versus 3e767c15.
+Speedup amount: 1.0108x raw; 1.725 s to 1.7065 s over four samples. Because pivots rose from 74,400 to 75,000, per-pivot throughput improved about 1.0190x.
+Is reward hacking: No, but it changes numerical ordering.
+Why it is (or is not) reward hacking: Mixed precision is used only in candidate filtering and the gate passed, but the pivot path changed. It needs a much larger numerical corpus before adoption.
+
+30.
+Title: Maintain primal infeasibilities incrementally
+Short description: Update only rows touched by delta-x and maintain a position map instead of rescanning all m rows each pivot.
+LOC: 125 (+116/-9), 0d29ff15 versus e44b83d3.
+Speedup amount: 1.0111x; 1.778 s to 1.7585 s, two samples, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: It replaces an O(m) per-pivot scan with exact sparse maintenance. A related lineage initially had a stale-removal-slot bug, so correctness and state invariants need focused tests.
+
+31.
+Title: Cache BTran across a norm-drift reprice restart
+Short description: Reuse the B-transpose result when the basis and RHS are unchanged and only steepest-edge norm refresh triggers a pricing retry.
+LOC: 49 (+34/-15), 5cedf197 versus 0b62b81a.
+Speedup amount: 1.0114x; 2.753 s to 2.722 s, one sample, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: The reuse is within one node and one unchanged basis. It needs stronger evidence and careful invalidation checks.
+
+32.
+Title: Use deterministic unit weights for cold steepest-edge initialization
+Short description: Skip exact initial norm solves, initialize basic weights to one, and let subsequent Forrest–Goldfarb updates refine them.
+LOC: 18 (+11/-7), 0b8c4b82 versus 4cf308d2.
+Speedup amount: 1.0066x raw; 1.688 s to 1.677 s over 57 samples. Pivots changed from 75,000 to 75,020; normalized gain is about 1.0068x.
+Is reward hacking: No, but it is an algorithmic policy change.
+Why it is (or is not) reward hacking: This removes legitimate initialization work rather than borrowing CPU results, but it changes the pivot trajectory and bit-exact count. It needs broader convergence and numerical validation than a code-generation optimization.
+
+33.
+Title: Cooperate on two-column sparse levels
+Short description: Special-case levels containing two columns so two lane groups can process them concurrently.
+LOC: 50 additions, 9aafd5ca versus 8f6f04e9.
+Speedup amount: 1.0090x raw; 1.8405 s to 1.824 s over two samples. Pivot-normalized gain is 1.0066x.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: It exposes parallelism inside a real factor solve. The low sample count and code size put it below the general cooperative-width implementation.
+
+34.
+Title: Slightly reduce occupancy to relieve cache contention
+Short description: Change launch geometry to trade one resident warp slot per SM for more effective cache capacity.
+LOC: 7 (+6/-1), 60341d31 versus 0567757d.
+Speedup amount: 1.0042x; 2.177 s to 2.168 s, one sample, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: Occupancy/cache tradeoffs are real, but this is one-sample, architecture-specific evidence. Re-measure with registers, occupancy, and cache metrics on the target GPU.
+
+35.
+Title: Parallelize setup buffer fills
+Short description: Convert several lane-0 initialization loops into lane-strided warp fills.
+LOC: 84 (+62/-22), 627fc151 versus 856e3971.
+Speedup amount: 1.0042x; 2.387 s to 2.377 s, 16 samples, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: Required device setup remains in the kernel and is parallelized, but the low gain per LOC makes it a later candidate.
+
+36.
+Title: Fuse delta-y norm and nonzero counting
+Short description: Accumulate the norm and count in one traversal/reduction.
+LOC: 46 (+24/-22), c608f083 versus c49b8428.
+Speedup amount: 1.0038x; 2.643 s to 2.633 s, two samples, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: It fuses required per-node reductions without changing the result. Evidence is weak for the amount of code touched.
+
+37.
+Title: Parallelize exact steepest-edge initialization
+Short description: Warp-parallelize norm accumulation while retaining exact cold-start norms.
+LOC: 11 (+7/-4), e22f027b versus e41425d8.
+Speedup amount: 1.0037x; 2.159 s to 2.151 s, three samples, unchanged pivots.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: It accelerates the original algorithm on-device. It is incompatible with the unit-weight policy above, so choose one after broader numerical testing.
+
+38.
+Title: Fold maximum-level tracking into existing traversals
+Short description: Track the maximum elimination level during the dependency walk and lazily initialize level storage instead of rescanning/zeroing it.
+LOC: 6 (+4/-2) for 992b5ffd; the follow-up lazy-zero step is 15 LOC.
+Speedup amount: 1.0027x for max tracking (1.6785 s to 1.674 s, three samples); the lazy-zero follow-up measured 1.0015x over two samples.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: Both remove redundant device passes, but the effects are near timing noise. Keep only after a larger local A/B run.
+
+39.
+Title: Terminal sparse update/sort threshold refinements
+Short description: Merge already sorted runs, avoid copy-back, tune tiny insertion/merge thresholds, and lower the sparse-vector bucket-sort density threshold.
+LOC: 49 (+39/-10), terminal cd43a132 versus d28aaf65.
+Speedup amount: 1.0006x combined; 1.672 s to 1.671 s, two terminal samples, unchanged pivots.
+Is reward hacking: No, but the measured gain is noise-sized.
+Why it is (or is not) reward hacking: The ideas are semantically real, yet several intermediate points alternated between 1.672 s and 1.6765 s. Treat this family as correctness/cleanup work unless a long A/B run resolves it.
+
+40.
+Title: Correct L4 device-heap sizing
+Short description: Apply the measured estimate-to-actual heap ratio before clamping the device malloc arena, allowing the benchmark to launch on the L4.
+LOC: 5 additions, 6c1cfd72 versus 6bad8ffb.
+Speedup amount: N/A; the parent had no usable kernel time and the fixed point ran at 2.822 s median over three samples.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: This is a portability/correctness prerequisite, not a performance claim. It should be retained if the same heap-sizing failure exists in the current source.
+
+Uncertain, misleading, or rejected findings
+===========================================
+
+41.
+Title: Keep the 128-register kernel cap; do not claim restoring it as a new win
+Short description: Multiple branches lowered the cap to 96 and then measured a roughly 10–12% “speedup” when changing it back to 128.
+LOC: 2 for a representative restore, efba3473 versus 0ecd0c44.
+Speedup amount: Apparent 1.1197x restore, 1.978 s to 1.7665 s; lowering 128 to 96 separately measured 0.8680x, 1.677 s to 1.932 s.
+Is reward hacking: Yes, if reported as a new optimization.
+Why it is (or is not) reward hacking: The 128-register setting was already present in the good baseline. Restoring damage introduced by an experimental parent is a recovery, not a new improvement.
+
+42.
+Title: DFS-stack and max-level changes confounded with the register restore
+Short description: Removing dfs_end and fusing max-level discovery may be useful, but both headline 10%+ records also changed maxnreg from 96 back to 128.
+LOC: 20 for 270cdc3b and 80 for 573e173d.
+Speedup amount: Apparent 1.1235x and 1.1097x, respectively.
+Is reward hacking: Yes, as attributed headline speedups.
+Why it is (or is not) reward hacking: Prior isolated data shows the register restoration explains approximately this scale. Re-test the structural idea against a 128-register parent; no independent win was established.
+
+43.
+Title: Division-temporary “win” is recovery from an anomalous parent
+Short description: Store four division results in const temporaries and change a delta-z zero test from exact zero to fabs(x) < 1e-12.
+LOC: 16 (+9/-7), 63861992 versus d3dc7f1a.
+Speedup amount: Apparent 1.1186x, 1.901 s to 1.6995 s. Against the stable grandparent at 1.701 s it is only about 1.0009x; the parent had one sample and pivot work changed.
+Is reward hacking: Yes, as a 1.1186x optimization claim.
+Why it is (or is not) reward hacking: The immediate parent was an isolated regression, and the tolerance change altered work from 76,320 to 74,580 pivots. Split the code-generation edit from the numerical predicate if the idea is revisited.
+
+44.
+Title: Comment-only apparent speedup
+Short description: Change only a workspace-reuse comment.
+LOC: 4 text lines, 459a935b versus 02e7a048.
+Speedup amount: Apparent 1.0109x, 1.863 s to 1.843 s, two samples.
+Is reward hacking: Yes.
+Why it is (or is not) reward hacking: There is no semantic or generated-code change. This record quantifies measurement/code-layout noise and proves that small few-sample deltas cannot be trusted blindly.
+
+45.
+Title: Host-precomputed elimination schedules
+Short description: Build fixed LU level schedules on the CPU and pass them to the GPU, later eliminating per-slot schedule copies.
+LOC: 160 (+136/-24), terminal 9bf6b1a3 versus pre-feature 2c77d5c0.
+Speedup amount: 1.0054x kernel-only; 1.7765 s to 1.767 s, two terminal samples. Another 233-LOC integration measured 0.9997x.
+Is reward hacking: Yes for the kernel-only objective used here.
+Why it is (or is not) reward hacking: Material schedule construction and upload are moved into unscored host setup. It is only a valid optimization if end-to-end time, CPU consumption, and amortization across real nodes all improve.
+
+46.
+Title: Consolidated upload/read-only blobs
+Short description: Coalesce per-problem device allocations/uploads, with one variant also adding L2 persistence.
+LOC: 311 for 04147c1d; 147 for fbe0e40e.
+Speedup amount: N/A; the representative variants failed the gate or produced no usable kernel time.
+Is reward hacking: No as an end-to-end idea, but it is outside this kernel-only score.
+Why it is (or is not) reward hacking: Reducing marshal/H2D submissions is legitimate and was motivated by prior host profiling, but Hiverge supplied no valid result here. It must be developed and timed end-to-end, not credited to kernel optimization.
+
+47.
+Title: Static shared-memory workspace/cache experiments
+Short description: Put x workspace, ratio buffers, or reach bitmaps in static shared memory.
+LOC: 21 for shared x, 10 for shared ratio, and 11 for shared reach.
+Speedup amount: 0.9541x, 0.9847x, and 0.9827x respectively.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: These are legitimate locality experiments, but static shared memory reduces L1/occupancy and loses on the measured kernel. This confirms the earlier factor-structure-cache rejection.
+
+48.
+Title: Global per-column diagonal reciprocal arrays
+Short description: Materialize reciprocal arrays for triangle solves and load them in the hot path.
+LOC: 89 (+60/-29), representative c2773495 versus c5a2e017.
+Speedup amount: 0.9768x; 2.318 s to 2.373 s. Many related variants were neutral or 2–3% slower.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: The saved division is outweighed by extra storage, loads, and resource pressure. This does not invalidate the smaller device-prologue-only result ranked above; the storage strategies are different.
+
+49.
+Title: Explicit L2 persistence policies
+Short description: Reserve a persisting-L2 window for shared matrix/SpMV data.
+LOC: 25 additions, a7475df1 versus 4a6e1d19.
+Speedup amount: 0.9951x; 1.726 s to 1.7345 s, two samples.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: Sharing immutable A across related B&B nodes is valid, but explicit persistence gave no benefit and slightly slowed this L4 workload.
+
+50.
+Title: Sort nodes by matrix identity for cache affinity
+Short description: Reorder the batch so nodes sharing the same original A are adjacent.
+LOC: 13 (+10/-3), 1f89a0ad versus 89cc1b8a.
+Speedup amount: 0.9644x; 1.8845 s to 1.954 s, one sample.
+Is reward hacking: No, conditionally.
+Why it is (or is not) reward hacking: Real B&B nodes from one original model do share immutable A, so matrix affinity itself is legitimate. The measured implementation loses and any host sorting cost was unscored.
+
+51.
+Title: Memoize repeated U-transpose solves
+Short description: Cache a prior U-transpose result and reuse it when a matching query recurs.
+LOC: 120 (+94/-26), 5f05cc45 versus 89b192b9.
+Speedup amount: 0.9367x; 1.7535 s to 1.872 s, one sample.
+Is reward hacking: No if keys and invalidation are exact.
+Why it is (or is not) reward hacking: Same-node same-basis reuse can be valid, but cache maintenance and low hit rate made it substantially slower. It should not be implemented.
+
+52.
+Title: Software prefetch and triangle-loop lookahead
+Short description: Add explicit prefetches/lookahead and simultaneously tune several thresholds.
+LOC: 87 (+52/-35), representative a370f838 versus 58311249.
+Speedup amount: 0.9876x; 1.677 s to 1.698 s, one sample; earlier isolated prefetch tests also regressed.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: It is a real latency-hiding attempt, but the GPU cache/compiler already handles these accesses better than the added instruction and register overhead.
+
+53.
+Title: FP32 factor storage and mixed-precision iterative refinement
+Short description: Store LU values in float or solve in FP32 followed by FP64 refinement.
+LOC: 164 for float-factor storage; 218 for representative refinement.
+Speedup amount: N/A for float storage because no valid gate-passing time; refinement measured 0.3384x, 2.714 s to 8.020 s.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: Mixed precision is a legitimate algorithmic direction, but these implementations either failed validation or spent far more on refinement than they saved.
+
+54.
+Title: Broad “cleanup” that removes established fast paths
+Short description: Delete fused two-RHS solves, reciprocal/generation state, work stealing, or specialized dispatch in the name of simplification.
+LOC: 3,145 (+956/-2,189), representative ccd16429 versus aadfa3bf.
+Speedup amount: 0.6289x; 1.673 s to 2.660 s, one sample.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: The cleanup is semantically honest but removes accumulated performance mechanisms. Source-size reduction alone is not an optimization metric.
+
+55.
+Title: Batch-fetch or statically preassign work-stealing jobs
+Short description: Reduce queue atomics by dequeuing batches or assigning an initial wave directly.
+LOC: 21 for batch fetch; a representative direct-grid replacement is 43 LOC.
+Speedup amount: Batch fetch measured 0.0696x, 1.731 s to 24.867 s; ordinary static replacements were typically about 0.975x.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: These are valid scheduling ideas, but they create severe intra-warp divergence or restore the heterogeneous tail that work stealing removed.
+
+56.
+Title: Pack independent LPs into lanes/subwarps
+Short description: Assign a lane or small subwarp to each independent node to increase the number of concurrent LPs per block.
+LOC: 490 for lane-per-LP and 451 for representative subwarp packing.
+Speedup amount: 0.1152x and 0.1891x respectively.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: It does not reuse duplicate solutions, but dual-simplex collectives and irregular solves require full-warp cooperation; packing destroys useful parallelism and adds complex masking.
+
+57.
+Title: Replace exact steepest-edge maintenance with Devex
+Short description: Remove paired FTran/exact norm maintenance and use approximate Devex weights.
+LOC: 108 (+45/-63), representative d5ed2f20 versus 46df956d.
+Speedup amount: 0.6177x; 1.761 s to 2.851 s, with pivots rising from 74,540 to 85,000. Many other Devex branches were far worse.
+Is reward hacking: No, but repair steps must not be counted as wins.
+Why it is (or is not) reward hacking: Devex is a legitimate simplex strategy, but it greatly increases pivot work here. Later 2.78x and 1.78x “improvements” only repaired broken Devex descendants and remained worse than the exact-steepest-edge baseline.
+
+58.
+Title: Long-step bound flipping
+Short description: Replace the Harris ratio test with long-step/bound-flip selection and correction.
+LOC: 265 (+184/-81), representative 4ba8b7ea versus 5919f911.
+Speedup amount: 0.0237x; 1.697 s to 71.505 s, with pivots rising from 74,580 to 159,680. A heavily gated conditional variant was only 1.0012x, within noise.
+Is reward hacking: No.
+Why it is (or is not) reward hacking: Bound flipping is a valid algorithmic feature, but the tested implementations explode work or add overhead. It should be redesigned for correctness/algorithmic reasons, not taken from this search as a performance win.
+
+59.
+Title: Replica-interleaved launch order
+Short description: Interleave the benchmark’s exact replicated nodes in the launch schedule to exploit their artificial grouping/cache pattern.
+LOC: 54 (+38/-16), 9d2f695d versus 968cce09.
+Speedup amount: 0.9527x; 2.757 s to 2.894 s, one sample.
+Is reward hacking: Yes.
+Why it is (or is not) reward hacking: The policy is explicitly keyed to the replicated benchmark structure rather than general B&B scheduling, and it is slower anyway. Exact-replica assumptions must never be used to justify production solver reuse.
+
+Recommended incorporation sequence
+==================================
+1. Rebuild and A/B ranks 1–11 individually on the current source, with compiler resource reports and the full correctness gate.
+2. Reconstruct the fused-two-RHS lineage (rank 12) in small stages, because the aggregate endpoint is large but under-sampled.
+3. Validate scheduling changes with realistic heterogeneous B&B node batches and include host ordering/marshal time.
+4. Treat ranks 26–39 as tuning or low-confidence follow-ups, never as established wins.
+5. Do not import entries 41–59 as performance patches. Some contain ideas worth isolated study, but their reported headline numbers are confounded, unscored host work, noise, failures, or regressions.

@@ -752,17 +752,28 @@ __device__ __forceinline__ void warp_fromdense_body(i_t* a_fd_count, i_t* a_fd_i
 
 // `a_rt_ratio` caches pass-1 ratios for pass 2; identical lane strides make every entry
 // write-before-read by the same lane.
-__device__ __forceinline__ void warp_rt_body(f_t a_rt_dual_tol, const f_t* a_rt_dz, i_t* a_rt_entering, i_t* a_rt_k, i_t a_rt_m, i_t a_rt_n, const i_t* a_rt_nonbasic, f_t a_rt_pivot_tol, f_t* a_rt_ratio, f_t* a_rt_step, const variable_status_t* a_rt_vstatus, const f_t* a_rt_z, f_t a_rt_zero_tol)
+__device__ __forceinline__ void warp_rt_body(f_t a_rt_dual_tol,
+                                                     const f_t* a_rt_dz,
+                                                     i_t* a_rt_entering,
+                                                     i_t* a_rt_k,
+                                                     const i_t* a_rt_dzi,
+                                                     i_t a_rt_dzn,
+                                                     const i_t* a_rt_pos,
+                                                     f_t a_rt_pivot_tol,
+                                                     f_t* a_rt_ratio,
+                                                     f_t* a_rt_step,
+                                                     const variable_status_t* a_rt_vstatus,
+                                                     const f_t* a_rt_z,
+                                                     f_t a_rt_zero_tol)
 {
-  const int lane   = static_cast<int>(threadIdx.x);
-  const i_t num_nb = a_rt_n - a_rt_m;
+  const int lane = static_cast<int>(threadIdx.x);
   const f_t ptol = a_rt_pivot_tol, dtol = a_rt_dual_tol, ztol = a_rt_zero_tol;
   const f_t INF  = dev_inf();
 
   // Pass 1: global minimum eligible ratio (all lanes get it).
   f_t lmin = INF;
-  for (i_t k = lane; k < num_nb; k += 32) {
-    const i_t j             = a_rt_nonbasic[k];
+  for (i_t h = lane; h < a_rt_dzn; h += 32) {
+    const i_t j             = a_rt_dzi[h];
     const variable_status_t s = a_rt_vstatus[j];
     f_t ratio = INF;
     if (s == variable_status_t::NONBASIC_LOWER && a_rt_dz[j] < -ptol) {
@@ -770,7 +781,7 @@ __device__ __forceinline__ void warp_rt_body(f_t a_rt_dual_tol, const f_t* a_rt_
     } else if (s == variable_status_t::NONBASIC_UPPER && a_rt_dz[j] > ptol) {
       ratio = (dtol - a_rt_z[j]) / a_rt_dz[j];
     }
-    a_rt_ratio[k] = ratio;
+    a_rt_ratio[h] = ratio;
     if (ratio < lmin) { lmin = ratio; }
   }
   const f_t gmin = warp_reduce_min(lmin);
@@ -791,9 +802,10 @@ __device__ __forceinline__ void warp_rt_body(f_t a_rt_dual_tol, const f_t* a_rt_
 
   // Pass 2: among ratio < gmin+ztol, pick max |z[j]| (tie → smaller k).
   f_t best_absz = -1.0; i_t best_k = 0x7fffffff; i_t best_j = -1; f_t best_r = INF;
-  for (i_t k = lane; k < num_nb; k += 32) {
-    const i_t j     = a_rt_nonbasic[k];
-    const f_t ratio = a_rt_ratio[k];
+  for (i_t h = lane; h < a_rt_dzn; h += 32) {
+    const i_t j     = a_rt_dzi[h];
+    const i_t k     = a_rt_pos[j];
+    const f_t ratio = a_rt_ratio[h];
     // Candidate = the argmin (always, so entering can't be spuriously -1) plus near-ties within
     // zero_tol. Use the difference (ratio - gmin) not (ratio < gmin + ztol): the latter drops the
     // argmin when gmin is large (gmin+ztol rounds back to gmin) or zero_tol == 0 → false DUAL_UNBOUNDED.
@@ -2840,16 +2852,21 @@ __device__ i_t compute_delta_x(const gpu_lp& lp,
     }
     if (numerical) { return -1; }
   }
-  lane0_serial([&] {
-    const f_t primal_step_length = delta_x_leaving / scale;
-    const i_t scaled_delta_xB_nz = scaled_delta_xB_sparse.i.size();
-    for (i_t k = 0; k < scaled_delta_xB_nz; ++k) {
-      const i_t j = basic_list[scaled_delta_xB_sparse.i[k]];
-      delta_x[j]  = primal_step_length * scaled_delta_xB_sparse.x[k];
-    }
+  // Sparse indices are distinct, so distribute the independent basic-variable updates. The
+  // barrier preserves the original ordering when a special-case index also appears in the loop.
+  const f_t primal_step_length = delta_x_leaving / scale;
+  const i_t scaled_delta_xB_nz = scaled_delta_xB_sparse.i.size();
+  const int lane                = static_cast<int>(threadIdx.x);
+  for (i_t k = lane; k < scaled_delta_xB_nz; k += 32) {
+    const i_t j = basic_list[scaled_delta_xB_sparse.i[k]];
+    delta_x[j]  = primal_step_length * scaled_delta_xB_sparse.x[k];
+  }
+  __syncwarp(0xffffffffu);
+  if (lane == 0) {
     delta_x[leaving_index]  = delta_x_leaving;
     delta_x[entering_index] = primal_step_length;
-  });
+  }
+  __syncwarp(0xffffffffu);
   return 0;
 }
 
@@ -3009,6 +3026,7 @@ struct slot_buffers {
   i_t* basic_mark;
   i_t* delta_z_mark;
   i_t* delta_z_indices;
+  i_t* nonbasic_pos;
   i_t* nonbasic_end;
   i_t* row_mark;
   i_t* infeas_idx;
@@ -3064,7 +3082,8 @@ struct slot_state {
 
   // Dense per-iteration workspaces.
   gpu_span<f_t> xB_workspace, delta_y, delta_z, delta_x, v, squared_infeas;
-  gpu_span<i_t> basic_mark, delta_z_mark, delta_z_indices, nonbasic_end, row_mark, infeas_idx;
+  gpu_span<i_t> basic_mark, delta_z_mark, delta_z_indices, nonbasic_pos, nonbasic_end, row_mark,
+    infeas_idx;
   gpu_span<f_t> rt_ratio;
 
   // Sparse per-iteration workspaces.
@@ -3117,6 +3136,7 @@ struct slot_state {
     basic_mark.attach(b.basic_mark, mn);
     delta_z_mark.attach(b.delta_z_mark, mn);
     delta_z_indices.attach(b.delta_z_indices, mn);
+    nonbasic_pos.attach(b.nonbasic_pos, mn);
     nonbasic_end.attach(b.nonbasic_end, mn);
     row_mark.attach(b.row_mark, mn);
     infeas_idx.attach(b.infeas_idx, mn);
@@ -3232,6 +3252,7 @@ struct slot_state {
     delta_x.assign(n, 0.0);
     v.assign(m, 0.0);
     basic_mark.assign(n, -1);
+    nonbasic_pos.assign(n, -1);
     rt_ratio.reserve(n);
     });
 
@@ -3239,8 +3260,10 @@ struct slot_state {
     // data() is read AFTER the lane-0 region above because assign() may have relocated the buffer.
     {
       i_t* bm = basic_mark.data();
+      i_t* np = nonbasic_pos.data();
       const int lane = static_cast<int>(threadIdx.x);
       for (i_t k = lane; k < m; k += 32) { bm[basic_list[k]] = k; }
+      for (i_t k = lane; k < n - m; k += 32) { np[nonbasic_list[k]] = k; }
       __syncwarp(0xffffffffu);
     }
 
@@ -3335,6 +3358,7 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
   gpu_span<i_t>& basic_mark     = st.basic_mark;
   gpu_span<i_t>& delta_z_mark   = st.delta_z_mark;
   gpu_span<i_t>& delta_z_indices = st.delta_z_indices;
+  gpu_span<i_t>& nonbasic_pos   = st.nonbasic_pos;
   gpu_span<i_t>& nonbasic_end   = st.nonbasic_end;
   gpu_span<i_t>& row_mark       = st.row_mark;
   gpu_span<i_t>& infeas_idx     = st.infeas_idx;
@@ -3450,8 +3474,9 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     // them at slot_state (global) and let the __syncwarp publish them to every lane — locals would
     // only ever be set on lane 0.
     warp_rt_body(settings.dual_tol / 10, delta_z.data(), &st.entering, &st.nonbasic_entering,
-                 lp.num_rows, lp.num_cols, nonbasic_list, settings.pivot_tol, rt_ratio.data(),
-                 &st.step_length, vstatus, z, settings.zero_tol);
+                 delta_z_indices.data(), static_cast<i_t>(delta_z_indices.size()),
+                 nonbasic_pos.data(), settings.pivot_tol, rt_ratio.data(), &st.step_length, vstatus,
+                 z, settings.zero_tol);
     __syncwarp(0xffffffffu);
     entering          = st.entering;
     nonbasic_entering = st.nonbasic_entering;
@@ -3501,6 +3526,7 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
                            : static_cast<variable_status_t>(-direction);
       basic_list[basic_leaving]        = entering;
       nonbasic_list[nonbasic_entering] = leaving;
+      nonbasic_pos[leaving]            = nonbasic_entering;
       basic_mark[leaving]              = -1;
       basic_mark[entering]             = basic_leaving;
 
@@ -3876,7 +3902,7 @@ struct marshal_storage {
   std::vector<rmm::device_buffer> bufs;
   // The CSR transpose is built here and its host storage must outlive marshal_problem.
   std::vector<cuopt::mathematical_optimization::csr_matrix_t<i_t, f_t>> arow_keep;
-  marshal_storage() { bufs.reserve(110); }  // ~34 uploads + 66 slot buffers; avoid vector churn
+  marshal_storage() { bufs.reserve(111); }  // ~34 uploads + 67 slot buffers; avoid vector churn
 };
 
 template <typename T>
@@ -4195,6 +4221,7 @@ static size_t slot_buffer_bytes(size_t m, size_t n, size_t ucap, size_t eta)
   const size_t mn = (m > n) ? m : n;
   const size_t m1 = m + 1;
   size_t t = 0;
+  t += (mn) * sizeof(i_t);  // nonbasic_pos
   t += (mn) * sizeof(f_t);
   t += (mn) * sizeof(f_t);
   t += (mn) * sizeof(f_t);
@@ -4406,6 +4433,7 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
     b.basic_mark = alloc_uninit<i_t>(mn, st);
     b.delta_z_mark = alloc_uninit<i_t>(mn, st);
     b.delta_z_indices = alloc_uninit<i_t>(mn, st);
+    b.nonbasic_pos = alloc_uninit<i_t>(mn, st);
     b.nonbasic_end = alloc_uninit<i_t>(mn, st);
     b.row_mark = alloc_uninit<i_t>(mn, st);
     b.infeas_idx = alloc_uninit<i_t>(mn, st);
