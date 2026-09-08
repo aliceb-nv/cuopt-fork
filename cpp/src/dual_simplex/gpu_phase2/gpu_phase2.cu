@@ -601,6 +601,17 @@ __device__ __forceinline__ void warp_solve_body_op(const i_t* a_corder, const i_
   dts::wavefront_solve_op<Op>(a_cs, a_ridx, a_val, a_x, a_lstart, a_corder, a_nlev);
 }
 
+
+template <int Op, typename FactorIndex>
+__device__ __forceinline__ void warp_solve2_body_op(const i_t* a_corder, const i_t* a_cs,
+                                                    const i_t* a_lstart, i_t a_nlev,
+                                                    const FactorIndex* a_ridx,
+                                                    const f_t* a_val, f_t* a_x0, f_t* a_x1)
+{
+  dts::wavefront_solve2_op<Op>(
+    a_cs, a_ridx, a_val, a_x0, a_x1, a_lstart, a_corder, a_nlev);
+}
+
 __device__ __forceinline__ void warp_tloop_body(bool a_tl_asc, i_t a_tl_axpyoff, const i_t* a_tl_cs, i_t a_tl_dotoff, const f_t* a_tl_mu, i_t a_tl_num, const i_t* a_tl_ri, f_t a_tl_tol, const f_t* a_tl_val, f_t* a_x)
 {
   const int lane = static_cast<int>(threadIdx.x);
@@ -649,6 +660,76 @@ __device__ __forceinline__ void warp_tloop_body(bool a_tl_asc, i_t a_tl_axpyoff,
       for (i_t p = ac0 + lane; p < ac1; p += 32) { x[a_tl_ri[p]] += (-theta) * a_tl_val[p]; }
     }
     __syncwarp(0xffffffffu);   // x writes visible before the next update's dot reads them
+  }
+}
+
+
+// Two dense RHS replay the same product-form update stack together. Factor metadata and values are
+// loaded once; the two reductions preserve the one-RHS accumulation order independently.
+template <bool Ascending, i_t AxpyOffset, i_t DotOffset>
+__device__ __forceinline__ void warp_tloop2_body(const i_t* a_cs,
+                                                 const f_t* a_mu,
+                                                 i_t a_num,
+                                                 const i_t* a_ri,
+                                                 f_t a_tol,
+                                                 const f_t* a_val,
+                                                 f_t* a_x0,
+                                                 f_t* a_x1)
+{
+  const int lane = static_cast<int>(threadIdx.x);
+  for (i_t step = 0; step < a_num; ++step) {
+    const i_t k    = Ascending ? step : (a_num - 1 - step);
+    const i_t dcol = 2 * k + DotOffset;
+    const i_t acol = 2 * k + AxpyOffset;
+    const i_t d0   = a_cs[dcol];
+    const i_t d1   = a_cs[dcol + 1];
+    const i_t dlen = d1 - d0;
+    f_t dot0, dot1;
+    if (dlen <= 2) {
+      dot0 = 0.0;
+      dot1 = 0.0;
+      if (dlen >= 1) {
+        const i_t i = a_ri[d0];
+        const f_t a = a_val[d0];
+        dot0 = a * a_x0[i];
+        dot1 = a * a_x1[i];
+      }
+      if (dlen == 2) {
+        const i_t i = a_ri[d0 + 1];
+        const f_t a = a_val[d0 + 1];
+        dot0 += a * a_x0[i];
+        dot1 += a * a_x1[i];
+      }
+      __syncwarp(0xffffffffu);
+    } else {
+      f_t part0 = 0.0;
+      f_t part1 = 0.0;
+      for (i_t q = d0 + lane; q < d1; q += 32) {
+        const i_t i = a_ri[q];
+        const f_t a = a_val[q];
+        part0 += a * a_x0[i];
+        part1 += a * a_x1[i];
+      }
+      dot0 = warp_reduce_add(part0);
+      dot1 = warp_reduce_add(part1);
+    }
+    const f_t mu     = a_mu[k];
+    const f_t theta0 = dot0 / mu;
+    const f_t theta1 = dot1 / mu;
+    const i_t a0     = a_cs[acol];
+    const i_t a1     = a_cs[acol + 1];
+    if (fabs(theta0) > a_tol) {
+      for (i_t q = a0 + lane; q < a1; q += 32) {
+        a_x0[a_ri[q]] += (-theta0) * a_val[q];
+      }
+      __syncwarp(0xffffffffu);
+    }
+    if (fabs(theta1) > a_tol) {
+      for (i_t q = a0 + lane; q < a1; q += 32) {
+        a_x1[a_ri[q]] += (-theta1) * a_val[q];
+      }
+      __syncwarp(0xffffffffu);
+    }
   }
 }
 
@@ -754,6 +835,20 @@ __device__ __forceinline__ void warp_fromdense_body(i_t* a_fd_count, i_t* a_fd_i
   __syncwarp(0xffffffffu);
 }
 
+
+// Count-only form for a dense result that will be consumed in place. It preserves from_dense's
+// exact v != 0.0 definition but avoids prefix computation and sparse index/value stores.
+__device__ __forceinline__ i_t warp_dense_nnz(const f_t* x, i_t n)
+{
+  const int lane = static_cast<int>(threadIdx.x);
+  i_t count = 0;
+  for (i_t base = 0; base < n; base += 32) {
+    const i_t k = base + lane;
+    count += __popc(__ballot_sync(0xffffffffu, k < n && x[k] != 0.0));
+  }
+  return count;
+}
+
 // `a_rt_ratio` caches pass-1 ratios for pass 2; identical lane strides make every entry
 // write-before-read by the same lane.
 __device__ __forceinline__ void warp_rt_body(f_t a_rt_dual_tol,
@@ -836,7 +931,7 @@ __device__ __forceinline__ void warp_rt_body(f_t a_rt_dual_tol,
   __syncwarp(0xffffffffu);
 }
 
-__device__ __forceinline__ void warp_seupd_body(const i_t* a_su_basic, f_t a_su_dynormsq, f_t* a_su_dyse, i_t a_su_entering, i_t a_su_leaving, i_t a_su_nz, f_t a_su_omegar, const i_t* a_su_sdxb_i, const f_t* a_su_sdxb_x, const f_t* a_su_v, f_t a_su_wr)
+__device__ __forceinline__ void warp_seupd_body(const i_t* a_su_basic, f_t a_su_dynormsq, f_t* a_su_dyse, i_t a_su_entering, i_t a_su_leaving, i_t a_su_nz, f_t a_su_omegar, const i_t* a_su_sdxb_i, const f_t* a_su_sdxb_x, const f_t* a_su_v, f_t a_su_wr, i_t a_su_direction)
 {
   const int lane = static_cast<int>(threadIdx.x);
   const i_t nz = a_su_nz;
@@ -848,7 +943,8 @@ __device__ __forceinline__ void warp_seupd_body(const i_t* a_su_basic, f_t a_su_
       a_su_dyse[a_su_entering] = (1.0 / (w * w)) * a_su_dynormsq;
     } else {
       const f_t wk      = -a_su_sdxb_x[h];
-      const f_t new_val = a_su_dyse[j] + wk * (2.0 * a_su_v[k] / a_su_wr + wk * a_su_omegar);
+      const f_t vk      = a_su_direction == -1 ? -a_su_v[k] : a_su_v[k];
+      const f_t new_val = a_su_dyse[j] + wk * (2.0 * vk / a_su_wr + wk * a_su_omegar);
       a_su_dyse[j]    = fmax(new_val, 1e-4);
     }
   }
@@ -1638,7 +1734,8 @@ struct gpu_basis_update_mpf_t {
   // Reused solve scratch (owning; grows to m once, then reused every call) so the b_solve /
   // b_transpose_solve dense↔sparse conversions and the sparse-Lᵀ gather no longer device-malloc a
   // fresh temporary per solve. Bit-identical to the per-call locals (same values, same order).
-  mutable gpu_span<f_t> dense_scratch_;    // solution_dense in the dense b_solve/b_transpose branches
+  mutable gpu_span<f_t> dense_scratch_;     // first dense solve RHS
+  mutable gpu_span<f_t> dense_scratch2_;    // second RHS for fused two-RHS FTran
   mutable gpu_sparse_vector sparse_scratch_; // gathered `b` (sparse Lᵀ) + throwaway Lsol
   mutable gpu_sparse_vector ei_scratch_;     // unit RHS for compute_delta_y (separate — b_transpose_solve
                                              // uses sparse_scratch_ internally, so ei can't share it)
@@ -1693,6 +1790,14 @@ struct gpu_basis_update_mpf_t {
     const warp_config_type* c = warp_cfg_;
     warp_solve_body_op<Op>(c->corder[Op], c->cs[Op], c->lstart[Op], c->nlev[Op], c->ridx[Op],
                            c->val[Op], rhs);
+  }
+
+  template <int Op>
+  __device__ void warp_dispatch2(f_t* rhs0, f_t* rhs1) const
+  {
+    const warp_config_type* c = warp_cfg_;
+    warp_solve2_body_op<Op>(c->corder[Op], c->cs[Op], c->lstart[Op], c->nlev[Op], c->ridx[Op],
+                            c->val[Op], rhs0, rhs1);
   }
 
   // Post the MPF rank-1 T-loop to the whole warp (op == WARP_TLOOP). One dispatch runs the
@@ -2047,6 +2152,10 @@ struct gpu_basis_update_mpf_t {
   {
     warp_dispatch<WARP_U_SOLVE>(rhs);
   }
+  __device__ void u_solve2(f_t* rhs0, f_t* rhs1) const
+  {
+    warp_dispatch2<WARP_U_SOLVE>(rhs0, rhs1);
+  }
   __device__ void u_solve(gpu_sparse_vector& rhs) const
   {
     i_t top;
@@ -2061,6 +2170,14 @@ struct gpu_basis_update_mpf_t {
     // dot col = v_col (2k+1), axpy col = u_col (2k), ascending k.
     if (num_updates_ > 0) {
       warp_dispatch_tloop(rhs, /*asc=*/true, /*dotoff=*/1, /*axpyoff=*/0, zero_tol);
+    }
+  }
+  __device__ void l_solve2(f_t* rhs0, f_t* rhs1) const
+  {
+    warp_dispatch2<WARP_L_SOLVE>(rhs0, rhs1);
+    if (num_updates_ > 0) {
+      warp_tloop2_body<true, 0, 1>(S_.col_start.data(), mu_values_.data(), num_updates_,
+                                   S_.i.data(), f_t{1e-16}, S_.x.data(), rhs0, rhs1);
     }
   }
   __device__ void l_solve(gpu_sparse_vector& rhs) const
@@ -2160,6 +2277,127 @@ struct gpu_basis_update_mpf_t {
       const f_t growth = static_cast<f_t>(solution.i.size()) / rhs_size;
       sum_U_ += growth;
       max_U_ = fmax(max_U_, growth);
+    });
+    return 0;
+  }
+
+  // Solve the entering-column and steepest-edge RHS together. Dense/dense legs share one factor
+  // traversal and one level-barrier sequence; a leg whose route differs uses the existing one-RHS
+  // sparse/dense implementation.
+  __device__ i_t b_solve2(const gpu_sparse_vector& rhs0,
+                          const gpu_sparse_vector& rhs1,
+                          gpu_sparse_vector& solution0,
+                          gpu_sparse_vector& Lsol0,
+                          gpu_sparse_vector& solution1) const
+  {
+    const f_t input0 = static_cast<f_t>(rhs0.i.size());
+    const f_t input1 = static_cast<f_t>(rhs1.i.size());
+    warp_sv_copy(rhs0, solution0);
+    warp_sv_copy(rhs1, solution1);
+    warp_permute_idx_body(solution0.i.data(), static_cast<i_t>(solution0.i.size()),
+                          inverse_row_permutation_.data());
+    warp_permute_idx_body(solution1.i.data(), static_cast<i_t>(solution1.i.size()),
+                          inverse_row_permutation_.data());
+
+    bool sparse0 = false;
+    bool sparse1 = false;
+    lane0_serial([&] {
+      estimate_solution_density(input0, sum_L_, num_calls_L_, max_L_, sparse0);
+      estimate_solution_density(input1, sum_L_, num_calls_L_, max_L_, sparse1);
+      // Size m means the dense buffer still contains this RHS's exact post-L values.
+      if (sparse0) { dense_scratch_.set_size(0); }
+      if (sparse1) { dense_scratch2_.set_size(0); }
+    });
+    sparse0 = lane0_bcast(static_cast<int>(sparse0)) != 0;
+    sparse1 = lane0_bcast(static_cast<int>(sparse1)) != 0;
+
+    gpu_span<f_t>& dense0 = dense_scratch_;
+    gpu_span<f_t>& dense1 = dense_scratch2_;
+    if (!sparse0 && !sparse1) {
+      warp_to_dense(solution0, dense0);
+      warp_to_dense(solution1, dense1);
+      l_solve2(dense0.data(), dense1.data());
+      warp_from_dense(dense0, solution0);
+      warp_from_dense(dense1, solution1);
+    } else {
+      if (sparse0) {
+        l_solve(solution0);
+      } else {
+        warp_to_dense(solution0, dense0);
+        l_solve(dense0.data());
+        warp_from_dense(dense0, solution0);
+      }
+      if (sparse1) {
+        l_solve(solution1);
+      } else {
+        warp_to_dense(solution1, dense1);
+        l_solve(dense1.data());
+        warp_from_dense(dense1, solution1);
+      }
+    }
+    lane0_serial([&] {
+      const f_t growth0 = static_cast<f_t>(solution0.i.size()) / input0;
+      sum_L_ += growth0;
+      max_L_ = fmax(max_L_, growth0);
+      const f_t growth1 = static_cast<f_t>(solution1.i.size()) / input1;
+      sum_L_ += growth1;
+      max_L_ = fmax(max_L_, growth1);
+    });
+
+    const f_t usize0 = static_cast<f_t>(solution0.i.size());
+    const f_t usize1 = static_cast<f_t>(solution1.i.size());
+    lane0_serial([&] {
+      estimate_solution_density(usize0, sum_U_, num_calls_U_, max_U_, sparse0);
+      estimate_solution_density(usize1, sum_U_, num_calls_U_, max_U_, sparse1);
+      // A sparse U route invalidates the second dense buffer. update_steepest_edge_norms uses size
+      // m to distinguish an in-place dense result from the sparse fallback.
+      if (sparse1) { dense_scratch2_.set_size(0); }
+    });
+    sparse0 = lane0_bcast(static_cast<int>(sparse0)) != 0;
+    sparse1 = lane0_bcast(static_cast<int>(sparse1)) != 0;
+
+    i_t output1_nz = 0;
+    if (!sparse0 && !sparse1) {
+      if (dense0.size() != static_cast<size_t>(L0_.m)) { warp_to_dense(solution0, dense0); }
+      if (dense1.size() != static_cast<size_t>(L0_.m)) { warp_to_dense(solution1, dense1); }
+      // U consumes dense0, so preserve its L intermediate with an O(1) span swap.
+      lane0_serial([&] {
+        solution0.i.swap(Lsol0.i);
+        solution0.x.swap(Lsol0.x);
+      });
+      u_solve2(dense0.data(), dense1.data());
+      warp_from_dense(dense0, solution0);
+      // The steepest-edge update consumes dense1 in place; routing statistics only need its nnz.
+      output1_nz = warp_dense_nnz(dense1.data(), L0_.m);
+    } else {
+      if (sparse0) {
+        warp_sv_copy(solution0, Lsol0);
+        u_solve(solution0);
+      } else {
+        if (dense0.size() != static_cast<size_t>(L0_.m)) { warp_to_dense(solution0, dense0); }
+        lane0_serial([&] {
+          solution0.i.swap(Lsol0.i);
+          solution0.x.swap(Lsol0.x);
+        });
+        u_solve(dense0.data());
+        warp_from_dense(dense0, solution0);
+      }
+      if (sparse1) {
+        u_solve(solution1);
+        output1_nz = static_cast<i_t>(solution1.i.size());
+      } else {
+        if (dense1.size() != static_cast<size_t>(L0_.m)) { warp_to_dense(solution1, dense1); }
+        u_solve(dense1.data());
+        output1_nz = warp_dense_nnz(dense1.data(), L0_.m);
+      }
+    }
+    lane0_serial([&] {
+      const f_t growth0 = static_cast<f_t>(solution0.i.size()) / usize0;
+      sum_U_ += growth0;
+      max_U_ = fmax(max_U_, growth0);
+      const f_t growth1 = static_cast<f_t>(output1_nz) / usize1;
+      sum_U_ += growth1;
+      max_U_ = fmax(max_U_, growth1);
     });
     return 0;
   }
@@ -2797,7 +3035,8 @@ __device__ i_t compute_delta_x(const gpu_lp& lp,
 {
   f_t delta_x_leaving = direction == 1 ? lp.lower[leaving_index] - x[leaving_index]
                                        : lp.upper[leaving_index] - x[leaving_index];
-  ft.b_solve(rhs_sparse, scaled_delta_xB_sparse, utilde_sparse);
+  // b_solve2 already produced scaled_delta_xB_sparse and its saved post-L values in
+  // utilde_sparse alongside the steepest-edge RHS.
   // warp_negate's trailing __syncwarp is what publishes the negated values to the other lanes
   // before find_coefficient below reads them on all 32.
   scaled_delta_xB_sparse.warp_negate();
@@ -2888,14 +3127,16 @@ __device__ i_t update_steepest_edge_norms(const gpu_settings& settings,
                                           gpu_sparse_vector& v_sparse,
                                           f_t* delta_y_steepest_edge)
 {
-  lane0_serial([&] { v_sparse.clear(); });
-  __syncwarp(0xffffffffu);
-  ft.b_solve(delta_y_sparse, v_sparse);
-  // `direction` is warp-uniform. The scatter accumulates into the dense `v`, but v_sparse's indices
-  // are distinct AND `v` is left all-zero by the v_nz loop at the end of every call below, so no two
-  // lanes touch the same slot and no atomics are needed.
-  if (direction == -1) { v_sparse.warp_negate(); }
-  v_sparse.warp_scatter(v);
+  // b_solve2 leaves the second solution dense when its U route is dense; otherwise v_sparse holds
+  // the ordinary sparse result. Applying `direction` inside warp_seupd_body avoids mutating either
+  // representation and preserves the original arithmetic for every updated edge norm.
+  const bool v_is_dense =
+    ft.dense_scratch2_.size() == static_cast<size_t>(delta_y_sparse.n);
+  if (v_is_dense) {
+    v = ft.dense_scratch2_.data();
+  } else {
+    v_sparse.warp_scatter(v);
+  }
 
   // find_coefficient is read-only: every lane computes the same wr/omegar, so `return -1` is taken
   // uniformly and no broadcast is needed.
@@ -2907,11 +3148,11 @@ __device__ i_t update_steepest_edge_norms(const gpu_settings& settings,
   // One lane per nonzero: distinct-location writes (see warp_collective_seupd) → bit-exact.
   warp_seupd_body(basic_list, dy_norm_squared, delta_y_steepest_edge, entering_index,
                   basic_leaving_index, scaled_delta_xB_nz, omegar, scaled_delta_xB.i.data(),
-                  scaled_delta_xB.x.data(), v, wr);
+                  scaled_delta_xB.x.data(), v, wr, direction);
 
-  // Restore `v` to all-zero for the next pivot. Distinct indices -> strided zeroing is bit-exact,
-  // and this is precisely the invariant warp_scatter above relies on.
-  {
+  // The dense result lives in factor scratch and is overwritten by the next paired solve. Restore
+  // only the sparse fallback's scatter target to zero for the next pivot.
+  if (!v_is_dense) {
     const i_t v_nz = v_sparse.i.size();
     const int lane = static_cast<int>(threadIdx.x);
     for (i_t k = lane; k < v_nz; k += 32) { v[v_sparse.i[k]] = 0.0; }
@@ -3037,6 +3278,7 @@ struct slot_buffers {
   i_t* se_row_degree;
   i_t* se_mapping;
   f_t* ft_dense_scratch;
+  f_t* ft_dense_scratch2;
   f_t* ft_sort_bucket;
   f_t* ft_sort_x;
   i_t* ft_sort_i;
@@ -3147,6 +3389,7 @@ struct slot_state {
     se_row_degree.attach(b.se_row_degree, mn);
     se_mapping.attach(b.se_mapping, mn);
     ft.dense_scratch_.attach(b.ft_dense_scratch, mn);
+    ft.dense_scratch2_.attach(b.ft_dense_scratch2, mn);
     ft.sort_bucket_.attach(b.ft_sort_bucket, mn);
     ft.sort_x_.attach(b.ft_sort_x, mn);
     ft.sort_i_.attach(b.ft_sort_i, mn);
@@ -3497,8 +3740,10 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     lane0_serial([&] {   // clear() is a header RMW; from_csc_column reserve+push_back mallocs
       utilde_sparse.clear();
       scaled_dxB_sparse.clear();
+      v_sparse.clear();
       rhs_sparse.from_csc_column(lp.A, entering);
     });
+    ft.b_solve2(rhs_sparse, delta_y_sparse, scaled_dxB_sparse, utilde_sparse, v_sparse);
     i_t dx_status =
       compute_delta_x(lp, ft, entering, leaving, basic_leaving, direction, basic_list, rhs_sparse,
                       delta_z.data(), x, utilde_sparse, scaled_dxB_sparse, delta_x.data());
@@ -4291,6 +4536,7 @@ static size_t slot_buffer_bytes(size_t m, size_t n, size_t ucap, size_t eta)
   t += mn * (sizeof(i_t) + sizeof(f_t));
   t += mn * (sizeof(i_t) + sizeof(f_t));
   t += mn * (sizeof(i_t) + sizeof(f_t));
+  t += mn * sizeof(f_t);  // ft_dense_scratch2
   return t;
 }
 
@@ -4454,6 +4700,7 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
     b.se_row_degree = alloc_uninit<i_t>(mn, st);
     b.se_mapping = alloc_uninit<i_t>(mn, st);
     b.ft_dense_scratch = alloc_uninit<f_t>(mn, st);
+    b.ft_dense_scratch2 = alloc_uninit<f_t>(mn, st);
     b.ft_sort_bucket = alloc_uninit<f_t>(mn, st);
     b.ft_sort_x = alloc_uninit<f_t>(mn, st);
     b.ft_sort_i = alloc_uninit<i_t>(mn, st);
