@@ -96,6 +96,7 @@ B200 implementation: distributed the independent sparse basic-variable writes ac
 B200 kernel A/B: rank-3 baseline median 3.313 s (runs 3.318, 3.313, 3.312); rank-4 median 3.242 s (runs 3.260, 3.242, 3.220); 1.0219x speedup, or 2.14% lower kernel time.
 B200 correctness: all three candidate full 15,000-case gates passed with zero disallowed status, objective, or cutoff changes and reproduced 574,350 GPU pivots plus 7,050/15,000 bit-exact results.
 B200 compiler resources (sm_100a): unchanged at 126 registers/thread, zero spills, 368-byte stack, and 1,008-byte static shared memory.
+B200 span-only revalidation (2026-09-08): KEEP. The fresh 3.008 s span baseline fell to 2.945 s median (runs 2.947, 2.937, 2.945), a 1.0214x speedup or 2.09% lower kernel time. This reproduces the previous 1.0219x result. All three full gates reproduced 574,350 pivots and 7,050/15,000 bit-exact results with zero disallowed changes. Resources remained at the span baseline: 128 registers, zero spills, 352-byte stack, and 1,008-byte static shared memory.
 
 5.
 Title: Arena-bind and pre-reserve common rank-update storage
@@ -109,6 +110,7 @@ B200 implementation: arena-bound S_/mu_values_ and pre-reserved space for 150 up
 B200 kernel A/B: rank-4 median 3.242 s (runs 3.260, 3.242, 3.220); rank-5 median 3.123 s (runs 3.118, 3.123, 3.128); 1.0381x speedup, or 3.67% lower kernel time.
 B200 correctness: all three candidate full 15,000-case gates passed with zero disallowed status, objective, or cutoff changes and reproduced 574,350 GPU pivots plus 7,050/15,000 bit-exact results.
 B200 compiler resources (sm_100a): unchanged at 126 registers/thread, zero spills, 368-byte stack, and 1,008-byte static shared memory.
+B200 span-only revalidation (2026-09-08): ALREADY PRESENT / SUBSUMED; no edit or standalone timing candidate. The refactor now host-allocates and attaches fixed-capacity S_, mu_values_, and sparse per-slot buffers before launch; reserve_store only publishes those capacities and grow_storage returns a capacity status when they are exhausted. Reapplying the historical allocation patch would duplicate existing behavior, so the old 1.0381x gain is already part of the 3.008 s baseline rather than an additional expected speedup.
 
 6.
 Title: Restrict the ratio test to the sparse delta-z candidate list
@@ -123,6 +125,7 @@ B200 kernel A/B: rank-5 median 3.123 s (runs 3.118, 3.123, 3.128); rank-6 median
 B200 correctness: all three candidate full 15,000-case gates passed with zero disallowed status, objective, or cutoff changes and reproduced 574,350 GPU pivots plus 7,050/15,000 bit-exact results.
 B200 compiler resources (sm_100a): unchanged at 126 registers/thread, zero spills, 368-byte stack, and 1,008-byte static shared memory.
 B200 cumulative ranks 4-6: 77 LOC (+53/-24), 3.313 s to 3.018 s median; 1.0977x speedup, or 8.90% lower kernel time.
+B200 span-only revalidation (2026-09-08): KEEP. Against the accepted rank-4 median of 2.945 s, rank 6 measured 2.807 s median (runs 2.807, 2.809, 2.807): 1.0492x, or 4.69% lower kernel time, exceeding the previous 1.0348x result. All three full 15,000-case gates reproduced 574,350 pivots and 7,050/15,000 bit-exact results with zero disallowed status, objective, or cutoff changes. Resources stayed at 128 registers, zero spills, 352-byte stack, and 1,008-byte static shared memory. The isolated current-source rank-6 diff is 49 LOC (+36/-13); cumulative ranks 4 and 6 are 70 LOC (+49/-21). Because rank 5 is already subsumed by the span baseline, the directly measurable current cumulative comparison is 3.008 s to 2.807 s: 1.0716x, or 6.68% lower kernel time.
 
 7.
 Title: Use exact integer arithmetic for density routing
@@ -135,6 +138,7 @@ B200 result (2026-09-07, current cleaned source): REJECT; not kept.
 B200 implementation: adapted the historical 25% comparison to the cleanup current 30% threshold as delta_y_nz0 <= (3 * m) / 10. Current-source diff: 4 LOC (+2/-2).
 B200 kernel A/B: rank-6 baseline median 3.018 s (runs 3.018, 3.013, 3.024); rank-7 median 3.051 s (runs 3.037, 3.051, 3.055); 0.9892x, or 1.09% slower.
 B200 correctness/resources: all three full gates reproduced 574,350 pivots and 7,050/15,000 bit-exact with zero disallowed changes; resources stayed at 126 registers, zero spills, 368-byte stack, and 1,008-byte shared memory. The candidate was reverted.
+B200 span-only revalidation (2026-09-08): REJECT again; not kept. Against the accepted rank-6 baseline median of 2.807 s, rank 7 measured 2.813 s median (runs 2.813, 2.812, 2.817): 0.9979x, or 0.21% slower. All three full gates reproduced 574,350 pivots and 7,050/15,000 bit-exact results with zero disallowed changes; resources remained 128 registers, zero spills, 352-byte stack, and 1,008-byte shared memory. The four-line candidate was reverted.
 
 8.
 Title: Delete the dlen <= 4 sparse T-loop fast path
@@ -145,6 +149,7 @@ Is reward hacking: No.
 Why it is (or is not) reward hacking: This is a direct simplification of the same computation with repeatable measurements.
 B200 result (2026-09-07, current cleaned source): ALREADY PRESENT / SUPERSEDED; no edit or timing candidate.
 B200 finding: the targeted dlen <= 4 branch is already absent. The current sparse T-loop has only a separate dlen <= 2 fast path, whose arithmetic order is bit-identical and whose removal would not reproduce rank 8. Batch impact: zero changes and zero LOC.
+B200 span-only revalidation (2026-09-08): ALREADY PRESENT / SUPERSEDED again. The refactor retained only the separate dlen <= 2 bit-identical fast paths; no dlen <= 4 branch exists in either current T-loop. No edit or timing candidate was produced.
 
 9.
 Title: Add restrict qualifiers to hot kernel pointer interfaces
@@ -157,6 +162,7 @@ B200 result (2026-09-07, current cleaned source): REJECT; not kept.
 B200 implementation: audited and annotated the eight historical hot interfaces; all asserted buffers are distinct by the existing function contracts. Current-source diff: 26 LOC (+13/-13).
 B200 kernel A/B: rank-6 baseline median 3.018 s (runs 3.018, 3.013, 3.024); rank-9 median 3.022 s (runs 3.016, 3.027, 3.022); 0.9987x, or 0.13% slower.
 B200 correctness/resources: all three full gates reproduced 574,350 pivots and 7,050/15,000 bit-exact with zero disallowed changes; resources stayed at 126 registers, zero spills, 368-byte stack, and 1,008-byte shared memory. The candidate was reverted.
+B200 span-only revalidation (2026-09-08): REJECT again; not kept. Against the accepted rank-6 baseline median of 2.807 s, rank 9 measured 2.808 s median (runs 2.808, 2.803, 2.808): 0.9996x, or 0.04% slower. All three full gates reproduced 574,350 pivots and 7,050/15,000 bit-exact results with zero disallowed changes; resources remained 128 registers, zero spills, 352-byte stack, and 1,008-byte shared memory. The 26-LOC candidate was reverted.
 
 10.
 Title: Select cooperative width for narrow wavefront levels
@@ -165,6 +171,7 @@ LOC: 32 (+22/-10), 6128859d versus 472d05e7.
 Speedup amount: 1.0202x; 1.949 s to 1.9105 s, 22 samples, unchanged pivots.
 Is reward hacking: No.
 Why it is (or is not) reward hacking: It changes how one node’s required solve is parallelized. It is not the failed strategy that assigns independent LPs to subwarps.
+B200 span-only audit (2026-09-08): DEFER until rank 12. The 32-LOC rank-10 delta specializes an already-existing paired-FTran b_solve2 path, but the accepted current source still performs the entering-column and steepest-edge FTrans separately and contains no paired dispatch. Applying rank 10 alone would compile only unused templates and cannot affect runtime. Re-test it immediately after the rank-12 fused-two-RHS prerequisite is reconstructed and passes locally.
 
 11.
 Title: Use a persistent work-stealing problem queue
@@ -173,6 +180,11 @@ LOC: 72 (+57/-15), de7dc48e versus 89cc1b8a.
 Speedup amount: 1.0121x; 1.8845 s to 1.862 s, 55 samples, unchanged pivots.
 Is reward hacking: No.
 Why it is (or is not) reward hacking: Real branch-and-bound batches are heterogeneous, and feedback explicitly checked that a block only reads args[idx] for its current job. It balances independent nodes without reusing their solutions.
+B200 span-only result (2026-09-08): KEEP. The resident-block work queue measured 2.681 s median (runs 2.699, 2.680, 2.681) versus the accepted rank-6 median of 2.807 s: 1.0470x, or 4.49% lower kernel time, exceeding the original 1.0121x Hiverge result. All three full 15,000-case gates reproduced 574,350 pivots and 7,050/15,000 bit-exact results with zero disallowed status, objective, or cutoff changes. Kernel resources remained 128 registers, zero spills, 352-byte stack, and 1,008-byte static shared memory; the queue adds four bytes of device-global storage. Current-source diff: 62 LOC (+45/-17), including the corrected persistent-grid configuration label. Each dequeue still runs the complete per-problem setup and touches only args[idx]; the gain is scheduling/tail and block-lifecycle efficiency, not skipped work or duplicate-node result reuse.
+B200 CCCL work-stealing follow-up (2026-09-08): REJECT; not kept. Replacing the resident-grid global atomic queue with CCCL 3.4.3 cuda::device::for_each_canceled_block<1> was correct but measured 3.484 s median (runs 3.484, 3.496, 3.476) versus the accepted manual queue's 2.681 s median: 0.7695x performance, or 29.95% more kernel time. All three full 15,000-case gates reproduced 574,350 pivots and 7,050/15,000 bit-exact results with zero disallowed status, objective, or cutoff changes. Registers, spills, and stack stayed at 128, zero, and 352 bytes; CCCL removed the four-byte global counter but added one CTA barrier and 32 bytes of internal shared state, taking static shared memory from 1,008 to 1,040 bytes. The CCCL candidate was 63 isolated changed LOC relative to the manual queue (+19/-44). It launched N logical blocks and consistently used the callback block index; the measured result shows the SM100 cancellation/scheduling path is substantially worse for this long-lived one-warp-per-LP workload, though this timing alone does not isolate its microarchitectural cause. The exact accepted manual source was restored and rebuilt; its final full-gate sanity run passed at 2.734 s.
+B200 CCCL causal follow-up (2026-09-08): the identical refactored body and shared-config argument launched directly as <<<N,32>>> passed the full gate at 2.812 s, matching the 2.807 s static rank-6 baseline and ruling out the lambda/body refactor. A minimally instrumented exact CCCL run passed at 3.522 s and counted exactly 2,368 physical CTAs for 15,000 logical problems, equal to the manual resident grid; thus extra physical launches are not the regression. The full candidate/header audit found no hidden built-in blockIdx consumer, and compiler resources other than CCCL's 32-byte barrier/result state remained unchanged. The cost is therefore specific to SM100 cancellation/scheduling or to the logical-job order it produces. The current measurements cannot split cancellation-request latency from cache/makespan effects; Nsight Compute launch-control counters were unavailable on the node.
+
+
 
 12.
 Title: Fuse the two RHS FTran path and product-form replay
@@ -180,7 +192,9 @@ Short description: Solve the two related right-hand sides with a shared level tr
 LOC: 329 (+310/-19), terminal 73d820d6 versus pre-feature 65bf3d4d.
 Speedup amount: 1.0689x; 2.575 s to 2.409 s with unchanged pivots. The exact lineage endpoints have one sample each, but independent fused-two-RHS branches repeatedly measured about 1.02x to 1.06x.
 Is reward hacking: No.
-Why it is (or is not) reward hacking: The two RHS operations arise within the same real pivot, so sharing their traversal is intrinsic reuse, not duplicate-node reuse. The size and low endpoint sample count require staged A/B reconstruction rather than landing all 329 LOC at once.
+Why it is (or is not) reward hacking: The two RHS operations arise within the same real pivot, so sharing their traversal is intrinsic reuse, not duplicate-node reuse. The historical endpoint's low sample count requires an isolated current-source A/B and full correctness gate.
+B200 span-only result (2026-09-08): KEPT. The complete feature was ported as one isolated change: 351 LOC (+335/-16) across gpu_phase2.cu and dense_triangle_solve.cuh. All three 15,000-case runs passed with the unchanged 574,350-pivot signature, 7,050/15,000 bit-exact results, and zero disallowed status/objective/cutoff changes. Kernel samples were 2.398/2.448/2.405 s (median 2.405 s) versus the exact pushed rank-11 baseline's 2.699/2.680/2.681 s (median 2.681 s): 1.1148x faster, or 10.29% less kernel time. Compiler resources are unchanged at 128 registers, 352-byte stack, 1008-byte static shared memory, and zero spills.
+B200 paired-routing follow-up (2026-09-08): REJECT; not kept. A three-line aggressive policy promoted both RHSs to dense at each L/U stage whenever either RHS independently selected dense. One full gate passed with zero disallowed status/objective/cutoff changes, but kernel time regressed to 2.525 s versus the accepted rank-12 median of 2.405 s: 0.9525x performance, or 4.99% more kernel time. It also changed the numerical route signature to 580,200 pivots and 7,350/15,000 bit-exact results. Resources stayed at 128 registers, 352-byte stack, 1,008-byte shared memory, and zero spills. The exact accepted rank-12 source was restored and rebuilt; no more elaborate pair-routing search was pursued so the ranked Hiverge work can continue.
 
 13.
 Title: Longest-processing-time batch ordering
