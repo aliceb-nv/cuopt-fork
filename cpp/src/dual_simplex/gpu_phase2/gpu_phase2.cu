@@ -37,7 +37,6 @@
 #include <utilities/manual_cuda_graph.cuh>   // run_while: the device-controlled super-step loop
 
 #include <rmm/cuda_stream.hpp>
-#include <cub/device/device_memcpy.cuh>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
@@ -769,7 +768,7 @@ __device__ __forceinline__ void warp_dz_body(const i_t* a_dz_Acs, const i_t* a_d
   __syncwarp(0xffffffffu);
 }
 
-__device__ __forceinline__ void warp_dz_scatter_body(i_t* a_dz_count, i_t a_dz_dir, i_t* a_dz_indices, i_t a_dz_leaving, i_t* a_dz_mark, f_t* a_dz_out, const i_t* a_dzs_dyi, const f_t* a_dzs_dyx, const i_t* a_dzs_j, const i_t* a_dzs_nbe, i_t a_dzs_nzdy, const i_t* a_dzs_rs, const f_t* a_dzs_x)
+__device__ __forceinline__ void warp_dz_scatter_body(i_t* a_dz_count, i_t a_dz_dir, i_t* a_dz_indices, i_t a_dz_leaving, i_t* a_dz_mark, f_t* a_dz_out, const i_t* a_dzs_dyi, const f_t* a_dzs_dyx, const i_t* a_dzs_j, const i_t* a_dzs_basic_mark, i_t a_dzs_nzdy, const i_t* a_dzs_rs, const f_t* a_dzs_x)
 {
   const int lane = static_cast<int>(threadIdx.x);
   const i_t nz   = a_dzs_nzdy;
@@ -780,14 +779,17 @@ __device__ __forceinline__ void warp_dz_scatter_body(i_t* a_dz_count, i_t a_dz_d
     if (fabs(dyi) < 1e-12) { continue; }         // uniform skip (dyi identical on all lanes)
     const i_t i  = a_dzs_dyi[kk];
     const i_t rs = a_dzs_rs[i];
-    const i_t re = a_dzs_nbe[i] + 1;
+    const i_t re = a_dzs_rs[i + 1];
     for (i_t base = rs; base < re; base += 32) {
       const i_t p = base + lane;
       i_t j = -1; bool newcol = false;
       if (p < re) {
-        j = a_dzs_j[p];
-        dz[j] -= dyi * a_dzs_x[p];             // distinct j within the row → no collision
-        if (!a_dz_mark[j]) { a_dz_mark[j] = 1; newcol = true; }
+        const i_t jj = a_dzs_j[p];
+        if (a_dzs_basic_mark[jj] < 0) {
+          j = jj;
+          dz[j] -= dyi * a_dzs_x[p];           // distinct j within the row -> no collision
+          if (!a_dz_mark[j]) { a_dz_mark[j] = 1; newcol = true; }
+        }
       }
       const unsigned ball = __ballot_sync(0xffffffffu, newcol);
       const int prefix    = __popc(ball & ((1u << lane) - 1u));
@@ -1376,30 +1378,6 @@ __device__ __forceinline__ void warp_sptrsv_body_op(const i_t* a_cs,
                                                     int a_sp_nlev, f_t* a_x)
 {
   dts::wavefront_solve_op<Op>(a_cs, a_ridx, a_val, a_x, a_sp_ls, a_sp_co, a_sp_nlev);
-}
-
-__device__ __forceinline__ void warp_nbe_body(const i_t* a_nbe_basic_mark, i_t* a_nbe_end, i_t* a_nbe_j, i_t a_nbe_m, const i_t* a_nbe_rs, f_t* a_nbe_x)
-{
-  const int lane = static_cast<int>(threadIdx.x);
-  const i_t m    = a_nbe_m;
-  for (i_t i = lane; i < m; i += 32) {
-    i_t lo = a_nbe_rs[i];
-    i_t hi = a_nbe_rs[i + 1] - 1;
-    while (lo <= hi) {
-      const i_t j = a_nbe_j[lo];
-      if (a_nbe_basic_mark[j] >= 0) {
-        const i_t tj = a_nbe_j[lo]; a_nbe_j[lo] = a_nbe_j[hi]; a_nbe_j[hi] = tj;
-        const f_t tx = a_nbe_x[lo]; a_nbe_x[lo] = a_nbe_x[hi]; a_nbe_x[hi] = tx;
-        hi--;
-      } else {
-        lo++;
-      }
-    }
-    a_nbe_end[i] = hi;
-  }
-  // Publish the per-row nonbasic partition (a_nbe_end) and the permuted Arow row/value arrays
-  // before compute_delta_z reads them from every lane.
-  __syncwarp(0xffffffffu);
 }
 
 // All-lane butterfly sum: every lane returns the full 32-lane total, so all lanes then compute the
@@ -2646,9 +2624,8 @@ __device__ void compute_reduced_cost_update(const gpu_lp& lp,
   delta_z_indices.set_size(dz_count);
 }
 
-// Transpose delta_z: delta_z_N = -A_N' delta_y, row-wise on the CSR copy Arow,
-// iterating only the nonzero rows of delta_y and only their nonbasic-column portion
-// (Arow.row_start[i] .. nonbasic_end[i]). Mirrors the CPU compute_delta_z bit-for-bit.
+// Transpose delta_z: delta_z_N = -A_N' delta_y, row-wise on immutable Arow.
+// Scan complete CSR rows and filter basic columns through the node-local basic_mark.
 // Direct=true (warp): ALL 32 lanes execute this function, so the collective is
 // called directly (no cfg_shared / op-code dispatch) and the lane-0-only output must be broadcast
 // before the global-memory set_size. Direct=false (monolith): only lane 0 is here — a __shfl_sync
@@ -2659,7 +2636,7 @@ __device__ void compute_delta_z(const FT& ft,
                                 const gpu_sparse_vector& delta_y,
                                 i_t leaving_index,
                                 i_t direction,
-                                const i_t* nonbasic_end,
+                                const i_t* basic_mark,
                                 i_t* delta_z_mark,
                                 gpu_span<i_t>& delta_z_indices,
                                 f_t* delta_z)
@@ -2669,76 +2646,12 @@ __device__ void compute_delta_z(const FT& ft,
   // Always taken on the warp path (proven ~1.12x overall, bit-exact — was CUOPT_GPU_DZSCAT, now default).
   i_t dz_count = 0;
   warp_dz_scatter_body(&dz_count, direction, delta_z_indices.data(), leaving_index, delta_z_mark,
-                       delta_z, delta_y.i.data(), delta_y.x.data(), Arow.j.data(), nonbasic_end,
+                       delta_z, delta_y.i.data(), delta_y.x.data(), Arow.j.data(), basic_mark,
                        static_cast<i_t>(delta_y.i.size()), Arow.row_start.data(), Arow.x.data());
   // No broadcast: the body writes *dz_count on EVERY lane (the count is warp-uniform), and
   // &dz_count is this lane's own local. The body also ends with __syncwarp, so the global
   // writes it made are visible before set_size below.
   delta_z_indices.set_size(dz_count);
-}
-
-// Partition each row of Arow so nonbasic-variable coefficients occupy
-// Arow.row_start[i] .. nonbasic_end[i]. Mirrors compute_initial_nonbasic_end.
-// Warp path: one lane per row (rows independent) via WARP_NBE; the serial loop is the reference.
-template <class FT>
-__device__ void compute_initial_nonbasic_end(const FT& ft,
-                                             const i_t* basic_mark,
-                                             gpu_csr_matrix& Arow,
-                                             i_t* nonbasic_end)
-{
-  const i_t m = Arow.m;
-  // One lane per row; rows touch disjoint j/x slices and disjoint nonbasic_end[i], so this is
-  // bit-exact vs the serial two-pointer partition regardless of lane scheduling. No barrier.
-  warp_nbe_body(basic_mark, nonbasic_end, Arow.j.data(), m, Arow.row_start.data(),
-                Arow.x.data());
-}
-
-// Keep the Arow nonbasic partition in sync after a pivot (entering -> basic, leaving
-// -> nonbasic). Mirrors update_Arow. row_mark is scratch.
-__device__ void update_Arow(i_t leaving,
-                            i_t entering,
-                            const gpu_csc_view& A,
-                            gpu_span<i_t>& row_mark,
-                            i_t* nonbasic_end,
-                            gpu_csr_matrix& Arow)
-{
-  row_mark.clear();
-  const i_t col_start_enter = A.col_start[entering];
-  const i_t col_end_enter   = A.col_start[entering + 1];
-  for (i_t p = col_start_enter; p < col_end_enter; p++) { row_mark.push_back(A.i[p]); }
-
-  for (i_t t = 0; t < (i_t)row_mark.size(); ++t) {
-    const i_t i         = row_mark[t];
-    const i_t row_start = Arow.row_start[i];
-    const i_t nb_end    = nonbasic_end[i];
-    for (i_t p = row_start; p <= nb_end; p++) {
-      if (Arow.j[p] == entering) {
-        const i_t tj = Arow.j[p]; Arow.j[p] = Arow.j[nb_end]; Arow.j[nb_end] = tj;
-        const f_t tx = Arow.x[p]; Arow.x[p] = Arow.x[nb_end]; Arow.x[nb_end] = tx;
-        nonbasic_end[i]--;
-        break;
-      }
-    }
-  }
-
-  row_mark.clear();
-  const i_t col_start_leave = A.col_start[leaving];
-  const i_t col_end_leave   = A.col_start[leaving + 1];
-  for (i_t p = col_start_leave; p < col_end_leave; p++) { row_mark.push_back(A.i[p]); }
-
-  for (i_t t = 0; t < (i_t)row_mark.size(); ++t) {
-    const i_t i       = row_mark[t];
-    const i_t nb_end  = nonbasic_end[i];
-    const i_t row_end = Arow.row_start[i + 1];
-    for (i_t p = nb_end + 1; p < row_end; p++) {
-      if (Arow.j[p] == leaving) {
-        const i_t tj = Arow.j[p]; Arow.j[p] = Arow.j[nb_end + 1]; Arow.j[nb_end + 1] = tj;
-        const f_t tx = Arow.x[p]; Arow.x[p] = Arow.x[nb_end + 1]; Arow.x[nb_end + 1] = tx;
-        nonbasic_end[i]++;
-        break;
-      }
-    }
-  }
 }
 
 // Exact steepest-edge norm init: gamma_j = ||B^-T e_k||^2 for each basic var, via a
@@ -3272,8 +3185,6 @@ struct slot_buffers {
   i_t* delta_z_mark;
   i_t* delta_z_indices;
   i_t* nonbasic_pos;
-  i_t* nonbasic_end;
-  i_t* row_mark;
   i_t* infeas_idx;
   i_t* se_row_degree;
   i_t* se_mapping;
@@ -3328,15 +3239,14 @@ struct slot_state {
 
   // Dense per-iteration workspaces.
   gpu_span<f_t> xB_workspace, delta_y, delta_z, delta_x, v, squared_infeas;
-  gpu_span<i_t> basic_mark, delta_z_mark, delta_z_indices, nonbasic_pos, nonbasic_end, row_mark,
-    infeas_idx;
+  gpu_span<i_t> basic_mark, delta_z_mark, delta_z_indices, nonbasic_pos, infeas_idx;
   gpu_span<f_t> rt_ratio;
 
   // Sparse per-iteration workspaces.
   gpu_sparse_vector delta_y_sparse, UTsol_sparse, utilde_sparse, scaled_dxB_sparse, rhs_sparse,
     v_sparse;
 
-  // CSR row copy of A + its incrementally maintained nonbasic partition.
+  // Immutable CSR row copy of A; basic membership is filtered through basic_mark at use time.
   gpu_csr_matrix Arow;
 
   // In the monolith these are gpu_phase2_kernel STACK LOCALS (lvl_* + a __shared__ cfg), so they die
@@ -3383,8 +3293,6 @@ struct slot_state {
     delta_z_mark.attach(b.delta_z_mark, mn);
     delta_z_indices.attach(b.delta_z_indices, mn);
     nonbasic_pos.attach(b.nonbasic_pos, mn);
-    nonbasic_end.attach(b.nonbasic_end, mn);
-    row_mark.attach(b.row_mark, mn);
     infeas_idx.attach(b.infeas_idx, mn);
     se_row_degree.attach(b.se_row_degree, mn);
     se_mapping.attach(b.se_mapping, mn);
@@ -3519,19 +3427,10 @@ struct slot_state {
     delta_z_indices.clear();
     delta_z_indices.reserve(n);
 
-    // Transpose delta_z state (Arow CSR copy of A + per-row nonbasic partition). Built
-    // once here; nonbasic_end is maintained per pivot by update_Arow (no refactor rebuild
-    // needed — the GPU is pure MPF stacking).
-    // Zero-copy view over the host-built Arow (uploaded per-solve, mutable). Every marshal path
-    // uploads it; the kernel has no CSR transpose of its own.
+    // Immutable host-built CSR view. All nodes sharing the original A share these arrays;
+    // node-local basic_mark supplies the changing basis membership.
     Arow.view_device(lp.Arow_row_start, lp.Arow_j, lp.Arow_x, m, n, lp.A.col_start[n]);
-    nonbasic_end.assign(m, 0);
-    row_mark.clear();
-    row_mark.reserve(m);
     });  // end lane-0 prologue
-
-    // WARP_NBE: one lane per Arow row. Bit-exact (disjoint slices), 0 internal barriers.
-    compute_initial_nonbasic_end(ft, basic_mark.data(), Arow, nonbasic_end.data());
 
     lane0_serial([&] {
       squared_infeas.clear();
@@ -3606,8 +3505,6 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
   gpu_span<i_t>& delta_z_mark   = st.delta_z_mark;
   gpu_span<i_t>& delta_z_indices = st.delta_z_indices;
   gpu_span<i_t>& nonbasic_pos   = st.nonbasic_pos;
-  gpu_span<i_t>& nonbasic_end   = st.nonbasic_end;
-  gpu_span<i_t>& row_mark       = st.row_mark;
   gpu_span<i_t>& infeas_idx     = st.infeas_idx;
   gpu_sparse_vector& delta_y_sparse    = st.delta_y_sparse;
   gpu_sparse_vector& UTsol_sparse      = st.UTsol_sparse;
@@ -3702,7 +3599,7 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     const bool used_transpose_dz    = delta_y_nz_percentage <= 30.0;
     if (used_transpose_dz) {
       compute_delta_z(ft, Arow, delta_y_sparse, leaving, direction,
-                                    nonbasic_end.data(), delta_z_mark.data(), delta_z_indices,
+                                    basic_mark.data(), delta_z_mark.data(), delta_z_indices,
                                     delta_z.data());
     } else {
       // to_dense RESIZES delta_y (header RMW + possible device malloc). warp_to_dense keeps the
@@ -3764,9 +3661,8 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     update_objective(basic_list, scaled_dxB_sparse, lp.objective, delta_x.data(), entering, obj);
 
     // 5. Basis swap + MPF rank-1 stacking update.
-    // Every line here is a read-modify-write on shared state (vstatus/basic_list/basic_mark stores,
-    // update_Arow's in-place row repartition + row_mark push_back, ft.update's S_ append + sort +
-    // allocations), so under Direct the whole block is lane 0's.
+    // Every line here is a read-modify-write on node-local state. Arow stays immutable;
+    // basic_mark is the sole source of truth for changing basis membership.
     i_t _fu_status = 0;
     lane0_serial([&] {
       vstatus[entering] = variable_status_t::BASIC;
@@ -3778,9 +3674,6 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
       nonbasic_pos[leaving]            = nonbasic_entering;
       basic_mark[leaving]              = -1;
       basic_mark[entering]             = basic_leaving;
-
-      // Keep the CSR nonbasic partition in sync for the next iteration's transpose delta_z.
-      update_Arow(leaving, entering, lp.A, row_mark, nonbasic_end.data(), Arow);
     });
 
     // ft.update is COLLECTIVE now, so it must sit outside the lane-0 region above. It returns the
@@ -3837,8 +3730,8 @@ struct kernel_args {
   i_t A_nz;
   // Host-built CSR of A (Arow). Always uploaded; the kernel has no transpose of its own.
   const i_t* Arow_row_start;
-  i_t* Arow_j;
-  f_t* Arow_x;
+  const i_t* Arow_j;
+  const f_t* Arow_x;
   f_t *rhs, *lower, *upper, *objective;
   f_t obj_scale, obj_constant;
   // Fixed-factor row-index width is selected once per launch.
@@ -4387,70 +4280,29 @@ static bool heap_demand_rejected(size_t demand, size_t granted, size_t requested
 // single-problem wrapper and the batch wrapper build kernel_args through here, so the device
 // sees byte-identical inputs either way. `ft` must be a fresh factorization (num_updates == 0).
 // Free the buffers afterwards with free_kernel_args.
-// Read-only device buffers shared across all batch items with the same problem+factor (same `lp`
-// pointer). These are never written by the kernel (A CSC, the base LU factor, rhs/bounds/objective,
-// row permutation), so N same-problem blocks read ONE resident copy instead of N (VRAM + L2 reuse).
-// Share the problem-invariant read-only data across a problem's nodes: A (CSC), rhs, objective, and
-// Arow.row_start. A master Arow j/x is also uploaded once, but only as the source for each node's
-// private mutable copy. Everything basis-dependent (the LU factor L0/U0/L0t/U0t and row_perm), the
-// branching bounds (lower/upper), and the permuted Arow j/x stay per-node because they legitimately
-// differ. A.col_start is safe to share: unlike the factor, A is never reach-marked.
+// Problem-invariant read-only data shared across nodes with the same original matrix.
+// A and the full CSR Arow are immutable; bounds and factorization data remain per node.
 struct ro_upload {
-  i_t *A_col_start{}, *A_i{}; f_t* A_x{}; i_t A_nz{};
+  i_t *A_col_start{}, *A_i{};
+  f_t* A_x{};
+  i_t A_nz{};
   f_t *rhs{}, *objective{};
-  // MASTER CSR transpose, uploaded once per distinct A. row_start is immutable and shared directly;
-  // each block gets its own device-side copy of j/x because the nonbasic scan permutes them in place.
-  // Arow was 43% of all uploaded bytes -- 1.200 GB of 2.813 GB at 1,200 problems -- and every node
-  // of a B&B tree re-sent byte-identical data over PCIe at ~5 GB/s, against ~200 GB/s D2D bandwidth.
   const i_t* Arow_row_start{};
-  i_t* Arow_j{}; f_t* Arow_x{};
-  size_t Arow_j_bytes{}, Arow_x_bytes{};
+  const i_t* Arow_j{};
+  const f_t* Arow_x{};
 };
-
-// Device-side fan-out of the mutable master Arow j/x into each block's private copy: one batched
-// memcpy. The immutable row_start is shared directly and needs no fan-out entry.
-struct arow_fanout {
-  std::vector<void*> dsts, srcs;
-  std::vector<size_t> sizes;
-};
-
-// Run the fan-out. cub::DeviceMemcpy::Batched dereferences the buffer pointers ON THE DEVICE, so
-// both sides must be device memory -- which is exactly the case here (master and per-block copies
-// are both device allocations). That is also why it is used for D2D and NOT for the host uploads:
-// a host->device copy belongs on the DMA copy engines, not in a kernel reading over PCIe.
-static void run_arow_fanout(const arow_fanout& fan, marshal_storage& st, cudaStream_t stream)
-{
-  const size_t n = fan.dsts.size();
-  if (n == 0) { return; }
-  // The three descriptor arrays must themselves live on the device.
-  st.bufs.emplace_back(fan.srcs.data(),  n * sizeof(void*),  rmm::cuda_stream_default);
-  void** d_src = static_cast<void**>(st.bufs.back().data());
-  st.bufs.emplace_back(fan.dsts.data(),  n * sizeof(void*),  rmm::cuda_stream_default);
-  void** d_dst = static_cast<void**>(st.bufs.back().data());
-  st.bufs.emplace_back(fan.sizes.data(), n * sizeof(size_t), rmm::cuda_stream_default);
-  size_t* d_sz = static_cast<size_t*>(st.bufs.back().data());
-
-  size_t temp_bytes = 0;
-  RAFT_CUDA_TRY(cub::DeviceMemcpy::Batched(nullptr, temp_bytes, d_src, d_dst, d_sz,
-                                           static_cast<::cuda::std::int64_t>(n), stream));
-  st.bufs.emplace_back(temp_bytes ? temp_bytes : 1, rmm::cuda_stream_default);
-  RAFT_CUDA_TRY(cub::DeviceMemcpy::Batched(st.bufs.back().data(), temp_bytes, d_src, d_dst, d_sz,
-                                           static_cast<::cuda::std::int64_t>(n), stream));
-}
 
 static ro_upload upload_ro(const lp_problem_t<i_t, f_t>& lp, marshal_storage& st)
 {
   const auto& A = lp.A;
   ro_upload r{};
-  // Build the CSR transpose ONCE per distinct A and upload it as the fan-out master.
+  // Build and upload the immutable CSR transpose once per distinct A.
   st.arow_keep.emplace_back(lp.num_rows, lp.num_cols, A.nnz());
   auto& Arow_host = st.arow_keep.back();
   A.to_compressed_row(Arow_host);
   r.Arow_row_start = upload(Arow_host.row_start, st);
   r.Arow_j         = upload(Arow_host.j, st);
   r.Arow_x         = upload(Arow_host.x, st);
-  r.Arow_j_bytes   = Arow_host.j.size() * sizeof(i_t);
-  r.Arow_x_bytes   = Arow_host.x.size() * sizeof(f_t);
   r.A_col_start = upload(A.col_start, st); r.A_nz = A.nnz();
   r.A_i = upload_n(A.i.data(), A.nnz(), st); r.A_x = upload_n(A.x.data(), A.nnz(), st);
   r.rhs = upload(lp.rhs, st); r.objective = upload(lp.objective, st);
@@ -4537,6 +4389,8 @@ static size_t slot_buffer_bytes(size_t m, size_t n, size_t ucap, size_t eta)
   t += mn * (sizeof(i_t) + sizeof(f_t));
   t += mn * (sizeof(i_t) + sizeof(f_t));
   t += mn * sizeof(f_t);  // ft_dense_scratch2
+  // Immutable Arow removes the per-slot nonbasic_end and row_mark buffers.
+  t -= 2 * mn * sizeof(i_t);
   return t;
 }
 
@@ -4550,8 +4404,7 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
                                    lp_solution_t<i_t, f_t>& sol,
                                    std::vector<f_t>& delta_y_steepest_edge,
                                    const ro_upload* ro,
-                                   marshal_storage& st,
-                                   arow_fanout* fan = nullptr)
+                                   marshal_storage& st)
 {
   const int m = lp.num_rows;
   const int n = lp.num_cols;
@@ -4567,44 +4420,26 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
 
   a.obj_scale   = lp.obj_scale;
   a.obj_constant = lp.obj_constant;
-  // Problem-invariant, read-only: A CSC + rhs + objective — shared across the problem's nodes when a
-  // shared `ro` is provided, else uploaded per-node. Arow is always per-node (its j/x get permuted in
-  // place), but when sharing it is built on-device via from_csc off the SHARED A → the A reads hit one
-  // cached copy instead of N.
+  // Share A, rhs, objective, and the complete immutable Arow across nodes from one original
+  // problem. Bounds, factors, and basis state remain node-local.
   if (ro != nullptr) {
-    a.A_col_start = ro->A_col_start; a.A_nz = ro->A_nz; a.A_i = ro->A_i; a.A_x = ro->A_x;
-    a.rhs = ro->rhs; a.objective = ro->objective;
-  } else {
-    a.A_col_start = upload(A.col_start, st); a.A_nz = A.nnz();
-    a.A_i = upload_n(A.i.data(), A.nnz(), st); a.A_x = upload_n(A.x.data(), A.nnz(), st);
-    a.rhs = upload(lp.rhs, st); a.objective = upload(lp.objective, st);
-  }
-  // Arow (host-built CSR of A) is ALWAYS uploaded, sharing or not.
-  //
-  // It used to be skipped on the RO-shared path, leaving the kernel to build it with from_csc — i.e.
-  // out of the in-kernel malloc arena, once per block. That looked like a saving (one shared A rather
-  // than N) but it is the wrong trade by two orders of magnitude: the device heap is capped at ~16 GB
-  // BY THE DRIVER, on every device, while ordinary VRAM here is 177 GB. Measured on the 100 v6 nodes,
-  // building Arow in-kernel costs 1.04 MB of heap per problem — 2.450 MB total against 1.408 MB with
-  // Arow uploaded — which cut the maximum batch from ~9,600 problems to ~5,500 and made a
-  // 10,000-problem run die with cudaErrorIllegalAddress after thousands of failed mallocs.
-  // Arow j/x are per-node because the nonbasic scan partitions them in place. row_start is immutable,
-  // so all nodes view the shared master offsets directly. to_compressed_row orders each row by
-  // ascending column, matching from_csc bit-for-bit, so results are unchanged.
-  if (ro != nullptr && fan != nullptr && ro->Arow_row_start != nullptr) {
-    // Share the immutable row offsets. Allocate this block's private mutable j/x and queue a
-    // DEVICE-side copy from the shared master.
-    auto alloc_from = [&](size_t bytes, void* src) {
-      st.bufs.emplace_back(bytes, rmm::cuda_stream_default);
-      void* d = st.bufs.back().data();
-      fan->dsts.push_back(d); fan->srcs.push_back(src); fan->sizes.push_back(bytes);
-      return d;
-    };
+    a.A_col_start    = ro->A_col_start;
+    a.A_nz           = ro->A_nz;
+    a.A_i            = ro->A_i;
+    a.A_x            = ro->A_x;
+    a.rhs            = ro->rhs;
+    a.objective      = ro->objective;
     a.Arow_row_start = ro->Arow_row_start;
-    a.Arow_j         = static_cast<i_t*>(alloc_from(ro->Arow_j_bytes,  ro->Arow_j));
-    a.Arow_x         = static_cast<f_t*>(alloc_from(ro->Arow_x_bytes,  ro->Arow_x));
+    a.Arow_j         = ro->Arow_j;
+    a.Arow_x         = ro->Arow_x;
   } else {
-    // No shared master (single-problem path): build and upload per node, as before.
+    a.A_col_start = upload(A.col_start, st);
+    a.A_nz        = A.nnz();
+    a.A_i         = upload_n(A.i.data(), A.nnz(), st);
+    a.A_x         = upload_n(A.x.data(), A.nnz(), st);
+    a.rhs         = upload(lp.rhs, st);
+    a.objective   = upload(lp.objective, st);
+
     st.arow_keep.emplace_back(m, n, A.nnz());
     auto& Arow_host = st.arow_keep.back();
     A.to_compressed_row(Arow_host);
@@ -4694,8 +4529,6 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
     b.delta_z_mark = alloc_uninit<i_t>(mn, st);
     b.delta_z_indices = alloc_uninit<i_t>(mn, st);
     b.nonbasic_pos = alloc_uninit<i_t>(mn, st);
-    b.nonbasic_end = alloc_uninit<i_t>(mn, st);
-    b.row_mark = alloc_uninit<i_t>(mn, st);
     b.infeas_idx = alloc_uninit<i_t>(mn, st);
     b.se_row_degree = alloc_uninit<i_t>(mn, st);
     b.se_mapping = alloc_uninit<i_t>(mn, st);
@@ -5003,9 +4836,8 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
   }
 
   // ---- Marshal every problem + upload (host-timed) ----
-  // Dedup the problem-invariant read-only device buffers (A CSC + rhs + objective)
-  // across items with the same `lp` pointer — N same-problem blocks read ONE resident copy of A instead
-  // of N (VRAM + L2 reuse). The basis-dependent factor L/U, row perm, and branching bounds stay per-node
+  // Deduplicate the immutable A CSC, CSR Arow, rhs, and objective across nodes with the same
+  // original matrix. Basis-dependent factors, row permutations, and bounds remain per-node.
   const double up_t0 = tic();
   std::vector<kernel_args> h_args(N);
   std::unordered_map<const void*, ro_upload> ro_cache;
@@ -5013,7 +4845,6 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
   // device_buffer for the batch and MUST outlive the kernel launch below.
   std::vector<marshal_storage> store(N);
   marshal_storage ro_store;
-  arow_fanout fan;
 
   for (size_t b = 0; b < N; ++b) {
     const auto& it = items[b];
@@ -5026,13 +4857,11 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
     h_args[b] = use_uint16_factors
                   ? marshal_problem<std::uint16_t>(
                       *it.lp, *it.settings, *it.vstatus, *it.ft, *it.basic_list,
-                      *it.nonbasic_list, *it.sol, *it.dy_se, ro, store[b], &fan)
+                      *it.nonbasic_list, *it.sol, *it.dy_se, ro, store[b])
                   : marshal_problem<i_t>(
                       *it.lp, *it.settings, *it.vstatus, *it.ft, *it.basic_list,
-                      *it.nonbasic_list, *it.sol, *it.dy_se, ro, store[b], &fan);
+                      *it.nonbasic_list, *it.sol, *it.dy_se, ro, store[b]);
   }
-
-  run_arow_fanout(fan, ro_store, rmm::cuda_stream_default.value());
 
   kernel_args* d_args = nullptr;
   RAFT_CUDA_TRY(cudaMalloc(&d_args, N * sizeof(kernel_args)));
