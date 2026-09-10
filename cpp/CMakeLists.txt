@@ -576,10 +576,11 @@ if (HOST_LINEINFO)
 endif ()
 
 # Needed for the fast MPS parser, available on all x86-64-v3 compliant x86 CPUs (essentially since Haswell ~2013)
+# x86-64-v3 also implies hardware FMA support
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" AND
         CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
     set_property(SOURCE ${MPS_FAST_SRC_FILES} DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-            APPEND PROPERTY COMPILE_OPTIONS "-mbmi2;-mavx2;-msse4.2")
+            APPEND PROPERTY COMPILE_OPTIONS "-mbmi2;-mavx2;-msse4.2;-mfma")
 endif ()
 
 # TODO: figure out a set of flags for ARM that fits the range of CPUs we wish to support (neoverse?)
@@ -1213,6 +1214,31 @@ if (BUILD_MIP_BENCHMARKS AND NOT BUILD_LP_ONLY)
     target_include_directories(solve_MIP
             PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+
+    # CPU FJ standalone portfolio benchmark
+    add_executable(solve_CPUFJ ../benchmarks/linear_programming/cuopt/run_cpufj.cu)
+    set_target_properties(solve_CPUFJ PROPERTIES CXX_SCAN_FOR_MODULES OFF)
+    target_compile_options(solve_CPUFJ
+            PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>"
+            "$<$<COMPILE_LANGUAGE:CUDA>:${CUOPT_CUDA_FLAGS}>"
+            "$<$<COMPILE_LANGUAGE:CUDA>:-fopenmp>"
+    )
+    target_link_libraries(solve_CPUFJ
+            PUBLIC
+            cuopt_static
+            OpenMP::OpenMP_CXX
+            OpenMP::OpenMP_CUDA
+    )
+    target_include_directories(solve_CPUFJ
+            PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${papilo_SOURCE_DIR}/src"
+            "${papilo_BINARY_DIR}"
+    )
+    target_include_directories(solve_CPUFJ SYSTEM PRIVATE
+            "${pslp_SOURCE_DIR}/include"
+            "${dejavu_SOURCE_DIR}"
     )
 
 endif ()

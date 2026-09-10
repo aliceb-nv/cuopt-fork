@@ -19,11 +19,8 @@
 
 #include <cuopt/error.hpp>
 
-#include <utilities/device_scalar_init.hpp>
-
-#ifdef CUPDLP_DEBUG_MODE
 #include <utilities/copy_helpers.hpp>
-#endif
+#include <utilities/device_scalar_init.hpp>
 
 #include <raft/sparse/detail/cusparse_wrappers.h>
 #include <raft/core/cusparse_macros.hpp>

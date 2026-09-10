@@ -7,8 +7,8 @@
 
 #pragma once
 
-#include <utilities/copy_helpers.hpp>
 #include <utilities/macros.cuh>
+#include <utilities/type_2.hpp>
 
 #include <cuopt/mathematical_optimization/optimization_problem_interface.hpp>
 

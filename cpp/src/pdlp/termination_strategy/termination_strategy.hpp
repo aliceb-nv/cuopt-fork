@@ -17,6 +17,7 @@
 #include <cuopt/mathematical_optimization/pdlp/solver_solution.hpp>
 #include <mip_heuristics/problem/problem.cuh>
 
+#include <utilities/copy_helpers.hpp>
 #include <utilities/unique_pinned_ptr.hpp>
 
 #include <raft/core/handle.hpp>

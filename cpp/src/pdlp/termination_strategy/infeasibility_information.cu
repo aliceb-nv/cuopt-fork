@@ -10,6 +10,7 @@
 #include <pdlp/restart_strategy/pdlp_restart_strategy.cuh>
 #include <pdlp/termination_strategy/infeasibility_information.hpp>
 #include <pdlp/utils.cuh>
+#include <utilities/copy_helpers.hpp>
 #include <utilities/device_scalar_init.hpp>
 
 #include <cuopt/mathematical_optimization/utilities/segmented_sum_handler.cuh>

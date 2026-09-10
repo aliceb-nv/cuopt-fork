@@ -19,6 +19,8 @@
 #include <cuopt/mathematical_optimization/pdlp/pdlp_warm_start_data.hpp>
 #include <cuopt/mathematical_optimization/pdlp/solver_settings.hpp>
 
+#include <utilities/copy_helpers.hpp>
+
 #include <raft/core/nvtx.hpp>
 #include <raft/util/cuda_utils.cuh>
 #include <raft/util/cudart_utils.hpp>

@@ -1017,7 +1017,7 @@ bool compute_probing_cache(bound_presolve_t<i_t, f_t>& bound_presolve,
   }  // end of step
 
   apply_substitution_queue_to_problem(substitution_vector_pool, problem);
-  const double probing_wall =
+  [[maybe_unused]] const double probing_wall =
     std::chrono::duration<double>(std::chrono::steady_clock::now() - probing_t0).count();
   CUOPT_LOG_DEBUG(
     "PRESOLVE_PROBING probes=%zu candidates=%zu iters=%.0f work=%.3f work_limit=%.3f step=%zu "
@@ -1049,9 +1049,9 @@ template <typename i_t, typename f_t>
 void probing_cache_t<i_t, f_t>::merge_forcings(const std::vector<probe_forcing_t<i_t>>& forcings,
                                                std::vector<std::pair<i_t, bool>>& fixings)
 {
-  i_t n_added        = 0;
-  i_t n_tightened    = 0;
-  i_t n_contradicted = 0;
+  [[maybe_unused]] i_t n_added        = 0;
+  [[maybe_unused]] i_t n_tightened    = 0;
+  [[maybe_unused]] i_t n_contradicted = 0;
   for (const auto& forcing : forcings) {
     cuopt_assert(forcing.var != forcing.forced_var, "self-forcing is not a projection finding");
     auto entry_it = probing_cache.find(forcing.var);

@@ -1459,8 +1459,8 @@ bool block_bve_phase(bound_presolve_t<i_t, f_t>& bound_presolve,
       break;
     }
 
-    const i_t n_vars_before = problem.n_variables;
-    const i_t n_rows_before = problem.n_constraints;
+    const i_t n_vars_before                 = problem.n_variables;
+    [[maybe_unused]] const i_t n_rows_before = problem.n_constraints;
     auto impl_adj           = bve_build_impl_adj(bound_presolve.probing_cache,
                                        problem.reverse_original_ids,
                                        problem.n_variables,

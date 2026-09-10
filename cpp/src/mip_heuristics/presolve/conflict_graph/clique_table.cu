@@ -228,8 +228,8 @@ void fill_knapsack_constraints(const user_problem_t<i_t, f_t>& problem,
 template <typename i_t, typename f_t>
 void remove_small_cliques(clique_table_t<i_t, f_t>& clique_table, cuopt::timer_t& timer)
 {
-  i_t num_removed_first = 0;
-  i_t num_removed_addtl = 0;
+  [[maybe_unused]] i_t num_removed_first = 0;
+  [[maybe_unused]] i_t num_removed_addtl = 0;
   std::vector<bool> to_delete(clique_table.first.size(), false);
   std::vector<std::pair<i_t, i_t>> small_edges;
 
@@ -708,7 +708,7 @@ void find_initial_cliques(user_problem_t<i_t, f_t>& problem,
   clique_table->tolerances                 = tolerances;
   double time_limit_for_additional_cliques = timer.remaining_time() / 2;
   cuopt::timer_t additional_cliques_timer(time_limit_for_additional_cliques);
-  double find_work_estimate = 0.0;
+  [[maybe_unused]] double find_work_estimate = 0.0;
   // Always build base cliques in full; signal_extend only gates the extension phase.
   for (const auto& knapsack_constraint : knapsack_constraints) {
     if (timer.check_time_limit()) { break; }

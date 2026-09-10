@@ -499,8 +499,8 @@ void mip_scaling_strategy_t<i_t, f_t>::scale_problem(bool do_objective_scaling)
   auto& constraint_bounds       = op_problem_scaled_.get_constraint_bounds();
   auto& constraint_lower_bounds = op_problem_scaled_.get_constraint_lower_bounds();
   auto& constraint_upper_bounds = op_problem_scaled_.get_constraint_upper_bounds();
-  const i_t n_rows              = op_problem_scaled_.get_n_constraints();
-  const i_t n_cols              = op_problem_scaled_.get_n_variables();
+  const i_t n_rows                    = op_problem_scaled_.get_n_constraints();
+  [[maybe_unused]] const i_t n_cols   = op_problem_scaled_.get_n_variables();
   const i_t nnz                 = op_problem_scaled_.get_nnz();
 
   if (do_objective_scaling) {
@@ -563,7 +563,7 @@ void mip_scaling_strategy_t<i_t, f_t>::scale_problem(bool do_objective_scaling)
                           row_nonzero_count,
                           row_skip_scaling);
 
-  i_t big_m_rows = thrust::count(
+  [[maybe_unused]] i_t big_m_rows = thrust::count(
     handle_ptr_->get_thrust_policy(), row_skip_scaling.begin(), row_skip_scaling.end(), i_t(1));
 
   CUOPT_LOG_DEBUG("MIP row scaling start: rows=%d cols=%d max_iterations=%d soft_big_m_rows=%d",

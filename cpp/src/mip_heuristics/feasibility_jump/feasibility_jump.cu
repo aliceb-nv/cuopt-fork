@@ -940,7 +940,8 @@ i_t fj_t<i_t, f_t>::host_loop(solution_t<i_t, f_t>& solution, i_t climber_idx)
 
       if (settings.mode != fj_mode_t::FIRST_FEASIBLE) {
         if (break_condition) {
-          f_t exit_best_objective = data.best_objective.value(handle_ptr->get_stream());
+          [[maybe_unused]] f_t exit_best_objective =
+            data.best_objective.value(handle_ptr->get_stream());
           CUOPT_LOG_TRACE(FJ_LOG_PREFIX "EXIT LOCAL MINIMUM step %d, best best_objective %f",
                           iterations,
                           exit_best_objective);
@@ -1117,7 +1118,7 @@ i_t fj_t<i_t, f_t>::solve(solution_t<i_t, f_t>& solution)
   RAFT_CHECK_CUDA(handle_ptr->get_stream().get());
   handle_ptr->sync_stream();
 
-  f_t effort_rate = (f_t)iterations / timer.elapsed_time();
+  [[maybe_unused]] f_t effort_rate = (f_t)iterations / timer.elapsed_time();
 
   // If we're in rounding mode and some fractionals remain: round them all
   // limit = total_limit * second_stage_split

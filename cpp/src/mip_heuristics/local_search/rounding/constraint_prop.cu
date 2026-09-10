@@ -769,7 +769,7 @@ bool constraint_prop_t<i_t, f_t>::run_repair_procedure(problem_t<i_t, f_t>& prob
   bounds_update.copy_input_bounds(problem);
   repair_stats.repair_attempts++;
   f_t repair_start_time                = timer.remaining_time();
-  i_t n_of_repairs_needed_for_feasible = 0;
+  [[maybe_unused]] i_t n_of_repairs_needed_for_feasible = 0;
   do {
     n_of_repairs_needed_for_feasible++;
     if (timer.check_time_limit()) {

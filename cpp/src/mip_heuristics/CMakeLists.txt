@@ -45,7 +45,8 @@ set(MIP_NON_LP_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/presolve/trivial_presolve.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/feasibility_jump.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/feasibility_jump_kernels.cu
-  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/fj_cpu.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/cpu/engine.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/fj_cpu_bridge.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/fj_cpu_binary.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/fj_cpu_binary_preprocess.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/fj_cpu_binary_kernels.cpp

@@ -12,6 +12,7 @@
 #include <pdlp/swap_and_resize_helper.cuh>
 #include <pdlp/termination_strategy/convergence_information.hpp>
 #include <pdlp/utils.cuh>
+#include <utilities/copy_helpers.hpp>
 #include <utilities/device_scalar_init.hpp>
 
 #include <mip_heuristics/mip_constants.hpp>
