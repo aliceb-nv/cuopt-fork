@@ -41,12 +41,13 @@
 #include <limits>
 #include <string>
 #include <system_error>
+#include <utilities/seed_generator.hpp>
 #include <vector>
 
 namespace {
 
-using i_t = int;
-using f_t = double;
+using i_t     = int;
+using f_t     = double;
 namespace mip = cuopt::mathematical_optimization::mip;
 
 using clk = std::chrono::high_resolution_clock;
@@ -109,7 +110,6 @@ void run_climber(mip::fj_cpu_climber_t<i_t, f_t>* climber,
   result.iterations = climber->iterations;
 }
 
-
 struct lane_reservoir_t {
   int lane{0};
   int capacity{0};
@@ -148,10 +148,10 @@ void sample_assignment(lane_reservoir_t& r,
     if (j < (uint64_t)r.capacity) { slot = (int)j; }
   }
   if (slot < 0) { return; }
-  r.samples[slot]     = assignment;
-  r.calls[slot]       = n;
-  r.iterations[slot]  = iteration;
-  r.objectives[slot]  = (double)objective;
+  r.samples[slot]    = assignment;
+  r.calls[slot]      = n;
+  r.iterations[slot] = iteration;
+  r.objectives[slot] = (double)objective;
 }
 
 std::vector<f_t> uncrush_assignment(mip::problem_t<i_t, f_t>& problem,
@@ -175,7 +175,9 @@ bool write_samples(const std::string& path,
   std::FILE* out = std::fopen(path.c_str(), "wb");
   if (out == nullptr) { return false; }
   int32_t n_records = 0;
-  for (const auto& r : reservoirs) { n_records += (int32_t)r.samples.size(); }
+  for (const auto& r : reservoirs) {
+    n_records += (int32_t)r.samples.size();
+  }
   int32_t nv = 0;
   for (const auto& r : reservoirs) {
     if (!r.samples.empty()) {
@@ -205,14 +207,15 @@ bool write_samples(const std::string& path,
   return true;
 }
 
-bool write_lane_solutions(const std::string& dir,
-                          const std::string& instance,
-                          const std::vector<std::string>& var_names,
-                          const std::vector<std::unique_ptr<mip::fj_cpu_climber_t<i_t, f_t>>>& climbers,
-                          const std::vector<climber_result_t>& results,
-                          mip::problem_t<i_t, f_t>& problem,
-                          rmm::cuda_stream_view stream,
-                          int& written)
+bool write_lane_solutions(
+  const std::string& dir,
+  const std::string& instance,
+  const std::vector<std::string>& var_names,
+  const std::vector<std::unique_ptr<mip::fj_cpu_climber_t<i_t, f_t>>>& climbers,
+  const std::vector<climber_result_t>& results,
+  mip::problem_t<i_t, f_t>& problem,
+  rmm::cuda_stream_view stream,
+  int& written)
 {
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
@@ -339,8 +342,10 @@ int main(int argc, char** argv)
   //
   // This file is outside target_code and is sha256-gated by evaluate.py's FROZEN_FILES,
   // so a candidate cannot restore the names. Do not move this below the solve.
-  for (auto& name : problem.var_names) name.clear();
-  for (auto& name : problem.row_names) name.clear();
+  for (auto& name : problem.var_names)
+    name.clear();
+  for (auto& name : problem.row_names)
+    name.clear();
   problem.objective_name.clear();
 
   // The same pair solve.cu runs before handing the model to the heuristics. Without it the harness
@@ -348,7 +353,8 @@ int main(int argc, char** argv)
   // coefficients, and every consumer downstream is entitled to assume a nonzero is nonzero.
   // trivial_presolve requires preprocess_problem first and says so.
   problem.preprocess_problem();
-  mip::trivial_presolve(problem, /*remap_cache_ids=*/true, /*compute_related_vars=*/!no_related_vars);
+  mip::trivial_presolve(
+    problem, /*remap_cache_ids=*/true, /*compute_related_vars=*/!no_related_vars);
 
   std::printf("instance: %s  n_vars=%d n_cstrs=%d nnz=%d\n",
               path.c_str(),
@@ -380,17 +386,18 @@ int main(int argc, char** argv)
     for (size_t k = 0; k < 10 && k < degree.size(); ++k)
       top10 += degree[degree.size() - 1 - k];
     const double mean_degree = n_cols > 0 ? (double)nnz / n_cols : 0.0;
-    std::printf("census cols: n=%d degree max=%d p99=%d p90=%d median=%d mean=%.1f"
-                "  widest=%.1f%% top10=%.1f%% of nnz  hub=%.0fx mean\n",
-                n_cols,
-                max_degree,
-                quantile(0.99),
-                quantile(0.90),
-                quantile(0.50),
-                mean_degree,
-                nnz > 0 ? 100.0 * max_degree / nnz : 0.0,
-                nnz > 0 ? 100.0 * top10 / nnz : 0.0,
-                mean_degree > 0 ? max_degree / mean_degree : 0.0);
+    std::printf(
+      "census cols: n=%d degree max=%d p99=%d p90=%d median=%d mean=%.1f"
+      "  widest=%.1f%% top10=%.1f%% of nnz  hub=%.0fx mean\n",
+      n_cols,
+      max_degree,
+      quantile(0.99),
+      quantile(0.90),
+      quantile(0.50),
+      mean_degree,
+      nnz > 0 ? 100.0 * max_degree / nnz : 0.0,
+      nnz > 0 ? 100.0 * top10 / nnz : 0.0,
+      mean_degree > 0 ? max_degree / mean_degree : 0.0);
 
     const i_t n_rows = (i_t)std::min(row_lb.size(), row_ub.size());
     i_t lb_only = 0, ub_only = 0, equality = 0, ranged = 0, free_rows = 0;
@@ -407,15 +414,16 @@ int main(int argc, char** argv)
         ++free_rows;
       }
     }
-    std::printf("census rows: n=%d lb_only=%d ub_only=%d equality=%d ranged=%d free=%d"
-                "  one_sided=%.1f%%\n",
-                n_rows,
-                lb_only,
-                ub_only,
-                equality,
-                ranged,
-                free_rows,
-                n_rows > 0 ? 100.0 * (lb_only + ub_only) / n_rows : 0.0);
+    std::printf(
+      "census rows: n=%d lb_only=%d ub_only=%d equality=%d ranged=%d free=%d"
+      "  one_sided=%.1f%%\n",
+      n_rows,
+      lb_only,
+      ub_only,
+      equality,
+      ranged,
+      free_rows,
+      n_rows > 0 ? 100.0 * (lb_only + ub_only) / n_rows : 0.0);
   }
 
   // FROZEN -- defines t=0 for the benchmark. Everything above it (the MPS parse,
@@ -431,19 +439,21 @@ int main(int argc, char** argv)
   // Composition and per-climber parameters come from build_climber_portfolio, which
   // is editable. The log prefix is assigned here and not there, so every climber
   // stays identifiable in the log whatever the portfolio does.
+  // The command-line seed controls lane RNG streams as well as persona tuning.
+  cuopt::seed_generator::set_seed(base_seed);
   mip::build_climber_portfolio<i_t, f_t>(
     problem, preemption_flags, climbers, base_seed, low_latency);
   std::vector<lane_reservoir_t> reservoirs(sample_path.empty() ? 0 : (size_t)n_climbers);
   for (int k = 0; k < n_climbers; ++k) {
     climbers[k]->log_prefix = "[climber " + std::to_string(k) + "] ";
     if (!sample_path.empty()) {
-      reservoirs[k].lane      = k;
-      reservoirs[k].capacity  = samples_per_lane;
-      reservoirs[k].rng_state          = (uint64_t)base_seed * 6364136223846793005ull +
-                                (uint64_t)k * 1442695040888963407ull + 1ull;
-      lane_reservoir_t* r                        = &reservoirs[k];
-      auto* climber                              = climbers[k].get();
-      climbers[k]->diversity_callback_interval   = sample_interval;
+      reservoirs[k].lane     = k;
+      reservoirs[k].capacity = samples_per_lane;
+      reservoirs[k].rng_state =
+        (uint64_t)base_seed * 6364136223846793005ull + (uint64_t)k * 1442695040888963407ull + 1ull;
+      lane_reservoir_t* r                      = &reservoirs[k];
+      auto* climber                            = climbers[k].get();
+      climbers[k]->diversity_callback_interval = sample_interval;
       climbers[k]->diversity_callback = [r, climber](f_t objective, const std::vector<f_t>& a) {
         sample_assignment(*r, objective, a, (long long)climber->iterations);
       };
@@ -452,7 +462,12 @@ int main(int argc, char** argv)
 
   const std::vector<int> cpus = allowed_cpus();
   std::printf("running %d climbers x %.0fs, base seed %u, %zu allowed CPUs (%d..%d)\n",
-              n_climbers, (double)time_limit, base_seed, cpus.size(), cpus.front(), cpus.back());
+              n_climbers,
+              (double)time_limit,
+              base_seed,
+              cpus.size(),
+              cpus.front(),
+              cpus.back());
 
   std::vector<climber_result_t> results(n_climbers);
   std::vector<std::thread> threads;
@@ -467,9 +482,9 @@ int main(int argc, char** argv)
   }
   const double wall = since(wall0);
 
-  int crossed       = 0;
-  double sum_iters  = 0;
-  f_t best_overall  = std::numeric_limits<f_t>::infinity();
+  int crossed      = 0;
+  double sum_iters = 0;
+  f_t best_overall = std::numeric_limits<f_t>::infinity();
   std::printf("\n climber | crossed | t_first(s) |          obj |    iters |  iters/s\n");
   std::printf("---------+---------+------------+--------------+----------+---------\n");
   for (int k = 0; k < n_climbers; ++k) {
@@ -495,10 +510,12 @@ int main(int argc, char** argv)
 
   int audited = 0, invalid = 0;
   int64_t escalated_rows = 0;
-  std::printf("\n climber | viol rows  worst/tol | bnd viol  worst/tol | int viol  worst/tol |"
-              "     obj drift    rel |    vs bks\n");
-  std::printf("---------+----------------------+---------------------+---------------------+"
-              "----------------------+----------\n");
+  std::printf(
+    "\n climber | viol rows  worst/tol | bnd viol  worst/tol | int viol  worst/tol |"
+    "     obj drift    rel |    vs bks\n");
+  std::printf(
+    "---------+----------------------+---------------------+---------------------+"
+    "----------------------+----------\n");
   for (int k = 0; k < n_climbers; ++k) {
     auto& c = *climbers[k];
     if (c.feasible_found != results[k].crossed) {
@@ -528,11 +545,11 @@ int main(int argc, char** argv)
       const f_t lb    = cpu_problem.cstr_lb[r];
       const f_t ub    = cpu_problem.cstr_ub[r];
 
-      const double row_tol = mip::get_cstr_tolerance<i_t, f_t>(
-        lb,
-        ub,
-        cpu_problem.tolerances.absolute_tolerance,
-        cpu_problem.tolerances.relative_tolerance);
+      const double row_tol =
+        mip::get_cstr_tolerance<i_t, f_t>(lb,
+                                          ub,
+                                          cpu_problem.tolerances.absolute_tolerance,
+                                          cpu_problem.tolerances.relative_tolerance);
       const double tol = std::max(row_tol - mip::fj_row_tolerance_margin, 1e-12);
 
       // Naive summation over w products: each product carries eps/2 and each of the w-1 additions
@@ -564,11 +581,11 @@ int main(int argc, char** argv)
     i_t integers_over          = 0;
     double worst_bound_ratio   = 0.0;
     double worst_integer_ratio = 0.0;
-    _Float128 objective       = 0;
+    _Float128 objective        = 0;
     for (i_t v = 0; v < cpu_problem.n_variables; ++v) {
       const auto bounds = c.h_var_bounds[v].get();
-      const double x   = (double)c.h_best_assignment[v];
-      const double out = std::max(
+      const double x    = (double)c.h_best_assignment[v];
+      const double out  = std::max(
         std::max((double)cuopt::get_lower(bounds) - x, x - (double)cuopt::get_upper(bounds)), 0.0);
       if (out > int_tol) ++bounds_over;
       worst_bound_ratio = std::max(worst_bound_ratio, int_tol > 0 ? out / int_tol : 0.0);
@@ -584,11 +601,11 @@ int main(int argc, char** argv)
 
     // Differenced before narrowing; the drift is smaller than a double ulp of the sum.
     const _Float128 difference = objective - (_Float128)results[k].best_objective;
-    const double drift          = (double)(difference < 0 ? -difference : difference);
-    const double exact          = (double)objective;
-    const double scale          = std::max(std::fabs(exact), 1.0);
-    const bool below_bks        = bks_user && exact < bks - bks_slack;
-    const bool bad = rows_over > 0 || bounds_over > 0 || integers_over > 0 || below_bks;
+    const double drift         = (double)(difference < 0 ? -difference : difference);
+    const double exact         = (double)objective;
+    const double scale         = std::max(std::fabs(exact), 1.0);
+    const bool below_bks       = bks_user && exact < bks - bks_slack;
+    const bool bad             = rows_over > 0 || bounds_over > 0 || integers_over > 0 || below_bks;
     if (bad) ++invalid;
     std::printf(" %7d | %9d %10.3g | %8d %10.3g | %8d %10.3g | %12.3g %6.1e | %9.3g%s%s\n",
                 k,
@@ -604,26 +621,26 @@ int main(int argc, char** argv)
                 below_bks ? "  BELOW BKS" : "",
                 bad ? "  INVALID" : "");
   }
-  std::printf("AUDIT: %d/%d reporting climbers checked, %d invalid, %lld rows re-summed exactly,"
-              " bks %s\n",
-              audited,
-              crossed,
-              invalid,
-              (long long)escalated_rows,
-              bks_user ? std::to_string(*bks_user).c_str()
-                       : (cuopt_bench::is_known_infeasible(path) ? "known infeasible" : "unknown"));
-
+  std::printf(
+    "AUDIT: %d/%d reporting climbers checked, %d invalid, %lld rows re-summed exactly,"
+    " bks %s\n",
+    audited,
+    crossed,
+    invalid,
+    (long long)escalated_rows,
+    bks_user ? std::to_string(*bks_user).c_str()
+             : (cuopt_bench::is_known_infeasible(path) ? "known infeasible" : "unknown"));
 
   // checked the uncrushed solution against the original model
   {
-    const auto& A_val  = mps_data_model.get_constraint_matrix_values();
-    const auto& A_idx  = mps_data_model.get_constraint_matrix_indices();
-    const auto& A_off  = mps_data_model.get_constraint_matrix_offsets();
-    const auto& row_lb = mps_data_model.get_constraint_lower_bounds();
-    const auto& row_ub = mps_data_model.get_constraint_upper_bounds();
-    const auto& col_lb = mps_data_model.get_variable_lower_bounds();
-    const auto& col_ub = mps_data_model.get_variable_upper_bounds();
-    const auto& v_type = mps_data_model.get_variable_types();
+    const auto& A_val     = mps_data_model.get_constraint_matrix_values();
+    const auto& A_idx     = mps_data_model.get_constraint_matrix_indices();
+    const auto& A_off     = mps_data_model.get_constraint_matrix_offsets();
+    const auto& row_lb    = mps_data_model.get_constraint_lower_bounds();
+    const auto& row_ub    = mps_data_model.get_constraint_upper_bounds();
+    const auto& col_lb    = mps_data_model.get_variable_lower_bounds();
+    const auto& col_ub    = mps_data_model.get_variable_upper_bounds();
+    const auto& v_type    = mps_data_model.get_variable_types();
     const i_t n_orig_rows = (i_t)A_off.size() - 1;
     const double abs_tol  = problem.tolerances.absolute_tolerance;
     const double int_tol  = problem.tolerances.integrality_tolerance;
@@ -637,7 +654,9 @@ int main(int argc, char** argv)
       const std::vector<f_t> user = uncrush_assignment(problem, solver, handle.get_stream());
       if ((i_t)user.size() != (i_t)col_lb.size()) {
         std::printf("LIFTED AUDIT: climber %d produced %d values for %d original columns\n",
-                    k, (int)user.size(), (int)col_lb.size());
+                    k,
+                    (int)user.size(),
+                    (int)col_lb.size());
         ++lifted_bad;
         continue;
       }
@@ -662,7 +681,10 @@ int main(int argc, char** argv)
                                  });
         if (verdict.excess > 0.0) {
           ++bad_rows;
-          if (verdict.excess > worst_row) { worst_row = verdict.excess; worst_row_id = r; }
+          if (verdict.excess > worst_row) {
+            worst_row    = verdict.excess;
+            worst_row_id = r;
+          }
         }
       }
       for (i_t v = 0; v < (i_t)user.size(); ++v) {
@@ -674,64 +696,80 @@ int main(int argc, char** argv)
       }
       if (bad_rows || bad_bnd || bad_int) {
         ++lifted_bad;
-        std::printf("LIFTED AUDIT: climber %d INVALID on the original model -- %d rows, %d bounds,"
-                    " %d integrality; worst row %d by %.6g\n",
-                    k, (int)bad_rows, (int)bad_bnd, (int)bad_int, (int)worst_row_id, worst_row);
+        std::printf(
+          "LIFTED AUDIT: climber %d INVALID on the original model -- %d rows, %d bounds,"
+          " %d integrality; worst row %d by %.6g\n",
+          k,
+          (int)bad_rows,
+          (int)bad_bnd,
+          (int)bad_int,
+          (int)worst_row_id,
+          worst_row);
       }
     }
-    std::printf("LIFTED AUDIT: %d/%d crossing climbers verified against the original model,"
-                " %d INVALID, %d original rows\n",
-                lifted_checked, crossed, lifted_bad, (int)n_orig_rows);
+    std::printf(
+      "LIFTED AUDIT: %d/%d crossing climbers verified against the original model,"
+      " %d INVALID, %d original rows\n",
+      lifted_checked,
+      crossed,
+      lifted_bad,
+      (int)n_orig_rows);
   }
 
-  std::printf("\n climber |     moves |  apply nnz | nnz/move | bitmap elems | ratio |"
-              " bump/apply | bump/weight | mtm inval | cache hit%%\n");
-  std::printf("---------+-----------+------------+----------+--------------+-------+"
-              "------------+-------------+-----------+-----------\n");
+  std::printf(
+    "\n climber |     moves |  apply nnz | nnz/move | bitmap elems | ratio |"
+    " bump/apply | bump/weight | mtm inval | cache hit%%\n");
+  std::printf(
+    "---------+-----------+------------+----------+--------------+-------+"
+    "------------+-------------+-----------+-----------\n");
   for (int k = 0; k < n_climbers; ++k) {
     const auto& c        = *climbers[k];
     const int64_t bitmap = 2 * c.n_moves_applied * (int64_t)c.problem->n_variables;
     const int64_t probes = c.hit_count + c.miss_count;
-    std::printf(" %7d | %9lld | %10lld | %8.1f | %12lld | %5.0f | %10lld | %11lld | %9lld |"
-                " %9.2f\n",
-                k,
-                (long long)c.n_moves_applied,
-                (long long)c.apply_move_nnz,
-                c.n_moves_applied > 0 ? (double)c.apply_move_nnz / c.n_moves_applied : 0.0,
-                (long long)bitmap,
-                c.apply_move_nnz > 0 ? (double)bitmap / c.apply_move_nnz : 0.0,
-                (long long)c.n_version_bumps_apply,
-                (long long)c.n_version_bumps_weights,
-                (long long)c.n_mtm_cache_invalidations,
-                probes > 0 ? 100.0 * c.hit_count / probes : 0.0);
+    std::printf(
+      " %7d | %9lld | %10lld | %8.1f | %12lld | %5.0f | %10lld | %11lld | %9lld |"
+      " %9.2f\n",
+      k,
+      (long long)c.n_moves_applied,
+      (long long)c.apply_move_nnz,
+      c.n_moves_applied > 0 ? (double)c.apply_move_nnz / c.n_moves_applied : 0.0,
+      (long long)bitmap,
+      c.apply_move_nnz > 0 ? (double)bitmap / c.apply_move_nnz : 0.0,
+      (long long)c.n_version_bumps_apply,
+      (long long)c.n_version_bumps_weights,
+      (long long)c.n_mtm_cache_invalidations,
+      probes > 0 ? 100.0 * c.hit_count / probes : 0.0);
   }
 
-  std::printf("\n climber | mtm calls | row entries | ent/call |  capped ent | capped/call |"
-              " score calls | score nnz | nnz/score | nnz budget\n");
-  std::printf("---------+-----------+-------------+----------+-------------+-------------+"
-              "-------------+-----------+-----------+-----------\n");
+  std::printf(
+    "\n climber | mtm calls | row entries | ent/call |  capped ent | capped/call |"
+    " score calls | score nnz | nnz/score | nnz budget\n");
+  std::printf(
+    "---------+-----------+-------------+----------+-------------+-------------+"
+    "-------------+-----------+-----------+-----------\n");
   for (int k = 0; k < n_climbers; ++k) {
     const auto& c = *climbers[k];
-    std::printf(" %7d | %9lld | %11lld | %8.0f | %11lld | %11.0f | %11lld | %9lld | %9.1f |"
-                " %10d\n",
-                k,
-                (long long)c.n_mtm_calls,
-                (long long)c.mtm_row_entries,
-                c.n_mtm_calls > 0 ? (double)c.mtm_row_entries / c.n_mtm_calls : 0.0,
-                (long long)c.mtm_entries_capped,
-                c.n_mtm_calls > 0 ? (double)c.mtm_entries_capped / c.n_mtm_calls : 0.0,
-                (long long)c.n_compute_score_calls,
-                (long long)c.compute_score_nnz,
-                c.n_compute_score_calls > 0
-                  ? (double)c.compute_score_nnz / c.n_compute_score_calls
-                  : 0.0,
-                c.nnz_samples);
+    std::printf(
+      " %7d | %9lld | %11lld | %8.0f | %11lld | %11.0f | %11lld | %9lld | %9.1f |"
+      " %10d\n",
+      k,
+      (long long)c.n_mtm_calls,
+      (long long)c.mtm_row_entries,
+      c.n_mtm_calls > 0 ? (double)c.mtm_row_entries / c.n_mtm_calls : 0.0,
+      (long long)c.mtm_entries_capped,
+      c.n_mtm_calls > 0 ? (double)c.mtm_entries_capped / c.n_mtm_calls : 0.0,
+      (long long)c.n_compute_score_calls,
+      (long long)c.compute_score_nnz,
+      c.n_compute_score_calls > 0 ? (double)c.compute_score_nnz / c.n_compute_score_calls : 0.0,
+      c.nnz_samples);
   }
 
-  std::printf("\n climber | refresh period | lhs total | periodic | bigval | perturb | restart |"
-              " epi vars | epi projections\n");
-  std::printf("---------+----------------+-----------+----------+--------+---------+---------+"
-              "----------+----------------\n");
+  std::printf(
+    "\n climber | refresh period | lhs total | periodic | bigval | perturb | restart |"
+    " epi vars | epi projections\n");
+  std::printf(
+    "---------+----------------+-----------+----------+--------+---------+---------+"
+    "----------+----------------\n");
   for (int k = 0; k < n_climbers; ++k) {
     const auto& c = *climbers[k];
     std::printf(" %7d | %14d | %9lld | %8lld | %6lld | %7lld | %7lld | %8zu | %15lld\n",
@@ -748,10 +786,12 @@ int main(int argc, char** argv)
 
   // Everything a climber spends outside the search loop. lp solve is the simplex share of lp seed,
   // so it is shown for attribution and left out of the total. A phase a lane does not run reads 0.
-  std::printf("\n climber |     seed | bnd prop |  lp seed | (lp solve) | colouring | features |"
-              " init lhs | bin setup |    total\n");
-  std::printf("---------+----------+----------+----------+------------+-----------+----------+"
-              "----------+-----------+---------\n");
+  std::printf(
+    "\n climber |     seed | bnd prop |  lp seed | (lp solve) | colouring | features |"
+    " init lhs | bin setup |    total\n");
+  std::printf(
+    "---------+----------+----------+----------+------------+-----------+----------+"
+    "----------+-----------+---------\n");
   for (int k = 0; k < n_climbers; ++k) {
     const auto& c      = *climbers[k];
     const double total = c.t_seed + c.t_bound_prop + c.t_lp_seed + c.t_coloring + c.t_features +
@@ -772,10 +812,12 @@ int main(int argc, char** argv)
   // The bin setup column above, by phase. Charged even when the fast path declines, so a scan that
   // only produces a rejection still shows. narrow, transpose and cardinality are the all-binary
   // path; encode is the general-integer one and runs twice when int8 is enough.
-  std::printf("\n climber | bin scan | bin narrow | transpose | cardinality | bin encode |"
-              " engine init | bin total\n");
-  std::printf("---------+----------+------------+-----------+-------------+------------+"
-              "-------------+----------\n");
+  std::printf(
+    "\n climber | bin scan | bin narrow | transpose | cardinality | bin encode |"
+    " engine init | bin total\n");
+  std::printf(
+    "---------+----------+------------+-----------+-------------+------------+"
+    "-------------+----------\n");
   for (int k = 0; k < n_climbers; ++k) {
     const auto& b = climbers[k]->bin_setup;
     std::printf(" %7d | %8.4f | %10.4f | %9.4f | %11.4f | %10.4f | %11.4f | %9.4f\n",
@@ -817,7 +859,9 @@ int main(int argc, char** argv)
 
   if (!sample_path.empty()) {
     size_t written = 0;
-    for (const auto& r : reservoirs) { written += r.samples.size(); }
+    for (const auto& r : reservoirs) {
+      written += r.samples.size();
+    }
     const bool ok = write_samples(sample_path, reservoirs, problem, handle.get_stream());
     std::printf("SAMPLES: %zu records from %d lanes, cap %d/lane, interval %d -> %s (%s)\n",
                 written,

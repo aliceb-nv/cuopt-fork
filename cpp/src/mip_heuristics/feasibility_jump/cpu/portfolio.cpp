@@ -145,7 +145,7 @@ void apply_lane_diversification(fj_cpu_climber_t<i_t, f_t>& c, int lane, int64_t
     // Enable more exploration
     c.settings.parameters.weight_smoothing_probability = 0.005;
   }
-  
+
   // Add specialized "escape" lane that aggressively explores the search space
   if (lane == 12) {
     c.infeasible_restart_window = 60;   // Ultra-aggressive restart
@@ -155,21 +155,21 @@ void apply_lane_diversification(fj_cpu_climber_t<i_t, f_t>& c, int lane, int64_t
     c.settings.parameters.tabu_tenure_min = 1;
     c.settings.parameters.tabu_tenure_max = 30;
   }
-  
+
   // Enhance lane 15 (structure-aware lane) for problematic structured instances
   if (lane == 15) {
     // Slightly more persistent search on structured problems
     c.infeasible_restart_window = 180;  // Increase from typical 250-500
     c.infeasible_restart_degrade_ratio = 1.04;  // Slightly more tolerant
   }
-  
+
   // Enhance lane 1 (already a sole crosser) for better performance on marginal instances
   if (lane == 1) {
     // Slightly more exploration while maintaining effectiveness
     c.settings.parameters.weight_smoothing_probability = 0.001;  // Increased from 0.0
     c.infeasible_restart_window = 150;  // Increased from 130
   }
-  
+
   // Enhance lane 9 (also a sole crosser) for better performance on extreme hub instances
   if (lane == 9) {
     // Slightly adjust for better balance between aggression and persistence

@@ -670,13 +670,15 @@ void build_start_assignment(problem_t<i_t, f_t>& problem,
 }
 
 #if MIP_INSTANTIATE_FLOAT
-template void build_start_assignment<int, float>(
-  problem_t<int, float>&, solution_t<int, float>&, const raft::handle_t*);
+template void build_start_assignment<int, float>(problem_t<int, float>&,
+                                                 solution_t<int, float>&,
+                                                 const raft::handle_t*);
 #endif
 
 #if MIP_INSTANTIATE_DOUBLE
-template void build_start_assignment<int, double>(
-  problem_t<int, double>&, solution_t<int, double>&, const raft::handle_t*);
+template void build_start_assignment<int, double>(problem_t<int, double>&,
+                                                  solution_t<int, double>&,
+                                                  const raft::handle_t*);
 #endif
 
 }  // namespace cuopt::mathematical_optimization::mip

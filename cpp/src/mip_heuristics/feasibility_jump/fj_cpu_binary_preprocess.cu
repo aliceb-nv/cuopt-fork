@@ -297,9 +297,9 @@ void fj_bin_narrow(const fj_cpu_climber_t<i_t, f_t>& c,
       const double a = s * coeffs[k];
       const long ai  = side * std::lround(a);
       cuopt_assert(is_integer(a, tol), "row scaling left a fractional coefficient");
-      cuopt_assert(ai >= std::numeric_limits<coef_t>::min() &&
-                     ai <= std::numeric_limits<coef_t>::max(),
-                   "scaled coefficient exceeds selected width");
+      cuopt_assert(
+        ai >= std::numeric_limits<coef_t>::min() && ai <= std::numeric_limits<coef_t>::max(),
+        "scaled coefficient exceeds selected width");
       const int32_t v = variables[k];
       if (pb.original_to_bin_mapping[v] < 0) {
         cuopt_assert(!ignore_var || !ignore_var[v],
@@ -387,13 +387,14 @@ void fj_bin_narrow(const fj_cpu_climber_t<i_t, f_t>& c,
       }
       std::sort(row_terms.begin(), row_terms.end());
       for (size_t i = 0; i < row_terms.size();) {
-        size_t j = i + 1;
+        size_t j       = i + 1;
         const double a = row_terms[i].first;
         while (j < row_terms.size() &&
                std::fabs(row_terms[j].first - a) <= tol * std::max(1.0, std::fabs(a)))
           ++j;
         if (j - i >= 2) {
-          for (size_t q = i; q < j; ++q) pb.selector_vars.push_back(row_terms[q].second);
+          for (size_t q = i; q < j; ++q)
+            pb.selector_vars.push_back(row_terms[q].second);
           pb.selector_offsets.push_back((int32_t)pb.selector_vars.size());
         }
         i = j;
@@ -420,8 +421,8 @@ void fj_bin_narrow(const fj_cpu_climber_t<i_t, f_t>& c,
     cuopt_assert(pb.selector_reverse_offsets[n_engine] == (int32_t)pb.selector_vars.size(),
                  "selector transpose lost a membership");
 
-    // Every variable here is binary, so an equality row whose members share one coefficient reads as
-    // a cardinality constraint. Counted on the unscaled row: the row scale multiplies bound and
+    // Every variable here is binary, so an equality row whose members share one coefficient reads
+    // as a cardinality constraint. Counted on the unscaled row: the row scale multiplies bound and
     // coefficients alike and leaves the ratio alone.
     pb.card_offsets.assign(1, 0);
     pb.card_vars.clear();
@@ -465,7 +466,7 @@ void fj_bin_narrow(const fj_cpu_climber_t<i_t, f_t>& c,
   }
 }
 
-constexpr int32_t fj_bin_encode_max_bits = 16;
+constexpr int32_t fj_bin_encode_max_bits   = 16;
 constexpr int64_t fj_bin_encode_max_growth = 6;
 
 // Encodes an all-integer model with bounded general integers into bits: x in [L,U] becomes
@@ -659,30 +660,42 @@ bool fj_bin_encode(const fj_cpu_climber_t<i_t, f_t>& c,
 
 #if MIP_INSTANTIATE_FLOAT
 template fj_bin_scan_t fj_bin_scan(const fj_cpu_climber_t<int, float>&, fj_bin_setup_times_t&);
-template void fj_bin_narrow(
-  const fj_cpu_climber_t<int, float>&, const fj_bin_scan_t&, fj_bin_problem_t<int8_t>&, fj_bin_setup_times_t&);
+template void fj_bin_narrow(const fj_cpu_climber_t<int, float>&,
+                            const fj_bin_scan_t&,
+                            fj_bin_problem_t<int8_t>&,
+                            fj_bin_setup_times_t&);
 template void fj_bin_narrow(const fj_cpu_climber_t<int, float>&,
                             const fj_bin_scan_t&,
                             fj_bin_problem_t<int16_t>&,
                             fj_bin_setup_times_t&);
-template bool fj_bin_encode(
-  const fj_cpu_climber_t<int, float>&, fj_bin_problem_t<int8_t>&, int&, fj_bin_setup_times_t&);
-template bool fj_bin_encode(
-  const fj_cpu_climber_t<int, float>&, fj_bin_problem_t<int16_t>&, int&, fj_bin_setup_times_t&);
+template bool fj_bin_encode(const fj_cpu_climber_t<int, float>&,
+                            fj_bin_problem_t<int8_t>&,
+                            int&,
+                            fj_bin_setup_times_t&);
+template bool fj_bin_encode(const fj_cpu_climber_t<int, float>&,
+                            fj_bin_problem_t<int16_t>&,
+                            int&,
+                            fj_bin_setup_times_t&);
 #endif
 
 #if MIP_INSTANTIATE_DOUBLE
 template fj_bin_scan_t fj_bin_scan(const fj_cpu_climber_t<int, double>&, fj_bin_setup_times_t&);
-template void fj_bin_narrow(
-  const fj_cpu_climber_t<int, double>&, const fj_bin_scan_t&, fj_bin_problem_t<int8_t>&, fj_bin_setup_times_t&);
+template void fj_bin_narrow(const fj_cpu_climber_t<int, double>&,
+                            const fj_bin_scan_t&,
+                            fj_bin_problem_t<int8_t>&,
+                            fj_bin_setup_times_t&);
 template void fj_bin_narrow(const fj_cpu_climber_t<int, double>&,
                             const fj_bin_scan_t&,
                             fj_bin_problem_t<int16_t>&,
                             fj_bin_setup_times_t&);
-template bool fj_bin_encode(
-  const fj_cpu_climber_t<int, double>&, fj_bin_problem_t<int8_t>&, int&, fj_bin_setup_times_t&);
-template bool fj_bin_encode(
-  const fj_cpu_climber_t<int, double>&, fj_bin_problem_t<int16_t>&, int&, fj_bin_setup_times_t&);
+template bool fj_bin_encode(const fj_cpu_climber_t<int, double>&,
+                            fj_bin_problem_t<int8_t>&,
+                            int&,
+                            fj_bin_setup_times_t&);
+template bool fj_bin_encode(const fj_cpu_climber_t<int, double>&,
+                            fj_bin_problem_t<int16_t>&,
+                            int&,
+                            fj_bin_setup_times_t&);
 #endif
 
 }  // namespace cuopt::mathematical_optimization::mip

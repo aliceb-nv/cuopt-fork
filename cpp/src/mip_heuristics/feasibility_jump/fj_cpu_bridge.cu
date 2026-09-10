@@ -39,19 +39,19 @@ void init_fj_cpu_from_problem(fj_cpu_climber_t<i_t, f_t>& fj_cpu,
                               f_t objective_weight,
                               const probing_cache_t<i_t, f_t>* probing_cache)
 {
-  auto problem_data = std::make_shared<fj_cpu_problem_t<i_t, f_t>>();
-  fj_cpu.problem    = problem_data;
-  problem_data->tolerances              = problem.tolerances;
-  problem_data->n_variables             = problem.n_variables;
-  problem_data->n_constraints           = problem.n_constraints;
-  problem_data->nnz                     = problem.nnz;
-  const auto problem_view = problem.view();
+  auto problem_data                      = std::make_shared<fj_cpu_problem_t<i_t, f_t>>();
+  fj_cpu.problem                         = problem_data;
+  problem_data->tolerances               = problem.tolerances;
+  problem_data->n_variables              = problem.n_variables;
+  problem_data->n_constraints            = problem.n_constraints;
+  problem_data->nnz                      = problem.nnz;
+  const auto problem_view                = problem.view();
   problem_data->objective_scaling_factor = problem_view.objective_scaling_factor;
   problem_data->objective_offset         = problem_view.objective_offset;
 
   // Queue the device-to-host copies together and synchronize once before constructing host state.
-  auto stream                         = handle_ptr->get_stream();
-  const double download_start         = tic();
+  auto stream                 = handle_ptr->get_stream();
+  const double download_start = tic();
   problem_data->reverse_coefficients =
     copy_problem_vector_to_host_async(problem.reverse_coefficients, stream);
   problem_data->reverse_constraints =
@@ -71,16 +71,14 @@ void init_fj_cpu_from_problem(fj_cpu_climber_t<i_t, f_t>& fj_cpu,
   problem_data->h_var_types = copy_problem_vector_to_host_async(problem.variable_types, stream);
   fj_cpu.h_is_binary_variable =
     copy_problem_vector_to_host_async(problem.is_binary_variable, stream);
-  fj_cpu.h_binary_indices =
-    copy_problem_vector_to_host_async(problem.binary_indices, stream);
+  fj_cpu.h_binary_indices = copy_problem_vector_to_host_async(problem.binary_indices, stream);
   problem_data->h_related_variables =
     copy_problem_vector_to_host_async(problem.related_variables, stream);
   problem_data->h_related_variables_offsets =
     copy_problem_vector_to_host_async(problem.related_variables_offsets, stream);
   handle_ptr->sync_stream();
-  CUOPT_LOG_DEBUG("CPUFJ model download from device: %.4fs for %d nnz",
-                  toc(download_start),
-                  problem.nnz);
+  CUOPT_LOG_DEBUG(
+    "CPUFJ model download from device: %.4fs for %d nnz", toc(download_start), problem.nnz);
 
   auto host_lp = std::make_shared<simplex::user_problem_t<i_t, f_t>>(handle_ptr);
   problem.get_host_user_problem(*host_lp);
@@ -138,8 +136,7 @@ std::unique_ptr<fj_cpu_climber_t<i_t, f_t>> init_fj_cpu_from_optimization_proble
     copy_problem_vector_to_host_async(problem.get_constraint_matrix_values(), stream);
   auto variables =
     copy_problem_vector_to_host_async(problem.get_constraint_matrix_indices(), stream);
-  auto offsets =
-    copy_problem_vector_to_host_async(problem.get_constraint_matrix_offsets(), stream);
+  auto offsets = copy_problem_vector_to_host_async(problem.get_constraint_matrix_offsets(), stream);
   auto objective_coefficients =
     copy_problem_vector_to_host_async(problem.get_objective_coefficients(), stream);
   auto variable_lower_bounds =
@@ -155,9 +152,8 @@ std::unique_ptr<fj_cpu_climber_t<i_t, f_t>> init_fj_cpu_from_optimization_proble
   auto row_types      = copy_problem_vector_to_host_async(problem.get_row_types(), stream);
   auto variable_types = copy_problem_vector_to_host_async(problem.get_variable_types(), stream);
   problem.get_handle_ptr()->sync_stream();
-  CUOPT_LOG_DEBUG("CPUFJ model download from device: %.4fs for %d nnz",
-                  toc(download_start),
-                  problem.get_nnz());
+  CUOPT_LOG_DEBUG(
+    "CPUFJ model download from device: %.4fs for %d nnz", toc(download_start), problem.get_nnz());
 
   return init_fj_cpu_from_host_model<i_t, f_t>(problem.get_n_variables(),
                                                problem.get_n_constraints(),
@@ -183,7 +179,10 @@ std::unique_ptr<fj_cpu_climber_t<i_t, f_t>> init_fj_cpu_from_optimization_proble
 
 template <typename i_t, typename f_t>
 std::unique_ptr<fj_cpu_climber_t<i_t, f_t>> init_fj_cpu_standalone(
-  problem_t<i_t, f_t>& problem, std::atomic<bool>& preemption_flag, uint64_t seed, fj_settings_t settings)
+  problem_t<i_t, f_t>& problem,
+  std::atomic<bool>& preemption_flag,
+  uint64_t seed,
+  fj_settings_t settings)
 {
   raft::common::nvtx::range scope("init_fj_cpu_standalone");
   auto fj_cpu = std::make_unique<fj_cpu_climber_t<i_t, f_t>>(preemption_flag);
@@ -197,7 +196,7 @@ std::unique_ptr<fj_cpu_climber_t<i_t, f_t>> init_fj_cpu_standalone(
                            default_weights,
                            f_t{0},
                            no_implications);
-  fj_cpu->settings = settings;
+  fj_cpu->settings      = settings;
   fj_cpu->settings.seed = seed;
   return fj_cpu;
 }
@@ -222,12 +221,8 @@ void build_climber_portfolio(problem_t<i_t, f_t>& problem,
   fj_settings_t settings;
   settings.seed = static_cast<int>(lane_seeds[0]);
   auto first    = init_fj_cpu_standalone(problem, preemption_flags[0], lane_seeds[0], settings);
-  complete_climber_portfolio(std::move(first),
-                             lane_seeds,
-                             preemption_flags,
-                             climbers,
-                             base_seed,
-                             low_latency);
+  complete_climber_portfolio(
+    std::move(first), lane_seeds, preemption_flags, climbers, base_seed, low_latency);
 }
 
 template <typename i_t, typename f_t>
@@ -243,7 +238,7 @@ std::unique_ptr<fj_cpu_climber_t<i_t, f_t>> fj_t<i_t, f_t>::create_cpu_climber(
 {
   raft::common::nvtx::range scope("fj_cpu_init");
 
-  auto fj_cpu  = std::make_unique<fj_cpu_climber_t<i_t, f_t>>(preemption_flag);
+  auto fj_cpu   = std::make_unique<fj_cpu_climber_t<i_t, f_t>>(preemption_flag);
   auto sol_copy = solution;
   clamp_within_var_bounds(sol_copy.assignment, solution.problem_ptr, solution.handle_ptr);
 
@@ -264,7 +259,7 @@ std::unique_ptr<fj_cpu_climber_t<i_t, f_t>> fj_t<i_t, f_t>::create_cpu_climber(
     fj_cpu->perturb_interval = std::uniform_int_distribution<i_t>(50, 500)(rng);
   }
   fj_cpu->objective_corner_jump_gate = fj_cpu->perturb_interval * 4;
-  fj_cpu->settings.seed               = cuopt::seed_generator::get_seed();
+  fj_cpu->settings.seed              = cuopt::seed_generator::get_seed();
   return fj_cpu;
 }
 
@@ -282,15 +277,15 @@ template void build_climber_portfolio<int, float>(
   std::vector<std::unique_ptr<fj_cpu_climber_t<int, float>>>&,
   int64_t,
   bool);
-template std::unique_ptr<fj_cpu_climber_t<int, float>>
-fj_t<int, float>::create_cpu_climber(solution_t<int, float>&,
-                                     const std::vector<float>&,
-                                     const std::vector<float>&,
-                                     float,
-                                     std::atomic<bool>&,
-                                     const probing_cache_t<int, float>*,
-                                     fj_settings_t,
-                                     bool);
+template std::unique_ptr<fj_cpu_climber_t<int, float>> fj_t<int, float>::create_cpu_climber(
+  solution_t<int, float>&,
+  const std::vector<float>&,
+  const std::vector<float>&,
+  float,
+  std::atomic<bool>&,
+  const probing_cache_t<int, float>*,
+  fj_settings_t,
+  bool);
 #endif
 
 #if MIP_INSTANTIATE_DOUBLE
@@ -307,15 +302,15 @@ template void build_climber_portfolio<int, double>(
   std::vector<std::unique_ptr<fj_cpu_climber_t<int, double>>>&,
   int64_t,
   bool);
-template std::unique_ptr<fj_cpu_climber_t<int, double>>
-fj_t<int, double>::create_cpu_climber(solution_t<int, double>&,
-                                      const std::vector<double>&,
-                                      const std::vector<double>&,
-                                      double,
-                                      std::atomic<bool>&,
-                                      const probing_cache_t<int, double>*,
-                                      fj_settings_t,
-                                      bool);
+template std::unique_ptr<fj_cpu_climber_t<int, double>> fj_t<int, double>::create_cpu_climber(
+  solution_t<int, double>&,
+  const std::vector<double>&,
+  const std::vector<double>&,
+  double,
+  std::atomic<bool>&,
+  const probing_cache_t<int, double>*,
+  fj_settings_t,
+  bool);
 #endif
 
 }  // namespace cuopt::mathematical_optimization::mip

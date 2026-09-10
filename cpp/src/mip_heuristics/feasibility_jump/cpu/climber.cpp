@@ -123,6 +123,7 @@ void finalize_fj_cpu_host_initialization(
   raft::common::nvtx::range scope("finalize_fj_cpu_host_initialization");
   cuopt_assert(fj_cpu.problem.get() == &problem, "mutable problem builder does not match climber");
 
+  detect_implied_integers(fj_cpu, problem);
   wire_fj_cpu_host_views(fj_cpu, n_variables, n_constraints, n_integer_vars, nnz, tolerances);
   // The recognized index belongs to the model shared by all lane clones.
   build_cardinality_index(fj_cpu, problem);

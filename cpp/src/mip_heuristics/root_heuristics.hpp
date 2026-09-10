@@ -166,7 +166,7 @@ struct root_heuristics_t {
 
   root_heuristics_t(i_t max_workers)
     : worker_count_(std::make_shared<omp_atomic_t<i_t>>(0)),
-     
+
       max_workers_(max_workers),
       shared_incumbent_(make_fj_cpu_shared_incumbent<i_t, f_t>()),
       next_diving_type_(0)
@@ -254,8 +254,8 @@ struct root_heuristics_t {
     const std::vector<f_t>& root_edge_norm,
     const simplex::simplex_solver_settings_t<i_t, f_t>& settings)
   {
-    auto& heuristic = cut_passes_heuristics_.emplace_back(
-      std::make_shared<cut_pass_heuristics_t<i_t, f_t>>(
+    auto& heuristic =
+      cut_passes_heuristics_.emplace_back(std::make_shared<cut_pass_heuristics_t<i_t, f_t>>(
         Arow, var_types, root_solution, root_edge_norm, settings));
     // Read by create_worker, so it has to be in place before the caller builds the climber.
     heuristic->fj_cpu_worker_.shared_incumbent = shared_incumbent_;

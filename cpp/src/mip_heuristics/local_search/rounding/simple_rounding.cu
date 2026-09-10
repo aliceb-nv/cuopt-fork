@@ -124,8 +124,8 @@ void invoke_random_round_nearest(solution_t<i_t, f_t>& solution,
                                  uint64_t seed)
 {
   pcgenerator_t seed_rng(seed);
-  i_t TPB        = 128;
-  i_t n_blocks   = (solution.problem_ptr->n_variables + TPB - 1) / TPB;
+  i_t TPB                         = 128;
+  i_t n_blocks                    = (solution.problem_ptr->n_variables + TPB - 1) / TPB;
   [[maybe_unused]] i_t n_integers = solution.compute_number_of_integers();
   CUOPT_LOG_TRACE("before random roundin n_integers %d total n_integers %d",
                   n_integers,

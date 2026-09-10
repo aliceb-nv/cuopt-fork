@@ -6,6 +6,8 @@
 // CPUFJ is intentionally instantiated in one host translation unit. The search headers contain the
 // latency-sensitive template chain; setup, seed, audit, and orchestration implementations retain
 // their final source-file boundaries while sharing this instantiation boundary.
+// Dependency-ordered implementation includes: declarations must precede their consumers.
+// clang-format off
 #include "problem.hpp"
 #include "state.hpp"
 #include "search/score.hpp"
@@ -26,6 +28,7 @@
 #include "climber.cpp"
 #include "loop.cpp"
 #include "portfolio.cpp"
+// clang-format on
 
 namespace cuopt::mathematical_optimization::mip {
 

@@ -105,7 +105,6 @@ struct host_contiguous_set_t {
   std::vector<uint8_t> is_member;
 };
 
-
 // Best feasible assignment found by any lane of one portfolio. A lane publishes its own
 // improvements and adopts a better one when it perturbs, so a lane that has stalled resumes from
 // the portfolio's progress instead of its own. Lanes run concurrently, so which lane observes
@@ -146,7 +145,6 @@ struct fj_cpu_shared_incumbent_t {
   std::vector<f_t> assignment;
   std::atomic<f_t> objective{std::numeric_limits<f_t>::infinity()};
 };
-
 
 // The problem as given: two-sided rows, original column space. Written once during climber
 // construction and read-only from then on, so every lane shares one copy rather than carrying its
@@ -463,39 +461,39 @@ struct fj_cpu_climber_t : fj_tabu_t<i_t>,
                           fj_lane_policy_t<i_t, f_t>,
                           fj_stats_t<i_t>,
                           fj_runtime_t<i_t, f_t> {
-  fj_cpu_climber_t(std::atomic<bool>& preemption_flag)
-    : fj_runtime_t<i_t, f_t>(preemption_flag)
+  fj_cpu_climber_t(std::atomic<bool>& preemption_flag) : fj_runtime_t<i_t, f_t>(preemption_flag)
   {
 #define ADD_INSTRUMENTED(var) \
   std::make_pair(#var, std::ref(static_cast<memory_instrumentation_base_t&>(this->var)))
 
     // Initialize memory aggregator with all ins_vector members
-    this->memory_aggregator = instrumentation_aggregator_t{ADD_INSTRUMENTED(h_tabu_nodec_until),
-                                                     ADD_INSTRUMENTED(h_tabu_noinc_until),
-                                                     ADD_INSTRUMENTED(h_tabu_lastdec),
-                                                     ADD_INSTRUMENTED(h_tabu_lastinc),
-                                                     ADD_INSTRUMENTED(h_lhs),
-                                                     ADD_INSTRUMENTED(h_lhs_sumcomp),
-                                                     ADD_INSTRUMENTED(h_cstr_left_weights),
-                                                     ADD_INSTRUMENTED(h_cstr_right_weights),
-                                                     ADD_INSTRUMENTED(h_var_bounds),
-                                                     ADD_INSTRUMENTED(h_is_binary_variable),
-                                                     ADD_INSTRUMENTED(h_binary_indices),
-                                                     ADD_INSTRUMENTED(h_binrow_offsets),
-                                                     ADD_INSTRUMENTED(h_binrow_vars),
-                                                     ADD_INSTRUMENTED(h_assignment),
-                                                     ADD_INSTRUMENTED(h_best_assignment),
-                                                     ADD_INSTRUMENTED(h_best_infeasible_assignment),
-                                                     ADD_INSTRUMENTED(h_row_state),
-                                                     ADD_INSTRUMENTED(h_row_is_integral),
-                                                     ADD_INSTRUMENTED(h_slack_sumcomp),
-                                                     ADD_INSTRUMENTED(h_bound),
-                                                     ADD_INSTRUMENTED(h_offsets),
-                                                     ADD_INSTRUMENTED(h_variables),
-                                                     ADD_INSTRUMENTED(h_coefficients),
-                                                     ADD_INSTRUMENTED(h_reverse_offsets),
-                                                     ADD_INSTRUMENTED(h_reverse_constraints),
-                                                     ADD_INSTRUMENTED(h_reverse_coefficients)};
+    this->memory_aggregator =
+      instrumentation_aggregator_t{ADD_INSTRUMENTED(h_tabu_nodec_until),
+                                   ADD_INSTRUMENTED(h_tabu_noinc_until),
+                                   ADD_INSTRUMENTED(h_tabu_lastdec),
+                                   ADD_INSTRUMENTED(h_tabu_lastinc),
+                                   ADD_INSTRUMENTED(h_lhs),
+                                   ADD_INSTRUMENTED(h_lhs_sumcomp),
+                                   ADD_INSTRUMENTED(h_cstr_left_weights),
+                                   ADD_INSTRUMENTED(h_cstr_right_weights),
+                                   ADD_INSTRUMENTED(h_var_bounds),
+                                   ADD_INSTRUMENTED(h_is_binary_variable),
+                                   ADD_INSTRUMENTED(h_binary_indices),
+                                   ADD_INSTRUMENTED(h_binrow_offsets),
+                                   ADD_INSTRUMENTED(h_binrow_vars),
+                                   ADD_INSTRUMENTED(h_assignment),
+                                   ADD_INSTRUMENTED(h_best_assignment),
+                                   ADD_INSTRUMENTED(h_best_infeasible_assignment),
+                                   ADD_INSTRUMENTED(h_row_state),
+                                   ADD_INSTRUMENTED(h_row_is_integral),
+                                   ADD_INSTRUMENTED(h_slack_sumcomp),
+                                   ADD_INSTRUMENTED(h_bound),
+                                   ADD_INSTRUMENTED(h_offsets),
+                                   ADD_INSTRUMENTED(h_variables),
+                                   ADD_INSTRUMENTED(h_coefficients),
+                                   ADD_INSTRUMENTED(h_reverse_offsets),
+                                   ADD_INSTRUMENTED(h_reverse_constraints),
+                                   ADD_INSTRUMENTED(h_reverse_coefficients)};
 
 #undef ADD_INSTRUMENTED
   }
@@ -520,10 +518,7 @@ struct fj_cpu_climber_t : fj_tabu_t<i_t>,
     return value <= get_upper(bounds) + tol && value >= get_lower(bounds) - tol;
   }
 
-  bool move_numerically_stable(f_t old_value,
-                               f_t new_value,
-                               f_t infeasibility,
-                               f_t total) const
+  bool move_numerically_stable(f_t old_value, f_t new_value, f_t infeasibility, f_t total) const
   {
     return std::abs(new_value - old_value) < 1e6 && std::abs(new_value) < 1e20 &&
            std::abs(total - infeasibility) < 1e20;
@@ -546,9 +541,8 @@ struct fj_cpu_climber_t : fj_tabu_t<i_t>,
     cuopt_assert(std::isfinite(excess) && excess < 0, "invalid breakthrough state");
     f_t value = old_value + excess / coefficient;
     if (problem->h_var_types[variable] == var_t::INTEGER) {
-      value = coefficient > 0
-                ? std::floor(value + problem->tolerances.integrality_tolerance)
-                : std::ceil(value - problem->tolerances.integrality_tolerance);
+      value = coefficient > 0 ? std::floor(value + problem->tolerances.integrality_tolerance)
+                              : std::ceil(value - problem->tolerances.integrality_tolerance);
     }
     if (!check_variable_within_bounds(variable, value))
       value = coefficient > 0 ? get_lower(bounds) : get_upper(bounds);
@@ -558,7 +552,6 @@ struct fj_cpu_climber_t : fj_tabu_t<i_t>,
 
   // Shared across every lane and frozen before the first clone is created; see fj_cpu_problem_t.
   std::shared_ptr<const fj_cpu_problem_t<i_t, f_t>> problem;
-
 };
 
 template <typename i_t, typename f_t>
@@ -582,12 +575,11 @@ void apply_lane_diversification(fj_cpu_climber_t<i_t, f_t>& climber, int lane, i
 // Completes a portfolio from a lane-zero climber whose GPU-backed problem has already been
 // adapted into host state by the CUDA bridge.
 template <typename i_t, typename f_t>
-void complete_climber_portfolio(
-  std::unique_ptr<fj_cpu_climber_t<i_t, f_t>> first_climber,
-  const std::vector<int64_t>& lane_seeds,
-  std::vector<std::atomic<bool>>& preemption_flags,
-  std::vector<std::unique_ptr<fj_cpu_climber_t<i_t, f_t>>>& climbers,
-  int64_t base_seed,
-  bool low_latency = false);
+void complete_climber_portfolio(std::unique_ptr<fj_cpu_climber_t<i_t, f_t>> first_climber,
+                                const std::vector<int64_t>& lane_seeds,
+                                std::vector<std::atomic<bool>>& preemption_flags,
+                                std::vector<std::unique_ptr<fj_cpu_climber_t<i_t, f_t>>>& climbers,
+                                int64_t base_seed,
+                                bool low_latency = false);
 
 }  // namespace cuopt::mathematical_optimization::mip

@@ -12,8 +12,8 @@
 namespace cuopt::mathematical_optimization::mip {
 
 template <typename i_t, typename f_t, typename Iterator>
-__attribute__((optimize("no-fast-math")))
-HDI f_t fj_kahan_babushka_neumaier_sum(Iterator begin, Iterator end)
+__attribute__((optimize("no-fast-math"))) HDI f_t fj_kahan_babushka_neumaier_sum(Iterator begin,
+                                                                                 Iterator end)
 {
   f_t sum = 0;
   f_t c   = 0;

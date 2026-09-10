@@ -11,14 +11,14 @@
 namespace cuopt::mathematical_optimization::mip {
 
 struct fj_hyper_parameters_t {
-  int max_sampled_moves = 32 * 16;
-  double random_var_probability = 0.04;
-  double random_cstr_probability = 0.16;
-  int global_move_update_period      = 10;
-  int heavy_move_update_period       = 50;
-  int sync_period                    = 200;
-  int lhs_refresh_period             = 500;
-  int allow_infeasibility_iterations = 200;
+  int max_sampled_moves                   = 32 * 16;
+  double random_var_probability           = 0.04;
+  double random_cstr_probability          = 0.16;
+  int global_move_update_period           = 10;
+  int heavy_move_update_period            = 50;
+  int sync_period                         = 200;
+  int lhs_refresh_period                  = 500;
+  int allow_infeasibility_iterations      = 200;
   double objective_weight_increment       = 0.01;
   int load_balancing_variable_threshold   = 300;
   int load_balancing_constraint_threshold = 5000;
@@ -44,13 +44,7 @@ struct fj_hyper_parameters_t {
   int load_balancing_codepath_min_varcount             = 3200;
 };
 
-enum class fj_mode_t {
-  FIRST_FEASIBLE,
-  GREEDY_DESCENT,
-  TREE,
-  ROUNDING,
-  EXIT_NON_IMPROVING
-};
+enum class fj_mode_t { FIRST_FEASIBLE, GREEDY_DESCENT, TREE, ROUNDING, EXIT_NON_IMPROVING };
 
 enum class MTMMoveType { FJ_MTM_VIOLATED, FJ_MTM_SATISFIED, FJ_MTM_ALL };
 
