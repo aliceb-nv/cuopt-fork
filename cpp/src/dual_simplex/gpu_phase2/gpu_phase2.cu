@@ -611,7 +611,7 @@ __device__ __forceinline__ void warp_solve2_body_op(const i_t* a_corder, const i
     a_cs, a_ridx, a_val, a_x0, a_x1, a_lstart, a_corder, a_nlev);
 }
 
-__device__ __forceinline__ void warp_tloop_body(bool a_tl_asc, i_t a_tl_axpyoff, const i_t* a_tl_cs, i_t a_tl_dotoff, const f_t* a_tl_mu, i_t a_tl_num, const i_t* a_tl_ri, f_t a_tl_tol, const f_t* a_tl_val, f_t* a_x)
+__device__ __forceinline__ void warp_tloop_body(bool a_tl_asc, i_t a_tl_axpyoff, const i_t* a_tl_cs, i_t a_tl_dotoff, const f_t* a_tl_inv_mu, i_t a_tl_num, const i_t* a_tl_ri, f_t a_tl_tol, const f_t* a_tl_val, f_t* a_x)
 {
   const int lane = static_cast<int>(threadIdx.x);
   const i_t num  = a_tl_num;
@@ -620,7 +620,7 @@ __device__ __forceinline__ void warp_tloop_body(bool a_tl_asc, i_t a_tl_axpyoff,
     const i_t k    = a_tl_asc ? s : (num - 1 - s);
     const i_t dcol = 2 * k + a_tl_dotoff;
     const i_t acol = 2 * k + a_tl_axpyoff;
-    const f_t mu   = a_tl_mu[k];
+    const f_t inv_mu = a_tl_inv_mu[k];
     const i_t dc0  = a_tl_cs[dcol];
     const i_t dc1  = a_tl_cs[dcol + 1];
     // Short-column fast path. The T-loop is 16.2% of all block cycles and its dot products run on
@@ -652,7 +652,7 @@ __device__ __forceinline__ void warp_tloop_body(bool a_tl_asc, i_t a_tl_axpyoff,
       for (i_t p = dc0 + lane; p < dc1; p += 32) { partial += a_tl_val[p] * x[a_tl_ri[p]]; }
       dot = warp_reduce_add(partial);   // every lane gets the full sum
     }
-    const f_t theta = dot / mu;
+    const f_t theta = dot * inv_mu;
     if (fabs(theta) > a_tl_tol) {
       const i_t ac0 = a_tl_cs[acol];
       const i_t ac1 = a_tl_cs[acol + 1];
@@ -667,7 +667,7 @@ __device__ __forceinline__ void warp_tloop_body(bool a_tl_asc, i_t a_tl_axpyoff,
 // loaded once; the two reductions preserve the one-RHS accumulation order independently.
 template <bool Ascending, i_t AxpyOffset, i_t DotOffset>
 __device__ __forceinline__ void warp_tloop2_body(const i_t* a_cs,
-                                                 const f_t* a_mu,
+                                                 const f_t* a_inv_mu,
                                                  i_t a_num,
                                                  const i_t* a_ri,
                                                  f_t a_tol,
@@ -712,9 +712,9 @@ __device__ __forceinline__ void warp_tloop2_body(const i_t* a_cs,
       dot0 = warp_reduce_add(part0);
       dot1 = warp_reduce_add(part1);
     }
-    const f_t mu     = a_mu[k];
-    const f_t theta0 = dot0 / mu;
-    const f_t theta1 = dot1 / mu;
+    const f_t inv_mu = a_inv_mu[k];
+    const f_t theta0 = dot0 * inv_mu;
+    const f_t theta1 = dot1 * inv_mu;
     const i_t a0     = a_cs[acol];
     const i_t a1     = a_cs[acol + 1];
     if (fabs(theta0) > a_tol) {
@@ -1101,7 +1101,7 @@ __device__ __forceinline__ void warp_solve_to_workspace_body(i_t a_m, i_t* a_mar
 // The <=2 dot fast path is bit-identical for the same reason as in warp_tloop_body.
 template <bool Ascending, int DotOffset, int AxpyOffset>
 __device__ __forceinline__ void warp_tloop_sparse_body(const i_t* a_cs,
-                                                       const f_t* a_mu,
+                                                       const f_t* a_inv_mu,
                                                        i_t a_num,
                                                        const i_t* a_ri,
                                                        f_t a_tol,
@@ -1118,7 +1118,7 @@ __device__ __forceinline__ void warp_tloop_sparse_body(const i_t* a_cs,
   i_t nz         = *a_nz;   // warp-uniform on entry, and every update below keeps it uniform
   for (i_t step = 0; step < a_num; ++step) {
     const i_t k = Ascending ? step : (a_num - 1 - step);
-    const f_t mu   = a_mu[k];
+    const f_t inv_mu = a_inv_mu[k];
     const i_t dcol = 2 * k + DotOffset;
     const i_t d0   = a_cs[dcol];
     const i_t d1   = a_cs[dcol + 1];
@@ -1137,7 +1137,7 @@ __device__ __forceinline__ void warp_tloop_sparse_body(const i_t* a_cs,
       }
       dot = warp_reduce_add(partial);
     }
-    const f_t theta = dot / mu;
+    const f_t theta = dot * inv_mu;
     if (fabs(theta) > a_tol) {
       // The dot and AXPY CSC columns are adjacent, so one AXPY boundary is already in d0/d1.
       // Compile-time offsets let both directions reuse it without adding a runtime branch.
@@ -2504,7 +2504,7 @@ struct gpu_basis_update_mpf_t {
                                       S_.x.data() + S_.col_start[S_start + 1],
                                       S_.col_start[S_start + 2] - S_.col_start[S_start + 1]);
       if (fabs(mu) < 1E-8 || fabs(mu) > 1E+8) { status = 1; }
-      else { mu_values_.push_back(mu); }
+      else { mu_values_.push_back(f_t{1.0} / mu); }
     });
     status = lane0_bcast(status);
     // Matches the serial version: on the numerical bail-out the workspace is NOT cleared and
@@ -3649,16 +3649,23 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
       return dual::status_t::NUMERICAL;
     }
 
-    update_steepest_edge_norms(settings, basic_list, ft, direction, delta_y_sparse, dy_norm_sq,
-                               scaled_dxB_sparse, basic_leaving, entering, v.data(), v_sparse,
-                               delta_y_steepest_edge);
-
     update_primal_variables(scaled_dxB_sparse, basic_list, delta_x.data(), entering, x);
 
     // Incrementally update the objective the SAME way the CPU driver does (phase2.cpp:4259):
     // obj += delta_x·objective over the changed basics + entering, true costs, called with the
     // OLD basic_list (before the swap below), WITHOUT the bound-flip contribution.
     update_objective(basic_list, scaled_dxB_sparse, lp.objective, delta_x.data(), entering, obj);
+
+    // A cutoff node is complete after its primal/objective update. The remaining state is only
+    // needed by a following pivot, so do not maintain it for a node that is being fathomed.
+    if (isfinite(settings.cut_off) && obj >= settings.cut_off) {
+      finish(iter + 1);
+      return dual::status_t::CUTOFF;
+    }
+
+    update_steepest_edge_norms(settings, basic_list, ft, direction, delta_y_sparse, dy_norm_sq,
+                               scaled_dxB_sparse, basic_leaving, entering, v.data(), v_sparse,
+                               delta_y_steepest_edge);
 
     // 5. Basis swap + MPF rank-1 stacking update.
     // Every line here is a read-modify-write on node-local state. Arow stays immutable;
@@ -3702,17 +3709,6 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     // back to `while` without counting, so `iter` counts pivots, not loop passes.
     lane0_serial([&] { iter++; });   // RMW on st.iter in global memory
 
-    // Objective cutoff (dual bound), checked AFTER the pivot/iter++ — mirrors the CPU
-    // simplified driver's placement + comparand (phase2.cpp:4377): the incrementally
-    // tracked objective `obj` (true costs, omits bound flips — a valid, conservative lower
-    // bound). Gated on a finite cutoff (default +inf skips it).
-    if (isfinite(settings.cut_off)) {
-      const f_t cutoff_obj = obj;
-      if (cutoff_obj >= settings.cut_off) {
-        finish(iter);
-        return dual::status_t::CUTOFF;
-      }
-    }
   }
   finish(iter_limit);
   return dual::status_t::ITERATION_LIMIT;
