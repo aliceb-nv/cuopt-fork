@@ -782,7 +782,8 @@ struct fj_bin_engine_t {
   }
 
   // look for objective-improving 2opt flips on the current assignment
-  void add_two_opt_partner(const fj_cpu_climber_t<i_t, f_t>& climber,
+  // for some reason GCC doesn't want to inline this function, despite bringin a 1.5x speedup on some instances
+  inline __attribute__((always_inline)) void add_two_opt_partner(const fj_cpu_climber_t<i_t, f_t>& climber,
                            int32_t first,
                            int32_t original,
                            f_t target,
@@ -795,8 +796,9 @@ struct fj_bin_engine_t {
     if (second < 0 || second == first) return;
     cuopt_assert(second < pb.n_variables && pb.bit_owner[second] == original,
                  "2-opt partner mapping is inconsistent");
-    const int32_t target_value = (int32_t)std::llround((double)target);
-    if (target_value < 0 || target_value > 1) return;
+    cuopt_assert(target == std::trunc(target), "2-opt partner target must be integral");
+    if (!(target >= 0 && target <= 1)) return;
+    const int32_t target_value = (int32_t)target;
     const int8_t delta = (int8_t)(target_value - assign[second]);
     if (delta == 0 || tabu_blocked(second, true)) return;
     two_opt_partners.emplace_back(second, delta);
