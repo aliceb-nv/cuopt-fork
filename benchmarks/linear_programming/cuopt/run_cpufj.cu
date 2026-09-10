@@ -440,7 +440,6 @@ int main(int argc, char** argv)
   // is editable. The log prefix is assigned here and not there, so every climber
   // stays identifiable in the log whatever the portfolio does.
   // The command-line seed controls lane RNG streams as well as persona tuning.
-  cuopt::seed_generator::set_seed(base_seed);
   mip::build_climber_portfolio<i_t, f_t>(
     problem, preemption_flags, climbers, base_seed, low_latency);
   std::vector<lane_reservoir_t> reservoirs(sample_path.empty() ? 0 : (size_t)n_climbers);
