@@ -224,6 +224,7 @@ void finalize_fj_cpu_host_initialization_from_template(
   }
 
   fj_cpu.bin_eliminated_rows = tmpl.bin_eliminated_rows;
+  fj_cpu.bin_singletons = tmpl.bin_singletons;
   fj_cpu.bin_ignore_row = tmpl.bin_ignore_row;
   fj_cpu.bin_ignore_var = tmpl.bin_ignore_var;
   fj_cpu.has_bin_elimination = tmpl.has_bin_elimination;

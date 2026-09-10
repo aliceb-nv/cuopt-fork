@@ -350,6 +350,8 @@ struct fj_bin_bridge_t {
     std::vector<f_t> positive_coeff, negative_coeff;
   };
   std::vector<bin_eliminated_row_t> bin_eliminated_rows;
+  // (row, column) substitutions that retain the singleton's bounds as row bounds.
+  std::vector<std::pair<i_t, i_t>> bin_singletons;
   std::vector<uint8_t> bin_ignore_row, bin_ignore_var;
   bool has_bin_elimination{false};
 };

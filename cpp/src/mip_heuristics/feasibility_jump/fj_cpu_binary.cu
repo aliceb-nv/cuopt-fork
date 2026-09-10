@@ -461,6 +461,12 @@ struct fj_bin_engine_t {
            ++p)
         lhs += climber.problem->coefficients[p] * values[climber.problem->variables[p]];
       const f_t residual = rec.rhs - lhs;
+      if (rec.all.size() == 1) {
+        const i_t var = rec.all[0];
+        values[var] +=
+          residual / climber.problem->reverse_coefficients[climber.problem->reverse_offsets[var]];
+        continue;
+      }
       if (residual > 0 && !rec.positive.empty())
         values[rec.positive[0]] += residual / rec.positive_coeff[0];
       else if (residual < 0 && !rec.negative.empty())
@@ -1306,6 +1312,7 @@ struct fj_bin_engine_t {
       for (int32_t b = 0; b < n_cols; ++b)
         bits_of[pb.bit_owner[b]].push_back(b);
       for (int32_t v = 0; v < pb.n_original; ++v) {
+        if (climber.has_bin_elimination && climber.bin_ignore_var[v]) continue;
         long residual = std::lround((double)h_assign[v] - pb.var_offset[v]);
         if (residual < 0) residual = 0;
         auto& bits = bits_of[v];
@@ -1360,7 +1367,7 @@ struct fj_bin_engine_t {
     cuopt_assert(std::isfinite(obj_magnitude) && obj_magnitude > 0,
                  "objective magnitude unit must be finite and positive");
 
-    objective_offset = 0;
+    objective_offset = pb.substitution_offset;
     for (int32_t v = 0; v < pb.n_original; ++v)
       objective_offset += pb.orig_objective[v] * pb.var_offset[v];
 
@@ -1504,6 +1511,7 @@ struct fj_bin_engine_t {
           h_assign[v] = (f_t)pb.var_offset[v];
         for (int32_t b = 0; b < pb.n_variables; ++b)
           if (assign[b]) h_assign[pb.bit_owner[b]] += (f_t)pb.bit_weight[b];
+        if (climber.has_bin_elimination) uncrush(climber, h_assign);
         climber.diversity_callback((f_t)incumbent_objective, h_assign);
       }
 

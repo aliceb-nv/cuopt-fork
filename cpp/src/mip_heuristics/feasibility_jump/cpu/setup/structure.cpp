@@ -192,6 +192,28 @@ void detect_free_equality_singletons(fj_cpu_climber_t<i_t, f_t>& c)
     const f_t rhs = model.cstr_lb[row];
     if (!std::isfinite(rhs) || rhs != model.cstr_ub[row]) continue;
     typename fj_cpu_climber_t<i_t, f_t>::bin_eliminated_row_t rec{row, rhs};
+    // A single nonnegative continuous slack can be substituted without fill-in.
+    // Keep the original model intact; the encoder applies its bounds and cost.
+    i_t singleton = -1;
+    for (i_t entry = model.offsets[row]; entry < model.offsets[row + 1]; ++entry) {
+      const i_t var = model.variables[entry];
+      if (model.h_var_types[var] != var_t::CONTINUOUS) continue;
+      const auto bounds = c.h_var_bounds[var].get();
+      if (singleton >= 0 || model.reverse_offsets[var + 1] - model.reverse_offsets[var] != 1 ||
+          std::abs(model.coefficients[entry]) != f_t{1} || get_lower(bounds) != f_t{0} ||
+          std::isfinite(get_upper(bounds)) || !std::isfinite(model.h_obj_coeffs[var])) {
+        singleton = -1;
+        break;
+      }
+      singleton = var;
+    }
+    if (singleton >= 0) {
+      c.bin_singletons.emplace_back(row, singleton);
+      c.bin_ignore_var[singleton] = 1;
+      rec.all.push_back(singleton);
+      c.bin_eliminated_rows.push_back(std::move(rec));
+      continue;
+    }
     bool valid = true, raises = false, lowers = false;
     for (i_t p = model.offsets[row]; p < model.offsets[row + 1]; ++p) {
       const i_t var = model.variables[p]; const f_t a = model.coefficients[p];
