@@ -4468,6 +4468,16 @@ template void compute_delta_z<int, double>(const csr_matrix_t<int, double>& Arow
 template void compute_initial_nonbasic_end<int, double>(const std::vector<int>& basic_mark,
                                                         csr_matrix_t<int, double>& Arow,
                                                         std::vector<int>& nonbasic_end);
+
+template int phase2::compute_primal_solution_from_basis<int, double>(
+  const lp_problem_t<int, double>&,
+  basis_update_mpf_t<int, double>&,
+  const std::vector<int>&,
+  const std::vector<int>&,
+  const std::vector<variable_status_t>&,
+  std::vector<double>&,
+  std::vector<double>&,
+  double&);
 #endif
 
 }  // namespace cuopt::mathematical_optimization::simplex

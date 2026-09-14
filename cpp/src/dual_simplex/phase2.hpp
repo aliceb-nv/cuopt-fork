@@ -32,7 +32,17 @@ enum class dual_status_t {
   ITERATION_LIMIT  = 5,
   CONCURRENT_LIMIT = 6,
   WORK_LIMIT       = 7,
-  UNSET            = 8
+  UNSET            = 8,
+  // NON-TERMINAL. The solve stopped because its basis representation must be rebuilt, not because
+  // it reached an answer: the periodic update limit was reached, the rank-1 update was unsafe
+  // (|mu| outside [1e-8,1e8]), or the preallocated update store is full. The caller refactorizes
+  // the basis the solve handed back and
+  // calls again to CONTINUE the same solve.
+  //
+  // Only the GPU driver produces it. The CPU drivers refactorize in place and keep iterating, which
+  // the device cannot do -- it has no LU factorization of its own. Nothing outside the solver may
+  // see this value: branch-and-bound must never treat it as a node result.
+  REFACTOR_NEEDED = 9
 };
 
 static std::string dual_status_to_string(dual_status_t status)
@@ -47,6 +57,7 @@ static std::string dual_status_to_string(dual_status_t status)
     case dual_status_t::CONCURRENT_LIMIT: return "CONCURRENT_LIMIT";
     case dual_status_t::WORK_LIMIT: return "WORK_LIMIT";
     case dual_status_t::UNSET: return "UNSET";
+    case dual_status_t::REFACTOR_NEEDED: return "REFACTOR_NEEDED";
   }
   return "UNKNOWN";
 }
@@ -129,5 +140,17 @@ template <typename i_t, typename f_t>
 void compute_initial_nonbasic_end(const std::vector<i_t>& basic_mark,
                                   csr_matrix_t<i_t, f_t>& Arow,
                                   std::vector<i_t>& nonbasic_end);
+
+namespace phase2 {
+template <typename i_t, typename f_t>
+i_t compute_primal_solution_from_basis(const lp_problem_t<i_t, f_t>& lp,
+                                       basis_update_mpf_t<i_t, f_t>& ft,
+                                       const std::vector<i_t>& basic_list,
+                                       const std::vector<i_t>& nonbasic_list,
+                                       const std::vector<variable_status_t>& vstatus,
+                                       std::vector<f_t>& x,
+                                       std::vector<f_t>& xB_workspace,
+                                       f_t& work_estimate);
+}  // namespace phase2
 
 }  // namespace cuopt::mathematical_optimization::simplex

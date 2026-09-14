@@ -29,6 +29,8 @@
 
 #include "dense_triangle_solve.cuh"
 
+#include <dual_simplex/basis_solves.hpp>
+
 #include <linear_algebra/sparse_matrix.hpp>
 #include <linear_algebra/sparse_vector.hpp>
 #include <math_optimization/tic_toc.hpp>
@@ -47,7 +49,6 @@
 
 #include <new>  // placement new: construct the per-slot persistent state in host-allocated memory
 
-#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <unordered_map>
@@ -3355,13 +3356,14 @@ struct slot_state {
   // lane 0; the collectives are opted in one at a time. The serial parts deliberately call the
   // <false> variants so porting one collective cannot silently move any other computation.
   __device__ __noinline__ void setup(const gpu_lp& lp,
-                        const gpu_settings& settings,
-                        variable_status_t* vstatus,
-                        i_t* basic_list,
-                        i_t* nonbasic_list,
-                        gpu_solution& sol,
-                        f_t* delta_y_steepest_edge,
-                        bool dy_se_empty)
+                                     const gpu_settings& settings,
+                                     variable_status_t* vstatus,
+                                     i_t* basic_list,
+                                     i_t* nonbasic_list,
+                                     gpu_solution& sol,
+                                     f_t* delta_y_steepest_edge,
+                                     bool dy_se_empty,
+                                     bool refactor_resume)
   {
     const i_t m = lp.num_rows;
     const i_t n = lp.num_cols;
@@ -3374,12 +3376,25 @@ struct slot_state {
     // not, so the two are split rather than sharing one lane-0 region.
     lane0_serial([&] { xB_workspace.assign(m, 0.0); });
 
-    set_primal_variables_on_bounds(lp, settings, z, vstatus, x);
+    // On a REFACTOR_NEEDED resume the host has already rebuilt x with
+    // phase2::compute_primal_solution_from_basis. Redoing it here would use a different formula
+    // -- these two set the nonbasic values from the sign of z and skip columns with
+    // |x_j| < 10*tight_tol -- and that difference moves the trajectory from the first refactor on.
+    if (!refactor_resume) {
+      set_primal_variables_on_bounds(lp, settings, z, vstatus, x);
 
-    // Both of these solve through the factors, so they follow the kernel's geometry — the monolith
-    // has always run them on the warp via Direct.
-    compute_primal_variables(
-      ft, lp.rhs, lp.A, basic_list, nonbasic_list, settings.tight_tol, x, xB_workspace, setup_rhs);
+      // Both of these solve through the factors, so they follow the kernel's geometry — the
+      // monolith has always run them on the warp via Direct.
+      compute_primal_variables(ft,
+                               lp.rhs,
+                               lp.A,
+                               basic_list,
+                               nonbasic_list,
+                               settings.tight_tol,
+                               x,
+                               xB_workspace,
+                               setup_rhs);
+    }
 
     if (dy_se_empty) {
       // Exact steepest-edge init (matches the CPU simplified's unconditional exact path).
@@ -3467,7 +3482,7 @@ struct slot_state {
 // `Direct`: all 32 lanes execute the body. Direct=false is the historical single-thread monolith
 // (lane 0 alone runs this body); Direct=true means ALL 32 lanes run it, so every allocation and
 // read-modify-write must be inside lane0_serial and every `return` must be warp-uniform.
-template <class FT>
+template <class FT, bool AllowRefactorExit>
 __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
                                                             const gpu_settings& settings,
                                                             variable_status_t* vstatus,
@@ -3476,7 +3491,8 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
                                                             i_t* nonbasic_list,
                                                             gpu_solution& sol,
                                                             f_t* delta_y_steepest_edge,
-                                                            bool dy_se_empty)
+                                                            bool dy_se_empty,
+                                                            bool refactor_resume)
 {
   const i_t m = lp.num_rows;
   const i_t n = lp.num_cols;
@@ -3488,8 +3504,15 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
   // Prologue into the slot. Unconditional: one launch is one solve, so this always runs. It used to
   // be guarded by st.inited so a re-entering fission super-step could skip it and reuse the live
   // state; there are no super-steps any more.
-  st.setup(
-    lp, settings, vstatus, basic_list, nonbasic_list, sol, delta_y_steepest_edge, dy_se_empty);
+  st.setup(lp,
+           settings,
+           vstatus,
+           basic_list,
+           nonbasic_list,
+           sol,
+           delta_y_steepest_edge,
+           dy_se_empty,
+           refactor_resume);
 
   // Bind the persistent slot members under their original names, so the pivot loop below is
   // unchanged by the state externalization and stays line-diffable against the CPU simplified
@@ -3686,16 +3709,28 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     // ft.update is COLLECTIVE now, so it must sit outside the lane-0 region above. It returns the
     // same status on every lane (its internal lane0_bcast), so the NUMERICAL exit is already
     // uniform; the broadcast below is kept for the !Warp instantiation.
+    // PERIODIC REFACTORIZATION, ON THE CPU'S SCHEDULE. The CPU evaluates this BEFORE ft.update and
+    // SKIPS that update when it fires (phase2.cpp). Testing after the update instead looks
+    // equivalent and is not: it refactorizes one pivot earlier while carrying one update more, so
+    // from the first refactor onward the two sides hold different numbers of stacked updates on
+    // LUs of DIFFERENT bases.
+    if constexpr (AllowRefactorExit) {
+      if (ft.num_updates() > settings.refactor_frequency) {
+        finish(iter + 1);
+        return dual::status_t::REFACTOR_NEEDED;
+      }
+    }
+
     _fu_status = ft.warp_update(utilde_sparse, UTsol_sparse, basic_leaving);
     _fu_status = lane0_bcast(_fu_status);
     if (_fu_status != 0) {
-      // Unchanged from before the store was preallocated: 1 = the rank-1 update is unsafe
-      // (|mu| outside [1e-8, 1e8]); 2 = the preallocated store is full. Both are terminal here.
-      //
-      // The CPU full driver treats the first as `should_refactor` and rebuilds the factorization in
-      // place rather than giving up, and the second is really the same condition. Surfacing that to
-      // the caller so it can refactor and resume needs a non-terminal status and a resume contract,
-      // which belongs with the branch-and-bound integration, not with this memory change.
+      // The CPU driver responds to an unsafe rank-1 update by refactorizing in place. The
+      // single-problem GPU path asks its host resume loop to do the same. The pivot and basis swap
+      // already happened, so resume from iter + 1 and do not repeat the pivot.
+      if constexpr (AllowRefactorExit) {
+        finish(iter + 1);
+        return dual::status_t::REFACTOR_NEEDED;
+      }
       finish(iter);
       return dual::status_t::NUMERICAL;
     }
@@ -3776,6 +3811,9 @@ struct kernel_args {
   f_t *x, *y, *z;
   f_t* dy_se;
   i_t dy_se_empty;
+  // Non-zero when this launch RESUMES after a host refactorization: the host already rebuilt the
+  // primal point the CPU's way, so setup() must leave x alone.
+  i_t refactor_resume;
   // settings
   f_t primal_tol, dual_tol, pivot_tol, tight_tol, fixed_tol, zero_tol, time_limit, cut_off,
     steepest_edge_ratio;
@@ -3859,7 +3897,7 @@ __device__ __noinline__ void warp_build_config(const gpu_basis_update_mpf_t<Fact
 // reads and writes only that problem's independently marshalled buffers in args[idx].
 // g_gpu_capacity_exceeded is reset by the HOST before launch (not here) so a late block cannot
 // clear a failure flag an earlier block already set.
-template <class FT>
+template <class FT, bool AllowRefactorExit>
 __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args, i_t idx)
 {
   using factor_index_type = typename FT::factor_index_type;
@@ -3969,15 +4007,17 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args, i_t id
     ft.warp_cfg_ = &cfg_shared;
   });
 
-  dual::status_t status = gpu_simplified_dual_phase2_device(lp,
-                                                            settings,
-                                                            a.vstatus,
-                                                            st,
-                                                            a.basic_list,
-                                                            a.nonbasic_list,
-                                                            sol,
-                                                            a.dy_se,
-                                                            a.dy_se_empty != 0);
+  dual::status_t status =
+    gpu_simplified_dual_phase2_device<FT, AllowRefactorExit>(lp,
+                                                             settings,
+                                                             a.vstatus,
+                                                             st,
+                                                             a.basic_list,
+                                                             a.nonbasic_list,
+                                                             sol,
+                                                             a.dy_se,
+                                                             a.dy_se_empty != 0,
+                                                             a.refactor_resume != 0);
 
   // `status` is warp-uniform (every terminal condition in the driver is), so these are same-value
   // stores from every lane — but keep a single writer.
@@ -4007,9 +4047,9 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args, i_t id
 // Keep the cleanup's measured 128-register occupancy target for both factor-index specializations.
 // Keep only the resident-block budget in flight. Each block dequeues another independent problem
 // after finishing its current one, reducing tail imbalance without sharing any per-problem state.
-template <class FT = gpu_basis_update_mpf_u16>
+template <class FT = gpu_basis_update_mpf_u16, bool AllowRefactorExit = false>
 __global__ void __launch_bounds__(32, 16)
-gpu_phase2_kernel_direct(kernel_args* args, i_t n_problems)
+  gpu_phase2_kernel_direct(kernel_args* args, i_t n_problems)
 {
   __shared__ i_t problem_idx;
   while (true) {
@@ -4018,7 +4058,7 @@ gpu_phase2_kernel_direct(kernel_args* args, i_t n_problems)
     }
     __syncwarp(0xffffffffu);
     if (problem_idx >= n_problems) { break; }
-    gpu_phase2_kernel_body<FT>(args, problem_idx);
+    gpu_phase2_kernel_body<FT, AllowRefactorExit>(args, problem_idx);
   }
 }
 
@@ -4123,15 +4163,6 @@ static void upload_solve_class_config()
 {
   const int on = 1;
   RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_elide_noop, &on, sizeof(int)));
-}
-
-// ---- [CONFIG] self-report -------------------------------------------------------------------
-// Every launch states its own decisive configuration. A measurement that reports its configuration
-// cannot be mislabelled by the operator, the shell history, or another agent reading the output.
-static void report_config(const char* path, size_t nprob, int factor_index_bits)
-{
-  std::printf("[CONFIG] path=%s geometry=persistent-warp<<<resident,32>>> problems=%zu factor_index_bits=%d\n",
-              path, nprob, factor_index_bits);
 }
 
 // Device heap (in-kernel gpu_span malloc arena) + stack are per-CONTEXT limits and the heap
@@ -4400,7 +4431,8 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
                                    lp_solution_t<i_t, f_t>& sol,
                                    std::vector<f_t>& delta_y_steepest_edge,
                                    const ro_upload* ro,
-                                   marshal_storage& st)
+                                   marshal_storage& st,
+                                   bool refactor_resume = false)
 {
   const int m = lp.num_rows;
   const int n = lp.num_cols;
@@ -4468,6 +4500,7 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   a.mpf_update_cap     = mpf_update_cap();
   a.mpf_eta_nnz_cap    = mpf_eta_nnz_cap();
 
+  a.refactor_resume = refactor_resume ? 1 : 0;
   a.vstatus       = upload(vstatus, st);
   a.basic_list    = upload(basic_list, st);
   a.nonbasic_list = upload(nonbasic_list, st);
@@ -4621,15 +4654,20 @@ static size_t problem_static_bytes(const lp_problem_t<i_t, f_t>& lp,
 // ---------------------------------------------------------------------------
 // Host wrapper. Same signature as simplified_dual_phase2.
 // ---------------------------------------------------------------------------
+// ONE LEG of a solve: marshal, launch, copy back. A leg ends either with a real answer or with
+// REFACTOR_NEEDED, in which case gpu_simplified_dual_phase2 below rebuilds the factorization and
+// calls this again. `resume` tells the device the host has already rebuilt the primal point.
 template <typename i_t, typename f_t>
-dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
-                                          const simplex_solver_settings_t<i_t, f_t>& settings,
-                                          std::vector<variable_status_t>& vstatus,
-                                          basis_update_mpf_t<i_t, f_t>& ft,
-                                          std::vector<i_t>& basic_list,
-                                          std::vector<i_t>& nonbasic_list,
-                                          lp_solution_t<i_t, f_t>& sol,
-                                          std::vector<f_t>& delta_y_steepest_edge)
+static dual::status_t gpu_simplified_dual_phase2_leg(
+  const lp_problem_t<i_t, f_t>& lp,
+  const simplex_solver_settings_t<i_t, f_t>& settings,
+  std::vector<variable_status_t>& vstatus,
+  basis_update_mpf_t<i_t, f_t>& ft,
+  std::vector<i_t>& basic_list,
+  std::vector<i_t>& nonbasic_list,
+  lp_solution_t<i_t, f_t>& sol,
+  std::vector<f_t>& delta_y_steepest_edge,
+  bool resume)
 {
   using namespace gpu_phase2_detail;
   static_assert(sizeof(i_t) == sizeof(int) && sizeof(f_t) == sizeof(double),
@@ -4666,17 +4704,28 @@ dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
   // Owns every uploaded buffer for this solve; destroyed at scope exit, returning them to the pool.
   marshal_storage store;
   const bool use_uint16_factors = factors_fit_uint16(m);
-  if (!use_uint16_factors) {
-    throw std::runtime_error(
-      "gpu_phase2: int32 factor-index kernel is temporarily disabled for faster compilation");
-  }
-  kernel_args a = use_uint16_factors
-                    ? marshal_problem<std::uint16_t>(
-                        lp, settings, vstatus, ft, basic_list, nonbasic_list, sol,
-                        delta_y_steepest_edge, nullptr, store)
-                    : marshal_problem<i_t>(
-                        lp, settings, vstatus, ft, basic_list, nonbasic_list, sol,
-                        delta_y_steepest_edge, nullptr, store);
+  kernel_args a                 = use_uint16_factors ? marshal_problem<std::uint16_t>(lp,
+                                                                      settings,
+                                                                      vstatus,
+                                                                      ft,
+                                                                      basic_list,
+                                                                      nonbasic_list,
+                                                                      sol,
+                                                                      delta_y_steepest_edge,
+                                                                      nullptr,
+                                                                      store,
+                                                                      resume)
+                                                     : marshal_problem<i_t>(lp,
+                                                            settings,
+                                                            vstatus,
+                                                            ft,
+                                                            basic_list,
+                                                            nonbasic_list,
+                                                            sol,
+                                                            delta_y_steepest_edge,
+                                                            nullptr,
+                                                            store,
+                                                            resume);
 
   // Reset the shared alloc-failed flag from the host (the kernel no longer does it).
   const int zero_flag = 0;
@@ -4690,23 +4739,14 @@ dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
   RAFT_CUDA_TRY(cudaMalloc(&d_args, sizeof(kernel_args)));
   RAFT_CUDA_TRY(cudaMemcpy(d_args, &a, sizeof(kernel_args), cudaMemcpyHostToDevice));
 
-  // Compile-time-selected optimized (warp) vs unoptimized (single-thread) kernel.
-  // Both templates are instantiated here so the compiler emits code for both; the
-  report_config("monolith", 1, use_uint16_factors ? 16 : 32);
   upload_solve_class_config();
-  const auto _k0 = std::chrono::steady_clock::now();
   if (use_uint16_factors) {
-    gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16><<<1, 32>>>(d_args, i_t{1});
+    gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16, true><<<1, 32>>>(d_args, i_t{1});
   } else {
-    // TEMPORARY: omit the validated int32 fallback from this profiling build to reduce ptxas time.
-    // Re-enable after host-setup optimization work.
-    // gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32><<<1, 32>>>(d_args, i_t{1});
+    gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32, true><<<1, 32>>>(d_args, i_t{1});
   }
   RAFT_CUDA_TRY(cudaPeekAtLastError());
   RAFT_CUDA_TRY(cudaDeviceSynchronize());
-  const double _kms = std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - _k0).count();
-  std::printf("[GPUKERNEL] ms=%.3f\n", _kms);
   cudaFree(d_args);
 
   // Marshal outputs back.
@@ -4720,6 +4760,15 @@ dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
   RAFT_CUDA_TRY(cudaMemcpy(sol.x.data(), a.x, n * sizeof(double), cudaMemcpyDeviceToHost));
   RAFT_CUDA_TRY(cudaMemcpy(sol.y.data(), a.y, m * sizeof(double), cudaMemcpyDeviceToHost));
   RAFT_CUDA_TRY(cudaMemcpy(sol.z.data(), a.z, n * sizeof(double), cudaMemcpyDeviceToHost));
+  // The FINAL basis and the maintained steepest-edge norms. Both are required to RESUME after a
+  // host refactorization: the next leg has to continue from the basis the device stopped on and
+  // from the norms it had, or it restarts pricing and takes a different path. y/z above are
+  // maintained incrementally by the driver for the same reason.
+  RAFT_CUDA_TRY(
+    cudaMemcpy(vstatus.data(), a.vstatus, n * sizeof(variable_status_t), cudaMemcpyDeviceToHost));
+  delta_y_steepest_edge.resize(static_cast<size_t>(n));
+  RAFT_CUDA_TRY(
+    cudaMemcpy(delta_y_steepest_edge.data(), a.dy_se, n * sizeof(double), cudaMemcpyDeviceToHost));
 
   sol.objective      = h_obj;
   sol.user_objective = h_uobj;
@@ -4773,14 +4822,6 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
       return;
     }
   }
-  if (!use_uint16_factors) {
-    timing.rejected = true;
-    timing.message  =
-      "int32 factor-index kernel is temporarily disabled for faster compilation";
-    std::fprintf(stderr, "[gpu_phase2] batch REJECTED: %s\n", timing.message.c_str());
-    return;
-  }
-
   // ---- Pre-flight VRAM check (fail loud, before any device allocation) ----
   size_t static_bytes = 0;
   for (size_t b = 0; b < N; ++b) {
@@ -4870,15 +4911,19 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
   timing.upload_s = toc(up_t0);
 
   // ---- Launch a resident work-stealing grid, timed with CUDA events (device compute only) ----
-  report_config("monolith", items.size(), use_uint16_factors ? 16 : 32);
   upload_solve_class_config();
   int device = 0;
   RAFT_CUDA_TRY(cudaGetDevice(&device));
   int sm_count = 1;
   RAFT_CUDA_TRY(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
   int blocks_per_sm = 1;
-  RAFT_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-    &blocks_per_sm, gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16>, 32, 0));
+  if (use_uint16_factors) {
+    RAFT_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &blocks_per_sm, gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16>, 32, 0));
+  } else {
+    RAFT_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &blocks_per_sm, gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32>, 32, 0));
+  }
   unsigned int nb = static_cast<unsigned int>(blocks_per_sm) * static_cast<unsigned int>(sm_count);
   if (nb == 0 || nb > N) { nb = static_cast<unsigned int>(N); }
   cudaEvent_t ev_start, ev_stop;
@@ -4892,9 +4937,7 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
       gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16><<<nb, 32>>>(
         d_args, static_cast<i_t>(N));
     } else {
-      // TEMPORARY: see the preflight rejection above.
-      // gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32><<<nb, 32>>>(
-      //   d_args, static_cast<i_t>(N));
+      gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32><<<nb, 32>>>(d_args, static_cast<i_t>(N));
     }
   }
   RAFT_CUDA_TRY(cudaEventRecord(ev_stop));
@@ -4940,6 +4983,89 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
 
   for (const auto& kv : ro_cache) { free_ro(kv.second); }
   cudaFree(d_args);
+}
+
+// ---------------------------------------------------------------------------
+// Public single-problem entry: the host refactor-and-resume loop.
+//
+// The device stops with REFACTOR_NEEDED at the periodic update limit, when its rank-1 update is
+// unsafe (|mu| outside [1e-8, 1e8]), or when its preallocated update store is full. The CPU driver
+// responds by refactorizing in place and continuing; the device cannot, because it has no LU of
+// its own. So this rebuilds the
+// factorization of the basis the device stopped on and calls it straight back, and REFACTOR_NEEDED
+// never escapes this function.
+//
+// The resume is exact, not a restart: the device hands back the basis it reached, its primal point,
+// its objective, its maintained duals and its steepest-edge norms, and every one of those goes
+// straight back in. Only the factorization is rebuilt. Two details are load-bearing, and both were
+// found by a trajectory divergence rather than by reasoning:
+//   - The duals are NOT re-priced. The CPU's in-place refactor rebuilds the LU and recomputes x
+//     ONLY, leaving the maintained reduced costs alone. A freshly priced z can violate the
+//     dual-feasibility signs the ratio test established against the maintained one, which produces
+//     negative steps and destroys the iterate.
+//   - The primal point is rebuilt with the CPU's post-refactor formula, and `refactor_resume` tells
+//     the device not to redo it with its different cold-start one.
+// ---------------------------------------------------------------------------
+template <typename i_t, typename f_t>
+dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
+                                          const simplex_solver_settings_t<i_t, f_t>& settings,
+                                          std::vector<variable_status_t>& vstatus,
+                                          basis_update_mpf_t<i_t, f_t>& ft,
+                                          std::vector<i_t>& basic_list,
+                                          std::vector<i_t>& nonbasic_list,
+                                          lp_solution_t<i_t, f_t>& sol,
+                                          std::vector<f_t>& delta_y_steepest_edge)
+{
+  const i_t m = lp.num_rows;
+  // Bound the loop on progress, not on a total leg count: a long solve may legitimately require
+  // many periodic refactorizations, while repeated legs without a pivot indicate a livelock.
+  constexpr int kMaxStalledLegs = 8;
+  int stalled_legs              = 0;
+  const f_t t0                  = cuopt::mathematical_optimization::tic();
+
+  std::vector<i_t> superbasic_list;
+  std::vector<f_t> xB_workspace;
+  f_t work_estimate = 0.0;
+  i_t total_iters   = 0;
+  bool resume       = false;
+
+  while (true) {
+    const dual::status_t st = gpu_simplified_dual_phase2_leg<i_t, f_t>(
+      lp, settings, vstatus, ft, basic_list, nonbasic_list, sol, delta_y_steepest_edge, resume);
+
+    // ONE solve, however many launches it took: the caller's iteration count must not reset at a
+    // refactorization the caller never asked for.
+    total_iters += sol.iterations;
+    if (st != dual::status_t::REFACTOR_NEEDED) {
+      sol.iterations = total_iters;
+      return st;
+    }
+    stalled_legs = (sol.iterations == 0) ? (stalled_legs + 1) : 0;
+    if (stalled_legs > kMaxStalledLegs) {
+      sol.iterations = total_iters;
+      return dual::status_t::NUMERICAL;
+    }
+
+    // Rebuild the factorization of the basis the device stopped on. get_basis_from_vstatus writes
+    // basic_list BY INDEX and only pushes back on nonbasic_list, so basic_list must be pre-sized to
+    // m -- clearing it instead writes out of bounds -- and nonbasic_list must be cleared, or it
+    // grows by n - m every leg and every later consumer reads the FIRST basis forever after.
+    basic_list.assign(static_cast<size_t>(m), 0);
+    nonbasic_list.clear();
+    nonbasic_list.reserve(static_cast<size_t>(lp.num_cols - m));
+    superbasic_list.clear();
+    get_basis_from_vstatus<i_t>(m, vstatus, basic_list, nonbasic_list, superbasic_list);
+    // Same policy as the CPU simplified driver: any non-zero return (singular basis, a repair that
+    // did not restore rank, a halt or time-limit code) ends the solve as NUMERICAL.
+    if (ft.refactor_basis(
+          lp.A, settings, lp.lower, lp.upper, t0, basic_list, nonbasic_list, vstatus) != 0) {
+      sol.iterations = total_iters;
+      return dual::status_t::NUMERICAL;
+    }
+    phase2::compute_primal_solution_from_basis(
+      lp, ft, basic_list, nonbasic_list, vstatus, sol.x, xB_workspace, work_estimate);
+    resume = true;
+  }
 }
 
 template dual::status_t gpu_simplified_dual_phase2<int, double>(
