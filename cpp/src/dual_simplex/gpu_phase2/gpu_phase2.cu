@@ -852,85 +852,70 @@ __device__ __forceinline__ i_t warp_dense_nnz(const f_t* x, i_t n)
   return count;
 }
 
-// `a_rt_ratio` caches pass-1 ratios for pass 2; identical lane strides make every entry
-// write-before-read by the same lane.
 __device__ __forceinline__ void warp_rt_body(f_t a_rt_dual_tol,
                                                      const f_t* a_rt_dz,
                                                      i_t* a_rt_entering,
                                                      i_t* a_rt_k,
-                                                     const i_t* a_rt_dzi,
-                                                     i_t a_rt_dzn,
-                                                     const i_t* a_rt_pos,
                                                      f_t a_rt_pivot_tol,
-                                                     f_t* a_rt_ratio,
                                                      f_t* a_rt_step,
                                                      const variable_status_t* a_rt_vstatus,
                                                      const f_t* a_rt_z,
-                                                     f_t a_rt_zero_tol)
+                                                     f_t a_rt_zero_tol,
+                                                     const i_t* a_rt_nonbasic,
+                                                     i_t a_rt_num_nonbasic)
 {
   const int lane = static_cast<int>(threadIdx.x);
   const f_t ptol = a_rt_pivot_tol, dtol = a_rt_dual_tol, ztol = a_rt_zero_tol;
   const f_t INF  = dev_inf();
 
-  // Pass 1: global minimum eligible ratio (all lanes get it).
-  f_t lmin = INF;
-  for (i_t h = lane; h < a_rt_dzn; h += 32) {
-    const i_t j             = a_rt_dzi[h];
-    const variable_status_t s = a_rt_vstatus[j];
-    f_t ratio = INF;
-    if (s == variable_status_t::NONBASIC_LOWER && a_rt_dz[j] < -ptol) {
-      ratio = (-dtol - a_rt_z[j]) / a_rt_dz[j];
-    } else if (s == variable_status_t::NONBASIC_UPPER && a_rt_dz[j] > ptol) {
-      ratio = (dtol - a_rt_z[j]) / a_rt_dz[j];
+  // The CPU near-tie rule updates min_val even when it accepts a slightly larger ratio, making the
+  // result order-dependent. Evaluate consecutive nonbasic positions in parallel, then visit the
+  // eligible lanes in ascending order. The shuffles avoid materializing and rereading a dense
+  // ratio array while keeping the lane-0 state transitions identical to the CPU scan.
+  i_t entering = -1, nonbasic_entering = -1;
+  f_t step_length = INF, min_val = INF;
+  for (i_t base = 0; base < a_rt_num_nonbasic; base += 32) {
+    const i_t k = base + lane;
+    i_t j       = -1;
+    f_t ratio   = INF;
+    if (k < a_rt_num_nonbasic) {
+      j                         = a_rt_nonbasic[k];
+      const variable_status_t s = a_rt_vstatus[j];
+      if (s == variable_status_t::NONBASIC_LOWER && a_rt_dz[j] < -ptol) {
+        ratio = (-dtol - a_rt_z[j]) / a_rt_dz[j];
+      } else if (s == variable_status_t::NONBASIC_UPPER && a_rt_dz[j] > ptol) {
+        ratio = (dtol - a_rt_z[j]) / a_rt_dz[j];
+      }
     }
-    a_rt_ratio[h] = ratio;
-    if (ratio < lmin) { lmin = ratio; }
-  }
-  const f_t gmin = warp_reduce_min(lmin);
-
-  // TRUE DUAL_UNBOUNDED: gmin == INF means NO column was eligible, and the serial scan returns -1
-  // here. This early-out is REQUIRED because pass 2's candidate test `ratio <= gmin` degenerates to
-  // `INF <= INF` — true for EVERY column — so without it the warp picks an arbitrary max-|z| column
-  // and returns step_length = INF. The driver then does z[j] += INF * delta_z[j] and the solve
-  // detonates: objective -> ~-3.7e15 and the node exits NUMERICAL instead of DUAL_UNBOUNDED.
-  // (This is the bug that made csched008/node_d79_id150 report NUMERICAL on every recorded warp run
-  // since 2026-08-04; it was invisible because the warp gate only counted bit-exactness.)
-  // The `ratio <= gmin` form is still right for the FINITE case — see the note below.
-  if (!isfinite(gmin)) {
-    if (lane == 0) { *a_rt_entering = -1; *a_rt_k = -1; *a_rt_step = INF; }
-    __syncwarp(0xffffffffu);  // same publish as the normal exit below; gmin is warp-uniform so all
-    return;                   // 32 lanes take this path together
-  }
-
-  // Pass 2: among ratio < gmin+ztol, pick max |z[j]| (tie → smaller k).
-  f_t best_absz = -1.0; i_t best_k = 0x7fffffff; i_t best_j = -1; f_t best_r = INF;
-  for (i_t h = lane; h < a_rt_dzn; h += 32) {
-    const i_t j     = a_rt_dzi[h];
-    const i_t k     = a_rt_pos[j];
-    const f_t ratio = a_rt_ratio[h];
-    // Candidate = the argmin (always, so entering can't be spuriously -1) plus near-ties within
-    // zero_tol. Use the difference (ratio - gmin) not (ratio < gmin + ztol): the latter drops the
-    // argmin when gmin is large (gmin+ztol rounds back to gmin) or zero_tol == 0 → false DUAL_UNBOUNDED.
-    if (ratio <= gmin || ratio - gmin < ztol) {
-      const f_t az = fabs(a_rt_z[j]);
-      if (az > best_absz || (az == best_absz && k < best_k)) {
-        best_absz = az; best_k = k; best_j = j; best_r = ratio;
+    const unsigned mask = __ballot_sync(0xffffffffu, ratio < INF);
+    if (mask == 0u) { continue; }
+    unsigned remaining = mask;
+    while (remaining != 0u) {
+      const int candidate_lane = __ffs(static_cast<int>(remaining)) - 1;
+      remaining &= remaining - 1u;
+      const f_t candidate_ratio = __shfl_sync(0xffffffffu, ratio, candidate_lane);
+      const i_t candidate_j     = __shfl_sync(0xffffffffu, j, candidate_lane);
+      if (lane == 0) {
+        if (candidate_ratio < min_val) {
+          min_val           = candidate_ratio;
+          entering          = candidate_j;
+          step_length       = candidate_ratio;
+          nonbasic_entering = base + candidate_lane;
+        } else if (candidate_ratio < min_val + ztol &&
+                   fabs(a_rt_z[candidate_j]) > fabs(a_rt_z[entering])) {
+          min_val           = candidate_ratio;
+          entering          = candidate_j;
+          step_length       = candidate_ratio;
+          nonbasic_entering = base + candidate_lane;
+        }
       }
     }
   }
-  // Reduce (best_absz, best_k, best_j, best_r) to lane 0: max |z|, tie → smaller k.
-  for (int off = 16; off > 0; off >>= 1) {
-    const f_t o_absz = __shfl_down_sync(0xffffffffu, best_absz, off);
-    const i_t o_k    = __shfl_down_sync(0xffffffffu, best_k, off);
-    const i_t o_j    = __shfl_down_sync(0xffffffffu, best_j, off);
-    const f_t o_r    = __shfl_down_sync(0xffffffffu, best_r, off);
-    if (o_absz > best_absz || (o_absz == best_absz && o_k < best_k)) {
-      best_absz = o_absz; best_k = o_k; best_j = o_j; best_r = o_r;
-    }
+  if (lane == 0) {
+    *a_rt_entering = entering;
+    *a_rt_k        = nonbasic_entering;
+    *a_rt_step     = step_length;
   }
-  if (lane == 0) { *a_rt_entering = best_j; *a_rt_k = best_j < 0 ? -1 : best_k; *a_rt_step = best_r; }
-  // These three go to GLOBAL slot state and every lane reads them back immediately, so publish them
-  // here rather than relying on the caller to remember a barrier.
   __syncwarp(0xffffffffu);
 }
 
@@ -3179,7 +3164,6 @@ struct slot_buffers {
   f_t* delta_x;
   f_t* v;
   f_t* squared_infeas;
-  f_t* rt_ratio;
   f_t* setup_rhs;
   f_t* se_coeff;
   i_t* basic_mark;
@@ -3241,7 +3225,6 @@ struct slot_state {
   // Dense per-iteration workspaces.
   gpu_span<f_t> xB_workspace, delta_y, delta_z, delta_x, v, squared_infeas;
   gpu_span<i_t> basic_mark, delta_z_mark, delta_z_indices, nonbasic_pos, infeas_idx;
-  gpu_span<f_t> rt_ratio;
 
   // Sparse per-iteration workspaces.
   gpu_sparse_vector delta_y_sparse, UTsol_sparse, utilde_sparse, scaled_dxB_sparse, rhs_sparse,
@@ -3287,7 +3270,6 @@ struct slot_state {
     delta_x.attach(b.delta_x, mn);
     v.attach(b.v, mn);
     squared_infeas.attach(b.squared_infeas, mn);
-    rt_ratio.attach(b.rt_ratio, mn);
     setup_rhs.attach(b.setup_rhs, mn);
     se_coeff.attach(b.se_coeff, mn);
     basic_mark.attach(b.basic_mark, mn);
@@ -3423,7 +3405,6 @@ struct slot_state {
     v.assign(m, 0.0);
     basic_mark.assign(n, -1);
     nonbasic_pos.assign(n, -1);
-    rt_ratio.reserve(n);
     });
 
     // basic_list holds m DISTINCT column indices, so no two lanes write the same slot — bit-exact.
@@ -3523,7 +3504,6 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
   gpu_span<f_t>& delta_x        = st.delta_x;
   gpu_span<f_t>& v              = st.v;
   gpu_span<f_t>& squared_infeas = st.squared_infeas;
-  gpu_span<f_t>& rt_ratio       = st.rt_ratio;
   gpu_span<i_t>& basic_mark     = st.basic_mark;
   gpu_span<i_t>& delta_z_mark   = st.delta_z_mark;
   gpu_span<i_t>& delta_z_indices = st.delta_z_indices;
@@ -3636,14 +3616,12 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     f_t step_length       = 0.0;
     i_t nonbasic_entering = -1;
     i_t entering          = -1;
-    // Same body the dispatcher already invokes (warp_dispatch_rt -> warp_rt_body), so this is a
-    // pure plumbing change, not a tie-break change. Its outputs are lane-0 pointer writes, so aim
+    // The ordered selector writes its outputs through lane 0, so aim
     // them at slot_state (global) and let the __syncwarp publish them to every lane — locals would
     // only ever be set on lane 0.
     warp_rt_body(settings.dual_tol / 10, delta_z.data(), &st.entering, &st.nonbasic_entering,
-                 delta_z_indices.data(), static_cast<i_t>(delta_z_indices.size()),
-                 nonbasic_pos.data(), settings.pivot_tol, rt_ratio.data(), &st.step_length, vstatus,
-                 z, settings.zero_tol);
+                 settings.pivot_tol, &st.step_length, vstatus, z, settings.zero_tol,
+                 nonbasic_list, n - m);
     __syncwarp(0xffffffffu);
     entering          = st.entering;
     nonbasic_entering = st.nonbasic_entering;
@@ -4368,7 +4346,6 @@ static size_t slot_buffer_bytes(size_t m, size_t n, size_t ucap, size_t eta)
   t += (mn) * sizeof(f_t);
   t += (mn) * sizeof(f_t);
   t += (mn) * sizeof(f_t);
-  t += (mn) * sizeof(f_t);
   t += (mn) * sizeof(i_t);
   t += (mn) * sizeof(i_t);
   t += (mn) * sizeof(i_t);
@@ -4551,7 +4528,6 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
     b.delta_x = alloc_uninit<f_t>(mn, st);
     b.v = alloc_uninit<f_t>(mn, st);
     b.squared_infeas = alloc_uninit<f_t>(mn, st);
-    b.rt_ratio = alloc_uninit<f_t>(mn, st);
     b.setup_rhs = alloc_uninit<f_t>(mn, st);
     b.se_coeff = alloc_uninit<f_t>(mn, st);
     b.basic_mark = alloc_uninit<i_t>(mn, st);
