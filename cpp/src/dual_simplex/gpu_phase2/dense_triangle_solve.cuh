@@ -89,7 +89,33 @@ __device__ __forceinline__ void wavefront_gather_solve_t(const i_t* __restrict__
 {
   const int lane = threadIdx.x;
   for (int L = 0; L < nlev; ++L) {
-    for (i_t t = lstart[L] + lane; t < lstart[L + 1]; t += 32) {
+    const i_t level_begin = lstart[L];
+    const i_t level_end   = lstart[L + 1];
+    // A dense U^T factor can have thousands of one-column dependency levels. The generic
+    // one-lane-per-column mapping leaves 31 lanes idle while that lane serially gathers a long
+    // column. For a sufficiently long singleton level, cooperate on its dot product instead.
+    if constexpr (!DiagFirst && !Descending && !Incremental) {
+      if (level_end - level_begin == 1) {
+        const i_t j  = corder[level_begin];
+        const i_t c0 = cs[j], c1 = cs[j + 1];
+        const i_t dp = c1 - 1;
+        const i_t lo = c0, hi = c1 - 1;
+        if (hi - lo >= 256) {
+          f_t sum = 0.0;
+          for (i_t p = lo + lane; p < hi; p += 32) { sum += val[p] * x[ri[p]]; }
+          for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+          }
+          if (lane == 0) {
+            const f_t diagonal_reciprocal = f_t{1.0} / val[dp];
+            x[j] = (x[j] - sum) * diagonal_reciprocal;
+          }
+          __syncwarp(0xffffffffu);
+          continue;
+        }
+      }
+    }
+    for (i_t t = level_begin + lane; t < level_end; t += 32) {
       const i_t j  = corder[t];
       const i_t c0 = cs[j], c1 = cs[j + 1];
       const i_t dp = DiagFirst ? c0 : (c1 - 1);

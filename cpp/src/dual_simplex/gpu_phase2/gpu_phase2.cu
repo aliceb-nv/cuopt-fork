@@ -4131,7 +4131,7 @@ static T* alloc_zeroed(size_t count, marshal_storage& st)
   const size_t bytes = (count == 0 ? 1 : count) * sizeof(T);
   st.bufs.emplace_back(bytes, rmm::cuda_stream_default);
   void* d = st.bufs.back().data();
-  RAFT_CUDA_TRY(cudaMemsetAsync(d, 0, bytes, rmm::cuda_stream_default.value()));
+  RAFT_CUDA_TRY(cudaMemsetAsync(d, 0, bytes, rmm::cuda_stream_default.get()));
   return static_cast<T*>(d);
 }
 
