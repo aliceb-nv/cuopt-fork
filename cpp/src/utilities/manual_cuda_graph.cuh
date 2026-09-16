@@ -11,9 +11,9 @@
 #include <utilities/logger.hpp>
 #include <utilities/macros.cuh>
 
+#include <cuda/stream>
 #include <raft/core/error.hpp>
 #include <raft/util/cudart_utils.hpp>
-#include <rmm/cuda_stream_view.hpp>
 
 #include <cuda_runtime.h>
 
@@ -69,18 +69,18 @@ class manual_cuda_graph_t {
   ~manual_cuda_graph_t() { destroy(); }
 
   template <typename F>
-  void run(rmm::cuda_stream_view stream, F&& work)
+  void run(cuda::stream_ref stream, F&& work)
   {
     if (instance_ != nullptr) {
-      RAFT_CUDA_TRY(cudaGraphLaunch(instance_, stream.value()));
+      RAFT_CUDA_TRY(cudaGraphLaunch(instance_, stream.get()));
       return;
     }
 
     // RAII: if user code throws mid-capture, end capture so the stream isn't
     // left in capture state. Errors are swallowed -- we're already unwinding.
-    capture_guard_t guard{stream.value()};
+    capture_guard_t guard{stream.get()};
 
-    RAFT_CUDA_TRY(cudaStreamBeginCapture(stream.value(), cudaStreamCaptureModeThreadLocal));
+    RAFT_CUDA_TRY(cudaStreamBeginCapture(stream.get(), cudaStreamCaptureModeThreadLocal));
     guard.capture_active = true;
 
     cudaGraph_t captured = nullptr;
@@ -93,7 +93,7 @@ class manual_cuda_graph_t {
       // call). End the capture and let its status disambiguate: if the capture was
       // invalidated the recorded work was never issued, so recover by re-running
       // `work` eagerly; otherwise the error is genuine and is rethrown.
-      cudaError_t catch_end_err = cudaStreamEndCapture(stream.value(), &captured);
+      cudaError_t catch_end_err = cudaStreamEndCapture(stream.get(), &captured);
       guard.capture_active      = false;
       if (catch_end_err == cudaErrorStreamCaptureInvalidated) {
         cudaGetLastError();
@@ -104,7 +104,7 @@ class manual_cuda_graph_t {
       throw;
     }
 
-    cudaError_t end_err  = cudaStreamEndCapture(stream.value(), &captured);
+    cudaError_t end_err  = cudaStreamEndCapture(stream.get(), &captured);
     guard.capture_active = false;
 
     if (end_err == cudaErrorStreamCaptureInvalidated) {
@@ -125,7 +125,7 @@ class manual_cuda_graph_t {
     RAFT_CUDA_TRY_NO_THROW(cudaGraphDestroy(captured));
     RAFT_CUDA_TRY(inst_err);
 
-    RAFT_CUDA_TRY(cudaGraphLaunch(instance_, stream.value()));
+    RAFT_CUDA_TRY(cudaGraphLaunch(instance_, stream.get()));
   }
 
   template <typename F>

@@ -190,7 +190,7 @@ endif ()
 # Add jobserver flags for parallel compilation if PARALLEL_LEVEL is set
 if (PARALLEL_LEVEL AND NOT "${PARALLEL_LEVEL}" STREQUAL "")
     message(STATUS "Enabling nvcc parallel compilation support")
-    list(APPEND CUOPT_CUDA_FLAGS --threads=0)
+    list(APPEND CUOPT_CUDA_FLAGS --threads=0 --split-compile=0)
     if (USE_NVCC_JOBSERVER AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
         message(STATUS "Enabling nvcc jobserver support (NVCC >= 13.0)")
         list(APPEND CUOPT_CUDA_FLAGS --jobserver)
@@ -277,7 +277,7 @@ FetchContent_Declare(
         # This is the reason we are using the development branch
         # from Oct 12, 2025. Once these changes are merged into the main branch,
         #we can switch to the main branch.
-        GIT_TAG "55d5edece584885061639ecf3a6eb8a4629be9f2"
+        GIT_TAG "32b3a87dbf4955d5a2803be74145c389ea31434d"
         GIT_PROGRESS TRUE
         EXCLUDE_FROM_ALL
         SYSTEM
@@ -295,7 +295,7 @@ FetchContent_MakeAvailable(papilo)
 FetchContent_Declare(
         pslp
         GIT_REPOSITORY "https://github.com/dance858/PSLP.git"
-        GIT_TAG "v0.0.11"
+        GIT_TAG "v0.0.8"
         GIT_PROGRESS TRUE
         EXCLUDE_FROM_ALL
         SYSTEM
@@ -395,21 +395,6 @@ if (NOT SKIP_GRPC_BUILD)
     add_compile_definitions(CUOPT_ENABLE_GRPC)
     message(STATUS "gRPC enabled (target gRPC::grpc++ is available)")
 
-    # The routing arm of the gRPC layer needs the routing engine. The wire
-    # protocol (including the routing protos) is always generated so LP-only
-    # builds still speak the same protocol; only the mappers and the VRP
-    # client/worker paths are dropped.
-    #
-    # This only gates which sources are compiled (see GRPC_ROUTING_FILES below).
-    # The matching -D is attached to cuopt_grpc_server alone, the one target
-    # whose sources test the macro, rather than to every target in the tree.
-    if (NOT SKIP_ROUTING_BUILD)
-        set(CUOPT_ENABLE_GRPC_ROUTING ON)
-        message(STATUS "gRPC routing (VRP) support enabled")
-    else ()
-        message(STATUS "gRPC routing (VRP) support disabled (SKIP_ROUTING_BUILD)")
-    endif ()
-
     # Find protoc compiler (provided by config package or target)
     if (TARGET protobuf::protoc)
         get_target_property(_PROTOBUF_PROTOC protobuf::protoc IMPORTED_LOCATION_RELEASE)
@@ -438,30 +423,9 @@ if (NOT SKIP_GRPC_BUILD)
         endif ()
     endif ()
 
-    # Proto search paths: LP/protocol protos in src/grpc, routing protos in
-    # src/grpc/routing, generated data proto in src/grpc/codegen/generated.
-    # Routing protos live under their own search root so the routing gRPC layer
-    # stays a self-contained directory; their import names are unchanged.
+    # Proto search paths: manual protos in src/grpc, generated data proto in src/grpc/codegen/generated
     set(PROTO_PATH_MANUAL "${CMAKE_CURRENT_SOURCE_DIR}/src/grpc")
     set(PROTO_PATH_GEN "${CMAKE_CURRENT_SOURCE_DIR}/src/grpc/codegen/generated")
-    set(PROTO_PATH_ROUTING "${CMAKE_CURRENT_SOURCE_DIR}/src/grpc/routing")
-
-    # Routing solution proto (leaf; no imports). Embedded structurally by the
-    # generated data proto and by cuopt_remote.proto, so it is generated first.
-    set(ROUTING_SOLUTION_PROTO_FILE "${PROTO_PATH_ROUTING}/cuopt_routing_solution.proto")
-    set(ROUTING_SOLUTION_PROTO_SRCS "${CMAKE_CURRENT_BINARY_DIR}/cuopt_routing_solution.pb.cc")
-    set(ROUTING_SOLUTION_PROTO_HDRS "${CMAKE_CURRENT_BINARY_DIR}/cuopt_routing_solution.pb.h")
-
-    add_custom_command(
-            OUTPUT "${ROUTING_SOLUTION_PROTO_SRCS}" "${ROUTING_SOLUTION_PROTO_HDRS}"
-            COMMAND ${_PROTOBUF_PROTOC}
-            ARGS --cpp_out ${CMAKE_CURRENT_BINARY_DIR}
-            --proto_path ${PROTO_PATH_ROUTING}
-            ${ROUTING_SOLUTION_PROTO_FILE}
-            DEPENDS ${ROUTING_SOLUTION_PROTO_FILE}
-            COMMENT "Generating C++ code from cuopt_routing_solution.proto"
-            VERBATIM
-    )
 
     # Generate C++ code from cuopt_remote_data.proto (auto-generated data definitions)
     set(DATA_PROTO_FILE "${PROTO_PATH_GEN}/cuopt_remote_data.proto")
@@ -473,10 +437,8 @@ if (NOT SKIP_GRPC_BUILD)
             COMMAND ${_PROTOBUF_PROTOC}
             ARGS --cpp_out ${CMAKE_CURRENT_BINARY_DIR}
             --proto_path ${PROTO_PATH_GEN}
-            --proto_path ${PROTO_PATH_MANUAL}
-            --proto_path ${PROTO_PATH_ROUTING}
             ${DATA_PROTO_FILE}
-            DEPENDS ${DATA_PROTO_FILE} ${ROUTING_SOLUTION_PROTO_FILE}
+            DEPENDS ${DATA_PROTO_FILE}
             COMMENT "Generating C++ code from cuopt_remote_data.proto"
             VERBATIM
     )
@@ -492,9 +454,8 @@ if (NOT SKIP_GRPC_BUILD)
             ARGS --cpp_out ${CMAKE_CURRENT_BINARY_DIR}
             --proto_path ${PROTO_PATH_MANUAL}
             --proto_path ${PROTO_PATH_GEN}
-            --proto_path ${PROTO_PATH_ROUTING}
             ${PROTO_FILE}
-            DEPENDS ${PROTO_FILE} ${DATA_PROTO_FILE} ${ROUTING_SOLUTION_PROTO_FILE}
+            DEPENDS ${PROTO_FILE} ${DATA_PROTO_FILE}
             COMMENT "Generating C++ code from cuopt_remote.proto"
             VERBATIM
     )
@@ -506,24 +467,6 @@ if (NOT SKIP_GRPC_BUILD)
     set(GRPC_SERVICE_SRCS "${CMAKE_CURRENT_BINARY_DIR}/cuopt_remote_service.grpc.pb.cc")
     set(GRPC_SERVICE_HDRS "${CMAKE_CURRENT_BINARY_DIR}/cuopt_remote_service.grpc.pb.h")
 
-    # Routing proto (standalone VRP messages; imported by service proto)
-    set(ROUTING_PROTO_FILE "${PROTO_PATH_ROUTING}/cuopt_routing.proto")
-    set(ROUTING_PROTO_SRCS "${CMAKE_CURRENT_BINARY_DIR}/cuopt_routing.pb.cc")
-    set(ROUTING_PROTO_HDRS "${CMAKE_CURRENT_BINARY_DIR}/cuopt_routing.pb.h")
-
-    add_custom_command(
-            OUTPUT "${ROUTING_PROTO_SRCS}" "${ROUTING_PROTO_HDRS}"
-            COMMAND ${_PROTOBUF_PROTOC}
-            ARGS --cpp_out ${CMAKE_CURRENT_BINARY_DIR}
-            --proto_path ${PROTO_PATH_ROUTING}
-            --proto_path ${PROTO_PATH_MANUAL}
-            --proto_path ${PROTO_PATH_GEN}
-            ${ROUTING_PROTO_FILE}
-            DEPENDS ${ROUTING_PROTO_FILE} ${PROTO_FILE} ${DATA_PROTO_FILE} ${ROUTING_SOLUTION_PROTO_FILE}
-            COMMENT "Generating C++ code from cuopt_routing.proto"
-            VERBATIM
-    )
-
     add_custom_command(
             OUTPUT "${GRPC_PROTO_SRCS}" "${GRPC_PROTO_HDRS}" "${GRPC_SERVICE_SRCS}" "${GRPC_SERVICE_HDRS}"
             COMMAND ${_PROTOBUF_PROTOC}
@@ -532,9 +475,8 @@ if (NOT SKIP_GRPC_BUILD)
             --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN_EXECUTABLE}
             --proto_path ${PROTO_PATH_MANUAL}
             --proto_path ${PROTO_PATH_GEN}
-            --proto_path ${PROTO_PATH_ROUTING}
             ${GRPC_PROTO_FILE}
-            DEPENDS ${GRPC_PROTO_FILE} ${PROTO_FILE} ${DATA_PROTO_FILE} ${ROUTING_PROTO_FILE} ${ROUTING_SOLUTION_PROTO_FILE}
+            DEPENDS ${GRPC_PROTO_FILE} ${PROTO_FILE} ${DATA_PROTO_FILE}
             COMMENT "Generating gRPC C++ code from cuopt_remote_service.proto"
             VERBATIM
     )
@@ -552,6 +494,12 @@ endif ()
 set(CUOPT_SRC_FILES)
 set(MPS_FAST_SRC_FILES)
 add_subdirectory(src)
+
+# nvcc 13.0.3 ICE (signal 11) compiling sliding_window.cu with 7 GPU architectures;
+# --split-compile breaks the codegen into per-arch sub-jobs to avoid the crash
+set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/routing/local_search/sliding_window.cu
+        PROPERTIES COMPILE_OPTIONS "--split-compile=0")
 
 if (HOST_LINEINFO)
     set_source_files_properties(${CUOPT_SRC_FILES} DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTIES COMPILE_OPTIONS "-g1")
@@ -576,21 +524,12 @@ if (DEFINE_ASSERT)
 endif ()
 
 if (NOT SKIP_GRPC_BUILD)
-    # Generated protobuf sources. The whole wire protocol is generated in every
-    # gRPC build, routing messages included: cuopt_remote.proto embeds
-    # RoutingSolution, so these carry no dependency on the routing engine.
-    set(GRPC_PROTO_GENERATED_FILES
-            ${ROUTING_SOLUTION_PROTO_SRCS}
+    # Add gRPC mapper files and generated protobuf sources
+    set(GRPC_INFRA_FILES
             ${DATA_PROTO_SRCS}
             ${PROTO_SRCS}
-            ${ROUTING_PROTO_SRCS}
             ${GRPC_PROTO_SRCS}
             ${GRPC_SERVICE_SRCS}
-    )
-
-    # LP/MIP arm: proto <-> mathematical_optimization, plus the shared client
-    # infrastructure (connection, chunking, polling, Cython shim).
-    set(GRPC_MATHOPT_FILES
             src/grpc/grpc_problem_mapper.cpp
             src/grpc/grpc_solution_mapper.cpp
             src/grpc/grpc_settings_mapper.cpp
@@ -600,22 +539,6 @@ if (NOT SKIP_GRPC_BUILD)
             src/grpc/client/cython_grpc_client.cpp
             src/grpc/client/solve_remote.cpp
     )
-
-    # Routing (VRP) arm: everything that depends on the routing engine. Kept as
-    # its own list so a routing-only gRPC client can be split out of the
-    # cuopt_grpc component without moving code around again.
-    set(GRPC_ROUTING_FILES
-            src/grpc/routing/grpc_routing_problem_mapper.cpp
-            src/grpc/routing/grpc_routing_settings_mapper.cpp
-            src/grpc/routing/grpc_routing_solution_mapper.cpp
-            src/grpc/routing/grpc_client_vrp.cpp
-            src/grpc/routing/cython_grpc_client_vrp.cpp
-    )
-
-    set(GRPC_INFRA_FILES ${GRPC_PROTO_GENERATED_FILES} ${GRPC_MATHOPT_FILES})
-    if (CUOPT_ENABLE_GRPC_ROUTING)
-        list(APPEND GRPC_INFRA_FILES ${GRPC_ROUTING_FILES})
-    endif ()
     list(APPEND CUOPT_SRC_FILES ${GRPC_INFRA_FILES})
 
     # Always keep NDEBUG defined for gRPC infrastructure files so that abseil
@@ -625,9 +548,7 @@ if (NOT SKIP_GRPC_BUILD)
     # at runtime with "undefined symbol: absl::…::Mutex::Dtor".
     set_property(SOURCE ${GRPC_INFRA_FILES} DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
             APPEND PROPERTY COMPILE_OPTIONS "-DNDEBUG")
-    # Generated protobuf symbols must stay visible in libcuopt.so: cuopt_grpc_server
-    # links them from the library rather than compiling the protos itself.
-    set_property(SOURCE ${GRPC_PROTO_GENERATED_FILES} DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    set_property(SOURCE ${PROTO_SRCS} ${GRPC_PROTO_SRCS} ${GRPC_SERVICE_SRCS} ${DATA_PROTO_SRCS} DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
             APPEND PROPERTY COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-fvisibility=default>")
 endif (NOT SKIP_GRPC_BUILD)
 
@@ -774,64 +695,49 @@ target_link_libraries(cuopt_objs
 )
 
 # ##################################################################################################
-# - cuopt_static ----------------------------------------------------------------------------------
-#
-# Deliberately OUTSIDE `if (BUILD_TESTS)`. It is a thin archive of objects that are compiled anyway
-# for libcuopt.so ($<TARGET_OBJECTS:cuopt_objs>), so defining it unconditionally costs one `ar`
-# invocation and no extra compilation.
-#
-# It has to be unconditional because `test_netlib` links it, and that target is built with
-# `build.sh libcuopt --skip-tests-build` (BUILD_TESTS=OFF). When cuopt_static is not a CMake target,
-# `target_link_libraries(test_netlib PUBLIC cuopt_static)` does NOT fail -- CMake silently treats the
-# name as a plain `-lcuopt_static` link flag, propagating none of the PUBLIC include directories.
-# The build then dies far away with `cuopt/mathematical_optimization/io/parser.hpp: No such file or
-# directory`, which looks like a missing header rather than a missing target.
-
-add_library(cuopt_static STATIC $<TARGET_OBJECTS:cuopt_objs>)
-target_link_libraries(cuopt_static
-        PUBLIC
-        CUDA::cublas
-        CUDA::cusparse
-        rmm::rmm
-        rapids_logger::rapids_logger
-        CCCL::CCCL
-        raft::raft
-        ${CUDSS_LIB_FILE}
-        OpenMP::OpenMP_CXX
-        PRIVATE
-        ${CUOPT_PRIVATE_CUDA_LIBS}
-        nccl_external
-        $<$<BOOL:${CUOPT_ENABLE_GRPC}>:protobuf::libprotobuf>
-        $<$<BOOL:${CUOPT_ENABLE_GRPC}>:gRPC::grpc++>
-)
-# Internal test sources include OMP-dependent headers (omp_helpers.hpp, omp_atomic_t).
-# Propagate -fopenmp for CUDA TUs since OpenMP::OpenMP_CXX only covers CXX.
-target_compile_options(cuopt_static INTERFACE
-        "$<$<COMPILE_LANGUAGE:CUDA>:-fopenmp>"
-)
-target_include_directories(cuopt_static
-        PUBLIC
-        "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
-        "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>"
-        "$<INSTALL_INTERFACE:include>"
-)
-target_compile_definitions(cuopt_static PUBLIC
-        CUOPT_CUDA_ARCHITECTURES="${JOINED_CUDA_ARCHITECTURES}"
-        CUOPT_CPU_ARCHITECTURE="${CMAKE_SYSTEM_PROCESSOR}"
-        "CUOPT_LOG_ACTIVE_LEVEL=RAPIDS_LOGGER_LOG_LEVEL_${LIBCUOPT_LOGGING_LEVEL}"
-        CUSPARSE_ENABLE_EXPERIMENTAL_API
-)
-target_link_libraries(cuopt_static PRIVATE $<TARGET_FILE:PSLP>)
-add_dependencies(cuopt_static PSLP)
-target_link_libraries(cuopt_static PRIVATE $<TARGET_FILE:KaMinPar::KaMinPar>)
-if (TARGET KaMinPar)
-    add_dependencies(cuopt_static KaMinPar)
-endif ()
-
-# ##################################################################################################
 # - generate tests --------------------------------------------------------------------------------
 if (BUILD_TESTS)
     include(CTest)
+    add_library(cuopt_static STATIC $<TARGET_OBJECTS:cuopt_objs>)
+    target_link_libraries(cuopt_static
+            PUBLIC
+            CUDA::cublas
+            CUDA::cusparse
+            rmm::rmm
+            rapids_logger::rapids_logger
+            CCCL::CCCL
+            raft::raft
+            ${CUDSS_LIB_FILE}
+            OpenMP::OpenMP_CXX
+            PRIVATE
+            ${CUOPT_PRIVATE_CUDA_LIBS}
+            nccl_external
+            $<$<BOOL:${CUOPT_ENABLE_GRPC}>:protobuf::libprotobuf>
+            $<$<BOOL:${CUOPT_ENABLE_GRPC}>:gRPC::grpc++>
+    )
+    # Internal test sources include OMP-dependent headers (omp_helpers.hpp, omp_atomic_t).
+    # Propagate -fopenmp for CUDA TUs since OpenMP::OpenMP_CXX only covers CXX.
+    target_compile_options(cuopt_static INTERFACE
+            "$<$<COMPILE_LANGUAGE:CUDA>:-fopenmp>"
+    )
+    target_include_directories(cuopt_static
+            PUBLIC
+            "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+            "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>"
+            "$<INSTALL_INTERFACE:include>"
+    )
+    target_compile_definitions(cuopt_static PUBLIC
+            CUOPT_CUDA_ARCHITECTURES="${JOINED_CUDA_ARCHITECTURES}"
+            CUOPT_CPU_ARCHITECTURE="${CMAKE_SYSTEM_PROCESSOR}"
+            "CUOPT_LOG_ACTIVE_LEVEL=RAPIDS_LOGGER_LOG_LEVEL_${LIBCUOPT_LOGGING_LEVEL}"
+            CUSPARSE_ENABLE_EXPERIMENTAL_API
+    )
+    target_link_libraries(cuopt_static PRIVATE $<TARGET_FILE:PSLP>)
+    add_dependencies(cuopt_static PSLP)
+    target_link_libraries(cuopt_static PRIVATE $<TARGET_FILE:KaMinPar::KaMinPar>)
+    if (TARGET KaMinPar)
+        add_dependencies(cuopt_static KaMinPar)
+    endif ()
     add_subdirectory(tests)
 endif (BUILD_TESTS)
 
@@ -995,56 +901,6 @@ rapids_cpm_find(
         GIT_SHALLOW TRUE
 )
 
-if (NOT BUILD_LP_ONLY)
-    add_executable(cuopt_cli cuopt_cli.cpp)
-
-    # PIE executable: auditwheel/patchelf expands .dynstr/RPATH when repairing wheels; non-PIE
-    # (ET_EXEC) binaries are prone to corrupt segment layout. PIE (ET_DYN) survives RPATH edits.
-    set_target_properties(cuopt_cli
-            PROPERTIES
-            CXX_SCAN_FOR_MODULES OFF
-            POSITION_INDEPENDENT_CODE ON
-    )
-
-    target_compile_options(cuopt_cli
-            PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>"
-            "$<$<COMPILE_LANGUAGE:CUDA>:${CUOPT_CUDA_FLAGS}>"
-    )
-
-    target_link_options(cuopt_cli PRIVATE -pie)
-
-    target_include_directories(cuopt_cli
-            PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}/src"
-            PUBLIC
-            "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
-            "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>"
-            ${CUDSS_INCLUDE}
-            "$<INSTALL_INTERFACE:include>"
-    )
-
-    target_link_libraries(cuopt_cli
-            PUBLIC
-            cuopt
-            OpenMP::OpenMP_CXX
-            ${CUDSS_LIBRARIES}
-            TBB::tbb
-            PRIVATE
-            argparse::argparse
-    )
-    # Use RUNPATH when building locally in order to allow LD_LIBRARY_PATH to override the conda env path
-    if (NOT DEFINED INSTALL_TARGET OR "${INSTALL_TARGET}" STREQUAL "")
-        target_link_options(cuopt_cli PRIVATE -Wl,--enable-new-dtags)
-    endif ()
-    set_property(TARGET cuopt_cli PROPERTY INSTALL_RPATH "$ORIGIN/../${lib_dir}")
-
-    # adds the cuopt_cli executable to the runtime deb package
-    install(TARGETS cuopt_cli
-            COMPONENT runtime
-            RUNTIME DESTINATION ${_BIN_DEST}
-    )
-endif ()
-
 
 option(BUILD_MIP_BENCHMARKS "Build MIP benchmarks" OFF)
 if (BUILD_MIP_BENCHMARKS AND NOT BUILD_LP_ONLY)
@@ -1084,6 +940,7 @@ endif ()
 
 option(BUILD_LP_BENCHMARKS "Build LP benchmarks" OFF)
 if (BUILD_LP_BENCHMARKS)
+
     add_executable(solve_LP ../benchmarks/linear_programming/cuopt/run_pdlp.cu)
 
     set_target_properties(solve_LP
@@ -1104,42 +961,22 @@ if (BUILD_LP_BENCHMARKS)
     if (NOT DEFINED INSTALL_TARGET OR "${INSTALL_TARGET}" STREQUAL "")
         target_link_options(solve_LP PRIVATE -Wl,--enable-new-dtags)
     endif ()
-endif ()
+
+endif ()  # BUILD_LP_BENCHMARKS — guards both solve_LP and test_netlib
 
 # ##################################################################################################
-# - test_netlib - dual-simplex NETLIB + node-verify / GPU throughput harness (local dev/benchmark) -
-#
-# Restored for the Hiverge GPU dual-simplex campaign. The evaluator drives exactly one mode of it,
-# `--benchmark-parallel <nodes-dir> --replicas N --time-limit S`, and scores the "kernel (device
-# compute)" line. Declared OUTSIDE the BUILD_LP_BENCHMARKS guard on purpose: that option is OFF by
-# default and the campaign must not depend on remembering to pass it.
-#
-# gpu_phase2.cu is compiled ONLY into this target, which is what lets the two source properties
-# below be set per-file instead of via CMAKE_CUDA_FLAGS (global, and would rebuild every CUDA TU in
-# libcuopt for a change that reaches exactly one file).
+# - test_netlib - dual-simplex NETLIB + node-verify / GPU warp harness (local dev/benchmark) ------
 add_executable(test_netlib
     ../benchmarks/linear_programming/cuopt/test_netlib.cu
     src/dual_simplex/gpu_phase2/gpu_phase2.cu)
 
-# --fmad=false: no FMA contraction, so the device arithmetic matches the CPU
-#   simplified_dual_phase2 reference bit-for-bit. Every triangular-solve inner loop is
-#   `sum += val[p] * x[ri[p]]`; FFMA rounds a*b+c once where the CPU rounds twice, and the dot
-#   products then drift in the last bits. nvcc's DEFAULT IS --fmad=true, so leaving this unset is
-#   not neutral -- it silently gives up the CPU-vs-GPU cross-check that the harness's correctness
-#   gate leans on. It is also what the previous campaign measured at, so scores stay comparable.
+# Disable FMA contraction in the GPU port so its arithmetic matches the CPU simplified_dual_phase2
+# bit-for-bit (fused multiply-add would otherwise change dot-product rounding).
 #
-# --split-compile=1: overrides the global --split-compile=0 (enabled whenever PARALLEL_LEVEL is
-#   set, i.e. by build.sh). --split-compile=0 makes CUDA codegen NON-DETERMINISTIC on sm_100:
-#   five compiles of identical source produced five different register allocations for this TU
-#   (128/130/130/178/180 registers = 8 or 16 blocks/SM, a 2x occupancy swing decided by nothing
-#   anyone controls). With =1 the same five compiles are byte-identical. sm_89/L4 is stable either
-#   way, but a campaign whose fitness is wall-clock must not have codegen roulette in it.
-#
-# -Xptxas=-v is a reporting flag only; it changes no code generation.
-set_source_files_properties(src/dual_simplex/gpu_phase2/gpu_phase2.cu PROPERTIES
-    COMPILE_OPTIONS "--fmad=false;--split-compile=1;-Xptxas=-v")
+set_source_files_properties(src/dual_simplex/gpu_phase2/gpu_phase2.cu PROPERTIES COMPILE_OPTIONS "--fmad=false;")
 
 set_target_properties(test_netlib PROPERTIES CXX_SCAN_FOR_MODULES OFF)
+
 target_include_directories(test_netlib PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_options(test_netlib
     PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>"
@@ -1147,7 +984,7 @@ target_compile_options(test_netlib
 # solution.hpp's omp_atomic_t<> is only defined under _OPENMP; pass -fopenmp to the CUDA host
 # compiler (flag only, so we do NOT add OpenMP's include dir).
 target_compile_options(test_netlib PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fopenmp>")
-target_link_libraries(test_netlib PUBLIC cuopt_static OpenMP::OpenMP_CXX PRIVATE)
+target_link_libraries(test_netlib PUBLIC cuopt OpenMP::OpenMP_CXX PRIVATE)
 if (NOT DEFINED INSTALL_TARGET OR "${INSTALL_TARGET}" STREQUAL "")
     target_link_options(test_netlib PRIVATE -Wl,--enable-new-dtags)
 endif ()
@@ -1173,12 +1010,6 @@ if (NOT SKIP_GRPC_BUILD)
             CXX_SCAN_FOR_MODULES OFF
             POSITION_INDEPENDENT_CODE ON
     )
-
-    # grpc_worker.cpp is the only source that tests this macro, so scope it to
-    # this target instead of leaking a -D into every target in the directory.
-    if (CUOPT_ENABLE_GRPC_ROUTING)
-        target_compile_definitions(cuopt_grpc_server PRIVATE CUOPT_ENABLE_GRPC_ROUTING)
-    endif ()
 
     target_compile_options(cuopt_grpc_server
             PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>"
