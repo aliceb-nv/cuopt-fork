@@ -93,7 +93,9 @@ void wire_fj_cpu_host_views(
 
   set_host_data_view(fj_cpu, n_variables, n_constraints, n_integer_vars, nnz, tolerances);
 
+  // Ahead of everything that reads a domain: bound propagation, the starts, and the scorers.
   cap_integer_domains(fj_cpu, n_variables);
+
   fj_cpu.h_best_objective = +std::numeric_limits<f_t>::infinity();
 
   // cached_mtm_moves, cached_mtm_moves_version and h_cstr_version are indexed by search row and
@@ -120,6 +122,7 @@ void finalize_fj_cpu_host_initialization(
 
   detect_implied_integers(fj_cpu, problem);
   wire_fj_cpu_host_views(fj_cpu, n_variables, n_constraints, n_integer_vars, nnz, tolerances);
+  // The recognized index belongs to the model shared by all lane clones.
   build_cardinality_index(fj_cpu, problem);
   detect_free_equality_singletons(fj_cpu);
 
@@ -155,7 +158,9 @@ void finalize_fj_cpu_host_initialization(
     recompute_lhs(fj_cpu);
   }
 
+  // Precompute static problem features for regression model
   precompute_problem_features(fj_cpu, problem);
+  compute_variable_coloring(fj_cpu);
 }
 
 template <typename i_t, typename f_t>
@@ -212,6 +217,21 @@ void finalize_fj_cpu_host_initialization_from_template(
   fj_cpu.total_violations_sumcomp = tmpl.total_violations_sumcomp;
   fj_cpu.h_incumbent_objective    = tmpl.h_incumbent_objective;
   fj_cpu.h_objective_sumcomp      = tmpl.h_objective_sumcomp;
+
+  // The colouring is structural, so it carries over; the score table is this climber's own.
+  fj_cpu.h_var_color = tmpl.h_var_color;
+  fj_cpu.n_colors    = tmpl.n_colors;
+  if (fj_cpu.n_colors > 0) {
+    fj_cpu.h_var_best_score.assign(n_variables, fj_staged_score_t::invalid());
+    fj_cpu.h_var_best_delta.assign(n_variables, f_t{0});
+    fj_cpu.h_var_best_stamp.assign(n_variables, 0);
+    fj_cpu.h_var_best_rowsum.assign(n_variables, 0);
+    fj_cpu.h_var_bucket_stamp.assign(n_variables, 0);
+    fj_cpu.batch_size_hist.assign(fj_batch_hist_bins, 0);
+    fj_cpu.h_color_candidates.assign(fj_cpu.n_colors, {});
+    fj_cpu.h_color_epoch.assign(fj_cpu.n_colors, 0);
+    fj_cpu.var_best_epoch = 1;
+  }
 
   fj_cpu.bin_eliminated_rows = tmpl.bin_eliminated_rows;
   fj_cpu.bin_singletons      = tmpl.bin_singletons;
@@ -507,7 +527,7 @@ std::unique_ptr<fj_cpu_climber_t<i_t, f_t>> init_fj_cpu_clone(
 
   std::vector<f_t> default_weights(tmpl.problem->n_constraints, 1.0);
   init_fj_cpu_from_template(*fj_cpu, tmpl, default_weights, default_weights, f_t{0});
-  // The seed is caller-drawn and is not taken from the global generator.
+  // See init_fj_cpu_standalone: the seed is caller-drawn, not taken from the global generator.
   fj_cpu->settings = settings;
 
   return fj_cpu;
