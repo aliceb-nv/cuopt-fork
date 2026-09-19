@@ -145,7 +145,6 @@ template <typename i_t, typename f_t>
 void cpufj_solve(fj_cpu_climber_t<i_t, f_t>* fj_cpu, f_t in_time_limit, double work_unit_limit)
 {
   const auto solve_start = std::chrono::high_resolution_clock::now();
-  apply_structural_completion_start(*fj_cpu);
   if (fj_cpu->use_precedence_start) apply_precedence_completion_start(*fj_cpu);
   apply_bound_propagation(*fj_cpu);
   if (fj_cpu->use_equality_substitution) {
