@@ -560,4 +560,15 @@ std::unique_ptr<fj_cpu_climber_t<i_t, f_t>> init_fj_cpu_clone(
   std::atomic<bool>& preemption_flag,
   fj_settings_t settings = fj_settings_t{});
 
+template <typename i_t, typename f_t>
+void apply_lane_diversification(fj_cpu_climber_t<i_t, f_t>& climber, int lane, int64_t base_seed);
+
+template <typename i_t, typename f_t>
+void complete_climber_portfolio(std::unique_ptr<fj_cpu_climber_t<i_t, f_t>> first_climber,
+                                const std::vector<int64_t>& lane_seeds,
+                                std::vector<std::atomic<bool>>& preemption_flags,
+                                std::vector<std::unique_ptr<fj_cpu_climber_t<i_t, f_t>>>& climbers,
+                                int64_t base_seed,
+                                bool low_latency = false);
+
 }  // namespace cuopt::mathematical_optimization::mip
