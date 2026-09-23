@@ -2392,6 +2392,10 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     return batch[seat].drop == drop_t::FACTORIZE_FILL ||
            batch[seat].drop == drop_t::SIZE_CONTRACT;
   };
+  auto stop_drain = [&](i_t seat) {
+    return batch[seat].drop == drop_t::DEADLINE ||
+           batch[seat].drop == drop_t::CONCURRENT_HALT;
+  };
   auto resume_failure = [&](i_t seat) {
     return batch[seat].status == dual_status_t::ITERATION_LIMIT ||
            batch[seat].drop == drop_t::FACTORIZE_RESUME ||
@@ -2409,6 +2413,11 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
       bool replaced = false;
       bool failed   = false;
       for (i_t seat = 0; seat < static_cast<i_t>(batch.size()); ++seat) {
+        if (stop_drain(seat)) {
+          count_drop(seat);
+          nondeterministic_gpu_pool_finish(worker);
+          return false;
+        }
         if (!fresh_factor_failure(seat)) { continue; }
         if (telemetry) {
           ++pool.preparation_failures;
@@ -2634,7 +2643,19 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     if (next[seat] != next_t::FRESH) { continue; }
     while (!gpu_persistent_batch_stage_fresh<i_t, f_t>(pool.run, seat, stage_error)) {
       if (!fresh_factor_failure(seat)) {
-        if (telemetry) { ++pool.fill_errors; }
+        if (stop_drain(seat)) {
+          count_drop(seat);
+          nondeterministic_gpu_pool_finish(worker);
+          return false;
+        }
+        if (telemetry) {
+          ++pool.fill_errors;
+          settings_.log.printf(
+            "[GPUPOOL-ERROR] worker=%d gpu=%d operation=stage-fresh detail=%s\n",
+            (int)worker->worker_id,
+            pool.device,
+            stage_error.empty() ? "unknown" : stage_error.c_str());
+        }
         nondeterministic_gpu_pool_finish(worker);
         return false;
       }
@@ -2654,7 +2675,19 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     if (next[seat] != next_t::REFACTOR) { continue; }
     if (gpu_persistent_batch_stage_refactor<i_t, f_t>(pool.run, seat, stage_error)) { continue; }
     if (!resume_failure(seat)) {
-      if (telemetry) { ++pool.relaunch_errors; }
+      if (stop_drain(seat)) {
+        count_drop(seat);
+        nondeterministic_gpu_pool_finish(worker);
+        return false;
+      }
+      if (telemetry) {
+        ++pool.relaunch_errors;
+        settings_.log.printf(
+          "[GPUPOOL-ERROR] worker=%d gpu=%d operation=stage-refactor detail=%s\n",
+          (int)worker->worker_id,
+          pool.device,
+          stage_error.empty() ? "unknown" : stage_error.c_str());
+      }
       nondeterministic_gpu_pool_finish(worker);
       return false;
     }
@@ -2681,7 +2714,14 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     if (next[seat] == next_t::CHILD &&
         !gpu_persistent_batch_stage_child<i_t, f_t>(
           pool.run, seat, deltas[seat], stage_error)) {
-      if (telemetry) { ++pool.relaunch_errors; }
+      if (telemetry) {
+        ++pool.relaunch_errors;
+        settings_.log.printf(
+          "[GPUPOOL-ERROR] worker=%d gpu=%d operation=stage-child detail=%s\n",
+          (int)worker->worker_id,
+          pool.device,
+          stage_error.empty() ? "unknown" : stage_error.c_str());
+      }
       nondeterministic_gpu_pool_finish(worker);
       return false;
     }
