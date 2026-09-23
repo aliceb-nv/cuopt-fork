@@ -10,6 +10,7 @@
 #include <branch_and_bound/symmetry.hpp>
 #include <branch_and_bound/worker.hpp>
 
+#include <dual_simplex/basis_solves.hpp>
 #include <dual_simplex/phase2.hpp>
 #include <dual_simplex/simplex_solver_settings.hpp>
 #include <dual_simplex/solve.hpp>
@@ -477,6 +478,39 @@ static bool sb_trace_enabled()
     return e != nullptr && std::string(e) != "0";
   }();
   return on;
+}
+
+// GPU node solves return the final vstatus but leave the worker's host factorization at an older
+// basis. Pseudocost-only branching never uses the factors; dual-pivot ranking and dual-simplex
+// trials do, so rebuild only before one of those operations.
+template <typename i_t, typename f_t>
+bool refresh_stale_basis(branch_and_bound_worker_t<i_t, f_t>* worker,
+                         const simplex_solver_settings_t<i_t, f_t>& settings)
+{
+  if (!worker->host_basis_stale) { return true; }
+
+  const i_t m = worker->leaf_problem.num_rows;
+  const i_t n = worker->leaf_problem.num_cols;
+
+  // get_basis_from_vstatus indexes basic_list but appends to nonbasic_list and superbasic_list.
+  std::vector<i_t> superbasic_list;
+  worker->basic_list.assign(static_cast<size_t>(m), 0);
+  worker->nonbasic_list.clear();
+  worker->nonbasic_list.reserve(static_cast<size_t>(n - m));
+  simplex::get_basis_from_vstatus<i_t>(
+    m, worker->leaf_vstatus, worker->basic_list, worker->nonbasic_list, superbasic_list);
+
+  const int rc = worker->basis_factors.refactor_basis(worker->leaf_problem.A,
+                                                      settings,
+                                                      worker->leaf_problem.lower,
+                                                      worker->leaf_problem.upper,
+                                                      tic(),
+                                                      worker->basic_list,
+                                                      worker->nonbasic_list,
+                                                      worker->leaf_vstatus);
+  if (rc != 0) { return false; }
+  worker->host_basis_stale = false;
+  return true;
 }
 
 template <typename i_t, typename f_t>
@@ -1629,6 +1663,18 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
     }
   }
 
+  if (sb_trace_enabled()) {
+    std::fprintf(stderr,
+                 "[SBRB] time=%.9f worker=%d node=%d rb_iters=%lld bb_iters=%lld unreliable=%zu threshold=%d\n",
+                 toc(start_time),
+                 static_cast<int>(worker->worker_id),
+                 static_cast<int>(node_ptr->node_id),
+                 static_cast<long long>(strong_branching_lp_iter),
+                 static_cast<long long>(branch_and_bound_lp_iters),
+                 unreliable_list.size(),
+                 static_cast<int>(reliable_threshold));
+  }
+
   if (unreliable_list.empty()) {
     settings.log.debug("pc branching on %d. Value %e. Score %e\n",
                        branch_var,
@@ -1636,6 +1682,15 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
                        max_score);
 
     return branch_var;
+  }
+
+  // Trials use the same parent LU concurrently. A GPU result makes the host copy stale; rebuild
+  // it once for this node only when unreliable candidates remain. CPU-solved nodes are unchanged.
+  if (worker->host_basis_stale) {
+    if (toc(start_time) > settings.time_limit) { return branch_var; }
+    if (!refresh_stale_basis(worker, settings)) {
+      return worker->pseudo_costs.variable_selection(fractional, leaf_solution.x);
+    }
   }
 
   // 0: no batch PDLP, 1: cooperative batch PDLP and DS, 2: batch PDLP only
@@ -1721,14 +1776,6 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
   assert(num_candidates > 0);
   assert(num_tasks > 0);
 
-  if (sb_trace_enabled()) {
-    std::fprintf(stderr,
-                 "[SBRB] rb_iters=%lld bb_iters=%lld unreliable=%zu threshold=%d\n",
-                 static_cast<long long>(strong_branching_lp_iter),
-                 static_cast<long long>(branch_and_bound_lp_iters),
-                 unreliable_list.size(),
-                 static_cast<int>(reliable_threshold));
-  }
   settings.log.debug(
     "RB iters = %d, B&B iters = %d, unreliable = %d, num_tasks = %d, reliable_threshold = %d\n",
     static_cast<int64_t>(strong_branching_lp_iter),

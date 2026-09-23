@@ -13,6 +13,7 @@
 #include <branch_and_bound/pseudo_costs.hpp>
 #include <branch_and_bound/symmetry.hpp>
 
+#include <cuopt/error.hpp>
 #include <cuopt/mathematical_optimization/mip/solver_settings.hpp>  // benchmark_info_t
 
 #include <cuts/cuts.hpp>
@@ -1082,54 +1083,6 @@ branch_direction_t martin_criteria(f_t val, f_t root_val)
   }
 }
 
-// Rebuild `worker->basis_factors` so it describes `worker->leaf_vstatus` again, and report whether
-// it worked.
-//
-// WHY. A GPU solve pivots the DEVICE's own copy of the factorization and hands back only the final
-// vstatus, so the worker's copy still describes whatever basis the last CPU solve left. Strong
-// branching consumes that factorization DIRECTLY and deliberately does not rebuild it
-// (`initialize_basis = false`, pseudo_costs.cpp:503; then `b_transpose_solve` at :105 and
-// `child_basis_factors = basis_factors` at :504), so handing it a stale one aborts the solver on
-// `triangle_solve.cpp:116  assert(b.n == m)`.
-//
-// `host_basis_stale` alone does not cover this: it is consumed by the NEXT LP solve and by
-// `recompute_basis`, both of which run AFTER variable selection. Hence a rebuild here.
-//
-// COST. One LU (~0.15 ms measured), paid only on nodes that actually strong branch -- reliability
-// branching already restricts that to unreliable variables. The alternative, shipping the device's
-// basis and MPF stack back, moves 0.4-1.6 MB per node over a link that is already the upload
-// bottleneck, and hands strong branching a stack degraded by up to 256 updates immediately before it
-// runs up to 500 more iterations on top of it.
-template <typename i_t, typename f_t>
-static bool refresh_stale_basis(branch_and_bound_worker_t<i_t, f_t>* worker,
-                                const simplex::simplex_solver_settings_t<i_t, f_t>& settings)
-{
-  const i_t m = worker->leaf_problem.num_rows;
-  const i_t n = worker->leaf_problem.num_cols;
-
-  // `get_basis_from_vstatus` INDEXES basic_list but PUSH_BACKS into the other two. These vectors
-  // live for the whole solve, so they must be reset first or they grow by (n-m) on every call and
-  // every consumer that reads the first n-m entries silently sees an older basis forever after.
-  std::vector<i_t> superbasic_list;
-  worker->basic_list.assign(static_cast<size_t>(m), 0);
-  worker->nonbasic_list.clear();
-  worker->nonbasic_list.reserve(static_cast<size_t>(n - m));
-  simplex::get_basis_from_vstatus<i_t>(
-    m, worker->leaf_vstatus, worker->basic_list, worker->nonbasic_list, superbasic_list);
-
-  const int rc = worker->basis_factors.refactor_basis(worker->leaf_problem.A,
-                                                      settings,
-                                                      worker->leaf_problem.lower,
-                                                      worker->leaf_problem.upper,
-                                                      tic(),
-                                                      worker->basic_list,
-                                                      worker->nonbasic_list,
-                                                      worker->leaf_vstatus);
-  if (rc != 0) { return false; }   // singular / repaired basis
-  worker->host_basis_stale = false;
-  return true;
-}
-
 template <typename i_t, typename f_t>
 branch_variable_t<i_t> branch_and_bound_t<i_t, f_t>::variable_selection(
   mip_node_t<i_t, f_t>* node_ptr,
@@ -1145,11 +1098,9 @@ branch_variable_t<i_t> branch_and_bound_t<i_t, f_t>::variable_selection(
   switch (worker->search_strategy) {
     case search_strategy_t::BEST_FIRST:
 
-      // Strong branching trial-solves from worker->basis_factors without rebuilding it, so that
-      // factorization has to match the current basis before we get here. After a GPU solve it does
-      // not -- see refresh_stale_basis above.
-      if (settings_.reliability_branching != 0 &&
-          (!worker->host_basis_stale || refresh_stale_basis(worker, settings_))) {
+      // Reliability branching checks pseudocost reliability before refreshing a GPU-stale host
+      // basis. A fully reliable node needs no host LU for variable selection.
+      if (settings_.reliability_branching != 0) {
         branch_var = pc_.reliable_variable_selection(node_ptr,
                                                      fractional,
                                                      worker,
@@ -2157,7 +2108,8 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_start(
     pool.accounted_kernel_s = 0.0;
     pool.host_service_s += toc(prepare_t0);
     settings_.log.printf(
-      "[GPUPOOL-START] worker=%d gpu=%d seats=%d p90=%d threshold=%lld wait=%.6f queue=%zu\n",
+      "[GPUPOOL-START] time=%.9f worker=%d gpu=%d seats=%d p90=%d threshold=%lld wait=%.6f queue=%zu\n",
+      now,
       (int)worker->worker_id,
       pool.device,
       pool.seats,
@@ -2307,6 +2259,10 @@ template <typename i_t, typename f_t>
 bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
   bfs_worker_t<i_t, f_t>* worker, bool may_block)
 {
+  static const bool trace_gpu_results = [] {
+    const char* e = std::getenv("CUOPT_SB_TRACE");
+    return e != nullptr && std::strcmp(e, "0") != 0;
+  }();
   assert(worker != nullptr);
   auto& pool  = *gpu_batch_pools_[worker->worker_id];
   auto& batch = pool.batch;
@@ -2542,6 +2498,12 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     bool gpu_answer_accepted = false;
     const dual_status_t lp_status = nondeterministic_gpu_pool_install_result(
       worker, node, batch[seat], gpu_answer_accepted);
+    if (trace_gpu_results && gpu_answer_accepted) {
+      std::fprintf(stderr,
+                   "[GPU-SB-NODE] worker=%d node=%d\n",
+                   static_cast<int>(worker->worker_id),
+                   static_cast<int>(node->node_id));
+    }
     ++exploration_stats_.nodes_since_last_log;
     ++exploration_stats_.nodes_explored;
     --exploration_stats_.nodes_unexplored;
@@ -4746,6 +4708,11 @@ template <typename i_t, typename f_t>
 mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solution)
 {
   raft::common::nvtx::range scope("BB::solve");
+
+  cuopt_expects(gpu_batch_seats() == 0 || settings_.inside_submip != 0 ||
+                  settings_.mip_batch_pdlp_reliability_branching == 0,
+                error_type_t::ValidationError,
+                "GPU B&B dual simplex does not support PDLP reliability branching (modes 1 or 2)");
 
   logger_t log;
   log.log                             = false;
