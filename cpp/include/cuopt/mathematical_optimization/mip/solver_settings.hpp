@@ -145,7 +145,10 @@ class mip_solver_settings_t {
   i_t mip_batch_pdlp_reliability_branching{
     0};  // 0 = DS only, 1 = cooperative DS + PDLP, 2 = batch PDLP only
   i_t strong_branching_simplex_iteration_limit = -1;
-  i_t num_gpus                                 = 1;
+  // GPUs for the whole MIP solve (-1 = all visible). The concurrent root LP uses at most 2 (PDLP on
+  // device 0, barrier on device 1); branch-and-bound then runs its GPU dual simplex on devices
+  // 1..num_gpus-1. The caller must give each of devices [0, num_gpus) an RMM pool (cuopt_cli does).
+  i_t num_gpus = 1;
   method_t method{method_t::Concurrent};
   bool log_to_console = true;
 

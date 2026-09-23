@@ -183,7 +183,10 @@ struct simplex_solver_settings_t {
                                     // caveat as above.
   f_t barrier_step_scale;           // step scale for barrier method
   i_t barrier_soc_threshold;        // SOC dimension above which rank-2 sparse scaling is used
-  int num_gpus;   // Number of GPUs to use (maximum of 2 gpus are supported at the moment)
+  // Number of GPUs to use (-1 = all visible). Used for two things: the concurrent LP puts barrier on
+  // device 1 when > 1 (it uses at most 2), and branch-and-bound runs its GPU dual simplex on
+  // devices 1..num_gpus-1 (device 0 keeps the heuristics).
+  int num_gpus;
   i_t folding;    // -1 automatic, 0 don't fold, 1 fold
   i_t augmented;  // -1 automatic, 0 to solve with ADAT, 1 to solve with augmented system
   i_t dualize;    // -1 automatic, 0 to not dualize, 1 to dualize

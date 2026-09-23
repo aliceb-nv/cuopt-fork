@@ -132,6 +132,18 @@ thrust::tuple<f_t, f_t, f_t, f_t> get_mtm_for_constraint(
   return {delta_ij, sign, slack, cstr_tolerance};
 }
 
+// The sat/viol consistency asserts of feas_score_constraint are compiled out (confirmed harmless by
+// the FJ author). They abort assert builds, CPU-only included (mas74: `new_sat == !new_viol`):
+// old_sat/new_sat below use a strict `<` while the device scorer (feasibility_jump_impl_common.cuh)
+// uses `<=`, so an LHS exactly on rhs + tolerance is neither satisfied nor violated. With the first
+// one off, that state trips the next three in the same call and the other two on the next call,
+// so all six go together. -DCUOPT_FJ_CPU_SAT_VIOL_ASSERTS restores them.
+#ifdef CUOPT_FJ_CPU_SAT_VIOL_ASSERTS
+#define FJ_CPU_SAT_VIOL_ASSERT(cond) cuopt_assert(cond, "")
+#else
+#define FJ_CPU_SAT_VIOL_ASSERT(cond) ((void)0)
+#endif
+
 template <typename i_t, typename f_t>
 std::pair<f_t, f_t> feas_score_constraint(const typename fj_t<i_t, f_t>::climber_data_t::view_t& fj,
                                           f_t delta,
@@ -186,28 +198,28 @@ std::pair<f_t, f_t> feas_score_constraint(const typename fj_t<i_t, f_t>::climber
 
     // equality
     if (fj.pb.integer_equal(c_lb, c_ub)) {
-      if (!old_viol) cuopt_assert(old_sat == !old_viol, "");
-      if (!new_viol) cuopt_assert(new_sat == !new_viol, "");
+      if (!old_viol) FJ_CPU_SAT_VIOL_ASSERT(old_sat == !old_viol);
+      if (!new_viol) FJ_CPU_SAT_VIOL_ASSERT(new_sat == !new_viol);
     }
 
     // if it would feasibilize this constraint
     if (!old_sat && new_sat) {
-      cuopt_assert(old_viol, "");
+      FJ_CPU_SAT_VIOL_ASSERT(old_viol);
       base_feas += cstr_weight;
     }
     // would cause this constraint to be violated
     else if (old_sat && !new_sat) {
-      cuopt_assert(new_viol, "");
+      FJ_CPU_SAT_VIOL_ASSERT(new_viol);
       base_feas -= cstr_weight;
     }
     // simple improvement
     else if (!old_sat && !new_sat && old_lhs > new_lhs) {
-      cuopt_assert(old_viol && new_viol, "");
+      FJ_CPU_SAT_VIOL_ASSERT(old_viol && new_viol);
       base_feas += (i_t)(cstr_weight * fj.settings->parameters.excess_improvement_weight);
     }
     // simple worsening
     else if (!old_sat && !new_sat && old_lhs < new_lhs) {
-      cuopt_assert(old_viol && new_viol, "");
+      FJ_CPU_SAT_VIOL_ASSERT(old_viol && new_viol);
       base_feas -= (i_t)(cstr_weight * fj.settings->parameters.excess_improvement_weight);
     }
 

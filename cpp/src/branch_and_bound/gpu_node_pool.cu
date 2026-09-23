@@ -89,9 +89,14 @@ static bool gpu_resume_dual_feasible(const std::vector<simplex::variable_status_
 }
 
 
-// Devices available to the dual simplex. Not a template: it depends on nothing but the driver and
-// the CUOPT_BNB_GPU_DEVICE override.
-std::vector<int> gpu_usable_devices()
+// Devices available to the dual simplex. Not a template: it depends on nothing but the driver, the
+// `num_gpus` solver parameter and the CUOPT_BNB_GPU_DEVICE override.
+//
+// `num_gpus` is the same parameter that sizes the concurrent root LP (PDLP on device 0, barrier on
+// device 1 when num_gpus > 1) and that cuopt_cli uses to give devices [0, num_gpus) an RMM pool.
+// Honouring it here keeps every dual-simplex allocation on a pooled device; ignoring it put the
+// pools on devices that only had the default cudaMalloc resource.
+std::vector<int> gpu_usable_devices(int num_gpus)
 {
   int count = 0;
   if (cudaGetDeviceCount(&count) != cudaSuccess) { return {}; }
@@ -101,10 +106,11 @@ std::vector<int> gpu_usable_devices()
     if (forced >= count) { return {}; }
     return {forced};
   }
-  // Device 0 runs PDLP, feasibility jump and probing. Only the extra devices are ours, so a
-  // single-GPU machine yields nothing and the pool stays disabled.
+  // Device 0 runs PDLP, feasibility jump and probing. Only the extra requested devices are ours, so
+  // num_gpus <= 1 (the default) or a single-GPU machine yields nothing and the pool stays disabled.
+  const int limit = num_gpus < 0 ? count : std::min(num_gpus, count);
   std::vector<int> devices;
-  for (int d = 1; d < count; ++d) { devices.push_back(d); }
+  for (int d = 1; d < limit; ++d) { devices.push_back(d); }
   return devices;
 }
 
@@ -120,9 +126,9 @@ std::vector<int> gpu_usable_devices()
 //
 // Round-robin by worker id: with 11 workers on 2 GPUs this gives 6/5 and is independent of thread
 // arrival order.
-std::vector<int> gpu_pool_device_map(int num_workers)
+std::vector<int> gpu_pool_device_map(int num_workers, int num_gpus)
 {
-  const auto devices = gpu_usable_devices();
+  const auto devices = gpu_usable_devices(num_gpus);
   std::vector<int> map(static_cast<size_t>(std::max(num_workers, 0)), -1);
   if (devices.empty() || num_workers <= 0) { return map; }
   const int nd = static_cast<int>(devices.size());
@@ -542,7 +548,7 @@ bool gpu_solve_node_serial(const simplex::lp_problem_t<i_t, f_t>& lp,
       z_at_launch     = node_sol.z;
     }
     auto* handle = gds::gpu_simplified_dual_phase2_batch_launch<i_t, f_t>(
-      items, 0, timing, worker_stream.view(), /*allow_refactor_exit*/ true);
+      items, timing, worker_stream.view(), /*allow_refactor_exit*/ true);
     if (handle == nullptr) { return false; }   // rejected: timing.message says needed-vs-free
     gds::gpu_simplified_dual_phase2_batch_finish<i_t, f_t>(handle, out, timing);
     if (timing.rejected || out.empty()) { return false; }
@@ -933,7 +939,7 @@ bool gpu_solve_node_serial(const simplex::lp_problem_t<i_t, f_t>& lp,
               std::vector<simplex::dual_status_t> bout;
               gds::gpu_batch_timing btiming;
               auto* bh = gds::gpu_simplified_dual_phase2_batch_launch<i_t, f_t>(
-                bbatch, 0, btiming, worker_stream.view(), /*allow_refactor_exit*/ true);
+                bbatch, btiming, worker_stream.view(), /*allow_refactor_exit*/ true);
               if (bh != nullptr) {
                 gds::gpu_simplified_dual_phase2_batch_finish<i_t, f_t>(bh, bout, btiming);
                 if (!bout.empty()) {
@@ -966,7 +972,7 @@ bool gpu_solve_node_serial(const simplex::lp_problem_t<i_t, f_t>& lp,
               std::vector<simplex::dual_status_t> rout;
               gds::gpu_batch_timing rtiming;
               auto* rh2 = gds::gpu_simplified_dual_phase2_batch_launch<i_t, f_t>(
-                rbatch, 0, rtiming, worker_stream.view(), /*allow_refactor_exit*/ true);
+                rbatch, rtiming, worker_stream.view(), /*allow_refactor_exit*/ true);
               if (rh2 == nullptr) { break; }
               gds::gpu_simplified_dual_phase2_batch_finish<i_t, f_t>(rh2, rout, rtiming);
               if (rtiming.rejected || rout.empty()) { break; }
@@ -1201,9 +1207,10 @@ int gpu_batch_auto_seats(int device, int num_rows, int num_cols, std::size_t num
   cudaSetDevice(previous_device);
   if (!valid) { return 0; }
 
-  // The queue absorbs the long tail after the resident waves diverge in pivot count. Two waves
-  // gave enough tail coverage in the original pool sizing without allocating an unbounded queue.
-  constexpr int oversubscription = 2;
+  // The queue absorbs the long tail after the resident waves diverge in pivot count. Four waves
+  // (~9.5K seats per B200: 4 x 148 SMs x 16 blocks) replaced the original two (4224 on H100),
+  // which left the device underfed at 111 BFS workers.
+  constexpr int oversubscription = 4;
   const int64_t occupancy_limit = oversubscription *
                                   static_cast<int64_t>(properties.multiProcessorCount) *
                                   static_cast<int64_t>(blocks_per_sm);
@@ -1261,6 +1268,9 @@ struct gpu_batch_run_t {
   i_t periodic_refactors{0}, rejected_refactors{0}, certificate_refactors{0};
   double upload_s{0.0}, kernel_s{0.0}, copyback_s{0.0}, host_factor_s{0.0};
   bool persistent_seats{false};
+  // Split of the initial launch (telemetry only; see gpu_persistent_batch_begin).
+  gds::gpu_batch_timing setup_timing;
+  double setup_wall_s{0.0}, setup_host_lu_s{0.0};
 
   gpu_batch_run_t(const simplex::lp_problem_t<i_t, f_t>& lp_,
                   std::vector<gpu_batch_node_t<i_t, f_t>>& nodes_,
@@ -1507,7 +1517,7 @@ struct gpu_batch_run_t {
     for (const auto& w : st) { active_count += w.active ? 1 : 0; }
 
     handle = gds::gpu_simplified_dual_phase2_batch_launch<i_t, f_t>(
-      items, 0, timing, stream, /*allow_refactor_exit*/ true, ro_cache, persistent_seats);
+      items, timing, stream, /*allow_refactor_exit*/ true, ro_cache, persistent_seats);
     if (handle == nullptr) {
       // Rejected before launch (VRAM pre-flight); timing.message says needed-vs-free. Every seat
       // still active goes to the CPU rather than being silently lost.
@@ -1887,6 +1897,9 @@ gpu_batch_run<i_t, f_t>* gpu_persistent_batch_begin(
 {
   static const std::vector<int> devices = gpu_usable_devices();
   if (devices.empty() || nodes.empty() || seat_state == nullptr) { return nullptr; }
+  const bool telemetry = gpu_pool_logging();
+  gds::gpu_batch_set_setup_telemetry(telemetry);
+  const double setup_t0 = telemetry ? cuopt::mathematical_optimization::tic() : 0.0;
   auto* run = new gpu_batch_run_t<i_t, f_t>(lp, nodes, stream, ro_cache, *seat_state, true);
   run->prepare();
   // The persistent pool never launches terminal/no-op seats. The caller replaces per-node preparation failures and
@@ -1902,6 +1915,11 @@ gpu_batch_run<i_t, f_t>* gpu_persistent_batch_begin(
     run->publish();
     delete run;
     return nullptr;
+  }
+  if (telemetry) {
+    run->setup_timing    = run->timing;
+    run->setup_host_lu_s = run->host_factor_s;   // prepare(): every seat's host LU
+    run->setup_wall_s    = cuopt::mathematical_optimization::toc(setup_t0);
   }
   return run;
 }
@@ -1962,6 +1980,15 @@ gpu_batch_run_metrics gpu_batch_run_get_metrics(const gpu_batch_run<i_t, f_t>* r
   result.copyback_s              = run->copyback_s;
   result.host_factor_s           = run->host_factor_s;
   result.wall_s = cuopt::mathematical_optimization::toc(run->t0);
+  result.setup_wall_s            = run->setup_wall_s;
+  result.setup_host_lu_s         = run->setup_host_lu_s;
+  result.setup_alloc_s           = run->setup_timing.setup_alloc_s;
+  result.setup_alloc_n           = run->setup_timing.setup_alloc_n;
+  result.setup_h2d_s             = run->setup_timing.setup_h2d_s;
+  result.setup_h2d_n             = run->setup_timing.setup_h2d_n;
+  result.setup_h2d_bytes         = run->setup_timing.setup_h2d_bytes;
+  result.setup_memset_s          = run->setup_timing.setup_memset_s;
+  result.setup_memset_n          = run->setup_timing.setup_memset_n;
   return result;
 }
 

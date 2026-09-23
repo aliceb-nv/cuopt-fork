@@ -2003,6 +2003,7 @@ void branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_finish(
     return;
   }
   auto& pool = *gpu_batch_pools_[worker->worker_id];
+  const double finish_t0 = gpu_pool_logging() ? tic() : 0.0;
   if (pool.device >= 0) { cudaSetDevice(pool.device); }
   if (pool.run != nullptr) {
     if (gpu_pool_logging()) {
@@ -2032,6 +2033,7 @@ void branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_finish(
   if (gpu_pool_logging()) {
     ++pool.drains;
     pool.available_since_s = toc(exploration_stats_.start_time);
+    pool.finish_s += toc(finish_t0);
   }
 }
 
@@ -2106,7 +2108,8 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_start(
     ++pool.starts;
     pool.accounted_upload_s = 0.0;
     pool.accounted_kernel_s = 0.0;
-    pool.host_service_s += toc(prepare_t0);
+    pool.last_fill_s = toc(prepare_t0);
+    pool.host_service_s += pool.last_fill_s;
     settings_.log.printf(
       "[GPUPOOL-START] time=%.9f worker=%d gpu=%d seats=%d p90=%d threshold=%lld wait=%.6f queue=%zu\n",
       now,
@@ -2298,10 +2301,35 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
 
   const bool telemetry = gpu_pool_logging();
   const double service_t0 = telemetry ? tic() : 0.0;
+  // Per-phase split of this service step (telemetry only). Phases are added to the pool as they
+  // finish; the step total and the continuation save/restore only for steps that harvested.
+  bool harvested    = false;
+  double guard_s    = 0.0;
+  double restore_s  = 0.0;
+  double restore_t0 = 0.0;
+  const double finish_before = pool.finish_s;
   scope_guard service_timer([&]() {
-    if (telemetry) { pool.host_service_s += toc(service_t0); }
+    if (!telemetry) { return; }
+    const double service = toc(service_t0);
+    pool.host_service_s += service;
+    if (harvested) {
+      pool.step_total_s += service;
+      pool.step_guard_s += guard_s;
+      pool.step_restore_s += restore_s;
+      pool.step_drain_s += pool.finish_s - finish_before;
+    }
   });
+  // Destroyed AFTER the continuation guard below, so it closes the restore timer.
+  scope_guard restore_end([&]() {
+    if (telemetry) { restore_s = toc(restore_t0); }
+  });
+  const double guard_t0 = telemetry ? tic() : 0.0;
   worker_lp_continuation_guard_t<i_t, f_t> preserve_cpu_continuation(*worker);
+  if (telemetry) { guard_s = toc(guard_t0); }
+  // Destroyed BEFORE the continuation guard, so it opens the restore timer.
+  scope_guard restore_begin([&]() {
+    if (telemetry) { restore_t0 = tic(); }
+  });
 
   using drop_t = typename gpu_batch_node_t<i_t, f_t>::drop_t;
   auto count_drop = [&](i_t seat) {
@@ -2428,6 +2456,40 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     if (telemetry) {
       ++pool.launches;
       pool.launch_started_at = launch_t0;
+      // Setup split of this pool start: host seat fill (in the start) + begin = host LU of every
+      // seat + marshal (alloc / H2D / memset) + launch. `other` is begin minus the measured parts.
+      const auto m        = gpu_batch_run_get_metrics<i_t, f_t>(pool.run);
+      const double other  = std::max(
+        0.0, m.setup_wall_s - m.setup_host_lu_s - m.setup_alloc_s - m.setup_h2d_s - m.setup_memset_s);
+      ++pool.setups;
+      pool.setup_fill_s += pool.last_fill_s;
+      pool.setup_begin_s += m.setup_wall_s;
+      pool.setup_host_lu_s += m.setup_host_lu_s;
+      pool.setup_alloc_s += m.setup_alloc_s;
+      pool.setup_alloc_n += m.setup_alloc_n;
+      pool.setup_h2d_s += m.setup_h2d_s;
+      pool.setup_h2d_n += m.setup_h2d_n;
+      pool.setup_h2d_bytes += m.setup_h2d_bytes;
+      pool.setup_memset_s += m.setup_memset_s;
+      pool.setup_memset_n += m.setup_memset_n;
+      settings_.log.printf(
+        "[GPUPOOL-SETUP] worker=%d gpu=%d seats=%d t=%.3f fill=%.3f begin=%.3f host_lu=%.3f "
+        "alloc=%.3f(n=%zu) h2d=%.3f(n=%zu,MB=%.1f) memset=%.3f(n=%zu) other=%.3f\n",
+        (int)worker->worker_id,
+        pool.device,
+        (int)batch.size(),
+        toc(exploration_stats_.start_time),
+        pool.last_fill_s,
+        m.setup_wall_s,
+        m.setup_host_lu_s,
+        m.setup_alloc_s,
+        m.setup_alloc_n,
+        m.setup_h2d_s,
+        m.setup_h2d_n,
+        static_cast<double>(m.setup_h2d_bytes) / (1024.0 * 1024.0),
+        m.setup_memset_s,
+        m.setup_memset_n,
+        other);
     }
     if (!may_block) { return true; }
   }
@@ -2449,10 +2511,16 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
   if (telemetry) {
     const double harvest_wall = toc(harvest_t0);
     if (!ready_before_harvest) { pool.host_blocked_s += harvest_wall; }
+    harvested = true;
+    ++pool.steps;
+    pool.step_harvest_s += harvest_wall;
     const auto metrics = gpu_batch_run_get_metrics<i_t, f_t>(pool.run);
     const double upload = std::max(0.0, metrics.upload_s - pool.accounted_upload_s);
     const double kernel = std::max(0.0, metrics.kernel_s - pool.accounted_kernel_s);
-    const double flight_wall = pool.launch_started_at > 0.0 ? toc(pool.launch_started_at) : 0.0;
+    // From the launch to the moment this worker ENTERED the step (it had just seen the completion
+    // flag), NOT to the end of the harvest: the copy-back is the harvest's own cost, not notice.
+    const double flight_wall =
+      pool.launch_started_at > 0.0 ? std::max(0.0, service_t0 - pool.launch_started_at) : 0.0;
     const double notice = std::max(0.0, flight_wall - upload - kernel);
     pool.completion_notice_s += notice;
     pool.completion_notice_max_s = std::max(pool.completion_notice_max_s, notice);
@@ -2460,6 +2528,7 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     pool.accounted_kernel_s = metrics.kernel_s;
   }
 
+  const double process_t0 = telemetry ? tic() : 0.0;
   enum class next_t : unsigned char { FRESH, REFACTOR, CHILD };
   std::vector<next_t> next(batch.size(), next_t::FRESH);
   std::vector<std::vector<gds::gpu_bound_delta<i_t, f_t>>> deltas(batch.size());
@@ -2578,6 +2647,7 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
 
     if (!child_installed) { ++fresh_required; }
   }
+  if (telemetry) { pool.step_process_s += toc(process_t0); }
 
   // The owner ran out of CPU work and failed to steal. Harvest this generation, but retire the
   // pool even if it produced children: those nodes now continue through the ordinary CPU heap.
@@ -2591,6 +2661,7 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     nondeterministic_gpu_pool_finish(worker);
     return false;
   }
+  const double refill_t0 = telemetry ? tic() : 0.0;
   for (i_t seat = 0; seat < static_cast<i_t>(batch.size()); ++seat) {
     if (next[seat] == next_t::FRESH &&
         !nondeterministic_gpu_pool_fill_fresh_seat(worker, seat)) {
@@ -2598,10 +2669,38 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
       return false;
     }
   }
+  if (telemetry) { pool.step_refill_s += toc(refill_t0); }
 
+  // Stage split: host LU is the run's host_factor_s delta, H2D / memset / growth allocations come
+  // from the per-thread CUDA call accounting, settings copies are timed here.
+  const double stage_t0        = telemetry ? tic() : 0.0;
+  const double stage_factor_t0 =
+    telemetry ? gpu_batch_run_get_metrics<i_t, f_t>(pool.run).host_factor_s : 0.0;
+  double stage_settings_s = 0.0;
+  if (telemetry) { gds::gpu_call_stats_begin(); }
+  bool stage_open  = telemetry;
+  auto close_stage = [&]() {
+    if (!stage_open) { return; }
+    stage_open       = false;
+    const auto calls = gds::gpu_call_stats_end();
+    pool.step_stage_s += toc(stage_t0);
+    pool.step_stage_settings_s += stage_settings_s;
+    pool.step_stage_lu_s +=
+      std::max(0.0, gpu_batch_run_get_metrics<i_t, f_t>(pool.run).host_factor_s - stage_factor_t0);
+    pool.step_stage_h2d_s += calls.h2d_s;
+    pool.step_h2d_n += calls.h2d_n;
+    pool.step_h2d_bytes += calls.h2d_bytes;
+    pool.step_stage_memset_s += calls.memset_s;
+    pool.step_memset_n += calls.memset_n;
+    pool.step_stage_alloc_s += calls.alloc_s;
+    pool.step_alloc_n += calls.alloc_n;
+  };
+  scope_guard stage_timer([&]() { close_stage(); });   // early-return paths
   std::string stage_error;
   for (i_t seat = 0; seat < static_cast<i_t>(batch.size()); ++seat) {
+    const double settings_t0 = telemetry ? tic() : 0.0;
     batch[seat].settings = nondeterministic_gpu_pool_settings(worker);
+    if (telemetry) { stage_settings_s += toc(settings_t0); }
     if (next[seat] != next_t::FRESH) { continue; }
     while (!gpu_persistent_batch_stage_fresh<i_t, f_t>(pool.run, seat, stage_error)) {
       if (!fresh_factor_failure(seat)) {
@@ -2688,6 +2787,7 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
       return false;
     }
   }
+  close_stage();
 
   nondeterministic_gpu_pool_update_lower_bound(worker);
   const double relaunch_t0 = telemetry ? tic() : 0.0;
@@ -2710,6 +2810,7 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
   if (telemetry) {
     ++pool.launches;
     pool.launch_started_at = relaunch_t0;
+    pool.step_relaunch_s += toc(relaunch_t0);
   }
   return true;
 }
@@ -5447,7 +5548,7 @@ void branch_and_bound_t<i_t, f_t>::initialize_nondeterministic_gpu_pools(i_t num
   if (gpu_batch_seats() == 0 || settings_.inside_submip != 0) { return; }
 
   destroy_nondeterministic_gpu_pools();
-  const std::vector<int> devmap = gpu_pool_device_map(num_bfs_workers);
+  const std::vector<int> devmap = gpu_pool_device_map(num_bfs_workers, settings_.num_gpus);
   int previous_device          = 0;
   cudaGetDevice(&previous_device);
   std::unordered_map<int, gds::gpu_ro_cache<i_t, f_t>*> ro_by_device;
@@ -5566,6 +5667,39 @@ void branch_and_bound_t<i_t, f_t>::log_nondeterministic_gpu_pool_telemetry()
     double wait_s{0.0}, wait_max_s{0.0}, overlap_s{0.0};
     double upload_s{0.0}, kernel_s{0.0}, copyback_s{0.0}, factor_s{0.0};
     double service_s{0.0}, blocked_s{0.0}, notice_s{0.0}, notice_max_s{0.0};
+    uint64_t setups{0}, setup_alloc_n{0}, setup_h2d_n{0}, setup_h2d_bytes{0}, setup_memset_n{0};
+    double setup_fill_s{0.0}, setup_begin_s{0.0}, setup_host_lu_s{0.0};
+    double setup_alloc_s{0.0}, setup_h2d_s{0.0}, setup_memset_s{0.0};
+    uint64_t steps{0}, step_h2d_n{0}, step_h2d_bytes{0}, step_memset_n{0}, step_alloc_n{0};
+    double step_total_s{0.0}, step_guard_s{0.0}, step_restore_s{0.0}, step_harvest_s{0.0};
+    double step_process_s{0.0}, step_refill_s{0.0}, step_stage_s{0.0}, step_stage_settings_s{0.0};
+    double step_stage_lu_s{0.0}, step_stage_h2d_s{0.0}, step_stage_memset_s{0.0};
+    double step_stage_alloc_s{0.0}, step_relaunch_s{0.0};
+    double finish_s{0.0}, step_drain_s{0.0};
+  };
+  // One `step` line: the service-step split summed over `n` harvesting steps. `stage_other` and
+  // `other` are the unmeasured remainders of the stage and of the whole step. `drain` is pool
+  // retirement inside a step; `finish` is all pool retirement, inside a step or not.
+  auto print_step = [&](const char* tag, const char* key, int id, const auto& s) {
+    const double stage_other =
+      std::max(0.0, s.step_stage_s - s.step_stage_settings_s - s.step_stage_lu_s -
+                      s.step_stage_h2d_s - s.step_stage_memset_s - s.step_stage_alloc_s);
+    const double other =
+      std::max(0.0, s.step_total_s - s.step_guard_s - s.step_restore_s - s.step_harvest_s -
+                      s.step_process_s - s.step_refill_s - s.step_stage_s - s.step_relaunch_s -
+                      s.step_drain_s);
+    settings_.log.printf(
+      "[%s] %s=%d step n=%llu total=%.3f guard=%.3f restore=%.3f harvest=%.3f process=%.3f "
+      "refill=%.3f stage=%.3f(settings=%.3f host_lu=%.3f h2d=%.3f(n=%llu,MB=%.1f) "
+      "memset=%.3f(n=%llu) alloc=%.3f(n=%llu) other=%.3f) relaunch=%.3f drain=%.3f other=%.3f "
+      "finish=%.3f\n",
+      tag, key, id, (unsigned long long)s.steps, s.step_total_s, s.step_guard_s,
+      s.step_restore_s, s.step_harvest_s, s.step_process_s, s.step_refill_s, s.step_stage_s,
+      s.step_stage_settings_s, s.step_stage_lu_s, s.step_stage_h2d_s,
+      (unsigned long long)s.step_h2d_n, static_cast<double>(s.step_h2d_bytes) / (1024.0 * 1024.0),
+      s.step_stage_memset_s, (unsigned long long)s.step_memset_n, s.step_stage_alloc_s,
+      (unsigned long long)s.step_alloc_n, stage_other, s.step_relaunch_s, s.step_drain_s, other,
+      s.finish_s);
   };
   std::unordered_map<int, device_stats_t> devices;
 
@@ -5623,6 +5757,20 @@ void branch_and_bound_t<i_t, f_t>::log_nondeterministic_gpu_pool_telemetry()
       (unsigned long long)pool.preparation_failures,
       (unsigned long long)pool.allocation_halvings,
       (unsigned long long)pool.allocation_disables);
+    {
+      const double setup_other =
+        std::max(0.0, pool.setup_begin_s - pool.setup_host_lu_s - pool.setup_alloc_s -
+                        pool.setup_h2d_s - pool.setup_memset_s);
+      settings_.log.printf(
+        "[GPUPOOL-WORKER] worker=%d setup n=%llu fill=%.3f begin=%.3f host_lu=%.3f "
+        "alloc=%.3f(n=%llu) h2d=%.3f(n=%llu,MB=%.1f) memset=%.3f(n=%llu) other=%.3f\n",
+        (int)worker_id, (unsigned long long)pool.setups, pool.setup_fill_s, pool.setup_begin_s,
+        pool.setup_host_lu_s, pool.setup_alloc_s, (unsigned long long)pool.setup_alloc_n,
+        pool.setup_h2d_s, (unsigned long long)pool.setup_h2d_n,
+        static_cast<double>(pool.setup_h2d_bytes) / (1024.0 * 1024.0), pool.setup_memset_s,
+        (unsigned long long)pool.setup_memset_n, setup_other);
+    }
+    print_step("GPUPOOL-WORKER", "worker", (int)worker_id, pool);
 
     auto& device = devices[pool.device];
     ++device.workers;
@@ -5652,6 +5800,37 @@ void branch_and_bound_t<i_t, f_t>::log_nondeterministic_gpu_pool_telemetry()
     device.blocked_s += pool.host_blocked_s;
     device.notice_s += pool.completion_notice_s;
     device.notice_max_s = std::max(device.notice_max_s, pool.completion_notice_max_s);
+    device.setups += pool.setups;
+    device.setup_fill_s += pool.setup_fill_s;
+    device.setup_begin_s += pool.setup_begin_s;
+    device.setup_host_lu_s += pool.setup_host_lu_s;
+    device.setup_alloc_s += pool.setup_alloc_s;
+    device.setup_alloc_n += pool.setup_alloc_n;
+    device.setup_h2d_s += pool.setup_h2d_s;
+    device.setup_h2d_n += pool.setup_h2d_n;
+    device.setup_h2d_bytes += pool.setup_h2d_bytes;
+    device.setup_memset_s += pool.setup_memset_s;
+    device.setup_memset_n += pool.setup_memset_n;
+    device.steps += pool.steps;
+    device.step_h2d_n += pool.step_h2d_n;
+    device.step_h2d_bytes += pool.step_h2d_bytes;
+    device.step_memset_n += pool.step_memset_n;
+    device.step_alloc_n += pool.step_alloc_n;
+    device.step_total_s += pool.step_total_s;
+    device.step_guard_s += pool.step_guard_s;
+    device.step_restore_s += pool.step_restore_s;
+    device.step_harvest_s += pool.step_harvest_s;
+    device.step_process_s += pool.step_process_s;
+    device.step_refill_s += pool.step_refill_s;
+    device.step_stage_s += pool.step_stage_s;
+    device.step_stage_settings_s += pool.step_stage_settings_s;
+    device.step_stage_lu_s += pool.step_stage_lu_s;
+    device.step_stage_h2d_s += pool.step_stage_h2d_s;
+    device.step_stage_memset_s += pool.step_stage_memset_s;
+    device.step_stage_alloc_s += pool.step_stage_alloc_s;
+    device.step_relaunch_s += pool.step_relaunch_s;
+    device.finish_s += pool.finish_s;
+    device.step_drain_s += pool.step_drain_s;
   }
 
   for (const auto& [gpu, device] : devices) {
@@ -5681,6 +5860,18 @@ void branch_and_bound_t<i_t, f_t>::log_nondeterministic_gpu_pool_telemetry()
       (unsigned long long)device.errors, (unsigned long long)device.shortfalls,
       (unsigned long long)device.preparation_failures, (unsigned long long)device.halvings,
       (unsigned long long)device.disables);
+    const double setup_other =
+      std::max(0.0, device.setup_begin_s - device.setup_host_lu_s - device.setup_alloc_s -
+                      device.setup_h2d_s - device.setup_memset_s);
+    settings_.log.printf(
+      "[GPUPOOL-GPU] gpu=%d setup n=%llu fill=%.3f begin=%.3f host_lu=%.3f alloc=%.3f(n=%llu) "
+      "h2d=%.3f(n=%llu,MB=%.1f) memset=%.3f(n=%llu) other=%.3f\n",
+      gpu, (unsigned long long)device.setups, device.setup_fill_s, device.setup_begin_s,
+      device.setup_host_lu_s, device.setup_alloc_s, (unsigned long long)device.setup_alloc_n,
+      device.setup_h2d_s, (unsigned long long)device.setup_h2d_n,
+      static_cast<double>(device.setup_h2d_bytes) / (1024.0 * 1024.0), device.setup_memset_s,
+      (unsigned long long)device.setup_memset_n, setup_other);
+    print_step("GPUPOOL-GPU", "gpu", gpu, device);
   }
 }
 
@@ -5787,7 +5978,7 @@ void branch_and_bound_t<i_t, f_t>::run_deterministic_coordinator(const csr_matri
     // #4 -- decide the whole pool->device assignment ONCE, here, where both inputs are known and no
     // worker has started. Each pool's stream is then created ON its own device, which requires
     // setting the current device first (per-thread state, and rmm::cuda_stream binds at construction).
-    const std::vector<int> devmap = gpu_pool_device_map(num_bfs_workers);
+    const std::vector<int> devmap = gpu_pool_device_map(num_bfs_workers, settings_.num_gpus);
     int prev_device = 0;
     cudaGetDevice(&prev_device);
     // ONE read-only cache per DEVICE, created here -- single-threaded, before any worker starts --
