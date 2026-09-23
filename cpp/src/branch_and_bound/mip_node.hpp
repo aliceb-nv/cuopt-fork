@@ -295,6 +295,7 @@ class mip_node_t {
     copy.children[0]        = nullptr;
     copy.children[1]        = nullptr;
     copy.status             = node_status_t::PENDING;
+    copy.cpu_only           = cpu_only;
 
     copy.orbital_fix_zero = orbital_fix_zero;
     copy.orbital_fix_one  = orbital_fix_one;
@@ -323,6 +324,12 @@ class mip_node_t {
   // Indicate if we can dive from this node or not. This is set to false when
   // this node was already selected for diving once.
   omp_atomic_t<bool> can_dive{true};
+
+  // A GPU attempt that cannot safely finish this LP (for example NUMERICAL,
+  // ITERATION_LIMIT, or a failed resume refactor) returns the node to its owning
+  // worker with this flag set. CPU workers may process it normally; GPU pool
+  // extraction must skip it so the same hard node cannot be selected again.
+  bool cpu_only{false};
 
   // Cumulative orbital fixing bound changes from root to this node.
   // Stored so that when a child starts a new plunge, the parent's

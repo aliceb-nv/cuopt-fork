@@ -44,18 +44,74 @@
 #include <rmm/mr/pool_memory_resource.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
+#include <cuda/atomic>
 #include <cuda/std/limits>
 #include <cuda/std/span>
 
 #include <new>  // placement new: construct the per-slot persistent state in host-allocated memory
 
+#include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <unordered_map>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <vector>
+
+static_assert(std::atomic_ref<std::uint32_t>::is_always_lock_free,
+              "the mapped completion word requires lock-free CPU atomics");
+
+// The GPU used to store 1/mu and MULTIPLY when applying each stacked rank-1
+// update; the CPU (basis_updates.cpp) stores mu and DIVIDES. That was two roundings against one, on
+// every stacked update, on every T-loop pass -- and the result feeds the `utilde` that produces the
+// NEXT mu, so it compounded through the stack. Dividing matches the CPU exactly.
+// Together with dividing by the triangular diagonal, this removes the wrong answer on nexp node
+// 783 without the dual rebuild that used to be needed.
+
+
+// NO-FLIP FIX, part 1 of 2 -- DEVICE-ONLY (the CPU drivers are deliberately untouched).
+//
+// THE DEFECT. The ratio test computes (+-dual_tol/10 - z_j)/delta_z_j. A reduced cost that has
+// drifted one ULP past the tolerance flips the numerator's sign, so the ratio comes out NEGATIVE.
+// Selection is `ratio < min_val`, so a negative ratio beats every legitimate candidate WITH
+// CERTAINTY -- it is a sorting bug, not a rare race. The resulting negative dual step is added to
+// every nonbasic reduced cost, the pivot element is tiny, and the primal step divides by it. On
+// badnode_m4640 that took dinf 1e-07 -> 0.022, |Ax-b| -> 8913, and drove the tracked objective to
+// 292.10 past a cutoff of 282.0 -- fathoming a node whose true optimum is 49.58.
+//
+// THE FIX. Clamp the ratio at zero in warp_rt_body: fmax(ratio, 0). The candidate becomes a
+// degenerate step, which is exactly what the bound-flipping breakpoint path has always produced.
+// The cost is more degenerate pivots, not a lost candidate -- and that distinction is the whole
+// point, because DROPPING such candidates can empty the eligible set, which the driver reports as
+// DUAL_UNBOUNDED and branch-and-bound fathoms. See part 2 at the cutoff exit.
+//
+// The clamp is unconditional; there is no switch. A guard that can be compiled out invites a
+// harness to measure the unguarded build by accident.
+//
+// NOTE: this BREAKS bit-exactness with simplified_dual_phase2 (dual_simplex/CLAUDE.md rule 2). The
+// CPU minimal driver still takes negative steps; it is exposed to the same defect and is simply not
+// guarded here. The CPU FULL driver is the reference and is not affected.
+//
+// REJECTED ALTERNATIVES, all measured, do not re-try without new evidence:
+//   * reject negative candidates outright -> emptied the set -> false DUAL_UNBOUNDED (csched008
+//     node 9304); adding an "emptied by rejection" -> NUMERICAL split fixed that but traded a wrong
+//     answer for a large NUMERICAL rate.
+//   * DS_RT_MIN_PIVOT (refuse a pivot below a magnitude): dead below pivot_tol=1e-7 by construction,
+//     and at 1e-5 it refused a good pivot at iteration 29 of 57 on nexp node 783 with dinf=0.
+//   * Lagrangian dual-bound certificates at the CUTOFF and OPTIMAL exits: correct, but they only
+//     REFUSE to fathom after the iterate is already destroyed, so the solve then spun to 214,299
+//     iterations, and most of the resulting NUMERICAL were false positives (node 783 bailed with
+//     its objective right to 5.6e-13) because the bound was built from the drifted y.
+//   * refuse OPTIMAL while the maintained z is dual infeasible: fires on 53-55% of seats.
+
+
+#ifndef GPU_DUAL_UNBOUNDED_TRACE
+#define GPU_DUAL_UNBOUNDED_TRACE 0
+#endif
 
 namespace cuopt::linear_programming::dual_simplex {
 // Shared simplex primitives live in mathematical_optimization::simplex; tic/toc
@@ -70,17 +126,10 @@ namespace dts = dense_triangle_solve;  // shared dense-solve cores
 
 
 
-// Set when a span is asked to exceed the capacity the host layout reserved for it, or when
-// the host and device slot walks disagree. Nothing allocates any more, so this is a LAYOUT
-// bug, not a resource shortage; the driver bails with NUMERICAL and the host reports it.
-// Shared across all blocks in a batch launch (a single failing block poisons the
-// whole batch by design → surfaces as a loud verification mismatch). Reset from
-// the host before each launch; set with atomicOr so concurrent blocks don't tear.
-__device__ int g_gpu_capacity_exceeded;
 
 // Next independent problem claimed by the persistent work-stealing grid. Reset by the host before
 // every launch; only lane 0 of each block updates it, then publishes the claimed index to its warp.
-__device__ unsigned int g_next_problem;
+// (the work-stealing counter is per launch, passed as a kernel argument -- not a device global)
 
 // MEASURED AND REJECTED (2026-08-18): making the hypersparse-vs-dense routing threshold tunable
 // per solve entry point. An earlier per-phase profile appeared to say the hard-coded 0.05 is badly
@@ -119,7 +168,6 @@ __device__ unsigned int g_next_problem;
 // clean and the <<<1,1>>> reference still 100/100 bit-exact.
 // Consumed ONLY in warp_build_levels -- the lane-0 prologue -- so unlike a flag in the wavefront
 // inner loop it costs no registers on the hot path and one binary measures both arms.
-__device__ int g_elide_noop;
 
 // REORDERING THE LEVEL SCHEDULE IS A DEAD END, measured 2026-08-26. Emitting each level by
 // descending column length instead of ascending index was built and measured at only -1.0%, and
@@ -213,10 +261,13 @@ struct gpu_span {
   __device__ void set_size(size_t n) { size_ = n; }
 
   // Capacity is fixed at allocation; these only move the LENGTH. Needing more than was allocated is
-  // a sizing bug, not a condition to recover from: it raises the flag and the write is skipped.
+  // a sizing bug in the host-side per-slot allocation, not a condition to recover from, so it is a
+  // debug-build assert rather than a runtime signal. The callers still skip the write in release so
+  // an undersized buffer degrades to a wrong answer rather than to memory corruption in a
+  // neighbouring seat.
   __device__ void require_capacity(size_t n) const
   {
-    if (n > cap_) { atomicOr(&g_gpu_capacity_exceeded, 1); }
+    cuopt_assert(n <= cap_, "gpu_span: write exceeds the capacity allocated for this buffer");
   }
   __device__ void reserve(size_t n) { require_capacity(n); }
   __device__ void resize(size_t n)
@@ -653,7 +704,7 @@ __device__ __forceinline__ void warp_tloop_body(bool a_tl_asc, i_t a_tl_axpyoff,
       for (i_t p = dc0 + lane; p < dc1; p += 32) { partial += a_tl_val[p] * x[a_tl_ri[p]]; }
       dot = warp_reduce_add(partial);   // every lane gets the full sum
     }
-    const f_t theta = dot * inv_mu;
+    const f_t theta = dot / inv_mu;
     if (fabs(theta) > a_tl_tol) {
       const i_t ac0 = a_tl_cs[acol];
       const i_t ac1 = a_tl_cs[acol + 1];
@@ -668,7 +719,7 @@ __device__ __forceinline__ void warp_tloop_body(bool a_tl_asc, i_t a_tl_axpyoff,
 // loaded once; the two reductions preserve the one-RHS accumulation order independently.
 template <bool Ascending, i_t AxpyOffset, i_t DotOffset>
 __device__ __forceinline__ void warp_tloop2_body(const i_t* a_cs,
-                                                 const f_t* a_inv_mu,
+                                                 const f_t* a_mu,
                                                  i_t a_num,
                                                  const i_t* a_ri,
                                                  f_t a_tol,
@@ -713,9 +764,9 @@ __device__ __forceinline__ void warp_tloop2_body(const i_t* a_cs,
       dot0 = warp_reduce_add(part0);
       dot1 = warp_reduce_add(part1);
     }
-    const f_t inv_mu = a_inv_mu[k];
-    const f_t theta0 = dot0 * inv_mu;
-    const f_t theta1 = dot1 * inv_mu;
+    const f_t mu = a_mu[k];
+    const f_t theta0 = dot0 / mu;
+    const f_t theta1 = dot1 / mu;
     const i_t a0     = a_cs[acol];
     const i_t a1     = a_cs[acol + 1];
     if (fabs(theta0) > a_tol) {
@@ -881,10 +932,19 @@ __device__ __forceinline__ void warp_rt_body(f_t a_rt_dual_tol,
     if (k < a_rt_num_nonbasic) {
       j                         = a_rt_nonbasic[k];
       const variable_status_t s = a_rt_vstatus[j];
+      // fmax(.., 0). The ratio is (+-dtol - z_j)/dz_j, so a reduced cost that has drifted one ULP
+      // past the tolerance flips the numerator's sign and yields a NEGATIVE ratio. Selection is
+      // `ratio < min_val`, so such a candidate beats every legitimate one with certainty, and the
+      // resulting negative dual step is added to every nonbasic reduced cost -- which is how a node
+      // with a true optimum of 49.58 got fathomed against a cutoff of 282.
+      // Clamping makes it a degenerate step, which is exactly what the bound-flipping breakpoint
+      // path has always produced. The cost is more degenerate pivots, not a lost candidate:
+      // clamping keeps it eligible, where DROPPING it could empty the set and be misreported as
+      // DUAL_UNBOUNDED.
       if (s == variable_status_t::NONBASIC_LOWER && a_rt_dz[j] < -ptol) {
-        ratio = (-dtol - a_rt_z[j]) / a_rt_dz[j];
+        ratio = fmax((-dtol - a_rt_z[j]) / a_rt_dz[j], f_t{0.0});
       } else if (s == variable_status_t::NONBASIC_UPPER && a_rt_dz[j] > ptol) {
-        ratio = (dtol - a_rt_z[j]) / a_rt_dz[j];
+        ratio = fmax((dtol - a_rt_z[j]) / a_rt_dz[j], f_t{0.0});
       }
     }
     const unsigned mask = __ballot_sync(0xffffffffu, ratio < INF);
@@ -1087,7 +1147,7 @@ __device__ __forceinline__ void warp_solve_to_workspace_body(i_t a_m, i_t* a_mar
 // The <=2 dot fast path is bit-identical for the same reason as in warp_tloop_body.
 template <bool Ascending, int DotOffset, int AxpyOffset>
 __device__ __forceinline__ void warp_tloop_sparse_body(const i_t* a_cs,
-                                                       const f_t* a_inv_mu,
+                                                       const f_t* a_mu,
                                                        i_t a_num,
                                                        const i_t* a_ri,
                                                        f_t a_tol,
@@ -1104,7 +1164,7 @@ __device__ __forceinline__ void warp_tloop_sparse_body(const i_t* a_cs,
   i_t nz         = *a_nz;   // warp-uniform on entry, and every update below keeps it uniform
   for (i_t step = 0; step < a_num; ++step) {
     const i_t k = Ascending ? step : (a_num - 1 - step);
-    const f_t inv_mu = a_inv_mu[k];
+    const f_t mu = a_mu[k];
     const i_t dcol = 2 * k + DotOffset;
     const i_t d0   = a_cs[dcol];
     const i_t d1   = a_cs[dcol + 1];
@@ -1123,7 +1183,7 @@ __device__ __forceinline__ void warp_tloop_sparse_body(const i_t* a_cs,
       }
       dot = warp_reduce_add(partial);
     }
-    const f_t theta = dot * inv_mu;
+    const f_t theta = dot / mu;
     if (fabs(theta) > a_tol) {
       // The dot and AXPY CSC columns are adjacent, so one AXPY boundary is already in d0/d1.
       // Compile-time offsets let both directions reuse it without adding a runtime branch.
@@ -1315,6 +1375,17 @@ __device__ __forceinline__ void warp_permute_dense_body(const f_t* a_b, i_t a_n,
   __syncwarp(0xffffffffu);
 }
 
+// x[p[k]] = b[k] over a dense length-n vector (inverse_permute_vector).
+__device__ __forceinline__ void warp_inverse_permute_dense_body(const f_t* a_b,
+                                                                i_t a_n,
+                                                                const i_t* a_p,
+                                                                f_t* a_x)
+{
+  const int lane = static_cast<int>(threadIdx.x);
+  for (i_t k = lane; k < a_n; k += 32) { a_x[a_p[k]] = a_b[k]; }
+  __syncwarp(0xffffffffu);
+}
+
 // Warp forms of the sptrsv prologue's data-parallel passes. The reach DFS itself is a pointer-chase
 // and stays on lane 0, but the O(reach) sweeps around it do not have to.
 //
@@ -1413,12 +1484,8 @@ __device__ int warp_build_levels(const gpu_csc_view_t<RI>& mat, bool diag_first,
   }
   i_t nlev = 0;
   for (i_t j = 0; j < m; ++j) { if (level[j] > nlev) { nlev = level[j]; } }
-  // No-op columns (see g_elide_noop). With length 1 the diagonal sits at col_start[j] whichever end
-  // diag_first puts it, so one test covers all four operators. Length 0 cannot occur in a
-  // nonsingular triangular factor and is left to the existing (unconditional val[dp]) path.
-  const bool elide = (g_elide_noop != 0);
   auto is_noop = [&](i_t j) {
-    return elide && mat.col_start[j + 1] - mat.col_start[j] == 1 && mat.x[mat.col_start[j]] == 1.0;
+    return mat.col_start[j + 1] - mat.col_start[j] == 1 && mat.x[mat.col_start[j]] == 1.0;
   };
   col_order.resize(m);                                 // sized m; the tail is unused when eliding
   // One counting sort by level, ascending j within a level.
@@ -1430,7 +1497,7 @@ __device__ int warp_build_levels(const gpu_csc_view_t<RI>& mat, bool diag_first,
   // block time, and was rejected ONLY because the extra static VRAM broke the lazily reserved malloc
   // heap at 1,200 problems (cudaErrorLaunchOutOfResources). Two things changed. It is now the LAST
   // device malloc in the kernel -- measured at exactly 4 per problem, one per solve op, ~105 B each
-  // -- so removing it retires the whole malloc path and g_gpu_capacity_exceeded with it. And the VRAM
+  // -- so removing it retires the whole malloc path. And the VRAM
   // objection is gone: one (m+1) array shared by all four ops costs 4(m+1) B/slot against the
   // iteration-driven S_ heap term it replaces, which is ~36 MB/slot at 200 iterations.
   // Deliberately NOT aliased onto sp_pos_v, which is live for the whole solve as cfg.sp_pos.
@@ -1442,9 +1509,10 @@ __device__ int warp_build_levels(const gpu_csc_view_t<RI>& mat, bool diag_first,
   }
   // Tag AFTER the level pull and the counting sort, both of which read PLAIN level values. From
   // here on level[] is a tagged word: read it through factor_level().
-  if (elide) {
-    for (i_t j = 0; j < m; ++j) { if (is_noop(j)) { level[j] |= kColNoop; } }
-  }
+  // Unconditional, and it must stay in step with the counting sort above: that sort already drops
+  // no-op columns from col_order, so leaving them untagged here would let the wavefront walk columns
+  // the schedule never emitted.
+  for (i_t j = 0; j < m; ++j) { if (is_noop(j)) { level[j] |= kColNoop; } }
   return static_cast<int>(nlev);
 }
 
@@ -1707,11 +1775,9 @@ struct gpu_basis_update_mpf_t {
   mutable gpu_span<i_t> sort_i_;           // in update(): the O(n) bucket + the n·log·n index/value/perm
   mutable gpu_span<f_t> sort_x_;           // buffers, all reused instead of malloc'd each pivot.
   mutable gpu_span<i_t> sort_perm_;
-  // NaN-recovery dense re-solve in compute_delta_x. Deliberately NOT arena-bound and never
-  // pre-sized: the branch is rare (0 of the 100 v6 nodes reach it), so these stay empty and cost
-  // nothing until the first time it fires. They exist because the recovery must be a WARP
-  // collective -- stack-local gpu_spans would give each of the 32 lanes a private malloc, and
-  // the collective would then write 32 different buffers.
+  // Dense solve scratch used by NaN recovery in compute_delta_x and by fresh terminal pricing.
+  // These are slices of the preallocated slot buffer: the operations are warp collectives, so
+  // stack-local gpu_spans would give each lane a different buffer.
   mutable gpu_span<f_t> recover_rhs_;
   mutable gpu_span<f_t> recover_sol_;
   // Statistics that drive the hypersparse-vs-dense path choice.
@@ -2490,7 +2556,7 @@ struct gpu_basis_update_mpf_t {
                                       S_.x.data() + S_.col_start[S_start + 1],
                                       S_.col_start[S_start + 2] - S_.col_start[S_start + 1]);
       if (fabs(mu) < 1E-8 || fabs(mu) > 1E+8) { status = 1; }
-      else { mu_values_.push_back(f_t{1.0} / mu); }
+      else { mu_values_.push_back(mu); }            // CPU form: store mu, divide at apply
     });
     status = lane0_bcast(status);
     // Matches the serial version: on the numerical bail-out the workspace is NOT cleared and
@@ -2638,74 +2704,6 @@ __device__ void compute_delta_z(const FT& ft,
   // &dz_count is this lane's own local. The body also ends with __syncwarp, so the global
   // writes it made are visible before set_size below.
   delta_z_indices.set_size(dz_count);
-}
-
-// Exact steepest-edge norm init: gamma_j = ||B^-T e_k||^2 for each basic var, via a
-// singleton-row fast path (1/alpha^2) or a b_transpose_solve. Mirrors the CPU
-// initialize_steepest_edge_norms (the simplified always uses the non-slack/exact path).
-// All scratch is CALLER-OWNED (slot-resident). Under Direct every lane executes this, so a
-// stack-local gpu_span would device-malloc PER LANE — 32 private buffers, and the collective
-// b_transpose_solve below would then operate on lane-private memory. The original even allocated a
-// fresh `sparse_ei` inside the per-column loop.
-template <class FT>
-__device__ i_t initialize_steepest_edge_norms(const gpu_lp& lp,
-                                              const i_t* basic_list,
-                                              FT& ft,
-                                              f_t* delta_y_steepest_edge,
-                                              gpu_span<i_t>& row_degree,
-                                              gpu_span<i_t>& mapping,
-                                              gpu_span<f_t>& coeff,
-                                              gpu_sparse_vector& sparse_dy,
-                                              gpu_sparse_vector& UTsol_scratch,
-                                              gpu_sparse_vector& sparse_ei)
-{
-  const i_t m = lp.num_rows;
-  lane0_serial([&] {
-    row_degree.assign(m, 0);
-    mapping.assign(m, -1);
-    coeff.assign(m, 0.0);
-    for (i_t k = 0; k < m; ++k) {
-      const i_t j         = basic_list[k];
-      const i_t col_start = lp.A.col_start[j];
-      const i_t col_end   = lp.A.col_start[j + 1];
-      for (i_t p = col_start; p < col_end; ++p) {
-        const i_t i   = lp.A.i[p];
-        row_degree[i]++;
-        mapping[k] = i;
-        coeff[k]   = lp.A.x[p];
-      }
-    }
-    sparse_dy.n = m;      sparse_dy.clear();
-    UTsol_scratch.n = m;  UTsol_scratch.clear();
-    sparse_ei.n = m;      sparse_ei.i.resize(1);  sparse_ei.x.resize(1);
-  });
-
-  for (i_t k = 0; k < m; ++k) {
-    const i_t j = basic_list[k];
-    f_t init    = -1.0;
-    // row_degree/mapping/coeff are global reads -> identical on every lane, so this branch is
-    // warp-uniform and the collective below is entered by all 32 lanes or none.
-    if (row_degree[mapping[k]] == 1) {
-      const f_t alpha = coeff[k];
-      init            = 1.0 / (alpha * alpha);
-    } else {
-      lane0_serial([&] {
-        sparse_ei.x[0] = -1.0;
-        sparse_ei.i[0] = k;
-        sparse_dy.clear();
-      });
-      ft.b_transpose_solve(sparse_ei, sparse_dy, UTsol_scratch);
-      f_t my_init = 0.0;
-      for (i_t p = 0; p < (i_t)sparse_dy.x.size(); ++p) {
-        my_init += sparse_dy.x[p] * sparse_dy.x[p];
-      }
-      init = my_init;
-    }
-    // Same value from every lane to the same address -> benign. NOT lane0_serial: that would add a
-    // __syncwarp per basic column (m of them, up to 25533 here) for no benefit.
-    delta_y_steepest_edge[j] = init;
-  }
-  return 0;
 }
 
 // `rhs` is CALLER-OWNED for the same reason as above: a stack-local would be per-lane under Direct.
@@ -3146,8 +3144,8 @@ __device__ void set_primal_variables_on_bounds(const gpu_lp& lp,
 // estimate_solution_density consumes and every solve updates. If those reset per launch the
 // route decisions would drift from the monolith's, breaking both parity and the timing model.
 //
-// setup() is the one-time S1-S7 prologue, kept as its own method so a persistent slot can
-// later run it as a dedicated setup kernel for a freshly refilled slot.
+// setup() is the one-time S1-S7 prologue, kept as its own method so a persistent block can re-run
+// it in place for a freshly refilled slot.
 // ---------------------------------------------------------------------------
 // ---- Per-slot buffers -----------------------------------------------------------------------
 // Every buffer the kernel uses is its own allocation, exactly like every other array the marshal
@@ -3165,14 +3163,11 @@ struct slot_buffers {
   f_t* v;
   f_t* squared_infeas;
   f_t* setup_rhs;
-  f_t* se_coeff;
   i_t* basic_mark;
   i_t* delta_z_mark;
   i_t* delta_z_indices;
   i_t* nonbasic_pos;
   i_t* infeas_idx;
-  i_t* se_row_degree;
-  i_t* se_mapping;
   f_t* ft_dense_scratch;
   f_t* ft_dense_scratch2;
   f_t* ft_sort_bucket;
@@ -3219,7 +3214,6 @@ struct slot_state {
   // Stored as i_t so the host can read it back as a plain int array.
   i_t status{static_cast<i_t>(dual::status_t::UNSET)};
 
-
   FT ft;  // basis update: S_/mu_values_, num_updates_, routing stats, reused scratch
 
   // Dense per-iteration workspaces.
@@ -3250,11 +3244,8 @@ struct slot_state {
   gpu_solution sol;
 
   // SETUP-ONLY scratch, slot-resident because under Direct a stack-local gpu_span allocates PER
-  // LANE. All start empty, so they cost nothing until the path that uses them actually runs (the
-  // SE-init group only runs when the node carries no edge norms, i.e. dy_se_empty).
-  gpu_span<f_t>   setup_rhs;                       // compute_primal_variables
-  gpu_span<i_t>   se_row_degree, se_mapping;       // initialize_steepest_edge_norms
-  gpu_span<f_t>   se_coeff;
+  // LANE. The sparse vectors are also reused to price child duals.
+  gpu_span<f_t> setup_rhs;  // compute_primal_variables
   gpu_sparse_vector se_dy, se_UTsol, se_ei;
 
 
@@ -3271,14 +3262,11 @@ struct slot_state {
     v.attach(b.v, mn);
     squared_infeas.attach(b.squared_infeas, mn);
     setup_rhs.attach(b.setup_rhs, mn);
-    se_coeff.attach(b.se_coeff, mn);
     basic_mark.attach(b.basic_mark, mn);
     delta_z_mark.attach(b.delta_z_mark, mn);
     delta_z_indices.attach(b.delta_z_indices, mn);
     nonbasic_pos.attach(b.nonbasic_pos, mn);
     infeas_idx.attach(b.infeas_idx, mn);
-    se_row_degree.attach(b.se_row_degree, mn);
-    se_mapping.attach(b.se_mapping, mn);
     ft.dense_scratch_.attach(b.ft_dense_scratch, mn);
     ft.dense_scratch2_.attach(b.ft_dense_scratch2, mn);
     ft.sort_bucket_.attach(b.ft_sort_bucket, mn);
@@ -3330,13 +3318,68 @@ struct slot_state {
   f_t step_length{0.0}, dy_norm_sq{0.0};
   bool used_transpose_dz{false};
 
-  // One-time prologue: S1 bounds -> S2 primal -> S3 SE-init -> S4 workspaces -> S5 Arow ->
-  // S6 nonbasic partition -> S7 primal infeasibilities. Byte-for-byte the setup the monolithic
+  // Price a plunge child from the LIVE factorization. A fresh GPU node is priced on the host and
+  // uploads y/z along with its factorization. CHILD_CONTINUE deliberately avoids that host round
+  // trip and keeps the parent's resident factorization, so it must reproduce the CPU node-entry
+  // pricing here: B' y = c_B followed by z_N = c_N - N' y. This runs even though the child inherits
+  // the parent's basis because the CPU advanced driver reprices every node when
+  // initialize_basis=false too, before assigning nonbasics to the new bounds.
+  __device__ __noinline__ void price_child_duals(const gpu_lp& lp,
+                                                 const i_t* basic_list,
+                                                 const i_t* nonbasic_list,
+                                                 gpu_solution& sol)
+  {
+    const i_t m = lp.num_rows;
+    const i_t n = lp.num_cols;
+    lane0_serial([&] {
+      se_ei.n = m;
+      se_ei.clear();
+      se_dy.n = m;
+      se_dy.clear();
+      se_UTsol.n = m;
+      se_UTsol.clear();
+      for (i_t k = 0; k < m; ++k) {
+        const f_t c = lp.objective[basic_list[k]];
+        if (c != 0.0) {
+          se_ei.i.push_back(k);
+          se_ei.x.push_back(c);
+        }
+      }
+    });
+    // Avoid feeding an empty sparse RHS to the routing-density estimator (its historical formula
+    // divides by the input nnz). An all-zero c_B simply means y=0.
+    if (!se_ei.i.empty()) { ft.b_transpose_solve(se_ei, se_dy, se_UTsol); }
+
+    f_t* y = sol.y.data();
+    f_t* z = sol.z.data();
+    const int lane = static_cast<int>(threadIdx.x);
+    for (i_t i = lane; i < m; i += 32) { y[i] = 0.0; }
+    __syncwarp(0xffffffffu);
+    // Sparse solve indices are unique, so the scatter has no write conflicts.
+    for (i_t p = lane; p < static_cast<i_t>(se_dy.i.size()); p += 32) {
+      y[se_dy.i[p]] = se_dy.x[p];
+    }
+    __syncwarp(0xffffffffu);
+    for (i_t k = lane; k < n - m; k += 32) {
+      const i_t j = nonbasic_list[k];
+      f_t dot      = 0.0;
+      for (i_t p = lp.A.col_start[j]; p < lp.A.col_start[j + 1]; ++p) {
+        dot += lp.A.x[p] * y[lp.A.i[p]];
+      }
+      z[j] = lp.objective[j] - dot;
+    }
+    for (i_t k = lane; k < m; k += 32) { z[basic_list[k]] = 0.0; }
+    __syncwarp(0xffffffffu);
+  }
+
+  // One-time prologue: bounds -> primal -> SE validation -> workspaces -> Arow -> nonbasic
+  // partition -> primal infeasibilities. Byte-for-byte the setup the monolithic
   // driver used to run inline, in the same order (bit-exactness depends on that order).
   // Direct=true: the prologue is almost entirely allocation and
   // read-modify-write (assign/reserve/clear, sparse-vector construction, Arow build) so it stays on
   // lane 0; the collectives are opted in one at a time. The serial parts deliberately call the
   // <false> variants so porting one collective cannot silently move any other computation.
+  template <bool PersistentSeats = false>
   __device__ __noinline__ void setup(const gpu_lp& lp,
                                      const gpu_settings& settings,
                                      variable_status_t* vstatus,
@@ -3344,13 +3387,21 @@ struct slot_state {
                                      i_t* nonbasic_list,
                                      gpu_solution& sol,
                                      f_t* delta_y_steepest_edge,
-                                     bool dy_se_empty,
-                                     bool refactor_resume)
+                                     bool refactor_resume,
+                                     bool child_continue,
+                                     f_t resume_obj,
+                                     i_t resume_iter)
   {
     const i_t m = lp.num_rows;
     const i_t n = lp.num_cols;
     f_t* x      = sol.x.data();
     f_t* z      = sol.z.data();
+
+    if constexpr (PersistentSeats) {
+      if (child_continue) {
+        lane0_serial([&] { status = static_cast<i_t>(dual::status_t::UNSET); });
+      }
+    }
 
     // assign (not resize) throughout: a slot is REUSED by the next B&B node, so every buffer must be
     // fully re-initialized, not just grown — resize would leave the previous node's tail values.
@@ -3362,6 +3413,10 @@ struct slot_state {
     // phase2::compute_primal_solution_from_basis. Redoing it here would use a different formula
     // -- these two set the nonbasic values from the sign of z and skip columns with
     // |x_j| < 10*tight_tol -- and that difference moves the trajectory from the first refactor on.
+    if constexpr (PersistentSeats) {
+      if (child_continue) { price_child_duals(lp, basic_list, nonbasic_list, sol); }
+    }
+
     if (!refactor_resume) {
       set_primal_variables_on_bounds(lp, settings, z, vstatus, x);
 
@@ -3378,15 +3433,11 @@ struct slot_state {
                                setup_rhs);
     }
 
-    if (dy_se_empty) {
-      // Exact steepest-edge init (matches the CPU simplified's unconditional exact path).
-      lane0_serial([&] {
-        for (i_t k = 0; k < n; ++k) { delta_y_steepest_edge[k] = -1.0; }
-      });
-      initialize_steepest_edge_norms(lp, basic_list, ft, delta_y_steepest_edge,
-                                                   se_row_degree, se_mapping, se_coeff, se_dy,
-                                                   se_UTsol, se_ei);
-    } else {
+    if (!refactor_resume && (!PersistentSeats || !child_continue)) {
+      // Repair for a WARM START only: norms inherited from a parent B&B node can carry entries that
+      // are stale or non-positive for this node's basis. A RESUME is not a warm start -- these are
+      // the device's own maintained norms from the previous leg, and the CPU's in-place
+      // refactorization does not touch them, so neither may this.
       // basic_list holds m DISTINCT column indices, so each delta_y_steepest_edge[j] is visited by
       // exactly one lane — bit-exact.
       const int lane = static_cast<int>(threadIdx.x);
@@ -3454,16 +3505,46 @@ struct slot_state {
     // Incrementally-tracked objective for the cutoff, mirroring the CPU simplified (and
     // advanced) driver: init fresh once, then update_objective per pivot. Using the true
     // costs lp.objective (the GPU has no perturbation) is a valid dual bound.
-    obj  = compute_objective(lp, x);
-    iter = 0;
+    // CONTINUE, do not restart. The CPU carries both across an in-place refactorization; only a
+    // fresh solve derives them. Recomputing obj from x also silently changes the cutoff comparand
+    // mid-solve, and resetting iter makes the driver's own iteration limit unreachable.
+    obj  = refactor_resume ? resume_obj : compute_objective(lp, x);
+    iter = refactor_resume ? resume_iter : 0;
     });  // end lane-0 epilogue
   }
 };
 
+__device__ bool dual_feasible_within_tol(const gpu_lp& lp,
+                                         const variable_status_t* vstatus,
+                                         const f_t* z,
+                                         f_t dual_tol)
+{
+  const i_t n    = lp.num_cols;
+  const int lane = static_cast<int>(threadIdx.x);
+  int bad        = 0;
+  for (i_t j = lane; j < n; j += 32) {
+    const variable_status_t s = vstatus[j];
+    if (s != variable_status_t::BASIC && !isfinite(z[j])) {
+      bad = 1;
+      continue;
+    }
+    if (s == variable_status_t::NONBASIC_LOWER) {
+      if (z[j] < -dual_tol) { bad = 1; }
+    } else if (s == variable_status_t::NONBASIC_UPPER) {
+      if (z[j] > dual_tol) { bad = 1; }
+    } else if (s == variable_status_t::NONBASIC_FREE) {
+      if (fabs(z[j]) > dual_tol) { bad = 1; }
+    }
+  }
+  return __any_sync(0xffffffffu, bad != 0) == 0;
+}
+
+
 // `Direct`: all 32 lanes execute the body. Direct=false is the historical single-thread monolith
 // (lane 0 alone runs this body); Direct=true means ALL 32 lanes run it, so every allocation and
 // read-modify-write must be inside lane0_serial and every `return` must be warp-uniform.
-template <class FT, bool AllowRefactorExit>
+template <class FT, bool AllowRefactorExit, bool PersistentSeats = false>
+
 __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
                                                             const gpu_settings& settings,
                                                             variable_status_t* vstatus,
@@ -3472,11 +3553,24 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
                                                             i_t* nonbasic_list,
                                                             gpu_solution& sol,
                                                             f_t* delta_y_steepest_edge,
-                                                            bool dy_se_empty,
-                                                            bool refactor_resume)
+                                                            bool refactor_resume,
+                                                            bool child_continue,
+                                                            bool terminal_certificate_retry,
+                                                            f_t resume_obj,
+                                                            i_t resume_iter,
+                                                            i_t& refactor_reason)
 {
   const i_t m = lp.num_rows;
   const i_t n = lp.num_cols;
+
+  // Why REFACTOR_NEEDED came back, for the host resume loop. 0 = periodic schedule (the update was
+  // skipped, the representation is merely long); 1 = the rank-1 update was REJECTED as unsafe
+  // (|mu| outside [1e-8,1e8]).
+  // Only meaningful when the returned status is REFACTOR_NEEDED.
+  // The host needs the distinction because case 1 follows the established rejected-update
+  // recovery trajectory: refactorize, but carry the maintained y/z without using fresh pricing as
+  // a rejection certificate. Periodic resumes can be certified independently.
+  refactor_reason = 0;
 
   f_t* x = sol.x.data();
   f_t* y = sol.y.data();
@@ -3485,15 +3579,17 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
   // Prologue into the slot. Unconditional: one launch is one solve, so this always runs. It used to
   // be guarded by st.inited so a re-entering fission super-step could skip it and reuse the live
   // state; there are no super-steps any more.
-  st.setup(lp,
+  st.template setup<PersistentSeats>(lp,
            settings,
            vstatus,
            basic_list,
            nonbasic_list,
            sol,
            delta_y_steepest_edge,
-           dy_se_empty,
-           refactor_resume);
+           refactor_resume,
+           child_continue,
+           resume_obj,
+           resume_iter);
 
   // Bind the persistent slot members under their original names, so the pivot loop below is
   // unchanged by the state externalization and stays line-diffable against the CPU simplified
@@ -3532,12 +3628,25 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     });
   };
 
-  const i_t iter_limit = min(500000, max(20000, 20 * (m + n)));
+  // A refactor exit is a SUSPENSION, not a terminal answer.  The next leg must resume from the
+  // incrementally maintained cutoff objective, just as the CPU driver does across its in-place
+  // refactorization.  `finish()` deliberately recomputes c'x for a user-facing terminal result;
+  // using it here silently replaced the carried objective at every refactor boundary.
+  auto suspend = [&](i_t iters) {
+    lane0_serial([&] {
+      sol.objective      = obj;
+      sol.user_objective = compute_user_objective(lp, obj);
+      sol.iterations     = iters;
+    });
+  };
+
+  // NO per-node iteration limit, matching the CPU plunge path, which calls solve_node_lp with its
+  // INT_MAX default. A size-derived cap on the device only is a DIFFERENT stopping rule for the same
+  // node, so a node could return ITERATION_LIMIT from the GPU where the CPU would have solved it and
+  // the tree would depend on which driver took the node. The solve still terminates on the host time
+  // limit and on the MPF store cap, so this is not an unbounded loop.
+  const i_t iter_limit = cuda::std::numeric_limits<i_t>::max();
   while (iter < iter_limit) {
-    if (g_gpu_capacity_exceeded) {
-      finish(iter);
-      return dual::status_t::NUMERICAL;
-    }
     // Time limit is handled on the host side
 
     // 1. Steepest-edge pricing.
@@ -3620,7 +3729,8 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     // them at slot_state (global) and let the __syncwarp publish them to every lane — locals would
     // only ever be set on lane 0.
     warp_rt_body(settings.dual_tol / 10, delta_z.data(), &st.entering, &st.nonbasic_entering,
-                 settings.pivot_tol, &st.step_length, vstatus, z, settings.zero_tol,
+                 settings.pivot_tol, &st.step_length, vstatus, z,
+                 settings.zero_tol,
                  nonbasic_list, n - m);
     __syncwarp(0xffffffffu);
     entering          = st.entering;
@@ -3659,7 +3769,15 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
 
     // A cutoff node is complete after its primal/objective update. The remaining state is only
     // needed by a following pivot, so do not maintain it for a node that is being fathomed.
-    if (isfinite(settings.cut_off) && obj >= settings.cut_off) {
+    // The tracked objective is a valid LOWER BOUND on the node optimum only while the basis stays
+    // dual feasible -- that is what weak duality gives, and it is the whole justification for
+    // fathoming here. The driver never re-tests the invariant, so test it now against the
+    // MAINTAINED z: if some nonbasic reduced cost no longer carries the sign its status demands,
+    // `obj` is not a bound on anything and fathoming on it can discard a live subtree.
+    // Not a certificate, a precondition: it costs one pass over the columns and it is the exact
+    // condition the objective's validity rests on.
+    if (isfinite(settings.cut_off) && obj >= settings.cut_off &&
+        dual_feasible_within_tol(lp, vstatus, z, settings.dual_tol)) {
       finish(iter + 1);
       return dual::status_t::CUTOFF;
     }
@@ -3694,7 +3812,8 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     // LUs of DIFFERENT bases.
     if constexpr (AllowRefactorExit) {
       if (ft.num_updates() > settings.refactor_frequency) {
-        finish(iter + 1);
+        refactor_reason = 0;  // periodic schedule
+        suspend(iter + 1);
         return dual::status_t::REFACTOR_NEEDED;
       }
     }
@@ -3706,7 +3825,8 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
       // single-problem GPU path asks its host resume loop to do the same. The pivot and basis swap
       // already happened, so resume from iter + 1 and do not repeat the pivot.
       if constexpr (AllowRefactorExit) {
-        finish(iter + 1);
+        refactor_reason = 1;  // rejected update: host refactor + maintained-dual recovery
+        suspend(iter + 1);
         return dual::status_t::REFACTOR_NEEDED;
       }
       finish(iter);
@@ -3720,6 +3840,55 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     // Increment only on a COMPLETED iteration, at the end of the body — matching the CPU
     // simplified driver's iter++ (phase2.cpp:4370). The SE-reset `continue` above jumps
     // back to `while` without counting, so `iter` counts pivots, not loop passes.
+#if GPU_PIVOT_TRACE
+    {
+      const f_t traced_obj = compute_objective(lp, x);
+      if (threadIdx.x == 0) {
+        // Mirror of the host's [CDINF]: dual infeasibility of the MAINTAINED z at this pivot. The
+        // driver never re-tests this invariant, so its growth is invisible to the solve yet decides
+        // whether the CUTOFF test is sound.
+        {
+          f_t dinf_maintained = 0.0;
+          for (i_t q = 0; q < lp.num_cols - lp.num_rows; ++q) {
+            const i_t j = nonbasic_list[q];
+            if (vstatus[j] == variable_status_t::NONBASIC_LOWER) {
+              dinf_maintained = fmax(dinf_maintained, -z[j]);
+            } else if (vstatus[j] == variable_status_t::NONBASIC_UPPER) {
+              dinf_maintained = fmax(dinf_maintained, z[j]);
+            }
+          }
+          printf("[GDINF] iter=%d dinf=%.17g\n", (int)iter, dinf_maintained);
+        }
+        auto dbits = [](f_t v) { return (unsigned long long)__double_as_longlong(v); };
+        printf("[GCMP] iter=%d leave=%d dir=%d enter=%d step=%016llx obj=%016llx p_inf=%016llx "
+               "nInf=%d nupd=%d\n",
+               (int)iter, (int)leaving, (int)direction, (int)entering, dbits(step_length),
+               dbits(traced_obj), dbits(primal_inf), (int)infeas_idx.size(),
+               (int)ft.num_updates());
+        // ORDER-INDEPENDENT checksums of the three vectors the pivot is built from, matching the
+        // host's [CVEC]. XOR of raw bits does not depend on traversal order, so a mismatch means the
+        // VECTOR differs -- which localises the divergence to BTRAN (delta_y), the reduced-cost SpMV
+        // (delta_z) or FTRAN (delta_x).
+        {
+          auto xorbits = [&](const f_t* v, i_t cnt) {
+            unsigned long long h = 0;
+            for (i_t q = 0; q < cnt; ++q) {
+              if (v[q] != 0.0) { h ^= (unsigned long long)__double_as_longlong(v[q]); }
+            }
+            return h;
+          };
+          auto nnz = [](const f_t* v, i_t cnt) {
+            i_t c = 0; for (i_t q = 0; q < cnt; ++q) { c += (v[q] != 0.0); } return c;
+          };
+          printf("[GVEC] iter=%d dy=%016llx dynz=%d dz=%016llx dznz=%d dx=%016llx dxnz=%d\n",
+                 (int)iter, xorbits(delta_y.data(), m), (int)nnz(delta_y.data(), m),
+                 xorbits(delta_z.data(), n), (int)nnz(delta_z.data(), n),
+                 xorbits(delta_x.data(), n), (int)nnz(delta_x.data(), n));
+        }
+      }
+      __syncwarp(0xffffffffu);
+    }
+#endif
     lane0_serial([&] { iter++; });   // RMW on st.iter in global memory
 
   }
@@ -3732,6 +3901,14 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
 // ---------------------------------------------------------------------------
 
 struct kernel_args {
+  // Non-zero for a fixed batch seat that already reached a terminal status in an earlier round.
+  // Its block is a no-op. Keeping the seat in the launch makes host-refactor batching a simple
+  // synchronous "mark done, refactor requests, relaunch the same array" loop.
+  i_t done;
+  // gpu_batch_seat_command. Fresh/refactor commands reconstruct the slot header and install the
+  // uploaded base factor. CHILD_CONTINUE deliberately leaves the live FT object (including its MPF
+  // stack and routing statistics) untouched.
+  i_t command;
   i_t m, n;
   // LP
   i_t *A_col_start, *A_i;
@@ -3742,6 +3919,8 @@ struct kernel_args {
   const i_t* Arow_j;
   const f_t* Arow_x;
   f_t *rhs, *lower, *upper, *objective;
+  gpu_bound_delta<i_t, f_t>* bound_deltas;
+  i_t bound_delta_count;
   f_t obj_scale, obj_constant;
   // Fixed-factor row-index width is selected once per launch.
   i_t* L0_col_start;
@@ -3788,10 +3967,18 @@ struct kernel_args {
   i_t* nonbasic_list;
   f_t *x, *y, *z;
   f_t* dy_se;
-  i_t dy_se_empty;
   // Non-zero when this launch RESUMES after a host refactorization: the host already rebuilt the
   // primal point the CPU's way, so setup() must leave x alone.
   i_t refactor_resume;
+  // Non-zero only on the one relaunch requested by refactor_reason=2. That launch retries the
+  // terminal optimality proof; it must not convert the request into a new terminal CUTOFF.
+  i_t terminal_certificate_retry;
+  // Carried across a REFACTOR_NEEDED resume so the next launch CONTINUES the solve rather than
+  // restarting it. The CPU's in-place refactorization leaves both untouched, so a faithful port
+  // must too: recomputing the objective from x and resetting the iteration counter are exactly the
+  // two things that turn a continuation into a restart.
+  f_t resume_obj;
+  i_t resume_iter;
   // settings
   f_t primal_tol, dual_tol, pivot_tol, tight_tol, fixed_tol, zero_tol, time_limit, cut_off,
     steepest_edge_ratio;
@@ -3875,7 +4062,7 @@ __device__ __noinline__ void warp_build_config(const gpu_basis_update_mpf_t<Fact
 // reads and writes only that problem's independently marshalled buffers in args[idx].
 // g_gpu_capacity_exceeded is reset by the HOST before launch (not here) so a late block cannot
 // clear a failure flag an earlier block already set.
-template <class FT, bool AllowRefactorExit>
+template <class FT, bool AllowRefactorExit, bool PersistentSeats = false>
 __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args, i_t idx)
 {
   using factor_index_type = typename FT::factor_index_type;
@@ -3897,6 +4084,29 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args, i_t id
   // (Direct). The lanes-1..31 -> warp_helper_loop split was deleted with the dispatcher.
 
   kernel_args& a = args[idx];
+
+  // Uniform for the whole warp and deliberately before touching any other argument: done seats
+  // are marshalled as this marker alone, with all problem pointers left null.
+  if (a.done != 0) { return; }
+
+  bool child_continue = false;
+  if constexpr (PersistentSeats) {
+    child_continue = a.command == static_cast<i_t>(gpu_batch_seat_command::CHILD_CONTINUE);
+  }
+  if constexpr (PersistentSeats) {
+    if (child_continue) {
+    // The persistent seat already contains the parent's complete solve representation. Apply the
+    // child's sparse bounds before constructing the lp view used by pricing/setup. One lane writes
+    // the small ordered list; the warp fence publishes it before any lane reads the bounds.
+    lane0_serial([&] {
+      for (i_t q = 0; q < a.bound_delta_count; ++q) {
+        const auto& d = a.bound_deltas[q];
+        if ((d.mask & 1u) != 0u) { a.lower[d.column] = d.lower; }
+        if ((d.mask & 2u) != 0u) { a.upper[d.column] = d.upper; }
+      }
+    });
+    }
+  }
 
   const i_t m = a.m;
   const i_t n = a.n;
@@ -3934,12 +4144,12 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args, i_t id
   slot_state<FT>& st = *static_cast<slot_state<FT>*>(a.slot);
   // placement-new, ft wiring and S_.init_empty (which resizes -> mallocs) are all RMW on shared
   // state, so under Direct they belong to lane 0 alone.
-  lane0_serial([&] {
-    new (&st) slot_state<FT>();  // placement new: host memory is zeroed, NSDMIs must run
+  if (!child_continue) {
+    lane0_serial([&] {
+      new (&st) slot_state<FT>();  // placement new: reset logical state for fresh/refactor commands
     // Wire every buffer into the host-provided slot memory. Nothing allocates: a buffer that
     // outgrows its layout slot is a layout bug and is reported, not silently regrown.
-    // Exceeding a span's reserved capacity is reported through g_gpu_capacity_exceeded rather than
-    // silently regrowing -- there is no allocator left to regrow with.
+    // Exceeding a span's reserved capacity is a host-side sizing bug; a debug build asserts.
     st.attach_all_buffers(a.buf, m, n, a.mpf_update_cap, a.mpf_eta_nnz_cap);
     FT& ft                      = st.ft;
     ft.num_updates_             = a.num_updates;
@@ -3956,9 +4166,26 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args, i_t id
     ft.update_cap_  = a.mpf_update_cap;
     ft.eta_nnz_cap_ = a.mpf_eta_nnz_cap;
     ft.reserve_store(m);
-    ft.hypersparse_threshold_ = 0.05;
-  });   // end lane-0 construction
+      ft.hypersparse_threshold_ = 0.05;
+    });   // end lane-0 construction
+  }
   FT& ft = st.ft;
+
+  if (!child_continue) {
+    // The factor-solve workspaces are reused across pivots but are not part of a node's state.
+    // Some terminal paths deliberately leave them dirty (notably a rejected MPF update). A fresh
+    // node or host-refactor resume in the same persistent seat must restore the clean-workspace
+    // precondition that the one-shot marshaller gets from alloc_zeroed; otherwise its very first
+    // hypersparse BTRAN can consume stale reach/value state and corrupt steepest-edge norms.
+    const i_t lane = static_cast<i_t>(threadIdx.x);
+    for (i_t k = lane; k < m; k += 32) {
+      ft.xi_workspace_[k]     = 0;
+      ft.xi_workspace_[m + k] = 0;
+      ft.x_workspace_[k]      = 0.0;
+      ft.reach_mark_[k]       = 0;
+    }
+    __syncwarp(0xffffffffu);
+  }
 
   gpu_solution sol;
   sol.x = gpu_span<f_t>(a.x, n);
@@ -3985,8 +4212,9 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args, i_t id
     ft.warp_cfg_ = &cfg_shared;
   });
 
+  i_t refactor_reason   = 0;
   dual::status_t status =
-    gpu_simplified_dual_phase2_device<FT, AllowRefactorExit>(lp,
+    gpu_simplified_dual_phase2_device<FT, AllowRefactorExit, PersistentSeats>(lp,
                                                              settings,
                                                              a.vstatus,
                                                              st,
@@ -3994,13 +4222,18 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args, i_t id
                                                              a.nonbasic_list,
                                                              sol,
                                                              a.dy_se,
-                                                             a.dy_se_empty != 0,
-                                                             a.refactor_resume != 0);
+                                                             a.refactor_resume != 0,
+                                                             child_continue,
+                                                             a.terminal_certificate_retry != 0,
+                                                            a.resume_obj,
+                                                            a.resume_iter,
+                                                            refactor_reason);
 
   // `status` is warp-uniform (every terminal condition in the driver is), so these are same-value
   // stores from every lane — but keep a single writer.
   lane0_serial([&] {
-    *a.out_status         = static_cast<i_t>(status);
+    a.out_status[0]       = static_cast<i_t>(status);
+    a.out_status[1]       = refactor_reason;  // see gpu_simplified_dual_phase2_device
     *a.out_objective      = sol.objective;
     *a.out_user_objective = sol.user_objective;
     *a.out_iterations     = sol.iterations;
@@ -4025,18 +4258,46 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args, i_t id
 // Keep the cleanup's measured 128-register occupancy target for both factor-index specializations.
 // Keep only the resident-block budget in flight. Each block dequeues another independent problem
 // after finishing its current one, reducing tail imbalance without sharing any per-problem state.
-template <class FT = gpu_basis_update_mpf_u16, bool AllowRefactorExit = false>
+template <class FT = gpu_basis_update_mpf_u16,
+          bool AllowRefactorExit = false,
+          bool PersistentSeats   = false>
 __global__ void __launch_bounds__(32, 16)
-  gpu_phase2_kernel_direct(kernel_args* args, i_t n_problems)
+// `next_problem` is PER LAUNCH, not a device global. Branch-and-bound runs one batch per GPU
+// worker, concurrently, on separate streams; a single global counter would have those launches
+// stealing from each other's index space and resetting it under each other mid-flight.
+gpu_phase2_kernel_direct(kernel_args* args,
+                         i_t n_problems,
+                         unsigned int* next_problem,
+                         unsigned int* completed_blocks,
+                         std::uint32_t* completion_flag)
 {
   __shared__ i_t problem_idx;
   while (true) {
     if (threadIdx.x == 0) {
-      problem_idx = static_cast<i_t>(atomicAdd(&g_next_problem, 1u));
+      problem_idx = static_cast<i_t>(atomicAdd(next_problem, 1u));
     }
     __syncwarp(0xffffffffu);
     if (problem_idx >= n_problems) { break; }
-    gpu_phase2_kernel_body<FT, AllowRefactorExit>(args, problem_idx);
+    gpu_phase2_kernel_body<FT, AllowRefactorExit, PersistentSeats>(args, problem_idx);
+  }
+
+  // Every block publishes all result writes before announcing that it has drained its share of
+  // the queue. The last block performs a system-scope release store into mapped pinned memory;
+  // branch-and-bound polls the same word with an acquire load, avoiding cudaEventQuery in its hot
+  // worker loop. The event recorded after this kernel remains the authoritative blocking/timing
+  // primitive for harvest and destruction.
+  if (completed_blocks != nullptr && completion_flag != nullptr) {
+    // Every lane can write its slice of the solve vectors, so every lane must publish before lane
+    // zero counts the block as complete.
+    __threadfence_system();
+    __syncwarp(0xffffffffu);
+  }
+  if (threadIdx.x == 0 && completed_blocks != nullptr && completion_flag != nullptr) {
+    const unsigned int previously_completed = atomicAdd(completed_blocks, 1u);
+    if (previously_completed + 1u == static_cast<unsigned int>(gridDim.x)) {
+      cuda::atomic_ref<std::uint32_t, cuda::thread_scope_system> ready(*completion_flag);
+      ready.store(1u, cuda::memory_order_release);
+    }
   }
 }
 
@@ -4068,15 +4329,22 @@ struct marshal_storage {
   std::vector<rmm::device_buffer> bufs;
   // The CSR transpose is built here and its host storage must outlive marshal_problem.
   std::vector<cuopt::mathematical_optimization::csr_matrix_t<i_t, f_t>> arow_keep;
-  marshal_storage() { bufs.reserve(111); }  // ~34 uploads + 67 slot buffers; avoid vector churn
+  // Every allocation and copy this storage makes is ordered on this stream. It is explicit rather
+  // than the default stream because branch-and-bound runs one batch per GPU worker concurrently:
+  // on the default stream those batches would serialise against each other.
+  rmm::cuda_stream_view stream{rmm::cuda_stream_default};
+  explicit marshal_storage(rmm::cuda_stream_view s = rmm::cuda_stream_default) : stream(s)
+  {
+    bufs.reserve(111);   // ~34 uploads + 67 slot buffers; avoid vector churn
+  }
 };
 
 template <typename T>
 static T* upload(const std::vector<T>& v, marshal_storage& st)
 {
   const size_t bytes = (v.empty() ? 1 : v.size()) * sizeof(T);
-  if (v.empty()) { st.bufs.emplace_back(bytes, rmm::cuda_stream_default); }
-  else { st.bufs.emplace_back(v.data(), bytes, rmm::cuda_stream_default); }
+  if (v.empty()) { st.bufs.emplace_back(bytes, st.stream); }
+  else { st.bufs.emplace_back(v.data(), bytes, st.stream); }
   return static_cast<T*>(st.bufs.back().data());
 }
 
@@ -4084,8 +4352,8 @@ template <typename T>
 static T* upload_n(const T* p, size_t count, marshal_storage& st)
 {
   const size_t bytes = (count == 0 ? 1 : count) * sizeof(T);
-  if (count == 0) { st.bufs.emplace_back(bytes, rmm::cuda_stream_default); }
-  else { st.bufs.emplace_back(p, bytes, rmm::cuda_stream_default); }
+  if (count == 0) { st.bufs.emplace_back(bytes, st.stream); }
+  else { st.bufs.emplace_back(p, bytes, st.stream); }
   return static_cast<T*>(st.bufs.back().data());
 }
 
@@ -4121,26 +4389,49 @@ template <typename T>
 static T* alloc_uninit(size_t count, marshal_storage& st)
 {
   const size_t bytes = (count == 0 ? 1 : count) * sizeof(T);
-  st.bufs.emplace_back(bytes, rmm::cuda_stream_default);
-  return static_cast<T*>(st.bufs.back().data());
+  st.bufs.emplace_back(bytes, st.stream);
+  void* d = st.bufs.back().data();
+  // DIAGNOSTIC (CUOPT_GPU_ZERO_WORKSPACE=1). These buffers are left uninitialised on the premise
+  // that the kernel writes every element before reading it. If that premise is wrong anywhere, the
+  // result depends on whatever the RMM pool last left in that memory -- so the same problem, with
+  // bit-identical inputs, answers differently depending on which solve ran before it. Zeroing them
+  // makes the pool's history irrelevant: a divergence that disappears under this flag is an
+  // uninitialised read, not an input difference.
+  static const bool zero_ws = [] {
+    const char* e = std::getenv("CUOPT_GPU_ZERO_WORKSPACE");
+    return e != nullptr && std::string(e) != "0";
+  }();
+  if (zero_ws) { RAFT_CUDA_TRY(cudaMemsetAsync(d, 0, bytes, st.stream.value())); }
+  return static_cast<T*>(d);
 }
 
 template <typename T>
 static T* alloc_zeroed(size_t count, marshal_storage& st)
 {
   const size_t bytes = (count == 0 ? 1 : count) * sizeof(T);
-  st.bufs.emplace_back(bytes, rmm::cuda_stream_default);
+  st.bufs.emplace_back(bytes, st.stream);
   void* d = st.bufs.back().data();
-  RAFT_CUDA_TRY(cudaMemsetAsync(d, 0, bytes, rmm::cuda_stream_default.get()));
+  // The STORAGE's stream, never the legacy default one. The buffer was just allocated on
+  // `st.stream`, so zeroing it anywhere else is unordered against that allocation; and
+  // branch-and-bound runs one batch per worker concurrently, which the default stream would
+  // serialise. It also breaks any CUDA graph capture live on another thread.
+  RAFT_CUDA_TRY(cudaMemsetAsync(d, 0, bytes, st.stream.value()));
   return static_cast<T*>(d);
 }
 
 
 
-static void upload_solve_class_config()
+// upload_solve_class_config() is gone: all it did was set g_elide_noop, and that device global was
+// removed. Nothing else read it.
+
+// ---- [CONFIG] self-report -------------------------------------------------------------------
+// Every launch states its own decisive configuration. A measurement that reports its configuration
+// cannot be mislabelled by the operator, the shell history, or another agent reading the output.
+static void report_config(const char* path, size_t nprob, int factor_index_bits)
 {
-  const int on = 1;
-  RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_elide_noop, &on, sizeof(int)));
+  std::printf("[CONFIG] path=%s geometry=persistent-warp<<<resident,32>>> problems=%zu factor_index_bits=%d "
+              "mu=divide tri_diag=divide\n",
+              path, nprob, factor_index_bits);
 }
 
 // Device heap (in-kernel gpu_span malloc arena) + stack are per-CONTEXT limits and the heap
@@ -4314,10 +4605,6 @@ static ro_upload upload_ro(const lp_problem_t<i_t, f_t>& lp, marshal_storage& st
   return r;
 }
 
-// Nothing to free: upload_ro's buffers are rmm::device_buffers owned by the caller's
-// marshal_storage, returned to the pool when that is destroyed.
-static void free_ro(const ro_upload&) {}
-
 static i_t mpf_update_cap()
 {
   if (const char* e = std::getenv("CUOPT_GPU_MPF_UPDATE_CAP")) { return std::atoi(e); }
@@ -4409,10 +4696,15 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
                                    std::vector<f_t>& delta_y_steepest_edge,
                                    const ro_upload* ro,
                                    marshal_storage& st,
-                                   bool refactor_resume = false)
+                                   bool refactor_resume  = false,
+                                   bool terminal_certificate_retry = false,
+                                   const std::vector<f_t>* lower_ovr = nullptr,
+                                   const std::vector<f_t>* upper_ovr = nullptr)
 {
   const int m = lp.num_rows;
   const int n = lp.num_cols;
+  assert(delta_y_steepest_edge.size() == static_cast<size_t>(n));
+
   const auto& A   = lp.A;
   const auto& L0  = ft.L0();
   const auto& U0  = ft.U0();
@@ -4453,8 +4745,12 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
     a.Arow_x         = upload(Arow_host.x, st);
   }
   // Per-node (basis- or branch-dependent), always uploaded per item: bounds, the LU factor, row perm.
-  a.lower       = upload(lp.lower, st);
-  a.upper       = upload(lp.upper, st);
+  a.lower       = upload(lower_ovr != nullptr ? *lower_ovr : lp.lower, st);
+  a.upper       = upload(upper_ovr != nullptr ? *upper_ovr : lp.upper, st);
+  // Allocated lazily only when the persistent path first continues a child. Keeping it null for
+  // one-shot launches preserves their allocation footprint exactly.
+  a.bound_deltas      = nullptr;
+  a.bound_delta_count = 0;
   a.L0_col_start = upload(L0.col_start, st); a.L0_nz = L0.nnz();
   a.L0_i = upload_factor_indices<FactorIndex>(L0.i.data(), L0.nnz(), m, st);
   a.L0_x = upload_n(L0.x.data(), L0.nnz(), st);
@@ -4478,19 +4774,27 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   a.mpf_eta_nnz_cap    = mpf_eta_nnz_cap();
 
   a.refactor_resume = refactor_resume ? 1 : 0;
+  a.terminal_certificate_retry = terminal_certificate_retry ? 1 : 0;
+  a.resume_obj      = sol.objective;
+  a.resume_iter     = static_cast<i_t>(sol.iterations);
   a.vstatus       = upload(vstatus, st);
   a.basic_list    = upload(basic_list, st);
+  // REACHABILITY CHECK for the nonbasic_list length contract. get_basis_from_vstatus routes
+  // SUPERBASIC variables to superbasic_list, NOT nonbasic_list (basis_solves.cpp:53), so
+  // nonbasic_list holds n - m - |superbasic| entries -- while the device's ratio test iterates
+  // n - m of them and the copy-back writes n - m back. Any shortfall is an out-of-bounds read on
+  // the device and a heap overflow on the host.
+  if (static_cast<i_t>(nonbasic_list.size()) != n - m) {
+    std::fprintf(stderr,
+                 "[NBLEN] nonbasic_list=%zu but n-m=%d (m=%d n=%d) -- short by %d\n",
+                 nonbasic_list.size(), (int)(n - m), (int)m, (int)n,
+                 (int)(n - m - static_cast<i_t>(nonbasic_list.size())));
+  }
   a.nonbasic_list = upload(nonbasic_list, st);
   a.x             = upload(sol.x, st);
   a.y             = upload(sol.y, st);
   a.z             = upload(sol.z, st);
-  if (delta_y_steepest_edge.empty()) {
-    a.dy_se       = alloc_zeroed<double>(n, st);
-    a.dy_se_empty = 1;
-  } else {
-    a.dy_se       = upload(delta_y_steepest_edge, st);
-    a.dy_se_empty = 0;
-  }
+  a.dy_se = upload(delta_y_steepest_edge, st);
 
   a.primal_tol = settings.primal_tol;
   a.dual_tol   = settings.dual_tol;
@@ -4503,7 +4807,8 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   a.steepest_edge_ratio = settings.steepest_edge_ratio;
   a.start_time          = tic();
 
-  a.out_status         = alloc_zeroed<int>(1, st);
+  // TWO ints: [0] = status, [1] = the REFACTOR_NEEDED reason (0 periodic / 1 rejected update).
+  a.out_status         = alloc_zeroed<int>(2, st);
   a.out_objective      = alloc_zeroed<double>(1, st);
   a.out_user_objective = alloc_zeroed<double>(1, st);
   a.out_iterations     = alloc_zeroed<int>(1, st);
@@ -4529,14 +4834,11 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
     b.v = alloc_uninit<f_t>(mn, st);
     b.squared_infeas = alloc_uninit<f_t>(mn, st);
     b.setup_rhs = alloc_uninit<f_t>(mn, st);
-    b.se_coeff = alloc_uninit<f_t>(mn, st);
     b.basic_mark = alloc_uninit<i_t>(mn, st);
     b.delta_z_mark = alloc_uninit<i_t>(mn, st);
     b.delta_z_indices = alloc_uninit<i_t>(mn, st);
     b.nonbasic_pos = alloc_uninit<i_t>(mn, st);
     b.infeas_idx = alloc_uninit<i_t>(mn, st);
-    b.se_row_degree = alloc_uninit<i_t>(mn, st);
-    b.se_mapping = alloc_uninit<i_t>(mn, st);
     b.ft_dense_scratch = alloc_uninit<f_t>(mn, st);
     b.ft_dense_scratch2 = alloc_uninit<f_t>(mn, st);
     b.ft_sort_bucket = alloc_uninit<f_t>(mn, st);
@@ -4580,6 +4882,19 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   return a;
 }
 
+// Bytes uploaded once per distinct immutable matrix block in a batch. marshal_problem deduplicates
+// exactly these arrays by A.col_start.data(), so the pre-flight must not charge them once per seat.
+static size_t problem_shared_ro_bytes(const lp_problem_t<i_t, f_t>& lp)
+{
+  const size_t m = lp.num_rows;
+  const size_t n = lp.num_cols;
+  auto bi = [](size_t c) { return (c == 0 ? 1 : c) * sizeof(i_t); };
+  auto bd = [](size_t c) { return (c == 0 ? 1 : c) * sizeof(f_t); };
+  // A CSC + rhs/objective + immutable CSR transpose.
+  return bi(lp.A.col_start.size()) + bi(lp.A.nnz()) + bd(lp.A.nnz()) + bd(m) + bd(n) +
+         bi(m + 1) + bi(lp.A.nnz()) + bd(lp.A.nnz());
+}
+
 // Exact device bytes marshal_problem cudaMallocs for one problem's STATIC buffers (read-only
 // factors/matrix + mutable state), EXCLUDING the in-kernel gpu_span heap (S_ growth). Used by
 // the batch pre-flight VRAM estimate; mirrors the upload/alloc sizes 1:1 (empty vectors still
@@ -4598,12 +4913,8 @@ static size_t problem_static_bytes(const lp_problem_t<i_t, f_t>& lp,
   auto bd = [](size_t c) { return (c == 0 ? 1 : c) * sizeof(f_t); };
   auto bf = [](size_t c) { return (c == 0 ? 1 : c) * sizeof(FactorIndex); };
   size_t b = 0;
-  // A (col_start, i, x) + rhs/lower/upper/objective
-  b += bi(lp.A.col_start.size()) + bi(lp.A.nnz()) + bd(lp.A.nnz());
-  b += bd(m) + 3 * bd(n);
-  // Arow (CSR): row_start(m+1) + j(nnz) + x(nnz). Always uploaded now, so it is STATIC VRAM and no
-  // longer part of the in-kernel heap demand.
-  b += bi(m + 1) + bi(lp.A.nnz()) + bd(lp.A.nnz());
+  // Immutable A/rhs/objective/Arow (deduplicated across seats) plus per-seat lower/upper.
+  b += problem_shared_ro_bytes(lp) + 2 * bd(n);
   // Four factors, each col_start + i + x
   b += bi(L0.col_start.size())  + bf(L0.nnz())  + bd(L0.nnz());
   b += bi(U0.col_start.size())  + bf(U0.nnz())  + bd(U0.nnz());
@@ -4611,9 +4922,10 @@ static size_t problem_static_bytes(const lp_problem_t<i_t, f_t>& lp,
   b += bi(U0t.col_start.size()) + bf(U0t.nnz()) + bd(U0t.nnz());
   // perms + workspaces
   b += bi(m) + bi(m) + bi(2 * m) + bd(m) + m * sizeof(unsigned char);
-  // state: vstatus(n) + basic(m) + nonbasic(<=n) + x(n)+y(m)+z(n) + dy_se(n) + 4 out scalars
+  // state: vstatus(n) + basic(m) + nonbasic(<=n) + x(n)+y(m)+z(n) + dy_se(n) + outputs
   b += n * sizeof(variable_status_t) + bi(m) + bi(n) + bd(n) + bd(m) + bd(n) + bd(n);
-  b += 2 * bi(1) + 2 * bd(1);
+  // out_status[2] + iterations + three zero-step diagnostics; objective + user_objective.
+  b += 6 * bi(1) + 2 * bd(1);
   // persistent per-slot solve state (slot_state<FT> header only -- its gpu_span payloads live in
   // the arena below, or on the in-kernel heap for the few buffers left there)
   b += sizeof(slot_state<gpu_basis_update_mpf_t<FactorIndex>>);
@@ -4625,7 +4937,119 @@ static size_t problem_static_bytes(const lp_problem_t<i_t, f_t>& lp,
 }
 
 
+// ---- In-flight batch -------------------------------------------------------------------------
+// Everything a launched batch owns until its results are read back. The synchronous entry point is
+// launch + wait + finish; branch-and-bound uses the three separately so the summoning worker can
+// keep plunging on the CPU while its nodes run.
+//
+// The compile is --default-stream=per-thread, so each host thread already launches on its own
+// stream and two workers do not serialise on the legacy default stream. What is NOT safe to run
+// concurrently is the pair of DEVICE GLOBALS this path writes per launch --
+// A read-only upload that OUTLIVES a single launch. Every node of a branch-and-bound tree shares the
+// same A / rhs / objective and the same Arow master, so re-uploading them on every launch is pure
+// repetition -- and with in-seat plunging a cycle now issues many launches. The caller (a pool)
+// creates one of these, hands it to every launch it makes, and destroys it when the pool dies.
+//
+// It holds ONLY the immutable problem block. Per-seat mutable state -- bounds, LU, perms, the Arow
+// WORKING copy that warp_nbe_body permutes in place -- stays per launch, because sharing any of that
+// across concurrently resident seats is a data race.
+template <typename i_t, typename f_t>
+struct gpu_ro_cache_t {
+  rmm::cuda_stream owned_stream;   // MUST be declared before `store`, which binds to its view
+  marshal_storage store;
+  // Keyed on A's storage address, as the per-launch cache is. Across a POOL's lifetime that address
+  // can be recycled: `original_lp_` is rebuilt when cuts add slack rows, and a freed vector can come
+  // back at the same address with different contents. So the shape is recorded with the entry and
+  // re-checked -- a mismatch re-uploads instead of handing the kernel a stale matrix.
+  struct entry_t {
+    ro_upload ro;
+    size_t col_start_len{0}, nz{0};
+  };
+  std::unordered_map<const void*, entry_t> cache;
+  // SHARED BY EVERY POOL ON THIS DEVICE, and populated lazily at the first launch that needs it --
+  // so several worker threads can reach it at once. Without this lock they race on the map and on
+  // `store`, which segfaults. Contention is negligible: one insert per distinct matrix, then
+  // lookups.
+  std::mutex mtx;
+  // OWNS its stream. It used to borrow a pool's, which tied the cache's lifetime to that pool's:
+  // destroying the pools first left the cache's device_buffers freeing on a dead stream, faulting
+  // inside libcuda (cuMemFreeAsync). A cache shared by several pools cannot belong to any one of
+  // them, so it has its own. Declared BEFORE `store` so it is constructed first and destroyed last.
+  gpu_ro_cache_t() : owned_stream(), store(owned_stream.view()) {}
+  // DIAGNOSTIC ONLY: reproduce the old behaviour where the cache BORROWED a pool's stream. Its
+  // device_buffers are then allocated stream-ordered on that pool's stream while kernels on the
+  // OTHER pools' streams read them. Used to prove whether that is what produced the rare wrong
+  // objective; never for production.
+  explicit gpu_ro_cache_t(rmm::cuda_stream_view borrowed) : owned_stream(), store(borrowed) {}
+};
+
+template <typename i_t, typename f_t>
+struct gpu_batch_handle_t {
+  std::vector<gpu_batch_item<i_t, f_t>> items;
+  std::vector<kernel_args> h_args;
+  std::vector<marshal_storage> store;
+  marshal_storage ro_store;
+  std::unordered_map<const void*, ro_upload> ro_cache;
+  kernel_args* d_args{nullptr};
+  unsigned int* d_next{nullptr};
+  unsigned int* d_completed_blocks{nullptr};
+  std::uint32_t* h_completion_flag{nullptr};
+  std::uint32_t* d_completion_flag{nullptr};
+  cudaEvent_t ev_start{nullptr}, ev_stop{nullptr};
+  rmm::cuda_stream_view stream{rmm::cuda_stream_default};
+  // Non-owning. When set, the immutable problem block lives here instead of in `ro_store`, and
+  // survives this launch. `ro_store` still owns the PER-LAUNCH scratch (d_args, the steal counter).
+  gpu_ro_cache_t<i_t, f_t>* ro_ext{nullptr};
+  double up_t0{0.0};
+  bool launched{false};
+  // Set from the launch. _finish needs it to decide whether to copy the duals back -- only a caller
+  // with a resume loop consumes them, and for everyone else it is m + n doubles of D2H for nothing.
+  bool allow_refactor_exit{false};
+  bool persistent_mode{false};
+  bool use_uint16_factors{true};
+  std::vector<unsigned char> staged;
+  // Pool-owned pinned host staging for sparse child bound deltas. Capacity grows per seat to the
+  // largest diff that seat has seen; it is not an N*n slab (which would pin hundreds of MB for the
+  // usual one-column branch updates).
+  std::vector<gpu_bound_delta<i_t, f_t>*> pinned_bound_deltas;
+  std::vector<size_t> pinned_bound_caps;
+  std::vector<std::vector<std::uint16_t>> factor_index16_scratch;
+  struct factor_caps_t {
+    size_t L0{0}, U0{0}, L0t{0}, U0t{0};
+  };
+  std::vector<factor_caps_t> factor_caps;
+
+  ~gpu_batch_handle_t()
+  {
+    for (auto* p : pinned_bound_deltas) {
+      if (p != nullptr) { cudaFreeHost(p); }
+    }
+    if (h_completion_flag != nullptr) { cudaFreeHost(h_completion_flag); }
+  }
+};
+
 }  // namespace gpu_phase2_detail
+
+template <typename f_t>
+static bool resume_dual_feasible(const std::vector<variable_status_t>& vstatus,
+                                 const std::vector<f_t>& z,
+                                 f_t dual_tol)
+{
+  if (z.size() < vstatus.size()) { return false; }
+  f_t infeasibility = 0.0;
+  for (size_t j = 0; j < vstatus.size(); ++j) {
+    if (!std::isfinite(z[j])) { return false; }
+    if (vstatus[j] == variable_status_t::NONBASIC_LOWER && z[j] < -dual_tol) {
+      infeasibility += -z[j];
+    } else if (vstatus[j] == variable_status_t::NONBASIC_UPPER && z[j] > dual_tol) {
+      infeasibility += z[j];
+    } else if (vstatus[j] == variable_status_t::NONBASIC_FREE) {
+      infeasibility += std::abs(z[j]);
+    }
+    if (infeasibility > dual_tol) { return false; }
+  }
+  return true;
+}
 
 // ---------------------------------------------------------------------------
 // Host wrapper. Same signature as simplified_dual_phase2.
@@ -4643,7 +5067,8 @@ static dual::status_t gpu_simplified_dual_phase2_leg(
   std::vector<i_t>& nonbasic_list,
   lp_solution_t<i_t, f_t>& sol,
   std::vector<f_t>& delta_y_steepest_edge,
-  bool resume)
+  bool resume,
+  i_t& refactor_reason)
 {
   using namespace gpu_phase2_detail;
   static_assert(sizeof(i_t) == sizeof(int) && sizeof(f_t) == sizeof(double),
@@ -4651,6 +5076,20 @@ static dual::status_t gpu_simplified_dual_phase2_leg(
 
   const int m = lp.num_rows;
   const int n = lp.num_cols;
+  assert(delta_y_steepest_edge.size() == static_cast<size_t>(n));
+
+  // These arrays are indexed by the mathematical dimensions with no device-side bounds checks.
+  // Reject a malformed first call here instead of turning a short host vector into an unrelated
+  // device illegal-address report later in the solve.
+  if (m < 0 || n < m || vstatus.size() != static_cast<size_t>(n) ||
+      basic_list.size() != static_cast<size_t>(m) ||
+      nonbasic_list.size() != static_cast<size_t>(n - m) ||
+      sol.x.size() != static_cast<size_t>(n) || sol.y.size() != static_cast<size_t>(m) ||
+      sol.z.size() != static_cast<size_t>(n) ||
+      delta_y_steepest_edge.size() != static_cast<size_t>(n)) {
+    std::fprintf(stderr, "[gpu_phase2] ERROR: first-call state has the wrong dimensions\n");
+    return dual::status_t::NUMERICAL;
+  }
 
   // Pure-stacking GPU port: the supplied factorization must be fresh (no stacked
   // updates yet), matching the harness which refactors immediately before the call.
@@ -4703,11 +5142,11 @@ static dual::status_t gpu_simplified_dual_phase2_leg(
                                                             store,
                                                             resume);
 
-  // Reset the shared alloc-failed flag from the host (the kernel no longer does it).
-  const int zero_flag = 0;
-  RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_gpu_capacity_exceeded, &zero_flag, sizeof(int)));
-  const unsigned int zero_counter = 0;
-  RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_next_problem, &zero_counter, sizeof(unsigned int)));
+  // Work-stealing counter for the persistent kernel, zeroed before the launch. Per launch, not a
+  // device global -- see the batch path for why.
+  unsigned int* d_next = nullptr;
+  RAFT_CUDA_TRY(cudaMalloc(&d_next, sizeof(unsigned int)));
+  RAFT_CUDA_TRY(cudaMemset(d_next, 0, sizeof(unsigned int)));
 
   // The kernel takes a device pointer to an array of kernel_args (one per problem);
   // the single-problem path is just N == 1.
@@ -4715,21 +5154,27 @@ static dual::status_t gpu_simplified_dual_phase2_leg(
   RAFT_CUDA_TRY(cudaMalloc(&d_args, sizeof(kernel_args)));
   RAFT_CUDA_TRY(cudaMemcpy(d_args, &a, sizeof(kernel_args), cudaMemcpyHostToDevice));
 
-  upload_solve_class_config();
+  report_config("monolith", 1, use_uint16_factors ? 16 : 32);
+  const auto _k0 = std::chrono::steady_clock::now();
+  // AllowRefactorExit = TRUE on the single-problem entry: this path owns a host resume loop that
+  // can answer REFACTOR_NEEDED. The batch entry takes the default (false) because it has none.
   if (use_uint16_factors) {
-    gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16, true><<<1, 32>>>(d_args, i_t{1});
+    gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16, true><<<1, 32>>>(
+      d_args, i_t{1}, d_next, nullptr, nullptr);
   } else {
-    gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32, true><<<1, 32>>>(d_args, i_t{1});
+    gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32, true><<<1, 32>>>(
+      d_args, i_t{1}, d_next, nullptr, nullptr);
   }
   RAFT_CUDA_TRY(cudaPeekAtLastError());
   RAFT_CUDA_TRY(cudaDeviceSynchronize());
   cudaFree(d_args);
+  cudaFree(d_next);
 
   // Marshal outputs back.
-  int h_status = 0;
+  int h_status[2] = {0, 0};
   double h_obj = 0.0, h_uobj = 0.0;
   int h_iters = 0;
-  RAFT_CUDA_TRY(cudaMemcpy(&h_status, a.out_status, sizeof(int), cudaMemcpyDeviceToHost));
+  RAFT_CUDA_TRY(cudaMemcpy(h_status, a.out_status, sizeof(h_status), cudaMemcpyDeviceToHost));
   RAFT_CUDA_TRY(cudaMemcpy(&h_obj, a.out_objective, sizeof(double), cudaMemcpyDeviceToHost));
   RAFT_CUDA_TRY(cudaMemcpy(&h_uobj, a.out_user_objective, sizeof(double), cudaMemcpyDeviceToHost));
   RAFT_CUDA_TRY(cudaMemcpy(&h_iters, a.out_iterations, sizeof(int), cudaMemcpyDeviceToHost));
@@ -4742,6 +5187,15 @@ static dual::status_t gpu_simplified_dual_phase2_leg(
   // maintained incrementally by the driver for the same reason.
   RAFT_CUDA_TRY(
     cudaMemcpy(vstatus.data(), a.vstatus, n * sizeof(variable_status_t), cudaMemcpyDeviceToHost));
+  // Preserve the exact pivot-history order.  Reconstructing the lists from vstatus sorts them by
+  // column index; that changes both the next LU and the order-dependent ratio-test scan after a
+  // host refactor resume.
+  RAFT_CUDA_TRY(
+    cudaMemcpy(basic_list.data(), a.basic_list, m * sizeof(i_t), cudaMemcpyDeviceToHost));
+  RAFT_CUDA_TRY(cudaMemcpy(nonbasic_list.data(),
+                           a.nonbasic_list,
+                           (n - m) * sizeof(i_t),
+                           cudaMemcpyDeviceToHost));
   delta_y_steepest_edge.resize(static_cast<size_t>(n));
   RAFT_CUDA_TRY(
     cudaMemcpy(delta_y_steepest_edge.data(), a.dy_se, n * sizeof(double), cudaMemcpyDeviceToHost));
@@ -4749,14 +5203,9 @@ static dual::status_t gpu_simplified_dual_phase2_leg(
   sol.objective      = h_obj;
   sol.user_objective = h_uobj;
   sol.iterations     = h_iters;
+  refactor_reason    = h_status[1];
 
-  int alloc_failed = 0;
-  RAFT_CUDA_TRY(cudaMemcpyFromSymbol(&alloc_failed, g_gpu_capacity_exceeded, sizeof(int)));
-  if (alloc_failed) {
-    std::fprintf(stderr, "[gpu_phase2] device allocation failed during solve.\n");
-  }
-
-  return static_cast<dual::status_t>(h_status);
+  return static_cast<dual::status_t>(h_status[0]);
 }
 
 
@@ -4769,41 +5218,86 @@ static dual::status_t gpu_simplified_dual_phase2_leg(
 // and each item->sol (x, objective, user_objective, iterations).
 // ---------------------------------------------------------------------------
 template <typename i_t, typename f_t>
-void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>>& items,
-                                      size_t heap_estimate_bytes,
-                                      std::vector<dual::status_t>& out_status,
-                                      gpu_batch_timing& timing)
+gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batch_launch(
+  const std::vector<gpu_batch_item<i_t, f_t>>& items,
+  size_t heap_estimate_bytes,
+  gpu_batch_timing& timing,
+  rmm::cuda_stream_view stream,
+  bool allow_refactor_exit,
+  gpu_phase2_detail::gpu_ro_cache_t<i_t, f_t>* ro_ext,
+  bool persistent_seats)
 {
   using namespace gpu_phase2_detail;
   static_assert(sizeof(i_t) == sizeof(int) && sizeof(f_t) == sizeof(double),
                 "gpu_simplified_dual_phase2_batch is only instantiated for <int, double>");
 
   const size_t N = items.size();
-  out_status.assign(N, dual::status_t::UNSET);
   timing = gpu_batch_timing{};
-  if (N == 0) return;
+  if (N == 0) return nullptr;
 
   // A launch has one compile-time factor-index type. If any node exceeds uint16 capacity,
   // use the int32 specialization for the entire batch.
   bool use_uint16_factors = true;
   // Every ft must be a fresh factorization (pure MPF stacking port, no on-device refactor).
   for (size_t b = 0; b < N; ++b) {
+    if (items[b].terminal_status != dual::status_t::UNSET) { continue; }
+    const auto reject_item = [&](const char* why) {
+      timing.rejected = true;
+      timing.message  = "item " + std::to_string(b) + " " + why;
+      std::fprintf(stderr, "[gpu_phase2] batch ERROR: %s\n", timing.message.c_str());
+    };
+    if (items[b].lp == nullptr || items[b].settings == nullptr || items[b].vstatus == nullptr ||
+        items[b].ft == nullptr || items[b].basic_list == nullptr ||
+        items[b].nonbasic_list == nullptr || items[b].sol == nullptr || items[b].dy_se == nullptr) {
+      reject_item("has a null state pointer");
+      return nullptr;
+    }
+    const i_t m = items[b].lp->num_rows;
+    const i_t n = items[b].lp->num_cols;
+    assert(items[b].dy_se->size() == static_cast<size_t>(n));
+    if (m < 0 || n < m || items[b].vstatus->size() != static_cast<size_t>(n) ||
+        items[b].basic_list->size() != static_cast<size_t>(m) ||
+        items[b].nonbasic_list->size() != static_cast<size_t>(n - m) ||
+        items[b].sol->x.size() != static_cast<size_t>(n) ||
+        items[b].sol->y.size() != static_cast<size_t>(m) ||
+        items[b].sol->z.size() != static_cast<size_t>(n) ||
+        (items[b].lower != nullptr && items[b].lower->size() != static_cast<size_t>(n)) ||
+        (items[b].upper != nullptr && items[b].upper->size() != static_cast<size_t>(n)) ||
+        items[b].dy_se->size() != static_cast<size_t>(n)) {
+      reject_item("has incorrectly sized state");
+      return nullptr;
+    }
     use_uint16_factors =
-      use_uint16_factors && factors_fit_uint16(items[b].lp->num_rows);
-    if (items[b].ft->num_updates() != 0) {
+      use_uint16_factors && factors_fit_uint16(m);
+    // A seat CONTINUING a plunge arrives with the parent's MPF stack on purpose -- that is the CPU's
+    // behaviour and the reason a dived child costs no LU. Only a seat that claims to be starting
+    // fresh must be fresh.
+    if (!items[b].continue_basis && items[b].ft->num_updates() != 0) {
       timing.rejected = true;
       timing.message  = "item " + std::to_string(b) + " has a non-fresh factorization (num_updates=" +
                         std::to_string(items[b].ft->num_updates()) + ")";
       std::fprintf(stderr, "[gpu_phase2] batch ERROR: %s\n", timing.message.c_str());
-      return;
+      return nullptr;
     }
   }
+  // Keep large bases on the int32 specialization. The launch and marshalling paths below already
+  // support it; rejecting it here made the resumable batch verifier silently unable to cover the
+  // large V7 nodes (including chromaticindex1024-7), precisely the nodes whose serial tail is most
+  // expensive.
   // ---- Pre-flight VRAM check (fail loud, before any device allocation) ----
   size_t static_bytes = 0;
+  std::unordered_map<const void*, std::pair<size_t, size_t>> counted_ro;
   for (size_t b = 0; b < N; ++b) {
-    static_bytes += use_uint16_factors
-                      ? problem_static_bytes<std::uint16_t>(*items[b].lp, *items[b].ft)
-                      : problem_static_bytes<int>(*items[b].lp, *items[b].ft);
+    if (items[b].terminal_status != dual::status_t::UNSET) { continue; }
+    const auto& item_lp = *items[b].lp;
+    size_t item_bytes = use_uint16_factors
+                          ? problem_static_bytes<std::uint16_t>(item_lp, *items[b].ft)
+                          : problem_static_bytes<int>(item_lp, *items[b].ft);
+    const void* ro_key = static_cast<const void*>(item_lp.A.col_start.data());
+    const std::pair<size_t, size_t> ro_shape{item_lp.A.col_start.size(), item_lp.A.i.size()};
+    const auto [it, inserted] = counted_ro.emplace(ro_key, ro_shape);
+    if (!inserted && it->second == ro_shape) { item_bytes -= problem_shared_ro_bytes(item_lp); }
+    static_bytes += item_bytes;
   }
   const size_t args_bytes = N * sizeof(kernel_args);
   const size_t need = static_bytes + heap_estimate_bytes + args_bytes;
@@ -4839,55 +5333,133 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
     timing.rejected = true;
     timing.message  = buf;
     std::fprintf(stderr, "[gpu_phase2] batch REJECTED: %s\n", buf);
-    return;
+    return nullptr;
   }
 
   // Size the malloc heap for all N concurrent S_ stacks (first GPU kernel this process).
   {
     const size_t granted = ensure_device_limits(heap_estimate_bytes);
-    if (heap_demand_rejected(heap_estimate_bytes, granted, g_device_heap_requested, N, timing)) { return; }
+    if (heap_demand_rejected(heap_estimate_bytes, granted, g_device_heap_requested, N, timing)) { return nullptr; }
   }
 
   // ---- Marshal every problem + upload (host-timed) ----
   // Deduplicate the immutable A CSC, CSR Arow, rhs, and objective across nodes with the same
   // original matrix. Basis-dependent factors, row permutations, and bounds remain per-node.
   const double up_t0 = tic();
-  std::vector<kernel_args> h_args(N);
-  std::unordered_map<const void*, ro_upload> ro_cache;
+  auto* H = new gpu_batch_handle_t<i_t, f_t>();
+  H->items  = items;
+  H->up_t0  = up_t0;
+  H->stream = stream;
+  H->allow_refactor_exit = allow_refactor_exit;
+  H->persistent_mode     = persistent_seats;
+  H->use_uint16_factors  = use_uint16_factors;
+  H->ro_store.stream = stream;
+  // One cache-line-aligned mapped word is the asynchronous host/device completion handshake for
+  // this handle. It is logically a bool, but a 32-bit word has well-defined CUDA and CPU atomic
+  // support. The CPU never polls CUDA runtime state in the worker-loop hot path.
+  RAFT_CUDA_TRY(cudaHostAlloc(reinterpret_cast<void**>(&H->h_completion_flag),
+                              sizeof(std::uint32_t),
+                              cudaHostAllocMapped | cudaHostAllocPortable));
+  RAFT_CUDA_TRY(cudaHostGetDevicePointer(
+    reinterpret_cast<void**>(&H->d_completion_flag), H->h_completion_flag, 0));
+  new (H->h_completion_flag) std::uint32_t{0u};
+  // marshal_storage owns rmm::device_buffers and is move-only, so construct in place.
+  H->store.reserve(N);
+  for (size_t k = 0; k < N; ++k) { H->store.emplace_back(stream); }
+  H->h_args.resize(N);
+  auto& h_args   = H->h_args;
+  auto& store    = H->store;
+  auto& ro_store = H->ro_store;
+  H->ro_ext = ro_ext;
+  // With a caller-supplied cache the shared block is uploaded once per POOL; without one it falls
+  // back to the handle's own cache and is uploaded once per launch, as before. The two caches hold
+  // different entry types, so the choice is made at each use site rather than through a reference.
+  // `H->ro_store` keeps the per-launch scratch (d_args, the steal counter) either way.
   // One storage per problem, plus one for the deduped read-only uploads. These own every
-  // device_buffer for the batch and MUST outlive the kernel launch below.
-  std::vector<marshal_storage> store(N);
-  marshal_storage ro_store;
+  // device_buffer for the batch and MUST outlive the kernel launch -- which is why they live on the
+  // HANDLE (bound by reference above) rather than on this stack frame: `_launch` returns before the
+  // kernel finishes.
 
   for (size_t b = 0; b < N; ++b) {
     const auto& it = items[b];
+    if (it.terminal_status != dual::status_t::UNSET) {
+      // The kernel checks this before reading any other field. Avoid re-uploading a completed
+      // seat's bounds, factorization and workspaces on every host-refactor round.
+      h_args[b]      = kernel_args{};
+      h_args[b].done = 1;
+      continue;
+    }
     // Key on A's storage, not on the lp object. Every node of a branch-and-bound tree shares the
     // SAME constraint matrix while carrying its own bounds and LU, so each node is a distinct
     // lp_problem_t -- keying on `it.lp` would miss the sharing that actually exists.
-    auto res = ro_cache.try_emplace(static_cast<const void*>(it.lp->A.col_start.data()));
-    if (res.second) { res.first->second = upload_ro(*it.lp, ro_store); }
-    const ro_upload* ro = &res.first->second;
+    const ro_upload* ro = nullptr;
+    ro_upload ro_copy{};
+    if (ro_ext != nullptr) {
+      const size_t cs_len = it.lp->A.col_start.size();
+      const size_t nz     = it.lp->A.i.size();
+      {
+        std::lock_guard<std::mutex> lk(ro_ext->mtx);
+        auto res = ro_ext->cache.try_emplace(static_cast<const void*>(it.lp->A.col_start.data()));
+        auto& e  = res.first->second;
+        if (res.second || e.col_start_len != cs_len || e.nz != nz) {
+          e.ro            = upload_ro(*it.lp, ro_ext->store);
+          e.col_start_len = cs_len;
+          e.nz            = nz;
+          // The upload is issued on the CACHE's stream, but the seats that read it run on their own
+          // pools' streams. Nothing orders those, so without this the first launch on another stream
+          // can read the matrix before it has landed. One sync per distinct matrix, not per launch.
+          ro_ext->store.stream.synchronize();
+        }
+        ro_copy = e.ro;   // copy out under the lock; the map may gain entries afterwards
+      }
+      ro = &ro_copy;
+    } else {
+      auto res = H->ro_cache.try_emplace(static_cast<const void*>(it.lp->A.col_start.data()));
+      if (res.second) { res.first->second = upload_ro(*it.lp, H->ro_store); }
+      ro = &res.first->second;
+    }
     h_args[b] = use_uint16_factors
                   ? marshal_problem<std::uint16_t>(
                       *it.lp, *it.settings, *it.vstatus, *it.ft, *it.basic_list,
-                      *it.nonbasic_list, *it.sol, *it.dy_se, ro, store[b])
+                      *it.nonbasic_list, *it.sol, *it.dy_se, ro, store[b], it.refactor_resume,
+                      it.terminal_certificate_retry, it.lower, it.upper)
                   : marshal_problem<i_t>(
                       *it.lp, *it.settings, *it.vstatus, *it.ft, *it.basic_list,
-                      *it.nonbasic_list, *it.sol, *it.dy_se, ro, store[b]);
+                      *it.nonbasic_list, *it.sol, *it.dy_se, ro, store[b], it.refactor_resume,
+                      it.terminal_certificate_retry, it.lower, it.upper);
   }
 
-  kernel_args* d_args = nullptr;
-  RAFT_CUDA_TRY(cudaMalloc(&d_args, N * sizeof(kernel_args)));
-  RAFT_CUDA_TRY(cudaMemcpy(d_args, h_args.data(), N * sizeof(kernel_args), cudaMemcpyHostToDevice));
-  const int zero_flag = 0;
-  RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_gpu_capacity_exceeded, &zero_flag, sizeof(int)));
-  const unsigned int zero_counter = 0;
-  RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_next_problem, &zero_counter, sizeof(unsigned int)));
-  RAFT_CUDA_TRY(cudaDeviceSynchronize());
+  // d_args comes from the pool on this batch's stream. It used to be a raw cudaMalloc plus a
+  // BLOCKING cudaMemcpy, which is a device-wide synchronisation point in the middle of the launch
+  // path -- fatal for running one batch per GPU worker.
+  H->ro_store.bufs.emplace_back(N * sizeof(kernel_args), stream);
+  kernel_args*& d_args = H->d_args;
+  d_args = static_cast<kernel_args*>(H->ro_store.bufs.back().data());
+  RAFT_CUDA_TRY(cudaMemcpyAsync(d_args, h_args.data(), N * sizeof(kernel_args),
+                                cudaMemcpyHostToDevice, stream.value()));
+
+  // The persistent kernel's work-stealing counter, allocated PER LAUNCH from the pool and zeroed
+  // stream-ordered. Per launch rather than a device global because branch-and-bound runs one batch
+  // per GPU worker concurrently; a shared counter would have those launches stealing from each
+  // other's index space. Zeroing on the stream also keeps the launch path free of any device sync.
+  H->ro_store.bufs.emplace_back(sizeof(unsigned int), stream);
+  unsigned int* d_next = static_cast<unsigned int*>(H->ro_store.bufs.back().data());
+  H->d_next            = d_next;
+  RAFT_CUDA_TRY(cudaMemsetAsync(d_next, 0, sizeof(unsigned int), stream.value()));
+  H->ro_store.bufs.emplace_back(sizeof(unsigned int), stream);
+  H->d_completed_blocks =
+    static_cast<unsigned int*>(H->ro_store.bufs.back().data());
+  RAFT_CUDA_TRY(
+    cudaMemsetAsync(H->d_completed_blocks, 0, sizeof(unsigned int), stream.value()));
+  // No device-wide sync: the copies are async and the caller may keep working.
   timing.upload_s = toc(up_t0);
 
   // ---- Launch a resident work-stealing grid, timed with CUDA events (device compute only) ----
-  upload_solve_class_config();
+  report_config("monolith", items.size(), use_uint16_factors ? 16 : 32);
+  // (upload_solve_class_config() was dropped with g_elide_noop -- all it did was set that flag.)
+  // Resident grid: launch only as many blocks as actually fit, and let them steal the remaining
+  // problems. This is what removes the intra-launch tail -- a block finishing a 3-iteration node
+  // takes another instead of idling until the 256-iteration node in the same launch finishes.
   int device = 0;
   RAFT_CUDA_TRY(cudaGetDevice(&device));
   int sm_count = 1;
@@ -4902,63 +5474,550 @@ void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>
   }
   unsigned int nb = static_cast<unsigned int>(blocks_per_sm) * static_cast<unsigned int>(sm_count);
   if (nb == 0 || nb > N) { nb = static_cast<unsigned int>(N); }
-  cudaEvent_t ev_start, ev_stop;
+  // Events live on the HANDLE, not the stack: _launch returns before the kernel finishes, and
+  // _finish reads them later to report kernel time.
+  cudaEvent_t& ev_start = H->ev_start;
+  cudaEvent_t& ev_stop  = H->ev_stop;
   RAFT_CUDA_TRY(cudaEventCreate(&ev_start));
   RAFT_CUDA_TRY(cudaEventCreate(&ev_stop));
-  RAFT_CUDA_TRY(cudaEventRecord(ev_start));
+  RAFT_CUDA_TRY(cudaEventRecord(ev_start, stream.value()));
   {
     // The register/occupancy target is a BUILD-time knob on the Direct kernel
     // gpu_phase2_kernel_direct.
-    if (use_uint16_factors) {
-      gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16><<<nb, 32>>>(
-        d_args, static_cast<i_t>(N));
+    // Two instantiations, selected at launch. `true` compiles IN the refactor exits so each problem
+    // can come back REFACTOR_NEEDED for a caller that owns a host resume loop; `false` compiles them
+    // out and is what the benchmark and any resume-less caller must use.
+    if (allow_refactor_exit) {
+      if (use_uint16_factors) {
+        gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16, true><<<nb, 32, 0, stream.value()>>>(
+          d_args,
+          static_cast<i_t>(N),
+          d_next,
+          H->d_completed_blocks,
+          H->d_completion_flag);
+      } else {
+        gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32, true><<<nb, 32, 0, stream.value()>>>(
+          d_args,
+          static_cast<i_t>(N),
+          d_next,
+          H->d_completed_blocks,
+          H->d_completion_flag);
+      }
+    } else if (use_uint16_factors) {
+      gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16><<<nb, 32, 0, stream.value()>>>(
+        d_args,
+        static_cast<i_t>(N),
+        d_next,
+        H->d_completed_blocks,
+        H->d_completion_flag);
     } else {
-      gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32><<<nb, 32>>>(d_args, static_cast<i_t>(N));
+      gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32><<<nb, 32, 0, stream.value()>>>(
+        d_args,
+        static_cast<i_t>(N),
+        d_next,
+        H->d_completed_blocks,
+        H->d_completion_flag);
     }
   }
-  RAFT_CUDA_TRY(cudaEventRecord(ev_stop));
+  RAFT_CUDA_TRY(cudaEventRecord(ev_stop, stream.value()));
   RAFT_CUDA_TRY(cudaPeekAtLastError());
-  RAFT_CUDA_TRY(cudaEventSynchronize(ev_stop));
+  H->launched = true;
+  return H;
+}
+
+// True once the kernel has finished. Non-blocking.
+template <typename i_t, typename f_t>
+gpu_ro_cache<i_t, f_t>* gpu_ro_cache_create()
+{
+  return new gpu_phase2_detail::gpu_ro_cache_t<i_t, f_t>();
+}
+
+template <typename i_t, typename f_t>
+gpu_ro_cache<i_t, f_t>* gpu_ro_cache_create_borrowed(rmm::cuda_stream_view borrowed)
+{
+  return new gpu_phase2_detail::gpu_ro_cache_t<i_t, f_t>(borrowed);
+}
+
+template <typename i_t, typename f_t>
+void gpu_ro_cache_destroy(gpu_ro_cache<i_t, f_t>* c)
+{
+  delete c;
+}
+
+template <typename i_t, typename f_t>
+bool gpu_simplified_dual_phase2_batch_ready(gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H)
+{
+  if (H == nullptr || !H->launched) { return true; }
+  return std::atomic_ref<std::uint32_t>(*H->h_completion_flag)
+           .load(std::memory_order_acquire) != 0u;
+}
+
+// Wait for the kernel, copy every result back, release the batch. Destroys the handle.
+template <typename i_t, typename f_t>
+void gpu_simplified_dual_phase2_batch_harvest(
+  gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H,
+  std::vector<dual::status_t>& out_status,
+  gpu_batch_timing& timing)
+{
+  using namespace gpu_phase2_detail;
+  if (H == nullptr) { return; }
+  const std::vector<gpu_batch_item<i_t, f_t>>& items = H->items;
+  const size_t N = items.size();
+  out_status.assign(N, dual::status_t::UNSET);
+  auto& h_args = H->h_args;
+
+  RAFT_CUDA_TRY(cudaEventSynchronize(H->ev_stop));
   float kernel_ms = 0.0f;
-  RAFT_CUDA_TRY(cudaEventElapsedTime(&kernel_ms, ev_start, ev_stop));
+  RAFT_CUDA_TRY(cudaEventElapsedTime(&kernel_ms, H->ev_start, H->ev_stop));
   timing.kernel_s = kernel_ms / 1000.0;
-  cudaEventDestroy(ev_start);
-  cudaEventDestroy(ev_stop);
+  cudaEventDestroy(H->ev_start);
+  cudaEventDestroy(H->ev_stop);
+  H->ev_start = nullptr;
+  H->ev_stop  = nullptr;
+  H->launched = false;
 
   // ---- Copy each problem's result back (host-timed) ----
   const double cb_t0 = tic();
   for (size_t b = 0; b < N; ++b) {
+    if (items[b].terminal_status != dual::status_t::UNSET) {
+      out_status[b] = items[b].terminal_status;
+      continue;
+    }
     const auto& a  = h_args[b];
     auto& sol      = *items[b].sol;
+    auto& vstatus  = *items[b].vstatus;
     const int n    = a.n;
-    const int m    = a.m;
-    int h_status = 0, h_iters = 0;
+    int h_status[2] = {0, 0};  // [0] status, [1] REFACTOR_NEEDED reason
+    int h_iters     = 0;
     double h_obj = 0.0, h_uobj = 0.0;
-    RAFT_CUDA_TRY(cudaMemcpy(&h_status, a.out_status, sizeof(int), cudaMemcpyDeviceToHost));
-    RAFT_CUDA_TRY(cudaMemcpy(&h_obj, a.out_objective, sizeof(double), cudaMemcpyDeviceToHost));
-    RAFT_CUDA_TRY(cudaMemcpy(&h_uobj, a.out_user_objective, sizeof(double), cudaMemcpyDeviceToHost));
-    RAFT_CUDA_TRY(cudaMemcpy(&h_iters, a.out_iterations, sizeof(int), cudaMemcpyDeviceToHost));
-    RAFT_CUDA_TRY(cudaMemcpy(sol.x.data(), a.x, n * sizeof(double), cudaMemcpyDeviceToHost));
-    RAFT_CUDA_TRY(cudaMemcpy(sol.y.data(), a.y, m * sizeof(double), cudaMemcpyDeviceToHost));
-    RAFT_CUDA_TRY(cudaMemcpy(sol.z.data(), a.z, n * sizeof(double), cudaMemcpyDeviceToHost));
+    const cudaStream_t cs = H->stream.value();
+    RAFT_CUDA_TRY(
+      cudaMemcpyAsync(h_status, a.out_status, 2 * sizeof(int), cudaMemcpyDeviceToHost, cs));
+    RAFT_CUDA_TRY(cudaMemcpyAsync(&h_obj, a.out_objective, sizeof(double), cudaMemcpyDeviceToHost, cs));
+    RAFT_CUDA_TRY(cudaMemcpyAsync(&h_uobj, a.out_user_objective, sizeof(double), cudaMemcpyDeviceToHost, cs));
+    RAFT_CUDA_TRY(cudaMemcpyAsync(&h_iters, a.out_iterations, sizeof(int), cudaMemcpyDeviceToHost, cs));
+    RAFT_CUDA_TRY(cudaMemcpyAsync(sol.x.data(), a.x, n * sizeof(double), cudaMemcpyDeviceToHost, cs));
+    // The FINAL basis. Branch-and-bound cannot use a result without it: search_tree_t::branch packs
+    // the parent's vstatus into BOTH children, and the child that is not kept for the dive leaves
+    // the device entirely, so it needs that basis to warm-start when it is popped again later.
+    // n bytes, so it is not worth making conditional on the status.
+    RAFT_CUDA_TRY(cudaMemcpyAsync(vstatus.data(), a.vstatus, n * sizeof(variable_status_t),
+                                  cudaMemcpyDeviceToHost, cs));
+    // The basis LISTS, not just the membership. Both drivers maintain them by an IN-PLACE swap
+    //     basic_list[basic_leaving] = entering;  nonbasic_list[nonbasic_entering] = leaving;
+    // so their ORDER is the pivot history. Rebuilding them on the host from `vstatus` instead
+    // (get_basis_from_vstatus scans j ascending) yields a SORTED order, which re-permutes both lists
+    // on every resume. That is not cosmetic:
+    //   - refactor_basis factorizes B = A(:, basic_list), so permuted columns give a different LU
+    //     than the CPU's in-place refactorization produces, and the resume no longer continues from
+    //     the same numerical state;
+    //   - the ratio test scans nonbasic_list IN ORDER and its near-tie rule is order-dependent (see
+    //     warp_rt_body), so a re-permuted list can change the entering choice after every resume.
+    // Only a caller with a resume loop reads these, hence the same gate as the duals.
+    if (H->allow_refactor_exit) {
+      RAFT_CUDA_TRY(cudaMemcpyAsync(items[b].basic_list->data(), a.basic_list,
+                                    a.m * sizeof(i_t), cudaMemcpyDeviceToHost, cs));
+      RAFT_CUDA_TRY(cudaMemcpyAsync(items[b].nonbasic_list->data(), a.nonbasic_list,
+                                    (n - a.m) * sizeof(i_t), cudaMemcpyDeviceToHost, cs));
+    }
+    // The steepest-edge norms, which the driver updates every pivot exactly as the CPU driver
+    // updates its `delta_y_steepest_edge` in place. Two callers need them back:
+    //   - a REFACTOR_NEEDED resume, which would otherwise restart pricing from the norms it was
+    //     first given and take a different pivot path than one uninterrupted solve;
+    //   - branch-and-bound, whose CPU path leaves the worker's norms updated, so leaving them
+    //     untouched here would make a GPU-solved node and a CPU-solved node behave differently.
+    {
+      auto& dy_se = *items[b].dy_se;
+      dy_se.resize(static_cast<size_t>(n));   // no-op once carried; sizes a cold-started node
+      RAFT_CUDA_TRY(cudaMemcpyAsync(dy_se.data(), a.dy_se, n * sizeof(f_t),
+                                    cudaMemcpyDeviceToHost, cs));
+    }
+    // The scalars above are read immediately below, so this per-item sync is required. It is on the
+    // batch's own stream, so it does not stall any other worker's batch.
+    RAFT_CUDA_TRY(cudaStreamSynchronize(cs));
+    // THE DUALS. Copied back only when the caller can resume, because only a resume consumes them.
+    //
+    // This is not an optimisation detail, it is the resume CONTRACT. The CPU driver's in-place
+    // refactorization (phase2.cpp) does exactly three things: refactor_basis, rebuild x via
+    // compute_primal_solution_from_basis, recompute the primal infeasibilities. It NEVER recomputes
+    // the duals -- y and z are carried forward as incrementally maintained values. The device stands
+    // in for that block, so it must hand its maintained y/z back or the host resumes with the duals
+    // from the START of the node while vstatus, x and dy_se have all moved on.
+    //
+    // Measured with them missing: the objective stops being monotone. germanrr oscillated between
+    // 117936034.95 and 121878287.74 for 503 legs and 51,408 iterations without converging; wachplan
+    // slid BACKWARDS from -8.667 to -7.783, crossed its -8.0 cutoff and fathomed a node whose true
+    // optimum is -8.5. Both converge in ~10 legs once the duals come back.
+    //
+    // For a caller with no resume loop nothing reads them, so the m + n doubles stay unsent.
+    if (H->allow_refactor_exit) {
+      RAFT_CUDA_TRY(cudaMemcpyAsync(sol.y.data(), a.y, a.m * sizeof(f_t),
+                                    cudaMemcpyDeviceToHost, cs));
+      RAFT_CUDA_TRY(cudaMemcpyAsync(sol.z.data(), a.z, n * sizeof(f_t),
+                                    cudaMemcpyDeviceToHost, cs));
+    }
     sol.objective      = h_obj;
     sol.user_objective = h_uobj;
     sol.iterations     = h_iters;
-    out_status[b]      = static_cast<dual::status_t>(h_status);
+    out_status[b]      = static_cast<dual::status_t>(h_status[0]);
+    if (items[b].refactor_reason != nullptr) { *items[b].refactor_reason = h_status[1]; }
   }
+  // y/z are enqueued after the per-item scalar synchronization above. Every resumable caller may
+  // consume them immediately for a host refactor, so make completion of *all* D2H state part of
+  // harvest's contract rather than relying on pageable-memory staging or a later allocation side
+  // effect (which notably left the final non-persistent seat unordered).
+  if (H->allow_refactor_exit) { H->stream.synchronize(); }
   timing.copyback_s = toc(cb_t0);
 
 
-  int alloc_failed = 0;
-  RAFT_CUDA_TRY(cudaMemcpyFromSymbol(&alloc_failed, g_gpu_capacity_exceeded, sizeof(int)));
-  if (alloc_failed) {
-    timing.message = "a device span exceeded the capacity the slot layout reserved for it — the "
-                     "layout is wrong, and results are unreliable";
-    std::fprintf(stderr, "[gpu_phase2] batch WARNING: %s\n", timing.message.c_str());
+
+  std::fill(H->staged.begin(), H->staged.end(), 0);
+}
+
+template <typename T>
+static void persistent_copy(T* dst,
+                            const T* src,
+                            size_t count,
+                            rmm::cuda_stream_view stream)
+{
+  if (count == 0) { return; }
+  RAFT_CUDA_TRY(cudaMemcpyAsync(
+    dst, src, count * sizeof(T), cudaMemcpyHostToDevice, stream.value()));
+}
+
+template <typename matrix_t, typename i_t, typename f_t>
+static void persistent_stage_factor(
+  gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H,
+  size_t seat,
+  size_t factor_ordinal,
+  const matrix_t& F,
+  i_t*& d_col,
+  void*& d_i,
+  f_t*& d_x,
+  i_t& d_nz,
+  size_t& capacity)
+{
+  using namespace gpu_phase2_detail;
+  const i_t rows = H->h_args[seat].m;
+  if (F.m != rows || F.n != rows || F.col_start.size() != static_cast<size_t>(rows + 1)) {
+    throw std::runtime_error("persistent factor has the wrong dimensions");
+  }
+  const size_t nz = static_cast<size_t>(F.nnz());
+  for (size_t p = 0; p < nz; ++p) {
+    if (F.i[p] < 0 || F.i[p] >= rows) {
+      throw std::runtime_error("persistent factor row index is outside [0, m)");
+    }
+  }
+  persistent_copy(d_col, F.col_start.data(), F.col_start.size(), H->stream);
+  if (nz > capacity) {
+    const size_t grown = std::max(nz, capacity == 0 ? size_t{1} : 2 * capacity);
+    if (H->use_uint16_factors) {
+      d_i = alloc_uninit<std::uint16_t>(grown, H->store[seat]);
+    } else {
+      d_i = alloc_uninit<i_t>(grown, H->store[seat]);
+    }
+    d_x      = alloc_uninit<f_t>(grown, H->store[seat]);
+    capacity = grown;
+  }
+  if (H->use_uint16_factors) {
+    auto& converted = H->factor_index16_scratch[4 * seat + factor_ordinal];
+    converted.resize(nz);
+    for (size_t p = 0; p < nz; ++p) {
+      if (static_cast<size_t>(F.i[p]) >= kUint16FactorRowCapacity) {
+        throw std::runtime_error("persistent factor index does not fit uint16");
+      }
+      converted[p] = static_cast<std::uint16_t>(F.i[p]);
+    }
+    persistent_copy(static_cast<std::uint16_t*>(d_i), converted.data(), nz, H->stream);
+  } else {
+    persistent_copy(static_cast<i_t*>(d_i), F.i.data(), nz, H->stream);
+  }
+  persistent_copy(d_x, F.x.data(), nz, H->stream);
+  d_nz = static_cast<i_t>(nz);
+}
+
+template <typename i_t, typename f_t>
+bool gpu_simplified_dual_phase2_batch_stage(
+  gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H,
+  std::size_t seat,
+  const gpu_batch_item<i_t, f_t>& item,
+  gpu_batch_seat_command command,
+  const std::vector<gpu_bound_delta<i_t, f_t>>& deltas,
+  std::string& error)
+{
+  using namespace gpu_phase2_detail;
+  error.clear();
+  if (H == nullptr || !H->persistent_mode || H->launched) {
+    error = "persistent batch must be harvested before staging";
+    return false;
+  }
+  if (seat >= H->h_args.size() || item.lp == nullptr || item.settings == nullptr ||
+      item.vstatus == nullptr || item.ft == nullptr || item.basic_list == nullptr ||
+      item.nonbasic_list == nullptr || item.sol == nullptr || item.dy_se == nullptr) {
+    error = "invalid persistent seat or null item field";
+    return false;
+  }
+  kernel_args& a = H->h_args[seat];
+  const i_t m    = a.m;
+  const i_t n    = a.n;
+  assert(item.dy_se->size() == static_cast<size_t>(n));
+  if (item.lp->num_rows != m || item.lp->num_cols != n || item.lower == nullptr ||
+      item.upper == nullptr || item.lower->size() != static_cast<size_t>(n) ||
+      item.upper->size() != static_cast<size_t>(n)) {
+    error = "persistent seat dimensions or bounds changed";
+    return false;
+  }
+  if (command == gpu_batch_seat_command::CHILD_CONTINUE && deltas.size() > static_cast<size_t>(n)) {
+    error = "child bound-delta list exceeds the column count";
+    return false;
+  }
+  if (H->staged.empty()) {
+    const size_t seats = H->h_args.size();
+    H->staged.assign(seats, 0);
+    H->factor_index16_scratch.resize(4 * seats);
+    H->factor_caps.resize(seats);
+    H->pinned_bound_deltas.assign(seats, nullptr);
+    H->pinned_bound_caps.assign(seats, 0);
+    for (size_t b = 0; b < seats; ++b) {
+      H->factor_caps[b] = {static_cast<size_t>(H->h_args[b].L0_nz),
+                           static_cast<size_t>(H->h_args[b].U0_nz),
+                           static_cast<size_t>(H->h_args[b].L0t_nz),
+                           static_cast<size_t>(H->h_args[b].U0t_nz)};
+    }
+  }
+  if (H->staged[seat] != 0) {
+    error = "persistent seat was staged more than once in one generation";
+    return false;
   }
 
-  for (const auto& kv : ro_cache) { free_ro(kv.second); }
-  cudaFree(d_args);
+  H->items[seat]         = item;
+  H->items[seat].command = command;
+  a.done                 = 0;
+  a.command              = static_cast<i_t>(command);
+  a.bound_delta_count    = 0;
+  a.primal_tol           = item.settings->primal_tol;
+  a.dual_tol             = item.settings->dual_tol;
+  a.pivot_tol            = item.settings->pivot_tol;
+  a.tight_tol            = item.settings->tight_tol;
+  a.fixed_tol            = item.settings->fixed_tol;
+  a.zero_tol             = item.settings->zero_tol;
+  a.time_limit           = item.settings->time_limit;
+  a.cut_off              = item.settings->cut_off;
+  a.steepest_edge_ratio = item.settings->steepest_edge_ratio;
+  a.refactor_frequency  = item.settings->refactor_frequency;
+  a.start_time           = tic();
+  a.terminal_certificate_retry = item.terminal_certificate_retry ? 1 : 0;
+  a.refactor_resume = command == gpu_batch_seat_command::REFACTOR_RESUME ? 1 : 0;
+  a.resume_obj      = item.sol->objective;
+  a.resume_iter     = static_cast<i_t>(item.sol->iterations);
+  const cudaStream_t cs = H->stream.value();
+
+  if (command == gpu_batch_seat_command::CHILD_CONTINUE) {
+    if (a.bound_deltas == nullptr) {
+      // Capacity n covers the exact full host diff after branching + strengthening. The pointer is
+      // retained in kernel_args for the rest of the pool lifetime.
+      a.bound_deltas = alloc_uninit<gpu_bound_delta<i_t, f_t>>(n, H->store[seat]);
+    }
+    if (deltas.size() > H->pinned_bound_caps[seat]) {
+      // The previous generation has already been harvested, so this seat's old staging buffer is
+      // no longer in flight. Grow geometrically to avoid repeated host registrations.
+      if (H->pinned_bound_deltas[seat] != nullptr) {
+        RAFT_CUDA_TRY(cudaFreeHost(H->pinned_bound_deltas[seat]));
+      }
+      const size_t cap = std::max(deltas.size(), 2 * H->pinned_bound_caps[seat]);
+      RAFT_CUDA_TRY(cudaMallocHost(
+        reinterpret_cast<void**>(&H->pinned_bound_deltas[seat]),
+        cap * sizeof(gpu_bound_delta<i_t, f_t>)));
+      H->pinned_bound_caps[seat] = cap;
+    }
+    auto* pinned = H->pinned_bound_deltas[seat];
+    for (size_t q = 0; q < deltas.size(); ++q) {
+      if (deltas[q].column < 0 || deltas[q].column >= n || (deltas[q].mask & ~3u) != 0u) {
+        error = "invalid child bound delta";
+        return false;
+      }
+      pinned[q] = deltas[q];
+    }
+    persistent_copy(a.bound_deltas, pinned, deltas.size(), H->stream);
+    a.bound_delta_count = static_cast<i_t>(deltas.size());
+    // x/y/z, lists, dy_se, the base factor and the MPF stack deliberately stay resident.
+  } else {
+    if (item.vstatus->size() != static_cast<size_t>(n) ||
+        item.basic_list->size() != static_cast<size_t>(m) ||
+        item.nonbasic_list->size() != static_cast<size_t>(n - m) ||
+        item.sol->x.size() != static_cast<size_t>(n) ||
+        item.sol->y.size() != static_cast<size_t>(m) ||
+        item.sol->z.size() != static_cast<size_t>(n) ||
+        item.dy_se->size() != static_cast<size_t>(n)) {
+      error = "persistent fresh/refactor state has the wrong size";
+      return false;
+    }
+    persistent_copy(a.lower, item.lower->data(), n, H->stream);
+    persistent_copy(a.upper, item.upper->data(), n, H->stream);
+    persistent_copy(a.vstatus, item.vstatus->data(), n, H->stream);
+    persistent_copy(a.basic_list, item.basic_list->data(), m, H->stream);
+    persistent_copy(a.nonbasic_list, item.nonbasic_list->data(), n - m, H->stream);
+    persistent_copy(a.x, item.sol->x.data(), n, H->stream);
+    persistent_copy(a.y, item.sol->y.data(), m, H->stream);
+    persistent_copy(a.z, item.sol->z.data(), n, H->stream);
+
+    persistent_copy(a.dy_se, item.dy_se->data(), n, H->stream);
+    persistent_copy(a.row_perm, item.ft->row_permutation().data(), m, H->stream);
+    persistent_copy(a.inv_row_perm, item.ft->inverse_row_permutation().data(), m, H->stream);
+    a.num_updates = 0;
+
+    auto& caps = H->factor_caps[seat];
+    persistent_stage_factor(
+      H, seat, 0, item.ft->L0(), a.L0_col_start, a.L0_i, a.L0_x, a.L0_nz, caps.L0);
+    persistent_stage_factor(
+      H, seat, 1, item.ft->U0(), a.U0_col_start, a.U0_i, a.U0_x, a.U0_nz, caps.U0);
+    persistent_stage_factor(H,
+                            seat,
+                            2,
+                            item.ft->L0_transpose(),
+                            a.L0t_col_start,
+                            a.L0t_i,
+                            a.L0t_x,
+                            a.L0t_nz,
+                            caps.L0t);
+    persistent_stage_factor(H,
+                            seat,
+                            3,
+                            item.ft->U0_transpose(),
+                            a.U0t_col_start,
+                            a.U0t_i,
+                            a.U0t_x,
+                            a.U0t_nz,
+                            caps.U0t);
+  }
+
+  RAFT_CUDA_TRY(cudaMemsetAsync(a.out_status, 0, 2 * sizeof(i_t), cs));
+  RAFT_CUDA_TRY(cudaMemsetAsync(a.out_objective, 0, sizeof(f_t), cs));
+  RAFT_CUDA_TRY(cudaMemsetAsync(a.out_user_objective, 0, sizeof(f_t), cs));
+  RAFT_CUDA_TRY(cudaMemsetAsync(a.out_iterations, 0, sizeof(i_t), cs));
+  H->staged[seat] = 1;
+  return true;
+}
+
+template <typename i_t, typename f_t>
+bool gpu_simplified_dual_phase2_batch_relaunch(
+  gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H,
+  gpu_batch_timing& timing,
+  std::string& error)
+{
+  using namespace gpu_phase2_detail;
+  error.clear();
+  if (H == nullptr || !H->persistent_mode || H->launched) {
+    error = "persistent batch is null or already launched";
+    return false;
+  }
+  const size_t N = H->h_args.size();
+  if (H->staged.size() != N ||
+      std::find(H->staged.begin(), H->staged.end(), 0) != H->staged.end()) {
+    error = "persistent batch relaunch requires every seat to be staged";
+    return false;
+  }
+  // Staging can include expensive host refactors. Read the settings again at the actual launch
+  // boundary so an incumbent published while those ran is not hidden behind the earlier snapshot.
+  for (size_t b = 0; b < N; ++b) { H->h_args[b].cut_off = H->items[b].settings->cut_off; }
+  const double t0 = tic();
+  RAFT_CUDA_TRY(cudaMemcpyAsync(H->d_args,
+                                H->h_args.data(),
+                                N * sizeof(kernel_args),
+                                cudaMemcpyHostToDevice,
+                                H->stream.value()));
+  RAFT_CUDA_TRY(cudaMemsetAsync(H->d_next, 0, sizeof(unsigned int), H->stream.value()));
+  RAFT_CUDA_TRY(cudaMemsetAsync(
+    H->d_completed_blocks, 0, sizeof(unsigned int), H->stream.value()));
+  std::atomic_ref<std::uint32_t>(*H->h_completion_flag)
+    .store(0u, std::memory_order_release);
+  timing.upload_s = toc(t0);
+
+  int device = 0;
+  RAFT_CUDA_TRY(cudaGetDevice(&device));
+  int sm_count = 1;
+  RAFT_CUDA_TRY(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
+  int blocks_per_sm = 1;
+  if (H->use_uint16_factors) {
+    RAFT_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &blocks_per_sm,
+      gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16, true, true>,
+      32,
+      0));
+  } else {
+    RAFT_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &blocks_per_sm,
+      gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32, true, true>,
+      32,
+      0));
+  }
+  unsigned int nb = static_cast<unsigned int>(blocks_per_sm) * static_cast<unsigned int>(sm_count);
+  if (nb == 0 || nb > N) { nb = static_cast<unsigned int>(N); }
+  RAFT_CUDA_TRY(cudaEventCreate(&H->ev_start));
+  RAFT_CUDA_TRY(cudaEventCreate(&H->ev_stop));
+  RAFT_CUDA_TRY(cudaEventRecord(H->ev_start, H->stream.value()));
+  if (H->use_uint16_factors) {
+    gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16, true, true>
+      <<<nb, 32, 0, H->stream.value()>>>(
+      H->d_args,
+      static_cast<i_t>(N),
+      H->d_next,
+      H->d_completed_blocks,
+      H->d_completion_flag);
+  } else {
+    gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32, true, true>
+      <<<nb, 32, 0, H->stream.value()>>>(
+      H->d_args,
+      static_cast<i_t>(N),
+      H->d_next,
+      H->d_completed_blocks,
+      H->d_completion_flag);
+  }
+  RAFT_CUDA_TRY(cudaEventRecord(H->ev_stop, H->stream.value()));
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+  H->launched = true;
+  return true;
+}
+
+template <typename i_t, typename f_t>
+void gpu_simplified_dual_phase2_batch_destroy(
+  gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H)
+{
+  if (H == nullptr) { return; }
+  // A caller may drain a pool while a launch is still running. Device buffers cannot be released
+  // until that stream has finished consuming them.
+  if (H->launched && H->ev_stop != nullptr) {
+    RAFT_CUDA_TRY(cudaEventSynchronize(H->ev_stop));
+    cudaEventDestroy(H->ev_start);
+    cudaEventDestroy(H->ev_stop);
+  }
+  if (!H->staged.empty()) { H->stream.synchronize(); }
+  delete H;
+}
+
+template <typename i_t, typename f_t>
+void gpu_simplified_dual_phase2_batch_finish(gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H,
+                                             std::vector<dual::status_t>& out_status,
+                                             gpu_batch_timing& timing)
+{
+  gpu_simplified_dual_phase2_batch_harvest<i_t, f_t>(H, out_status, timing);
+  gpu_simplified_dual_phase2_batch_destroy<i_t, f_t>(H);
+}
+
+// Synchronous entry point: launch, wait, collect. What the benchmark harness uses.
+template <typename i_t, typename f_t>
+void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>>& items,
+                                      size_t heap_estimate_bytes,
+                                      std::vector<dual::status_t>& out_status,
+                                      gpu_batch_timing& timing,
+                                      bool allow_refactor_exit)
+{
+  out_status.assign(items.size(), dual::status_t::UNSET);
+  auto* H = gpu_simplified_dual_phase2_batch_launch<i_t, f_t>(items, heap_estimate_bytes, timing,
+                                                             rmm::cuda_stream_default,
+                                                             allow_refactor_exit);
+  if (H == nullptr) { return; }   // rejected; timing.message says why
+  gpu_simplified_dual_phase2_batch_finish<i_t, f_t>(H, out_status, timing);
 }
 
 // ---------------------------------------------------------------------------
@@ -4999,19 +6058,30 @@ dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
   int stalled_legs              = 0;
   const f_t t0                  = cuopt::mathematical_optimization::tic();
 
-  std::vector<i_t> superbasic_list;
   std::vector<f_t> xB_workspace;
   f_t work_estimate = 0.0;
   i_t total_iters   = 0;
   bool resume       = false;
 
   while (true) {
+    i_t refactor_reason = 0;
     const dual::status_t st = gpu_simplified_dual_phase2_leg<i_t, f_t>(
-      lp, settings, vstatus, ft, basic_list, nonbasic_list, sol, delta_y_steepest_edge, resume);
+      lp,
+      settings,
+      vstatus,
+      ft,
+      basic_list,
+      nonbasic_list,
+      sol,
+      delta_y_steepest_edge,
+      resume,
+      refactor_reason);
 
     // ONE solve, however many launches it took: the caller's iteration count must not reset at a
     // refactorization the caller never asked for.
-    total_iters += sol.iterations;
+    // ASSIGN, not accumulate: `iter` now continues across a resume (it is carried in via
+    // kernel_args::resume_iter), so sol.iterations is already the node's running total.
+    total_iters = sol.iterations;
     if (st != dual::status_t::REFACTOR_NEEDED) {
       sol.iterations = total_iters;
       return st;
@@ -5022,22 +6092,43 @@ dual::status_t gpu_simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
       return dual::status_t::NUMERICAL;
     }
 
-    // Rebuild the factorization of the basis the device stopped on. get_basis_from_vstatus writes
-    // basic_list BY INDEX and only pushes back on nonbasic_list, so basic_list must be pre-sized to
-    // m -- clearing it instead writes out of bounds -- and nonbasic_list must be cleared, or it
-    // grows by n - m every leg and every later consumer reads the FIRST basis forever after.
-    basic_list.assign(static_cast<size_t>(m), 0);
-    nonbasic_list.clear();
-    nonbasic_list.reserve(static_cast<size_t>(lp.num_cols - m));
-    superbasic_list.clear();
-    get_basis_from_vstatus<i_t>(m, vstatus, basic_list, nonbasic_list, superbasic_list);
-    // Same policy as the CPU simplified driver: any non-zero return (singular basis, a repair that
-    // did not restore rank, a halt or time-limit code) ends the solve as NUMERICAL.
-    if (ft.refactor_basis(
-          lp.A, settings, lp.lower, lp.upper, t0, basic_list, nonbasic_list, vstatus) != 0) {
+    // Rebuild the factorization from the exact ordered lists returned by the device.  The order is
+    // part of the numerical state: refactor_basis factorizes A(:, basic_list), and the ratio test
+    // scans nonbasic_list in order.
+    // A successful refactorization can still have repaired a rank-deficient basis by replacing
+    // columns. The maintained y/z then belong to the pre-repair basis and cannot be resumed.
+    bool repaired = false;
+    if (ft.refactor_basis(lp.A,
+                          settings,
+                          lp.lower,
+                          lp.upper,
+                          t0,
+                          basic_list,
+                          nonbasic_list,
+                          vstatus,
+                          &repaired) != 0 ||
+        repaired) {
       sol.iterations = total_iters;
       return dual::status_t::NUMERICAL;
     }
+
+    // Refactorization gives us an independent way to price a periodic resume. Use it only as a
+    // certificate: replacing the maintained duals changes the trajectory. A rejected rank-1
+    // update is deliberately exempt, matching the B&B resume path: its maintained duals are part
+    // of the established recovery trajectory and fresh pricing can temporarily violate their
+    // signs even though the next leg restores feasibility.
+    if (refactor_reason != 1) {
+      std::vector<f_t> fresh_y(static_cast<size_t>(m), 0.0);
+      std::vector<f_t> fresh_z(static_cast<size_t>(lp.num_cols), 0.0);
+      f_t certificate_work = 0.0;
+      phase2::compute_dual_solution_from_basis(
+        lp, ft, basic_list, nonbasic_list, fresh_y, fresh_z, certificate_work);
+      if (!resume_dual_feasible(vstatus, fresh_z, settings.dual_tol)) {
+        sol.iterations = total_iters;
+        return dual::status_t::NUMERICAL;
+      }
+    }
+
     phase2::compute_primal_solution_from_basis(
       lp, ft, basic_list, nonbasic_list, vstatus, sol.x, xB_workspace, work_estimate);
     resume = true;
@@ -5058,7 +6149,44 @@ template void gpu_simplified_dual_phase2_batch<int, double>(
   const std::vector<gpu_batch_item<int, double>>&,
   size_t,
   std::vector<dual::status_t>&,
-  gpu_batch_timing&);
+  gpu_batch_timing&, bool);
 
+template gpu_phase2_detail::gpu_batch_handle_t<int, double>*
+gpu_simplified_dual_phase2_batch_launch<int, double>(
+  const std::vector<gpu_batch_item<int, double>>&, size_t, gpu_batch_timing&, rmm::cuda_stream_view,
+  bool, gpu_phase2_detail::gpu_ro_cache_t<int, double>*, bool);
+template gpu_phase2_detail::gpu_ro_cache_t<int, double>* gpu_ro_cache_create<int, double>();
+template gpu_phase2_detail::gpu_ro_cache_t<int, double>* gpu_ro_cache_create_borrowed<int, double>(
+  rmm::cuda_stream_view);
+template void gpu_ro_cache_destroy<int, double>(gpu_phase2_detail::gpu_ro_cache_t<int, double>*);
+template bool gpu_simplified_dual_phase2_batch_ready<int, double>(
+  gpu_phase2_detail::gpu_batch_handle_t<int, double>*);
+template void gpu_simplified_dual_phase2_batch_finish<int, double>(
+  gpu_phase2_detail::gpu_batch_handle_t<int, double>*,
+  std::vector<dual::status_t>&, gpu_batch_timing&);
+template void gpu_simplified_dual_phase2_batch_harvest<int, double>(
+  gpu_phase2_detail::gpu_batch_handle_t<int, double>*,
+  std::vector<dual::status_t>&, gpu_batch_timing&);
+template bool gpu_simplified_dual_phase2_batch_stage<int, double>(
+  gpu_phase2_detail::gpu_batch_handle_t<int, double>*,
+  std::size_t,
+  const gpu_batch_item<int, double>&,
+  gpu_batch_seat_command,
+  const std::vector<gpu_bound_delta<int, double>>&,
+  std::string&);
+template bool gpu_simplified_dual_phase2_batch_relaunch<int, double>(
+  gpu_phase2_detail::gpu_batch_handle_t<int, double>*, gpu_batch_timing&, std::string&);
+template void gpu_simplified_dual_phase2_batch_destroy<int, double>(
+  gpu_phase2_detail::gpu_batch_handle_t<int, double>*);
+
+
+int gpu_max_blocks_per_sm()
+{
+  using namespace gpu_phase2_detail;
+  int blocks = 0;
+  const cudaError_t rc = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+    &blocks, gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16>, 32, 0);
+  return (rc == cudaSuccess) ? blocks : 0;
+}
 
 }  // namespace cuopt::linear_programming::dual_simplex

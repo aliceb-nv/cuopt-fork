@@ -16,6 +16,8 @@
 
 #include <pdlp/translate.hpp>
 
+#include <branch_and_bound/bad_node_dump.hpp>
+#include <branch_and_bound/gpu_node_pool.hpp>
 #include <dual_simplex/basis_solves.hpp>
 #include <dual_simplex/basis_updates.hpp>
 #include <dual_simplex/gpu_phase2/gpu_phase2.cuh>
@@ -72,6 +74,7 @@ static inline bool env_on(const char* name)
 namespace ds  = cuopt::mathematical_optimization::simplex;
 namespace mo  = cuopt::mathematical_optimization;
 namespace gds = cuopt::linear_programming::dual_simplex;
+namespace mip = cuopt::mathematical_optimization::mip;
 
 namespace {
 
@@ -130,8 +133,9 @@ ds::user_problem_t<int, double> load_user_problem(const raft::handle_t& handle,
                                                                                            opt);
 }
 
-// y solves B' y = c_B ; z_N = c_N - N' y ; z_B = 0.  Mirrors
-// compute_dual_solution_from_basis (phase2.cpp), which is not header-declared.
+// y solves B' y = c_B ; z_N = c_N - N' y ; z_B = 0.  Thin wrapper over the library's
+// phase2::compute_dual_solution_from_basis (declared in phase2.hpp); this used to be a private
+// copy of it here.
 void compute_duals(const ds::lp_problem_t<int, double>& lp,
                    ds::basis_update_mpf_t<int, double>& ft,
                    const std::vector<int>& basic_list,
@@ -139,31 +143,38 @@ void compute_duals(const ds::lp_problem_t<int, double>& lp,
                    std::vector<double>& y,
                    std::vector<double>& z)
 {
-  const int m = lp.num_rows;
-  const int n = lp.num_cols;
-  std::vector<double> cB(m);
-  for (int k = 0; k < m; ++k) {
-    cB[k] = lp.objective[basic_list[k]];
-  }
-  y.assign(m, 0.0);
-  ft.b_transpose_solve(cB, y);
-
-  z.assign(n, 0.0);
-  for (std::size_t k = 0; k < nonbasic_list.size(); ++k) {
-    const int j = nonbasic_list[k];
-    double dot  = 0.0;
-    for (int p = lp.A.col_start[j]; p < lp.A.col_start[j + 1]; ++p) {
-      dot += lp.A.x[p] * y[lp.A.i[p]];
-    }
-    z[j] = lp.objective[j] - dot;
-  }
-  for (int k = 0; k < m; ++k) {
-    z[basic_list[k]] = 0.0;
-  }
+  double work = 0.0;
+  ds::phase2::compute_dual_solution_from_basis(lp, ft, basic_list, nonbasic_list, y, z, work);
 }
 
 // Sum of dual-feasibility sign violations of the reduced costs against the
 // nonbasic statuses.  ~0 means the basis is dual feasible (minimization form).
+// Max violation of x against the node's own bounds, and the max residual of Ax = b. A dual simplex
+// stops when its PRIMAL infeasibility list empties; that list is maintained incrementally, so if it
+// goes stale the driver can stop at a point that is not actually feasible -- which is exactly the
+// case a suboptimal "OPTIMAL" has to be tested against.
+static void primal_residuals(const ds::lp_problem_t<int, double>& lp,
+                             const std::vector<double>& x,
+                             double& bound_viol,
+                             double& row_resid)
+{
+  bound_viol = 0.0;
+  for (size_t j = 0; j < x.size(); ++j) {
+    bound_viol = std::max(bound_viol, lp.lower[j] - x[j]);
+    bound_viol = std::max(bound_viol, x[j] - lp.upper[j]);
+  }
+  std::vector<double> ax(static_cast<size_t>(lp.num_rows), 0.0);
+  for (int j = 0; j < lp.num_cols; ++j) {
+    for (int p = lp.A.col_start[j]; p < lp.A.col_start[j + 1]; ++p) {
+      ax[lp.A.i[p]] += lp.A.x[p] * x[j];
+    }
+  }
+  row_resid = 0.0;
+  for (int i = 0; i < lp.num_rows; ++i) {
+    row_resid = std::max(row_resid, std::fabs(ax[i] - lp.rhs[i]));
+  }
+}
+
 double dual_infeasibility(const ds::lp_problem_t<int, double>& lp,
                           const std::vector<ds::variable_status_t>& vstatus,
                           const std::vector<double>& z,
@@ -726,7 +737,14 @@ bool load_doubles_file(const std::string& path, std::vector<double>& out)
 void apply_dumped_settings(ds::simplex_solver_settings_t<int, double>& s,
                            const node_verify_info_t& info)
 {
-  s.cut_off = info.cut_off;
+  // TEST_NETLIB_NO_CUTOFF=1 drives every node to its own optimum instead of stopping at the
+  // recorded bound. That is what isolates "does the driver get the right ANSWER" from "does it
+  // fathom at the right moment" -- with the cutoff on, a node can look right for the wrong reason.
+  static const bool no_cutoff = [] {
+    const char* e = std::getenv("TEST_NETLIB_NO_CUTOFF");
+    return e != nullptr && std::string(e) != "0";
+  }();
+  s.cut_off = no_cutoff ? std::numeric_limits<double>::infinity() : info.cut_off;
   if (!info.has_state) return;
   s.refactor_frequency       = info.refactor_frequency;
   s.dual_tol                 = info.dual_tol;
@@ -748,6 +766,19 @@ void verify_nodes_mode(const raft::handle_t& handle, const std::string& dir, dou
   for (const auto& e : fs::directory_iterator(dir)) {
     if (e.is_directory() && e.path().filename().string().rfind("node_", 0) == 0) {
       node_dirs.push_back(e.path().string());
+    }
+  }
+  // COLLECTION ROOT: a directory of INSTANCE directories, each holding node_* + its own
+  // edge_norms.txt. Walking them in ONE process instead of one process per instance removes a CUDA
+  // init and a multi-GB malloc-arena allocation per instance -- 199 of them on the V7 collection.
+  if (node_dirs.empty()) {
+    for (const auto& e : fs::directory_iterator(dir)) {
+      if (!e.is_directory()) { continue; }
+      for (const auto& g : fs::directory_iterator(e.path())) {
+        if (g.is_directory() && g.path().filename().string().rfind("node_", 0) == 0) {
+          node_dirs.push_back(g.path().string());
+        }
+      }
     }
   }
   std::sort(node_dirs.begin(), node_dirs.end());
@@ -772,7 +803,10 @@ void verify_nodes_mode(const raft::handle_t& handle, const std::string& dir, dou
   int n_pass = 0, n_fail = 0, n_opt = 0, n_cut = 0, n_adv_ok = 0, n_sim_ok = 0;
   int n_gpu_ran = 0, n_gpu_mismatch = 0;
   for (const auto& nd : node_dirs) {
-    const std::string name = fs::path(nd).filename().string();
+    // "<instance>/<node>" -- node folder names like node_d74_id148 REPEAT across instances, so the
+    // bare name is not a key. A scorer that uses it silently merges different nodes.
+    const std::string name = fs::path(nd).parent_path().filename().string() + "/" +
+                             fs::path(nd).filename().string();
     node_verify_info_t info = parse_verify_log(nd + "/verify.log");
     if (!info.ok) {
       std::printf("%-22s  (missing/invalid verify.log)\n", name.c_str());
@@ -806,9 +840,13 @@ void verify_nodes_mode(const raft::handle_t& handle, const std::string& dir, dou
       if (have_saved) {
         // Exact replay: also feed the carried edge norms + the recompute_basis flag
         // so dual_phase2_with_advanced_basis gets the identical warm-start state.
-        // The steepest-edge seed is a single shared vector per instance (dir/edge_norms.txt);
-        // fall back to the legacy per-node file for older dumps.
-        if ((!load_doubles_file(dir + "/edge_norms.txt", edge_norms) &&
+        // The steepest-edge seed is a single shared vector per instance. In collection-root mode
+        // `dir` is the directory ABOVE all instances, so derive the file from this node's parent;
+        // otherwise every collection replay silently falls back to `saved(no-en)`. Fall back to
+        // the legacy per-node file for older dumps.
+        const std::string instance_edge_norms =
+          (fs::path(nd).parent_path() / "edge_norms.txt").string();
+        if ((!load_doubles_file(instance_edge_norms, edge_norms) &&
              !load_doubles_file(nd + "/child_edge_norms.txt", edge_norms)) ||
             static_cast<int>(edge_norms.size()) != child_lp.num_cols) {
           edge_norms.clear();
@@ -841,16 +879,20 @@ void verify_nodes_mode(const raft::handle_t& handle, const std::string& dir, dou
       // ([ADV] from advanced, [CMP] from simplified) so the exact iteration where the
       // two pivot sequences diverge can be located. Use on a single-node dir.
       const bool verbose_trace = std::getenv("TEST_NETLIB_VERBOSE") != nullptr;
+      // TEST_NETLIB_GPU_ONLY=1: skip BOTH CPU legs. The full driver's answer is the golden
+      // reference and does not change between GPU experiments, so re-solving it on every run is
+      // pure cost -- freeze it once (TEST_NETLIB_REF_DUMP) and compare against that file instead.
+      static const bool gpu_only = env_on("TEST_NETLIB_GPU_ONLY");
       auto s_adv = make_settings(time_limit);
       apply_dumped_settings(s_adv, info);
       if (verbose_trace) { enable_verbose(s_adv); std::printf(">>> ADV %s\n", name.c_str()); }
-      const ds::dual::status_t adv_st = run_phase2_from_basis(
+      const ds::dual::status_t adv_st = gpu_only ? ds::dual::status_t::UNSET : run_phase2_from_basis(
         child_lp, vstatus_warm, s_adv, /*advanced*/ 0, adv_obj, adv_it, dinf, upd, init_basis,
         edge_norms, &adv_sec, &se_adv);
       auto s_sim = make_settings(time_limit);
       apply_dumped_settings(s_sim, info);
       if (verbose_trace) { enable_verbose(s_sim); std::printf(">>> SIM %s\n", name.c_str()); }
-      const ds::dual::status_t sim_st = run_phase2_from_basis(
+      const ds::dual::status_t sim_st = gpu_only ? ds::dual::status_t::UNSET : run_phase2_from_basis(
         child_lp, vstatus_warm, s_sim, /*simplified*/ 1, sim_obj, sim_it, dinf, upd, false,
         edge_norms, &sim_sec, &se_sim);
       // GPU parity check (TEST_NETLIB_GPU=1): run the GPU simplified driver (mode 2) from
@@ -939,6 +981,16 @@ void verify_nodes_mode(const raft::handle_t& handle, const std::string& dir, dou
         std::printf("\n[NODEDUMP] %-44s %-16s it=%-6d obj=%.17g",
                     name.c_str(), ds::dual_status_to_string(gpu_st).c_str(), gpu_it, gpu_obj);
       }
+      // Full-precision CPU results. The summary table above prints %10.6g, which is far too coarse
+      // to build a golden reference from -- an LP optimum of -278045.4060865763 lands as -278045.
+      // Emitted for BOTH CPU drivers so a golden can be derived from the full driver, independently
+      // of the simplified driver the GPU is a port of.
+      if (env_on("TEST_NETLIB_REF_DUMP")) {
+        std::printf("\n[REFDUMP] %-44s adv %-16s it=%-6d obj=%.17g | sim %-16s it=%-6d obj=%.17g",
+                    name.c_str(),
+                    ds::dual_status_to_string(adv_st).c_str(), adv_it, adv_obj,
+                    ds::dual_status_to_string(sim_st).c_str(), sim_it, sim_obj);
+      }
       std::printf("\n");
       std::fflush(stdout);
       if (pass) n_pass++; else n_fail++;
@@ -966,6 +1018,168 @@ void verify_nodes_mode(const raft::handle_t& handle, const std::string& dir, dou
   if (n_opt == 0) {
     std::printf("WARNING: no OPTIMAL nodes in the sample.\n");
   }
+}
+
+// GPU-only correctness sweep through the SAME resumable batch state machine used by branch and
+// bound. Nodes are grouped by instance, then split whenever their immutable A/rhs/objective block
+// differs (cut-expanded B&B nodes from one instance can have different shapes). A chunk is one
+// multi-block launch sequence: seats independently stop for host refactorization, carry their
+// complete state back, and relaunch until terminal.
+//
+// CPU-full references are intentionally not recomputed here. Generate them once with
+// --verify-nodes + TEST_NETLIB_REF_DUMP=1, then concatenate that frozen log with this mode's
+// [NODEDUMP] stream for score_goal_verify.py. That makes repeated GPU experiments cheap without
+// weakening the golden reference.
+void verify_nodes_batch_mode(const raft::handle_t& handle,
+                             const std::string& dir,
+                             double time_limit,
+                             int requested_seats)
+{
+  namespace fs = std::filesystem;
+  using batch_node_t = mip::gpu_batch_node_t<int, double>;
+
+  const int seats = std::max(1, requested_seats);
+  std::map<std::string, std::vector<std::string>> by_instance;
+  if (fs::path(dir).filename().string().rfind("node_", 0) == 0) {
+    by_instance[fs::path(dir).parent_path().string()].push_back(dir);
+  } else {
+    for (const auto& e : fs::directory_iterator(dir)) {
+      if (!e.is_directory()) { continue; }
+      if (e.path().filename().string().rfind("node_", 0) == 0) {
+        by_instance[dir].push_back(e.path().string());
+        continue;
+      }
+      for (const auto& n : fs::directory_iterator(e.path())) {
+        if (n.is_directory() && n.path().filename().string().rfind("node_", 0) == 0) {
+          by_instance[e.path().string()].push_back(n.path().string());
+        }
+      }
+    }
+  }
+  for (auto& [instance, nodes] : by_instance) { std::sort(nodes.begin(), nodes.end()); }
+
+  rmm::cuda_stream stream;
+  int total = 0, direct = 0, fallback = 0, skipped = 0, cold_edge_norms = 0;
+  double kernel_s = 0.0;
+
+  for (const auto& [instance, node_dirs] : by_instance) {
+    std::vector<double> instance_edge_norms;
+    load_doubles_file(instance + "/edge_norms.txt", instance_edge_norms);
+
+    size_t begin = 0;
+    while (begin < node_dirs.size()) {
+      std::vector<batch_node_t> batch;
+      std::vector<std::string> names;
+      batch.reserve(static_cast<size_t>(seats));
+      names.reserve(static_cast<size_t>(seats));
+      std::unique_ptr<ds::lp_problem_t<int, double>> shared_lp;
+
+      size_t p = begin;
+      while (p < node_dirs.size() && batch.size() < static_cast<size_t>(seats)) {
+        const std::string& nd = node_dirs[p];
+        const std::string name = fs::path(instance).filename().string() + "/" +
+                                 fs::path(nd).filename().string();
+        const node_verify_info_t info = parse_verify_log(nd + "/verify.log");
+        if (!info.ok) {
+          std::printf("[BATCHSKIP] %s invalid verify.log\n", name.c_str());
+          ++skipped;
+          ++p;
+          continue;
+        }
+
+        try {
+          ds::lp_problem_t<int, double> child =
+            load_lp_problem_direct(handle, nd + "/child.mps");
+          std::vector<ds::variable_status_t> vstatus;
+          if (!load_vstatus_file(nd + "/child_vstatus.txt", vstatus) ||
+              static_cast<int>(vstatus.size()) != child.num_cols) {
+            std::printf("[BATCHSKIP] %s missing/invalid saved basis\n", name.c_str());
+            ++skipped;
+            ++p;
+            continue;
+          }
+
+          if (shared_lp == nullptr) {
+            shared_lp = std::make_unique<ds::lp_problem_t<int, double>>(child);
+          } else {
+            // Per-instance batching is valid only when the immutable LP block is genuinely shared.
+            // Refuse a malformed collection instead of solving a node against another node's A.
+            const bool same_immutable =
+              child.num_rows == shared_lp->num_rows && child.num_cols == shared_lp->num_cols &&
+              child.A.col_start == shared_lp->A.col_start && child.A.i == shared_lp->A.i &&
+              child.A.x == shared_lp->A.x && child.rhs == shared_lp->rhs &&
+              child.objective == shared_lp->objective;
+            if (!same_immutable) {
+              // Finish the current homogeneous chunk. Do not consume this node: it becomes the
+              // first seat of the next batch, with its own shared immutable block.
+              break;
+            }
+          }
+
+          std::vector<double> node_edge_norms = instance_edge_norms;
+          if (static_cast<int>(node_edge_norms.size()) != child.num_cols) {
+            node_edge_norms.clear();
+            load_doubles_file(nd + "/child_edge_norms.txt", node_edge_norms);
+          }
+          if (static_cast<int>(node_edge_norms.size()) != child.num_cols) {
+            node_edge_norms.clear();
+            ++cold_edge_norms;
+            std::printf("[BATCHCOLD] %s no valid edge norms for n=%d; initialize on device\n",
+                        name.c_str(), child.num_cols);
+          }
+
+          batch.emplace_back(child.num_rows, child.num_cols);
+          auto& node   = batch.back();
+          node.lower   = std::move(child.lower);
+          node.upper   = std::move(child.upper);
+          node.settings = make_settings(time_limit);
+          apply_dumped_settings(node.settings, info);
+          node.vstatus = std::move(vstatus);
+          node.dy_se   = std::move(node_edge_norms);
+          names.push_back(name);
+          ++p;
+        } catch (const std::exception& ex) {
+          std::printf("[BATCHSKIP] %s exception: %s\n", name.c_str(), ex.what());
+          ++skipped;
+          ++p;
+        }
+      }
+
+      begin = p;
+
+      if (batch.empty()) { continue; }
+      auto* ro_cache = gds::gpu_ro_cache_create<int, double>();
+      const double t0 = mo::tic();
+      mip::gpu_solve_nodes_batch<int, double>(*shared_lp, batch, stream.view(), ro_cache);
+      kernel_s += mo::toc(t0);
+      gds::gpu_ro_cache_destroy<int, double>(ro_cache);
+
+      for (size_t k = 0; k < batch.size(); ++k) {
+        auto& node = batch[k];
+        ++total;
+        ds::dual::status_t status = node.status;
+        double obj = kNaN;
+        if (node.solved) {
+          ++direct;
+          obj = ds::compute_user_objective<int, double>(*shared_lp, node.sol.x);
+        } else {
+          // No device answer is a safe CPU handoff, never a terminal claim about the subtree.
+          status = ds::dual::status_t::NUMERICAL;
+          ++fallback;
+          std::printf("[BATCHDROP] %s reason=%d\n", names[k].c_str(),
+                      static_cast<int>(node.drop));
+        }
+        std::printf("[NODEDUMP] %-44s %-16s it=%-6d obj=%.17g\n",
+                    names[k].c_str(), ds::dual_status_to_string(status).c_str(),
+                    node.sol.iterations, obj);
+      }
+      std::fflush(stdout);
+    }
+  }
+
+  std::printf("\n==== verify-nodes-batch summary ====\n");
+  std::printf("nodes=%d direct=%d fallback=%d skipped=%d cold_edge_norms=%d seats=%d wall_s=%.6f\n",
+              total, direct, fallback, skipped, cold_edge_norms, seats, kernel_s);
 }
 
 // ===========================================================================
@@ -1571,6 +1785,777 @@ void solve_mps_from_scratch_mode(const raft::handle_t& handle,
   std::fflush(stdout);
 }
 
+// ===========================================================================
+// --replay-node mode: re-solve ONE bad B&B node, captured by gpu_node_pool's
+// CUOPT_BNB_DUMP_BAD_NODES writer, through all three drivers.
+//
+// The dump is the state AS UPLOADED to the device -- bounds already strengthened,
+// vstatus already repaired by refactor_basis -- so this replay starts each driver
+// from exactly the state the GPU consumed when it made the wrong decision. The
+// header also carries what was OBSERVED at capture time, so the artifact reports
+// whether the defect reproduces without needing the original log.
+void replay_node_mode(const raft::handle_t& handle, const std::string& file, double time_limit)
+{
+  namespace bn = cuopt::mathematical_optimization::mip::bad_node;
+
+  bn::header_t h{};
+  ds::lp_problem_t<int, double> lp(&handle, 1, 1, 1);
+  std::vector<double> lower, upper, dy_se;
+  std::vector<ds::variable_status_t> vstatus;
+  // v3 dumps carry the SOLVE STATE the device was launched with. A seat captured mid-solve (after a
+  // REFACTOR_NEEDED resume) cannot be reproduced without them -- recomputing x/y/z from the basis
+  // starts the replay somewhere else, which is what made the one wrong-objective node we caught
+  // replay cleanly while the live run had failed.
+  std::vector<double> dump_x, dump_y, dump_z;
+  std::string why;
+  if (!bn::read<int, double>(file, h, lp, lower, upper, vstatus, dy_se, dump_x, dump_y, dump_z,
+                             why)) {
+    std::printf("replay-node: cannot load %s (%s)\n", file.c_str(), why.c_str());
+    std::exit(1);
+  }
+
+  // A/B (TEST_NETLIB_REPLAY_COLD_SE=1): drop the carried steepest-edge norms and let every driver
+  // re-initialise them. The GPU driver was proven bit-exact against the CPU simplified driver with an
+  // EMPTY dy_se; branch-and-bound is the first caller that carries norms in, so the carried path is
+  // the under-validated one. If a divergence disappears here, it is in that path.
+  const bool cold_se = std::getenv("TEST_NETLIB_REPLAY_COLD_SE") != nullptr;
+  if (cold_se) { dy_se.clear(); }
+
+  // The carried vector is the ONE input that differs between the working and failing configurations,
+  // so characterise it before blaming any code that consumes it. A non-positive entry matters: the
+  // ratio test divides the squared primal infeasibility by dy_se[basic_list[i]], so a zero or
+  // negative norm on a column that later enters the basis produces exactly the 1e+70 blow-up seen.
+  if (!dy_se.empty()) {
+    double lo = dy_se[0], hi = dy_se[0];
+    size_t nonpos = 0, zero = 0;
+    for (double v : dy_se) {
+      lo = std::min(lo, v); hi = std::max(hi, v);
+      if (v <= 0.0) { ++nonpos; }
+      if (v == 0.0) { ++zero; }
+    }
+    std::printf("  dy_se stats: n=%zu min=%.17g max=%.17g nonpositive=%zu zero=%zu\n",
+                dy_se.size(), lo, hi, nonpos, zero);
+  }
+
+  std::printf("replay-node %s\n", file.c_str());
+  std::printf("  m=%d n=%d nnz=%lld  dy_se=%s\n",
+              h.m, h.n, static_cast<long long>(h.nnz),
+              cold_se ? "CLEARED (cold-SE A/B)" : (h.has_dy_se ? "carried" : "none"));
+  std::printf("  cut_off=%.17g  obj_constant=%.17g obj_scale=%.17g obj_integral=%d\n",
+              h.cut_off, h.obj_constant, h.obj_scale, h.objective_is_integral);
+  std::printf("  captured: gpu %-16s obj=%.17g it=%d\n",
+              ds::dual_status_to_string(static_cast<ds::dual::status_t>(h.gpu_status)).c_str(),
+              h.gpu_objective, h.gpu_iters);
+  std::printf("  captured: cpu %-16s obj=%.17g it=%d\n\n",
+              ds::dual_status_to_string(static_cast<ds::dual::status_t>(h.cpu_status)).c_str(),
+              h.cpu_objective, h.cpu_iters);
+
+  // Every device-read setting comes from the dump; the rest stay at harness defaults.
+  auto settings_for = [&]() {
+    auto s = make_settings(time_limit);
+    bn::apply_settings<int, double>(h, s);
+    // TEST_NETLIB_REPLAY_PIVOT_TRACE=1: emit the simplified driver's per-pivot [CMP] bit trace, to
+    // diff against the device's [GCMP]. Both print the same fields in the same order.
+    if (std::getenv("TEST_NETLIB_REPLAY_PIVOT_TRACE") != nullptr) { s.log.log = true; }
+    // TEST_NETLIB_REPLAY_REFACFREQ=<n>: override the refactorization frequency. Raising it past the
+    // node's iteration count removes the PERIODIC refactor trigger entirely, so whatever still exits
+    // must be the unsafe-rank-1-update trigger. Applies to both drivers, so they stay comparable.
+    if (const char* e = std::getenv("TEST_NETLIB_REPLAY_REFACFREQ")) {
+      s.refactor_frequency = std::atoi(e);
+    }
+    // TEST_NETLIB_REPLAY_CUTOFF=<v>: override the cutoff the dump recorded.
+    //
+    // WHY THIS EXISTS. The dump stores `cut_off` AS IT WAS AT FILL TIME, but the live pool
+    // broadcasts the newest incumbent to every seat before each relaunch, so a node can be solved
+    // against a materially tighter cutoff than the dump preserves. A tighter cutoff makes
+    // `obj >= cut_off` fire earlier -- which is a candidate explanation for why a node that fathoms
+    // WRONGLY in the live run replays perfectly here (measured on dano3_5: live CUTOFF/773.116 vs
+    // replay OPTIMAL/578.362 on the same dump).
+    if (const char* e = std::getenv("TEST_NETLIB_REPLAY_CUTOFF")) { s.cut_off = std::atof(e); }
+    return s;
+  };
+
+  // Sanitizer harness: execute exactly one fresh V2 kernel launch for this captured node and
+  // return. The normal replay intentionally runs several CPU/GPU drivers and many refactor legs;
+  // under compute-sanitizer that obscures which launch produced a report and takes minutes before
+  // reaching the persistent kernel used by B&B.
+  if (env_on("TEST_NETLIB_REPLAY_ONE_V2")) {
+    const int seats = [] {
+      const char* e = std::getenv("TEST_NETLIB_REPLAY_SEATS");
+      return e != nullptr ? std::max(1, std::atoi(e)) : 1;
+    }();
+    struct one_v2_state_t {
+      std::vector<ds::variable_status_t> vs;
+      std::vector<int> basic, nonbasic, superbasic;
+      ds::basis_update_mpf_t<int, double> ft;
+      ds::lp_solution_t<int, double> sol;
+      std::vector<double> se;
+      ds::simplex_solver_settings_t<int, double> settings;
+      int refactor_reason{0};
+      one_v2_state_t(int m_, int n_, int rf) : ft(m_, rf), sol(m_, n_) {}
+    };
+    std::vector<std::unique_ptr<one_v2_state_t>> state;
+    std::vector<gds::gpu_batch_item<int, double>> items;
+    state.reserve(static_cast<size_t>(seats));
+    items.reserve(static_cast<size_t>(seats));
+    bool prepared = true;
+    for (int k = 0; k < seats; ++k) {
+      auto q      = std::make_unique<one_v2_state_t>(h.m, h.n, h.refactor_frequency);
+      q->vs       = vstatus;
+      q->se       = dy_se;
+      q->settings = settings_for();
+      q->basic.assign(static_cast<size_t>(h.m), 0);
+      ds::get_basis_from_vstatus<int>(
+        h.m, q->vs, q->basic, q->nonbasic, q->superbasic);
+      const double ft0 = mo::tic();
+      if (q->ft.refactor_basis(lp.A,
+                               q->settings,
+                               lp.lower,
+                               lp.upper,
+                               ft0,
+                               q->basic,
+                               q->nonbasic,
+                               q->vs) != 0) {
+        prepared = false;
+        break;
+      }
+      if (!dump_x.empty()) { q->sol.x = dump_x; }
+      if (!dump_y.empty() && !dump_z.empty()) {
+        q->sol.y = dump_y;
+        q->sol.z = dump_z;
+      } else {
+        compute_duals(lp, q->ft, q->basic, q->nonbasic, q->sol.y, q->sol.z);
+      }
+      gds::gpu_batch_item<int, double> item{};
+      item.lp              = &lp;
+      item.lower           = &lp.lower;
+      item.upper           = &lp.upper;
+      item.settings        = &q->settings;
+      item.vstatus         = &q->vs;
+      item.ft              = &q->ft;
+      item.basic_list      = &q->basic;
+      item.nonbasic_list   = &q->nonbasic;
+      item.sol             = &q->sol;
+      item.dy_se           = &q->se;
+      item.refactor_reason = &q->refactor_reason;
+      items.push_back(item);
+      state.push_back(std::move(q));
+    }
+    if (!prepared) {
+      std::printf("one-v2: initial factorization failed\n");
+      return;
+    }
+    gds::gpu_batch_timing timing;
+    auto* run = gds::gpu_simplified_dual_phase2_batch_launch<int, double>(
+      items,
+      0,
+      timing,
+      rmm::cuda_stream_default,
+      /*allow_refactor_exit=*/true,
+      /*ro_cache=*/nullptr,
+      /*persistent_seats=*/true);
+    if (run == nullptr) {
+      std::printf("one-v2: launch rejected: %s\n", timing.message.c_str());
+      return;
+    }
+    std::vector<ds::dual::status_t> out;
+    gds::gpu_simplified_dual_phase2_batch_finish<int, double>(run, out, timing);
+    for (size_t k = 0; k < out.size(); ++k) {
+      std::printf("one-v2[%zu] %s obj=%.17g it=%d\n",
+                  k,
+                  ds::dual_status_to_string(out[k]).c_str(),
+                  state[k]->sol.objective,
+                  state[k]->sol.iterations);
+    }
+    return;
+  }
+
+  struct row_t {
+    const char* name;
+    ds::dual::status_t st;
+    double obj;
+    int it;
+    double sec;
+    bool ran;
+  };
+  row_t rows[3] = {{"full-cpu", ds::dual::status_t::OPTIMAL, kNaN, 0, 0.0, false},
+                   {"simplified", ds::dual::status_t::OPTIMAL, kNaN, 0, 0.0, false},
+                   {"gpu", ds::dual::status_t::OPTIMAL, kNaN, 0, 0.0, false}};
+
+  // Filled in by the refactor-and-resume leg below; that is the result branch-and-bound consumes.
+  ds::dual::status_t resumed_st = ds::dual::status_t::UNSET;
+  double resumed_obj            = kNaN;
+  bool resumed_ran              = false;
+  auto obj_close = [](double a, double b) {
+    return std::abs(a - b) <= 1e-6 * (1.0 + std::abs(b));
+  };
+
+  std::printf("%-12s %-18s %22s %8s %10s\n", "driver", "status", "objective", "iters", "seconds");
+  // TEST_NETLIB_VERBOSE=1 turns on the CPU drivers' per-pivot [CMP] bit trace. Paired with a
+  // GPU_PIVOT_TRACE build (its [GCMP] line carries the same fields in the same order) the two
+  // sequences diff directly to the first iteration on which they part.
+  const bool verbose_trace = std::getenv("TEST_NETLIB_VERBOSE") != nullptr;
+  for (int mode = 0; mode < 3; ++mode) {
+    auto s     = settings_for();
+    if (verbose_trace && mode == 1) { enable_verbose(s); }
+    double obj = kNaN, dinf = 0.0, sec = 0.0;
+    int it = 0, upd = 0;
+    try {
+      rows[mode].st  = run_phase2_from_basis(lp, vstatus, s, mode, obj, it, dinf, upd,
+                                             /*initialize_basis*/ false, dy_se, &sec);
+      rows[mode].ran = true;
+    } catch (const std::exception& ex) {
+      std::printf("%-12s (exception: %s)\n", rows[mode].name, ex.what());
+      continue;
+    }
+    rows[mode].obj = obj;
+    rows[mode].it  = it;
+    rows[mode].sec = sec;
+    std::printf("%-12s %-18s %22.17g %8d %10.4f\n",
+                rows[mode].name, ds::dual_status_to_string(rows[mode].st).c_str(), obj, it, sec);
+    std::fflush(stdout);
+  }
+
+
+  // Fourth leg: the GPU the way B&B ACTUALLY drives it -- REFACTOR-AND-RESUME. The single-shot
+  // mode-2 call above stops at the first REFACTOR_NEEDED, but `gpu_solve_node_serial` rebuilds the
+  // factorization on the host and calls the device straight back, carrying the primal point, the
+  // objective and the steepest-edge norms across. A defect that only appears after a resume is
+  // invisible to the single-shot leg, so the two must be reported side by side.
+  {
+    const int m = lp.num_rows;
+    const int n = lp.num_cols;
+    std::vector<ds::variable_status_t> vs = vstatus;
+    std::vector<int> basic_list(m), nonbasic_list, superbasic_list;
+    ds::basis_update_mpf_t<int, double> ft(m, h.refactor_frequency);
+    ds::lp_solution_t<int, double> sol(m, n);
+    std::vector<double> se = dy_se;
+    auto s = settings_for();
+    const double t0 = mo::tic();
+
+    auto refactorize_and_price = [&]() {
+      basic_list.assign(static_cast<size_t>(m), 0);
+      nonbasic_list.clear();
+      superbasic_list.clear();
+      ds::get_basis_from_vstatus<int>(m, vs, basic_list, nonbasic_list, superbasic_list);
+      return ft.refactor_basis(lp.A, s, lp.lower, lp.upper, t0, basic_list, nonbasic_list, vs) == 0;
+    };
+
+    // CO-SEAT REPLICATION (TEST_NETLIB_REPLAY_SEATS=<n>, default 1).
+    //
+    // WHY. The live pool runs up to 10 problems in ONE kernel launch; this replay ran exactly one,
+    // so a fault that needs co-resident seats could never appear here. Measured on dano3_5:
+    // seats=1 gives 0 mismatches over 90 consumed nodes, seats=10 gives 39 over 282. Everything
+    // else -- child-continue, the cutoff value, basis repair -- was eliminated by A/B.
+    //
+    // Each shadow seat gets its OWN mutable state (vstatus / basis lists / ft / sol / dy_se) and
+    // shares only `lp`, exactly as the pool's seats share one problem through the read-only cache.
+    // If seat 0's answer changes when shadows are present, the fault is cross-seat.
+    struct shadow_seat_t {
+      std::vector<ds::variable_status_t> vs;
+      std::vector<int> basic_list, nonbasic_list, superbasic_list;
+      ds::basis_update_mpf_t<int, double> ft;
+      ds::lp_solution_t<int, double> sol;
+      std::vector<double> se;
+      ds::simplex_solver_settings_t<int, double> s;
+      int refactor_reason{0};
+      bool refactor_resume{false};
+      bool cert_retry{false};
+      bool live{true};
+      shadow_seat_t(int m_, int n_, int rf) : ft(m_, rf), sol(m_, n_) {}
+    };
+    const int replay_seats = [] {
+      const char* e = std::getenv("TEST_NETLIB_REPLAY_SEATS");
+      return e != nullptr ? std::max(1, std::atoi(e)) : 1;
+    }();
+    std::vector<std::unique_ptr<shadow_seat_t>> shadows;
+    for (int k = 1; k < replay_seats; ++k) {
+      auto sh = std::make_unique<shadow_seat_t>(m, n, h.refactor_frequency);
+      sh->vs = vstatus;
+      sh->se = dy_se;
+      sh->s  = settings_for();
+      sh->basic_list.assign(static_cast<size_t>(m), 0);
+      ds::get_basis_from_vstatus<int>(m, sh->vs, sh->basic_list, sh->nonbasic_list,
+                                      sh->superbasic_list);
+      if (sh->ft.refactor_basis(lp.A, sh->s, lp.lower, lp.upper, t0, sh->basic_list,
+                                sh->nonbasic_list, sh->vs) != 0) {
+        sh->live = false;
+      } else {
+        compute_duals(lp, sh->ft, sh->basic_list, sh->nonbasic_list, sh->sol.y, sh->sol.z);
+      }
+      shadows.push_back(std::move(sh));
+    }
+    if (replay_seats > 1) {
+      std::printf("  co-seat replication: %d seats in one launch (%zu shadows live)\n",
+                  replay_seats,
+                  std::count_if(shadows.begin(), shadows.end(),
+                                [](const auto& p) { return p->live; }));
+    }
+
+    std::printf("\n---- gpu refactor-and-resume (as B&B drives it) ----\n");
+    if (!refactorize_and_price()) {
+      std::printf("  initial refactorization failed\n");
+    } else {
+      compute_duals(lp, ft, basic_list, nonbasic_list, sol.y, sol.z);
+      int total_iters = 0, resumes = 0;
+      int revalidations = 0;   // times a returned OPTIMAL failed fresh pricing
+      bool item_refactor_resume = false;
+      bool item_terminal_certificate_retry = false;
+      ds::dual::status_t st = ds::dual::status_t::UNSET;
+      while (true) {
+        // A resume that carries nothing looks exactly like a resume that makes no progress, so
+        // count what actually came back changed rather than inferring it from the objective.
+        const std::vector<ds::variable_status_t> vs_in = vs;
+        const std::vector<double> se_in = se;
+        // BATCH entry, not the single-problem one: `gpu_simplified_dual_phase2` copies back only
+        // x / y / z / objective / iterations, NOT vstatus or dy_se. A resume driven through it
+        // restarts from the basis it was first given every time and can never make progress --
+        // which is exactly what B&B drives, so the replay must use the same path B&B does.
+        gds::gpu_batch_item<int, double> item{};
+        item.lp            = &lp;
+        item.lower         = &lp.lower;
+        item.upper         = &lp.upper;
+        item.settings      = &s;
+        item.vstatus       = &vs;
+        item.ft            = &ft;
+        item.basic_list    = &basic_list;
+        item.nonbasic_list = &nonbasic_list;
+        item.sol           = &sol;
+        item.dy_se         = &se;
+        item.refactor_resume = item_refactor_resume;
+        item.terminal_certificate_retry = item_terminal_certificate_retry;
+        int refactor_reason  = 0;  // 0 periodic, 1 rejected update, 2 certificate retry
+        item.refactor_reason = &refactor_reason;
+        std::vector<gds::gpu_batch_item<int, double>> batch{item};
+        // Co-resident shadow seats. They share `lp` and nothing else; seat 0 stays at index 0 so
+        // `out[0]` is still the node under test.
+        for (auto& sh : shadows) {
+          if (!sh->live) { continue; }
+          gds::gpu_batch_item<int, double> e{};
+          e.lp            = &lp;
+          e.lower         = &lp.lower;
+          e.upper         = &lp.upper;
+          e.settings      = &sh->s;
+          e.vstatus       = &sh->vs;
+          e.ft            = &sh->ft;
+          e.basic_list    = &sh->basic_list;
+          e.nonbasic_list = &sh->nonbasic_list;
+          e.sol           = &sh->sol;
+          e.dy_se         = &sh->se;
+          e.refactor_resume            = sh->refactor_resume;
+          e.terminal_certificate_retry = sh->cert_retry;
+          e.refactor_reason            = &sh->refactor_reason;
+          batch.push_back(e);
+        }
+        std::vector<ds::dual::status_t> out;
+        gds::gpu_batch_timing timing;
+        // allow_refactor_exit=TRUE. Without it this leg gets the kernel with the refactor exits
+        // compiled OUT, so at the 256-update MPF cap it returns NUMERICAL instead of
+        // REFACTOR_NEEDED and the loop stops after one leg -- which is NOT how B&B drives it.
+        gds::gpu_simplified_dual_phase2_batch<int, double>(batch, 0, out, timing,
+                                                          /*allow_refactor_exit*/ true);
+        if (out.empty() || timing.rejected) {
+          std::printf("  batch rejected: %s\n", timing.message.c_str());
+          break;
+        }
+        st = out[0];
+        // Advance the shadow seats the same way B&B would, so they stay co-resident for the whole
+        // solve instead of going terminal after one leg and leaving seat 0 alone again.
+        {
+          size_t oi = 1;
+          for (auto& sh : shadows) {
+            if (!sh->live) { continue; }
+            if (oi >= out.size()) { break; }
+            const ds::dual::status_t sst = out[oi++];
+            if (sst == ds::dual::status_t::REFACTOR_NEEDED) {
+              sh->basic_list.assign(static_cast<size_t>(m), 0);
+              sh->nonbasic_list.clear();
+              sh->superbasic_list.clear();
+              ds::get_basis_from_vstatus<int>(m, sh->vs, sh->basic_list, sh->nonbasic_list,
+                                              sh->superbasic_list);
+              sh->live = sh->ft.refactor_basis(lp.A, sh->s, lp.lower, lp.upper, t0,
+                                               sh->basic_list, sh->nonbasic_list, sh->vs) == 0;
+              sh->refactor_resume = false;   // rebuilt from vstatus, so the device re-derives x
+            } else {
+              sh->live = false;              // terminal: this shadow stops occupying a seat
+            }
+          }
+        }
+        int vs_changed = 0, se_changed = 0;
+        for (size_t k = 0; k < vs.size(); ++k) { vs_changed += (vs[k] != vs_in[k]); }
+        for (size_t k = 0; k < se.size() && k < se_in.size(); ++k) {
+          se_changed += (se[k] != se_in[k]);
+        }
+        // The device carries the cumulative iteration count in `sol` across refactor resumes.
+        // Assign it; accumulating it would count all earlier legs again on every resume.
+        const int leg_iters = sol.iterations - total_iters;
+        total_iters         = sol.iterations;
+        // Is the CARRIED z still DUAL FEASIBLE for the basis that just came back? That, not its
+        // distance from freshly priced duals, is what the ratio test depends on: a dual simplex is
+        // only valid while every nonbasic reduced cost carries the sign its status demands.
+        const double dinf_carried = dual_infeasibility(lp, vs, sol.z, s.dual_tol);
+        std::printf(
+          "  leg %-2d %-18s it=%-6d cum_it=%-6d obj=%.17g  dinf=%.3e vs_chg=%d se_chg=%d\n",
+          resumes, ds::dual_status_to_string(st).c_str(), leg_iters, total_iters,
+          ds::compute_user_objective<int, double>(lp, sol.x), dinf_carried, vs_changed, se_changed);
+        std::fflush(stdout);
+        // VALIDATE AN "OPTIMAL" AGAINST FRESHLY PRICED REDUCED COSTS -- the same check the pool's
+        // resume loop applies. The driver's optimality test reads the MAINTAINED z, which has no
+        // error control across a long stacked-update sequence; if the basis is not actually dual
+        // feasible then the solve has stopped at a primal-feasible but NON-optimal vertex.
+        if (st == ds::dual::status_t::OPTIMAL &&
+            std::getenv("TEST_NETLIB_REPLAY_VALIDATE_OPTIMAL") != nullptr && revalidations < 4) {
+          basic_list.assign(static_cast<size_t>(m), 0);
+          nonbasic_list.clear();
+          superbasic_list.clear();
+          ds::get_basis_from_vstatus<int>(m, vs, basic_list, nonbasic_list, superbasic_list);
+          ds::basis_update_mpf_t<int, double> ft_v(m, s.refactor_frequency);
+          const double tv = cuopt::mathematical_optimization::tic();
+          if (ft_v.refactor_basis(lp.A, s, lp.lower, lp.upper, tv, basic_list, nonbasic_list, vs) ==
+              0) {
+            std::vector<double> y_v(static_cast<size_t>(m), 0.0),
+              z_v(static_cast<size_t>(lp.num_cols), 0.0);
+            double w_v = 0.0;
+            ds::phase2::compute_dual_solution_from_basis(lp, ft_v, basic_list, nonbasic_list, y_v,
+                                                         z_v, w_v);
+            const double dinf_fresh = dual_infeasibility(lp, vs, z_v, s.dual_tol);
+            if (dinf_fresh > s.dual_tol) {
+              ++revalidations;
+              std::printf("  OPTIMAL REJECTED: fresh dinf=%.6e (maintained said %.6e) -- resuming\n",
+                          dinf_fresh, dual_infeasibility(lp, vs, sol.z, s.dual_tol));
+              sol.y = y_v;
+              sol.z = z_v;
+              std::vector<double> xB_v(m, 0.0);
+              double wx_v = 0.0;
+              ds::phase2::compute_primal_solution_from_basis(lp, ft_v, basic_list, nonbasic_list,
+                                                             vs, sol.x, xB_v, wx_v);
+              item_refactor_resume = true;
+              item_terminal_certificate_retry = false;
+              continue;
+            }
+          }
+        }
+        if (st != ds::dual::status_t::REFACTOR_NEEDED) { break; }
+        if (++resumes > 64) {
+          std::printf("  resume budget exhausted\n");
+          break;
+        }
+        // MIRROR THE LIVE PATH EXACTLY, or this leg proves nothing about it. gpu_solve_node_serial
+        // refactorizes WITHOUT re-pricing, rebuilds x with the CPU's post-refactor formula, and sets
+        // refactor_resume so the device does not redo it. Re-pricing here (which is what this loop
+        // used to do) is a different algorithm that converges on nodes the live path stalls on --
+        // which is precisely why the stall never reproduced offline.
+        // FAITHFUL TO THE POOL: do NOT rebuild the lists from vstatus here. The device returns
+        // basic_list / nonbasic_list in PIVOT-HISTORY order (it maintains them by in-place swap) and
+        // gpu_node_pool's refactorize() keeps that order on a resume -- rebuilding gives a SORTED
+        // permutation, which changes the LU that refactor_basis produces and the order the
+        // order-dependent ratio test scans the nonbasics in. This loop used to rebuild, so it ran a
+        // DIFFERENT resume algorithm from the pool: that is why a dumped node could replay cleanly
+        // while the live solve had failed, and it made every dump-based comparison unsound.
+        // TEST_NETLIB_REPLAY_RESORT_LISTS=1 restores the old (unfaithful) behaviour for A/B.
+        // WHEN does the carried y stop belonging to its basis -- during the device leg, or during
+        // the host refactorization? Measure |B'y-c_B| against the basis the DEVICE handed back,
+        // BEFORE refactor_basis can repair it, and keep that basis to diff against the repaired one.
+        // A residual that is already large here indicts the leg; one that only grows after
+        // refactor_basis indicts the repair, which changes the basis without re-pricing y.
+        std::vector<int> bl_before(basic_list.begin(), basic_list.end());
+        std::vector<int> nbl_before(nonbasic_list.begin(), nonbasic_list.end());
+        std::vector<ds::variable_status_t> vs_before(vs);
+        double pre_resid = 0.0;
+        for (int i = 0; i < m; ++i) {
+          const int j  = bl_before[i];
+          double dot   = 0.0;
+          for (int p = lp.A.col_start[j]; p < lp.A.col_start[j + 1]; ++p) {
+            dot += lp.A.x[p] * sol.y[lp.A.i[p]];
+          }
+          pre_resid = std::max(pre_resid, std::fabs(dot - lp.objective[j]));
+        }
+        static const bool resort_lists = std::getenv("TEST_NETLIB_REPLAY_RESORT_LISTS") != nullptr;
+        if (resort_lists) {
+          basic_list.assign(static_cast<size_t>(m), 0);
+          nonbasic_list.clear();
+          superbasic_list.clear();
+          ds::get_basis_from_vstatus<int>(m, vs, basic_list, nonbasic_list, superbasic_list);
+        }
+        bool repaired = false;
+        if (ft.refactor_basis(
+              lp.A, s, lp.lower, lp.upper, t0, basic_list, nonbasic_list, vs, &repaired) != 0) {
+          std::printf("  resume refactorization failed\n");
+          st = ds::dual::status_t::NUMERICAL;
+          break;
+        }
+        if (repaired) {
+          std::printf("  resume refactorization repaired the basis -- CPU takeback\n");
+          st = ds::dual::status_t::NUMERICAL;
+          break;
+        }
+        {
+          // The factorization is fresh here, so this is the one place the CARRIED duals can be
+          // checked against the truth mid-solve. A dual simplex maintains dual feasibility as an
+          // INVARIANT and never re-tests it, so a drift that accumulates here is invisible to the
+          // driver and decides the final answer.
+          std::vector<double> y_chk(static_cast<size_t>(m), 0.0),
+            z_chk(static_cast<size_t>(lp.num_cols), 0.0);
+          double w_chk = 0.0;
+          ds::phase2::compute_dual_solution_from_basis(lp, ft, basic_list, nonbasic_list, y_chk,
+                                                       z_chk, w_chk);
+          double dz = 0.0, dy = 0.0;
+          int argmax = -1;
+          for (int j = 0; j < lp.num_cols; ++j) {
+            const double d = std::fabs(z_chk[j] - sol.z[j]);
+            if (d > dz) { dz = d; argmax = j; }
+          }
+          for (int i = 0; i < m; ++i) { dy = std::max(dy, std::fabs(y_chk[i] - sol.y[i])); }
+          // WHICH of the two duals is the liar? Both are tested against the DEFINING equation of
+          // the dual solution, B'y = c_B, evaluated directly from A -- no factorization involved.
+          // A large residual for y_fresh indicts the LU that refactor_basis just built (so the
+          // basis ORDER is the fault); a large residual for y_kept alone indicts the carried
+          // duals (so the resume is the fault). They are different bugs with different fixes.
+          auto basis_residual = [&](const std::vector<double>& yv) {
+            double r = 0.0;
+            for (int i = 0; i < m; ++i) {
+              const int j  = basic_list[i];
+              double dot   = 0.0;
+              for (int p = lp.A.col_start[j]; p < lp.A.col_start[j + 1]; ++p) {
+                dot += lp.A.x[p] * yv[lp.A.i[p]];
+              }
+              r = std::max(r, std::fabs(dot - lp.objective[j]));
+            }
+            return r;
+          };
+          // Did refactor_basis change WHICH columns are basic? Compare as sets: a repair
+          // substitutes slacks for deficient columns, so membership changes even though the
+          // caller never asked for it.
+          std::vector<int> a(bl_before), b(basic_list.begin(), basic_list.end());
+          std::sort(a.begin(), a.end());
+          std::sort(b.begin(), b.end());
+          int set_changed = 0;
+          {
+            std::vector<int> diff;
+            std::set_difference(a.begin(), a.end(), b.begin(), b.end(), std::back_inserter(diff));
+            set_changed = static_cast<int>(diff.size());
+          }
+          // Is the post-repair dual infeasibility CONCENTRATED on the columns the repair ejected?
+          // basis_repair picks the ejected column's status from bound availability alone and never
+          // looks at the sign of its reduced cost, so it can seat it at a dual-INFEASIBLE bound.
+          // If the whole violation sits on those few columns, a sign-correct restatement fixes it;
+          // if it is spread, the node has to go to the CPU.
+          if (set_changed > 0) {
+            // IS THE DEFICIENCY GENUINE, OR AN ARTIFACT OF THE COLUMN ORDER? Re-factorize the SAME
+            // pre-repair basis from a scratch factorization, once in pivot-history order (control,
+            // must repair) and once SORTED. factorize_basis uses threshold partial pivoting, so the
+            // elimination order decides which columns still have an acceptable pivot -- a sorted
+            // permutation of the same column SET can therefore factorize cleanly where pivot order
+            // does not. If it does, the repair was provoked by the order, not by a singular basis.
+            for (int variant = 0; variant < 2; ++variant) {
+              std::vector<int> bl_try(bl_before), nbl_try(nbl_before);
+              std::vector<ds::variable_status_t> vs_try(vs_before);
+              if (variant == 1) { std::sort(bl_try.begin(), bl_try.end()); }
+              ds::basis_update_mpf_t<int, double> ft_try(m, s.refactor_frequency);
+              const int rc_try = ft_try.refactor_basis(lp.A, s, lp.lower, lp.upper, t0, bl_try,
+                                                       nbl_try, vs_try);
+              std::vector<int> t(bl_try.begin(), bl_try.end()), o(bl_before);
+              std::sort(t.begin(), t.end());
+              std::sort(o.begin(), o.end());
+              std::vector<int> d;
+              std::set_difference(o.begin(), o.end(), t.begin(), t.end(), std::back_inserter(d));
+              std::printf("      ORDER TEST [%s]: rc=%d basis_changed=%zu\n",
+                          variant == 0 ? "pivot order (control)" : "SORTED", rc_try, d.size());
+            }
+            std::vector<int> left;
+            std::set_difference(a.begin(), a.end(), b.begin(), b.end(), std::back_inserter(left));
+            double tot = 0.0, on_left = 0.0;
+            int nviol = 0;
+            for (int j = 0; j < lp.num_cols; ++j) {
+              double v = 0.0;
+              if (vs[j] == ds::variable_status_t::NONBASIC_LOWER && z_chk[j] < -s.dual_tol) {
+                v = -z_chk[j];
+              } else if (vs[j] == ds::variable_status_t::NONBASIC_UPPER && z_chk[j] > s.dual_tol) {
+                v = z_chk[j];
+              } else if (vs[j] == ds::variable_status_t::NONBASIC_FREE) {
+                v = std::fabs(z_chk[j]);
+              }
+              if (v > 0.0) { tot += v; nviol++; }
+              if (v > 0.0 && std::find(left.begin(), left.end(), j) != left.end()) { on_left += v; }
+            }
+            std::printf("    REPAIR: ejected %zu col(s); dinf_total=%.4e over %d col(s); "
+                        "dinf_on_ejected=%.4e (%.1f%%)\n",
+                        left.size(), tot, nviol, on_left,
+                        tot > 0.0 ? 100.0 * on_left / tot : 0.0);
+            for (int j : left) {
+              const bool lo_fin = lp.lower[j] > -1e30, up_fin = lp.upper[j] < 1e30;
+              std::printf("      ejected col %d: vstatus=%d z_fresh=%+.6e lower_finite=%d "
+                          "upper_finite=%d  sign-correct status would be %s\n",
+                          j, (int)vs[j], z_chk[j], (int)lo_fin, (int)up_fin,
+                          z_chk[j] >= 0.0 ? (lo_fin ? "NONBASIC_LOWER" : "<none: lower is -inf>")
+                                          : (up_fin ? "NONBASIC_UPPER" : "<none: upper is +inf>"));
+            }
+          }
+          std::printf("    leg-end drift: max|z_fresh-z_kept|=%.6e (col %d, vstatus=%d) "
+                      "max|y_fresh-y_kept|=%.6e  dinf(kept)=%.3e dinf(fresh)=%.3e "
+                      "|B'y-c_B|: pre_refac=%.3e kept=%.3e fresh=%.3e basis_set_changed=%d\n",
+                      dz, argmax, argmax >= 0 ? (int)vs[argmax] : -1, dy,
+                      dual_infeasibility(lp, vs, sol.z, s.dual_tol),
+                      dual_infeasibility(lp, vs, z_chk, s.dual_tol),
+                      pre_resid, basis_residual(sol.y), basis_residual(y_chk), set_changed);
+          std::fflush(stdout);
+          const double fresh_dinf = dual_infeasibility(lp, vs, z_chk, s.dual_tol);
+          if (refactor_reason != 1 && fresh_dinf > s.dual_tol) {
+            std::printf("  fresh pricing is dual infeasible (%.6e) -- CPU takeback\n", fresh_dinf);
+            st = ds::dual::status_t::NUMERICAL;
+            break;
+          }
+        }
+        // The device reports WHY it stopped (0 periodic / 1 rejected update / 2 certificate retry).
+        if (refactor_reason == 1) {
+          std::printf("  resume: rank-1 update was REJECTED (dinf carried=%.6e)\n",
+                      dual_infeasibility(lp, vs, sol.z, s.dual_tol));
+        } else if (refactor_reason == 2) {
+          std::printf("  resume: retry terminal certificate from a fresh factorization\n");
+        }
+        {
+          std::vector<double> xB_workspace(m, 0.0);
+          double work_est = 0.0;
+          ds::phase2::compute_primal_solution_from_basis(
+            lp, ft, basic_list, nonbasic_list, vs, sol.x, xB_workspace, work_est);
+        }
+        item_refactor_resume = true;
+        item_terminal_certificate_retry = (refactor_reason == 2);
+      }
+      const double resume_user_obj = ds::compute_user_objective<int, double>(lp, sol.x);
+      {
+        // A dual simplex stops when its PRIMAL infeasibility list empties. That list is maintained
+        // incrementally, so a stale one lets the driver report OPTIMAL at a point that is not
+        // actually feasible -- the first thing to test when an "OPTIMAL" objective is wrong.
+        double bv = 0.0, rr = 0.0;
+        primal_residuals(lp, sol.x, bv, rr);
+        std::printf("  gpu-resume FINAL x: max bound violation=%.6e  max |Ax-b|=%.6e\n", bv, rr);
+
+        // `dinf` above is measured on the MAINTAINED z, which is what the driver's own optimality
+        // test sees. Price the final basis fresh and measure again: if the maintained z has drifted,
+        // the driver can believe it is dual feasible at a basis that is not, and stop early.
+        {
+          ds::basis_update_mpf_t<int, double> ft_chk(m, s.refactor_frequency);
+          std::vector<int> b_chk(static_cast<size_t>(m), 0), nb_chk, sb_chk;
+          ds::get_basis_from_vstatus<int>(m, vs, b_chk, nb_chk, sb_chk);
+          const double tchk = cuopt::mathematical_optimization::tic();
+          if (ft_chk.refactor_basis(lp.A, s, lp.lower, lp.upper, tchk, b_chk, nb_chk, vs) == 0) {
+            std::vector<double> y_chk(static_cast<size_t>(m), 0.0),
+              z_chk(static_cast<size_t>(lp.num_cols), 0.0);
+            double w_chk = 0.0;
+            ds::phase2::compute_dual_solution_from_basis(lp, ft_chk, b_chk, nb_chk, y_chk, z_chk,
+                                                         w_chk);
+            double dz = 0.0;
+            for (int j = 0; j < lp.num_cols; ++j) {
+              dz = std::max(dz, std::fabs(z_chk[j] - sol.z[j]));
+            }
+            std::printf("  gpu-resume FINAL basis: dinf(maintained z)=%.6e  dinf(FRESH z)=%.6e  "
+                        "max|z_fresh-z_kept|=%.6e\n",
+                        dual_infeasibility(lp, vs, sol.z, s.dual_tol),
+                        dual_infeasibility(lp, vs, z_chk, s.dual_tol), dz);
+          }
+        }
+      }
+      std::printf("%-12s %-18s %22.17g %8d\n", "gpu-resume",
+                  ds::dual_status_to_string(st).c_str(), resume_user_obj, total_iters);
+      resumed_st  = st;
+      // USER objective, to match the three table rows above (they come from
+      // compute_user_objective, which applies obj_scale and adds obj_constant). Comparing the
+      // RAW sol.objective against them reported a spurious DISAGREES on every node whose
+      // obj_constant is non-zero -- germanrr's is 286120.9568, exactly the gap that appeared.
+      resumed_obj = resume_user_obj;
+      resumed_ran = true;
+      // The node was mis-decided because the objective the device reported rose ABOVE the true
+      // optimum. A dual simplex objective ascends toward the optimum from below, so exceeding it is
+      // the defect itself -- state it explicitly rather than leaving it to be read off the numbers.
+      if (rows[0].ran && resume_user_obj > rows[0].obj + 1e-6 * (1.0 + std::abs(rows[0].obj))) {
+        std::printf("DEFECT: resumed objective %.17g EXCEEDS the true optimum %.17g\n",
+                    resume_user_obj, rows[0].obj);
+        if (resume_user_obj >= h.cut_off) {
+          std::printf("        and it is >= cut_off %.17g, which is what fathomed a live subtree\n",
+                      h.cut_off);
+        }
+      }
+    }
+  }
+
+  // Exercise two concurrent V2 pools, which is the smallest live configuration that reproduces
+  // the wrong cutoff. A single pool and repeated fresh-node reuse of its seats are bit-exact.
+  {
+    constexpr int v2_pools = 2;
+    constexpr int v2_seats = 10;
+    struct replay_pool_t {
+      std::vector<mip::gpu_batch_node_t<int, double>> nodes;
+      std::vector<mip::batch_seat_state_t<int, double>> seat_state;
+      std::unique_ptr<rmm::cuda_stream> stream;
+      mip::gpu_batch_run<int, double>* run{nullptr};
+    };
+    std::vector<replay_pool_t> pools(v2_pools);
+    for (auto& pool : pools) {
+      pool.nodes.reserve(v2_seats);
+      for (int seat = 0; seat < v2_seats; ++seat) {
+        pool.nodes.emplace_back(lp.num_rows, lp.num_cols);
+        auto& node    = pool.nodes.back();
+        node.lower    = lp.lower;
+        node.upper    = lp.upper;
+        node.settings = settings_for();
+        node.vstatus  = vstatus;
+        node.dy_se    = dy_se;
+      }
+    }
+    auto* cache = gds::gpu_ro_cache_create<int, double>();
+    #pragma omp parallel for num_threads(v2_pools)
+    for (int p = 0; p < v2_pools; ++p) {
+      cudaSetDevice(0);
+      pools[p].stream = std::make_unique<rmm::cuda_stream>();
+      pools[p].run    = mip::gpu_persistent_batch_begin<int, double>(
+        lp, pools[p].nodes, pools[p].stream->view(), cache, &pools[p].seat_state);
+    }
+    for (int p = 0; p < v2_pools; ++p) {
+      bool harvested = pools[p].run != nullptr &&
+                       mip::gpu_persistent_batch_harvest<int, double>(pools[p].run);
+      if (pools[p].run != nullptr) {
+        mip::gpu_batch_run_end<int, double>(pools[p].run);
+        pools[p].run = nullptr;
+      }
+      if (!harvested) {
+        std::printf("gpu-v2[%d] INCONCLUSIVE\n", p);
+        continue;
+      }
+      for (int seat = 0; seat < v2_seats; ++seat) {
+        const auto& node = pools[p].nodes[seat];
+        const double obj = ds::compute_user_objective<int, double>(lp, node.sol.x);
+        std::printf("gpu-v2[%d,%d] %-18s %.17g it=%d\n", p, seat,
+                    ds::dual_status_to_string(node.status).c_str(), obj, node.sol.iterations);
+      }
+    }
+    gds::gpu_ro_cache_destroy<int, double>(cache);
+  }
+
+  // The verdict the artifact exists to give: does the GPU still disagree with the CPU?
+  // Judge the RESUMED result, not the single-shot one. REFACTOR_NEEDED is not an answer about the
+  // LP -- branch-and-bound never sees it, because the host refactorizes and calls the device back.
+  // Comparing the single-shot leg would report every periodic refactorization as a disagreement.
+  const row_t& full = rows[0];
+  std::printf("\n==== replay verdict ====\n");
+  if (!full.ran || !resumed_ran) {
+    std::printf("INCONCLUSIVE: a driver did not complete.\n");
+  } else if (resumed_st == ds::dual::status_t::CUTOFF &&
+             full.st == ds::dual::status_t::OPTIMAL && full.obj < h.cut_off) {
+    std::printf("WRONG PRUNE: gpu fathomed at obj=%.17g, but the node's true optimum %.17g is "
+                "below the cutoff %.17g -- a live subtree was lost.\n",
+                resumed_obj, full.obj, h.cut_off);
+  } else if (resumed_st == full.st && obj_close(resumed_obj, full.obj)) {
+    std::printf("AGREES: gpu (resumed) %s obj=%.17g  ==  full-cpu %s obj=%.17g\n",
+                ds::dual_status_to_string(resumed_st).c_str(), resumed_obj,
+                ds::dual_status_to_string(full.st).c_str(), full.obj);
+  } else {
+    std::printf("DISAGREES: gpu (resumed) %s obj=%.17g  vs  full-cpu %s obj=%.17g\n",
+                ds::dual_status_to_string(resumed_st).c_str(), resumed_obj,
+                ds::dual_status_to_string(full.st).c_str(), full.obj);
+  }
+}
+
 }  // namespace
 
 int main(int argc, char* argv[])
@@ -1596,6 +2581,18 @@ int main(int argc, char* argv[])
           "dumped by cuopt_cli with CUOPT_DUMP_NODES=<dir>; solve each parent to its optimal "
           "basis, then replay the child from that basis through the advanced and simplified "
           "drivers (with the recorded objective cutoff) and check the recorded status/objective");
+  program.add_argument("--verify-nodes-batch")
+    .help("GPU-only resumable batch verification of a node collection. Nodes are grouped by "
+          "instance, solved through the production per-seat host-refactor loop, and emitted as "
+          "full-precision [NODEDUMP] rows for comparison with a frozen full-CPU golden log");
+  program.add_argument("--batch-seats")
+    .help("maximum nodes per resumable GPU verification batch")
+    .default_value(8)
+    .scan<'i', int>();
+  program.add_argument("--replay-node")
+    .help("binary bad-node dump written by the B&B GPU hook under "
+          "CUOPT_BNB_DUMP_BAD_NODES=<dir>; re-solve that single node from its captured "
+          "state with the full CPU driver, the simplified CPU driver and the GPU driver");
   program.add_argument("--benchmark-parallel")
     .help("directory of B&B node samples (as for --verify-nodes); replicate the nodes --replicas "
           "times and solve them ALL on the CPU (OpenMP across problems) and the GPU (one block per "
@@ -1648,6 +2645,20 @@ int main(int argc, char* argv[])
   // --verify-nodes mode: replay dumped B&B node samples and exit.
   if (program.is_used("--verify-nodes")) {
     verify_nodes_mode(handle, program.get<std::string>("--verify-nodes"), time_limit);
+    return 0;
+  }
+
+  if (program.is_used("--verify-nodes-batch")) {
+    verify_nodes_batch_mode(handle,
+                            program.get<std::string>("--verify-nodes-batch"),
+                            time_limit,
+                            program.get<int>("--batch-seats"));
+    return 0;
+  }
+
+  // --replay-node mode: re-solve one captured bad node with all three drivers and exit.
+  if (program.is_used("--replay-node")) {
+    replay_node_mode(handle, program.get<std::string>("--replay-node"), time_limit);
     return 0;
   }
 

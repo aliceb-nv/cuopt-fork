@@ -393,7 +393,8 @@ class basis_update_mpf_t {
                      f_t start_time,
                      std::vector<i_t>& basic_list,
                      std::vector<i_t>& nonbasic_list,
-                     std::vector<variable_status_t>& vstatus);
+                     std::vector<variable_status_t>& vstatus,
+                     bool* repaired = nullptr);
 
   void set_refactor_frequency(i_t new_frequency) { refactor_frequency_ = new_frequency; }
 

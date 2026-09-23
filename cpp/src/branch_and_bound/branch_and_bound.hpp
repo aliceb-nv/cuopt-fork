@@ -9,6 +9,7 @@
 
 #include <branch_and_bound/bb_event.hpp>
 #include <branch_and_bound/deterministic_workers.hpp>
+#include <branch_and_bound/gpu_node_pool.hpp>
 #include <branch_and_bound/mip_node.hpp>
 #include <branch_and_bound/node_queue.hpp>
 #include <branch_and_bound/pseudo_costs.hpp>
@@ -38,6 +39,7 @@
 
 #include <omp.h>
 
+#include <array>
 #include <atomic>
 #include <functional>
 #include <future>
@@ -362,6 +364,13 @@ class branch_and_bound_t {
   // Unexplored nodes in the subtree are inserted back into the global heap.
   void plunge_with(bfs_worker_t<i_t, f_t>* worker, mip_node_t<i_t, f_t>* start_node);
 
+  // Count + optionally trace a CPU takeback of an untrusted device certificate. `where` is "pool"
+  // or "serial". See the gpu_takeback_* counters.
+  void record_gpu_takeback(simplex::dual_status_t st,
+                           const mip_node_t<i_t, f_t>* node_ptr,
+                           i_t node_iter,
+                           const char* where);
+
   // A worker attempts to steal nodes from another worker
   void work_stealing(bfs_worker_t<i_t, f_t>* worker);
 
@@ -404,7 +413,8 @@ class branch_and_bound_t {
                                        branch_and_bound_worker_t<i_t, f_t>* worker,
                                        branch_and_bound_stats_t<i_t, f_t>& stats,
                                        simplex::logger_t& log,
-                                       int64_t iter_limit = std::numeric_limits<i_t>::max());
+                                       int64_t iter_limit = std::numeric_limits<i_t>::max(),
+                                       i_t* completed_iterations = nullptr);
 
   // Apply symmetry-based bound reductions (orbital fixing and, when
   // settings_.symmetry == 2, lexical reduction) to the current node.
@@ -461,6 +471,57 @@ class branch_and_bound_t {
   void run_deterministic_bfs_loop(deterministic_bfs_worker_t<i_t, f_t>& worker,
                                   search_tree_t<i_t, f_t>& search_tree);
 
+  // WHOLE-BATCH POOL (CUOPT_BNB_GPU_BATCH=<seats>). One synchronous cycle: take `seats` nodes OUT
+  // of this worker's queue, prepare each, solve them all in ONE launch on the worker's stream, then
+  // process every one of them through solve_node_deterministic before returning. The pool owns its
+  // nodes for the duration and is empty again on return, which is what lets the barrier-time scans
+  // (lower bound, termination, determinism state hash) stay unchanged.
+  // #2 -- one slice of a pool cycle. Returns false once the pool has drained. Driven either by
+  // gpu_pool_cycle (synchronous, the default) or by the worker loop (CUOPT_BNB_GPU_ASYNC=1).
+  // may_block=false: return as soon as the device is not ready, so the caller can do other work.
+  bool gpu_pool_step(deterministic_bfs_worker_t<i_t, f_t>& worker,
+                     search_tree_t<i_t, f_t>& search_tree,
+                     bool may_block);
+  simplex::simplex_solver_settings_t<i_t, f_t> gpu_pool_settings(
+    const deterministic_bfs_worker_t<i_t, f_t>& worker) const;
+  bool gpu_pool_prepare_fresh(deterministic_bfs_worker_t<i_t, f_t>& worker,
+                              mip_node_t<i_t, f_t>* node,
+                              gpu_batch_node_t<i_t, f_t>& batch_node,
+                              gpu_seat_ctx_t<i_t, f_t>& seat_ctx);
+  bool gpu_pool_fill_fresh_seat(deterministic_bfs_worker_t<i_t, f_t>& worker,
+                                search_tree_t<i_t, f_t>& search_tree,
+                                i_t seat);
+  // "Is the GPU worker done?" -- true when a step will progress without waiting on the device.
+  bool gpu_pool_ready(deterministic_bfs_worker_t<i_t, f_t>& worker);
+  void gpu_pool_overlap_node(deterministic_bfs_worker_t<i_t, f_t>& worker,
+                             search_tree_t<i_t, f_t>& search_tree);
+  // copy_rest_to_cpu -- returns every node the pool still holds to the worker's queue.
+  void gpu_pool_finish(deterministic_bfs_worker_t<i_t, f_t>& worker);
+  bool gpu_pool_cycle(deterministic_bfs_worker_t<i_t, f_t>& worker,
+                      search_tree_t<i_t, f_t>& search_tree);
+
+  // Opportunistic B&B adapter around the same persistent GPU run/staging primitives.
+  void initialize_nondeterministic_gpu_pools(i_t num_bfs_workers);
+  void destroy_nondeterministic_gpu_pools();
+  void log_nondeterministic_gpu_pool_telemetry();
+  bool nondeterministic_gpu_pool_start(bfs_worker_t<i_t, f_t>* worker);
+  bool nondeterministic_gpu_pool_step(bfs_worker_t<i_t, f_t>* worker, bool may_block);
+  bool nondeterministic_gpu_pool_ready(const bfs_worker_t<i_t, f_t>* worker) const;
+  void nondeterministic_gpu_pool_finish(bfs_worker_t<i_t, f_t>* worker);
+  simplex::simplex_solver_settings_t<i_t, f_t> nondeterministic_gpu_pool_settings(
+    const bfs_worker_t<i_t, f_t>* worker);
+  bool nondeterministic_gpu_pool_prepare_fresh(bfs_worker_t<i_t, f_t>* worker,
+                                               mip_node_t<i_t, f_t>* node,
+                                               gpu_batch_node_t<i_t, f_t>& batch_node,
+                                               gpu_seat_ctx_t<i_t, f_t>& seat_ctx);
+  bool nondeterministic_gpu_pool_fill_fresh_seat(bfs_worker_t<i_t, f_t>* worker, i_t seat);
+  void nondeterministic_gpu_pool_update_lower_bound(const bfs_worker_t<i_t, f_t>* worker);
+  simplex::dual_status_t nondeterministic_gpu_pool_install_result(
+    bfs_worker_t<i_t, f_t>* worker,
+    mip_node_t<i_t, f_t>* node,
+    gpu_batch_node_t<i_t, f_t>& batch_node,
+    bool& gpu_answer_accepted);
+
   // Executed when all workers reach barrier
   // Handles termination logic serially in deterministic mode
   void deterministic_sync_callback();
@@ -496,6 +557,47 @@ class branch_and_bound_t {
   // unique_ptr as we only want to initialize these if we're in the deterministic codepath
   std::unique_ptr<deterministic_bfs_worker_pool_t<i_t, f_t>> deterministic_workers_;
   std::unique_ptr<cuopt::work_unit_scheduler_t> deterministic_scheduler_;
+  // One GPU batch pool per BFS worker, indexed by worker id. Empty unless CUOPT_BNB_GPU_BATCH is
+  // set. Each pool owns its own stream, so two workers never serialise against each other.
+  std::vector<std::unique_ptr<gpu_batch_pool_t<i_t, f_t>>> gpu_batch_pools_;
+  // ONE read-only cache per GPU (not per pool): every pool on a device solves nodes of the same MIP,
+  // so A / Arow / rhs / objective are identical across them. Owner; pools hold a borrowed pointer.
+  std::vector<gds::gpu_ro_cache<i_t, f_t>*> gpu_ro_caches_;
+  // Where each node's LP answer came from, so a run can say what the pool actually did rather than
+  // leaving it to be inferred from node counts.
+  std::atomic<int64_t> gpu_batch_hits_{0};        // consumed from the pool
+  std::atomic<int64_t> gpu_batch_stale_{0};       // cached, but the bounds had moved since the fill
+  std::atomic<int64_t> gpu_batch_absent_{0};      // not in the pool at all
+  std::atomic<int64_t> gpu_batch_rejected_{0};    // consumed, then rejected as an untrusted certificate
+  // The CPU takeback, split by the certificate the device produced. This is NOT the temporary
+  // recheck gate -- it is the production rule of plan §3a (a device DUAL_UNBOUNDED that fathoms a
+  // feasible subtree loses optimality silently, and a device NUMERICAL reaching on_numerical_issue
+  // clamps lower_bound_numerical_ for the rest of the solve because it is never reset). Counted
+  // separately so a run can report HOW OFTEN the CPU had to save the GPU, not just that it could.
+  std::atomic<int64_t> gpu_takeback_dual_unbounded_{0};
+  std::atomic<int64_t> gpu_takeback_numerical_{0};
+  std::atomic<int64_t> gpu_takeback_cutoff_{0};
+  std::atomic<int64_t> gpu_takeback_iter_limit_{0};
+  std::atomic<int64_t> gpu_takeback_other_{0};
+  std::atomic<int64_t> gpu_batch_agreed_{0};             // CPU recheck agreed with the device
+  std::atomic<int64_t> gpu_batch_corrected_decision_{0}; // recheck disagreed on the FATHOM decision
+  std::atomic<int64_t> gpu_batch_corrected_obj_{0};      // recheck agreed on the decision, not the objective
+  std::atomic<int64_t> gpu_batch_plunged_{0}; // seats refilled in place with the plunged child
+  std::atomic<int64_t> gpu_batch_overlap_nodes_{0};   // CPU nodes solved while a round was in flight
+  std::atomic<int64_t> gpu_batch_cycles_{0};   // gpu_pool_cycle calls that stole at least one node
+  // #5 -- plunge refills refused because the worker queue had fallen below the engagement
+  // threshold. Distinguishes "stopped diving because the heap ran dry" from the other stop reasons.
+  std::atomic<int64_t> gpu_batch_plunge_stop_heap_{0};
+  std::atomic<int64_t> gpu_batch_stolen_{0};   // nodes taken out of a worker queue by the pool
+  std::atomic<int64_t> gpu_batch_noseat_fathom_{0};    // no seat: already fathomed by its own bound
+  std::atomic<int64_t> gpu_batch_noseat_infeas_{0};    // no seat: bound strengthening proved infeasible
+  std::atomic<int64_t> gpu_batch_noseat_time_{0};      // no seat: past the deadline
+  std::atomic<int64_t> gpu_batch_noseat_{0};   // stolen, but no seat prepared (fathomed / infeasible
+                                               // by strengthening / past the deadline)
+  // Why seats never produced a device answer, indexed by gpu_batch_node_t::drop_t.
+  std::array<std::atomic<int64_t>, 9> gpu_batch_drops_{};
+  std::atomic<int64_t> gpu_batch_launched_{0};    // seats sent to the device
+  std::atomic<int64_t> gpu_batch_launches_{0};    // launches
   mip_status_t deterministic_global_termination_status_{mip_status_t::UNSET};
   double deterministic_horizon_step_{5.0};     // Work unit step per horizon (tunable)
   double deterministic_current_horizon_{0.0};  // Current horizon target

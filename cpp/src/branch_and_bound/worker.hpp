@@ -91,6 +91,12 @@ class branch_and_bound_worker_t {
 
   bool recompute_basis  = true;
   bool recompute_bounds = true;
+  // Set when this node's LP was solved somewhere that did NOT update `basis_factors` -- today, on
+  // the GPU, which pivots its own copy of the factorization. While it is set, the host factorization
+  // does not match `leaf_vstatus` and MUST NOT be reused: a continuing plunge sets
+  // recompute_basis = false and would otherwise hand the next node a factorization for the wrong
+  // basis. Cleared as soon as a solve refactorizes on the host.
+  bool host_basis_stale = false;
 
   // During the cut passes, this values can change. So we save a copy on root_heuristics
   // and point these attributes to it. During normal exploration, this is set

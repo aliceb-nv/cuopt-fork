@@ -107,8 +107,7 @@ __device__ __forceinline__ void wavefront_gather_solve_t(const i_t* __restrict__
             sum += __shfl_down_sync(0xffffffffu, sum, offset);
           }
           if (lane == 0) {
-            const f_t diagonal_reciprocal = f_t{1.0} / val[dp];
-            x[j] = (x[j] - sum) * diagonal_reciprocal;
+            x[j] = (x[j] - sum) / val[dp];
           }
           __syncwarp(0xffffffffu);
           continue;
@@ -121,17 +120,16 @@ __device__ __forceinline__ void wavefront_gather_solve_t(const i_t* __restrict__
       const i_t dp = DiagFirst ? c0 : (c1 - 1);
       const i_t lo = DiagFirst ? c0 + 1 : c0;
       const i_t hi = DiagFirst ? c1 : (c1 - 1);
-      const f_t diagonal_reciprocal = f_t{1.0} / val[dp];
       if constexpr (Incremental) {
         f_t xi = x[j];
         if constexpr (!Descending) { for (i_t p = lo; p < hi; ++p) { xi -= val[p] * x[ri[p]]; } }
         else                       { for (i_t p = hi - 1; p >= lo; --p) { xi -= val[p] * x[ri[p]]; } }
-        x[j] = xi * diagonal_reciprocal;
+        x[j] = xi / val[dp];
       } else {
         f_t sum = 0.0;
         if constexpr (!Descending) { for (i_t p = lo; p < hi; ++p) { sum += val[p] * x[ri[p]]; } }
         else                       { for (i_t p = hi - 1; p >= lo; --p) { sum += val[p] * x[ri[p]]; } }
-        x[j] = (x[j] - sum) * diagonal_reciprocal;
+        x[j] = (x[j] - sum) / val[dp];
       }
     }
     __syncwarp(0xffffffffu);
@@ -157,7 +155,6 @@ __device__ __forceinline__ void wavefront_gather_solve2_t(const i_t* __restrict_
       const i_t dp = DiagFirst ? c0 : (c1 - 1);
       const i_t lo = DiagFirst ? c0 + 1 : c0;
       const i_t hi = DiagFirst ? c1 : (c1 - 1);
-      const f_t diagonal_reciprocal = f_t{1.0} / val[dp];
       if constexpr (Incremental) {
         f_t xi0 = x0[j], xi1 = x1[j];
         if constexpr (!Descending) {
@@ -171,8 +168,8 @@ __device__ __forceinline__ void wavefront_gather_solve2_t(const i_t* __restrict_
             xi0 -= a * x0[r]; xi1 -= a * x1[r];
           }
         }
-        x0[j] = xi0 * diagonal_reciprocal;
-        x1[j] = xi1 * diagonal_reciprocal;
+        x0[j] = xi0 / val[dp];
+        x1[j] = xi1 / val[dp];
       } else {
         f_t sum0 = 0.0, sum1 = 0.0;
         if constexpr (!Descending) {
@@ -186,8 +183,8 @@ __device__ __forceinline__ void wavefront_gather_solve2_t(const i_t* __restrict_
             sum0 += a * x0[r]; sum1 += a * x1[r];
           }
         }
-        x0[j] = (x0[j] - sum0) * diagonal_reciprocal;
-        x1[j] = (x1[j] - sum1) * diagonal_reciprocal;
+        x0[j] = (x0[j] - sum0) / val[dp];
+        x1[j] = (x1[j] - sum1) / val[dp];
       }
     }
     __syncwarp(0xffffffffu);

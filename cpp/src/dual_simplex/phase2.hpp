@@ -151,6 +151,36 @@ i_t compute_primal_solution_from_basis(const lp_problem_t<i_t, f_t>& lp,
                                        std::vector<f_t>& x,
                                        std::vector<f_t>& xB_workspace,
                                        f_t& work_estimate);
+
+// Bounds-explicit form, for a caller whose bounds are NOT `lp.lower` / `lp.upper`. The GPU node pool
+// shares ONE lp_problem_t across every seat -- the read-only upload dedups on `lp.A.col_start.data()`,
+// so a per-seat copy would re-upload the matrix per node -- and carries each node's bounds
+// separately. Its REFACTOR_NEEDED resume has to rebuild the primal point with THIS node's bounds,
+// using the same formula the CPU driver's in-place refactor uses. The form above delegates here, so
+// there is only one implementation.
+template <typename i_t, typename f_t>
+i_t compute_primal_solution_from_basis(const lp_problem_t<i_t, f_t>& lp,
+                                       const std::vector<f_t>& lower,
+                                       const std::vector<f_t>& upper,
+                                       basis_update_mpf_t<i_t, f_t>& ft,
+                                       const std::vector<i_t>& basic_list,
+                                       const std::vector<i_t>& nonbasic_list,
+                                       const std::vector<variable_status_t>& vstatus,
+                                       std::vector<f_t>& x,
+                                       std::vector<f_t>& xB_workspace,
+                                       f_t& work_estimate);
+
+// y and z from a basis: B^T y = c_B, then z_N = c_N - N^T y. Declared here because callers outside
+// phase2.cpp need it to set up a solve -- the GPU batch entry point requires the duals as input, and
+// its harness used to carry a private copy of this function.
+template <typename i_t, typename f_t>
+void compute_dual_solution_from_basis(const lp_problem_t<i_t, f_t>& lp,
+                                      basis_update_mpf_t<i_t, f_t>& ft,
+                                      const std::vector<i_t>& basic_list,
+                                      const std::vector<i_t>& nonbasic_list,
+                                      std::vector<f_t>& y,
+                                      std::vector<f_t>& z,
+                                      f_t& work_estimate);
 }  // namespace phase2
 
 }  // namespace cuopt::mathematical_optimization::simplex

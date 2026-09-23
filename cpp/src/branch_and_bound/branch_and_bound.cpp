@@ -6,6 +6,8 @@
 /* clang-format on */
 
 #include <branch_and_bound/branch_and_bound.hpp>
+#include <branch_and_bound/bad_node_dump.hpp>
+#include <branch_and_bound/gpu_node_pool.hpp>
 #include <branch_and_bound/diving_heuristics.hpp>
 #include <branch_and_bound/mip_node.hpp>
 #include <branch_and_bound/pseudo_costs.hpp>
@@ -40,6 +42,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <list>
 #include <string>
@@ -77,6 +80,81 @@ using simplex::variable_status_t;
 using simplex::variable_type_t;
 
 namespace {
+
+// GPU-pool host processing temporarily borrows the owning CPU worker's LP scratch. Preserve the
+// cached state only when the CPU was going to reuse it for a plunge child; otherwise the next CPU
+// solve was already going to reconstruct that state.
+template <typename i_t, typename f_t>
+class worker_lp_continuation_guard_t {
+ public:
+  explicit worker_lp_continuation_guard_t(branch_and_bound_worker_t<i_t, f_t>& worker)
+    : worker_(worker),
+      restore_basis_(!worker.recompute_basis),
+      restore_bounds_(!worker.recompute_bounds),
+      recompute_basis_(worker.recompute_basis),
+      recompute_bounds_(worker.recompute_bounds),
+      host_basis_stale_(worker.host_basis_stale),
+      had_orbital_fixing_(worker.orbital_fixing != nullptr)
+  {
+    if (restore_basis_) {
+      basis_factors_ = std::make_unique<basis_update_mpf_t<i_t, f_t>>(worker.basis_factors);
+      basic_list_    = worker.basic_list;
+      nonbasic_list_ = worker.nonbasic_list;
+    }
+    if (restore_bounds_) {
+      lower_ = worker.leaf_problem.lower;
+      upper_ = worker.leaf_problem.upper;
+      if (had_orbital_fixing_) {
+        orbital_fixing_ =
+          std::make_unique<orbital_fixing_t<i_t, f_t>>(*worker.orbital_fixing);
+      }
+    }
+  }
+
+  ~worker_lp_continuation_guard_t()
+  {
+    if (restore_basis_) {
+      worker_.basis_factors = *basis_factors_;
+      worker_.basic_list    = std::move(basic_list_);
+      worker_.nonbasic_list = std::move(nonbasic_list_);
+    }
+    if (restore_bounds_) {
+      worker_.leaf_problem.lower = std::move(lower_);
+      worker_.leaf_problem.upper = std::move(upper_);
+      if (had_orbital_fixing_) {
+        if (worker_.orbital_fixing == nullptr) {
+          worker_.orbital_fixing =
+            std::make_unique<orbital_fixing_t<i_t, f_t>>(*orbital_fixing_);
+        } else {
+          *worker_.orbital_fixing = *orbital_fixing_;
+        }
+      } else {
+        worker_.orbital_fixing.reset();
+      }
+    }
+    worker_.host_basis_stale = host_basis_stale_;
+    worker_.recompute_basis  = recompute_basis_;
+    worker_.recompute_bounds = recompute_bounds_;
+  }
+
+  worker_lp_continuation_guard_t(const worker_lp_continuation_guard_t&)            = delete;
+  worker_lp_continuation_guard_t& operator=(const worker_lp_continuation_guard_t&) = delete;
+
+ private:
+  branch_and_bound_worker_t<i_t, f_t>& worker_;
+  bool restore_basis_;
+  bool restore_bounds_;
+  bool recompute_basis_;
+  bool recompute_bounds_;
+  bool host_basis_stale_;
+  bool had_orbital_fixing_;
+  std::unique_ptr<basis_update_mpf_t<i_t, f_t>> basis_factors_;
+  std::vector<i_t> basic_list_;
+  std::vector<i_t> nonbasic_list_;
+  std::vector<f_t> lower_;
+  std::vector<f_t> upper_;
+  std::unique_ptr<orbital_fixing_t<i_t, f_t>> orbital_fixing_;
+};
 
 template <typename f_t>
 bool is_fractional(f_t x, variable_type_t var_type, f_t integer_tol)
@@ -335,6 +413,10 @@ f_t branch_and_bound_t<i_t, f_t>::get_lower_bound()
       if (bfs_worker_pool_[i]->is_active) {
         lower_bound = std::min(lower_bound, bfs_worker_pool_[i]->lower_bound.load());
         lower_bound = std::min(lower_bound, bfs_worker_pool_[i]->node_queue.get_lower_bound());
+        if (i < static_cast<i_t>(gpu_batch_pools_.size()) &&
+            gpu_batch_pools_[i] != nullptr && gpu_batch_pools_[i]->busy) {
+          lower_bound = std::min(lower_bound, gpu_batch_pools_[i]->lower_bound.load());
+        }
       }
     }
   }
@@ -1000,6 +1082,54 @@ branch_direction_t martin_criteria(f_t val, f_t root_val)
   }
 }
 
+// Rebuild `worker->basis_factors` so it describes `worker->leaf_vstatus` again, and report whether
+// it worked.
+//
+// WHY. A GPU solve pivots the DEVICE's own copy of the factorization and hands back only the final
+// vstatus, so the worker's copy still describes whatever basis the last CPU solve left. Strong
+// branching consumes that factorization DIRECTLY and deliberately does not rebuild it
+// (`initialize_basis = false`, pseudo_costs.cpp:503; then `b_transpose_solve` at :105 and
+// `child_basis_factors = basis_factors` at :504), so handing it a stale one aborts the solver on
+// `triangle_solve.cpp:116  assert(b.n == m)`.
+//
+// `host_basis_stale` alone does not cover this: it is consumed by the NEXT LP solve and by
+// `recompute_basis`, both of which run AFTER variable selection. Hence a rebuild here.
+//
+// COST. One LU (~0.15 ms measured), paid only on nodes that actually strong branch -- reliability
+// branching already restricts that to unreliable variables. The alternative, shipping the device's
+// basis and MPF stack back, moves 0.4-1.6 MB per node over a link that is already the upload
+// bottleneck, and hands strong branching a stack degraded by up to 256 updates immediately before it
+// runs up to 500 more iterations on top of it.
+template <typename i_t, typename f_t>
+static bool refresh_stale_basis(branch_and_bound_worker_t<i_t, f_t>* worker,
+                                const simplex::simplex_solver_settings_t<i_t, f_t>& settings)
+{
+  const i_t m = worker->leaf_problem.num_rows;
+  const i_t n = worker->leaf_problem.num_cols;
+
+  // `get_basis_from_vstatus` INDEXES basic_list but PUSH_BACKS into the other two. These vectors
+  // live for the whole solve, so they must be reset first or they grow by (n-m) on every call and
+  // every consumer that reads the first n-m entries silently sees an older basis forever after.
+  std::vector<i_t> superbasic_list;
+  worker->basic_list.assign(static_cast<size_t>(m), 0);
+  worker->nonbasic_list.clear();
+  worker->nonbasic_list.reserve(static_cast<size_t>(n - m));
+  simplex::get_basis_from_vstatus<i_t>(
+    m, worker->leaf_vstatus, worker->basic_list, worker->nonbasic_list, superbasic_list);
+
+  const int rc = worker->basis_factors.refactor_basis(worker->leaf_problem.A,
+                                                      settings,
+                                                      worker->leaf_problem.lower,
+                                                      worker->leaf_problem.upper,
+                                                      tic(),
+                                                      worker->basic_list,
+                                                      worker->nonbasic_list,
+                                                      worker->leaf_vstatus);
+  if (rc != 0) { return false; }   // singular / repaired basis
+  worker->host_basis_stale = false;
+  return true;
+}
+
 template <typename i_t, typename f_t>
 branch_variable_t<i_t> branch_and_bound_t<i_t, f_t>::variable_selection(
   mip_node_t<i_t, f_t>* node_ptr,
@@ -1015,16 +1145,20 @@ branch_variable_t<i_t> branch_and_bound_t<i_t, f_t>::variable_selection(
   switch (worker->search_strategy) {
     case search_strategy_t::BEST_FIRST:
 
-      if (settings_.reliability_branching != 0) {
-        branch_var = worker->pseudo_costs.reliable_variable_selection(node_ptr,
-                                                                      fractional,
-                                                                      worker,
-                                                                      var_types_,
-                                                                      exploration_stats_,
-                                                                      upper_bound_,
-                                                                      bfs_worker_pool_.num_idle(),
-                                                                      new_slacks_,
-                                                                      original_lp_);
+      // Strong branching trial-solves from worker->basis_factors without rebuilding it, so that
+      // factorization has to match the current basis before we get here. After a GPU solve it does
+      // not -- see refresh_stale_basis above.
+      if (settings_.reliability_branching != 0 &&
+          (!worker->host_basis_stale || refresh_stale_basis(worker, settings_))) {
+        branch_var = pc_.reliable_variable_selection(node_ptr,
+                                                     fractional,
+                                                     worker,
+                                                     var_types_,
+                                                     exploration_stats_,
+                                                     upper_bound_,
+                                                     bfs_worker_pool_.num_idle(),
+                                                     new_slacks_,
+                                                     original_lp_);
       } else {
         branch_var = worker->pseudo_costs.variable_selection(fractional, solution);
       }
@@ -1468,7 +1602,7 @@ std::pair<node_status_t, branch_direction_t> branch_and_bound_t<i_t, f_t>::updat
       assert(dir != branch_direction_t::NONE);
 
       policy.update_objective_estimate(node_ptr, leaf_fractional, leaf_solution.x);
-      worker->recompute_basis  = false;
+      worker->recompute_basis  = worker->host_basis_stale;
       worker->recompute_bounds = false;
 
       logger_t log;
@@ -1565,9 +1699,11 @@ dual_status_t branch_and_bound_t<i_t, f_t>::solve_node_lp(
   branch_and_bound_worker_t<i_t, f_t>* worker,
   branch_and_bound_stats_t<i_t, f_t>& stats,
   logger_t& log,
-  int64_t iter_limit)
+  int64_t iter_limit,
+  i_t* completed_iterations)
 {
   raft::common::nvtx::range scope("BB::solve_node");
+  if (completed_iterations != nullptr) { *completed_iterations = -1; }
 #ifdef DEBUG_BRANCHING
   i_t num_integer_variables = 0;
   for (i_t j = 0; j < original_lp_.num_cols; j++) {
@@ -1664,9 +1800,93 @@ dual_status_t branch_and_bound_t<i_t, f_t>::solve_node_lp(
       i_t node_iter     = 0;
       f_t lp_start_time = tic();
 
-      lp_status = dual_phase2_with_advanced_basis(2,
+      // TEST PATH (CUOPT_BNB_GPU_SERIAL=1): solve this node on the GPU as a batch of one,
+      // synchronously, instead of on the CPU. Deliberately serial -- it isolates whether the GPU LP
+      // agrees with the CPU one, without the pool's batching and stealing perturbing the search.
+      // MAIN TREE ONLY. A sub-MIP is a different problem -- its own reduced matrix, its own row and
+      // column counts -- solved by a nested branch_and_bound_t as a primal heuristic. The pool
+      // uploads ONE matrix per device and has every seat share it, so a sub-MIP node cannot use it,
+      // and offloading it would mean a second resident problem per device.
+      bool solved_on_gpu = false;
+      // Kept so a rejected GPU answer can be re-solved from the basis the node ARRIVED with. The
+      // device writes its final basis into leaf_vstatus, and warm-starting the CPU fallback from a
+      // basis the device reached while going wrong is both slower and not what a CPU-only run does.
+      std::vector<variable_status_t> vstatus_before_gpu;
+      if (!node_ptr->cpu_only && gpu_serial_enabled() && lp_settings.inside_submip == 0) {
+        vstatus_before_gpu = worker->leaf_vstatus;
+        solved_on_gpu      = gpu_solve_node_serial<i_t, f_t>(worker->leaf_problem,
+                                                        Arow_,
+                                                        var_types_,
+                                                        lp_settings,
+                                                        worker->leaf_problem.lower,
+                                                        worker->leaf_problem.upper,
+                                                        worker->leaf_vstatus,
+                                                        worker->basic_list,
+                                                        worker->nonbasic_list,
+                                                        worker->leaf_solution,
+                                                        worker->leaf_edge_norms,
+                                                        node_iter,
+                                                        lp_status);
+        if (solved_on_gpu) {
+          // The device pivoted its OWN copy of the factorization, so worker->basis_factors no longer
+          // matches worker->leaf_vstatus. Recorded on the worker rather than just setting
+          // recompute_basis here, because plunge_with overwrites recompute_basis from the node
+          // status AFTER we return -- setting it here alone is silently undone for any node that
+          // has children.
+          worker->host_basis_stale = true;
+
+          // NEVER FATHOM ON A DEVICE INFEASIBILITY CERTIFICATE.
+          //
+          // DUAL_UNBOUNDED means "this LP is infeasible", and branch-and-bound answers it by pruning
+          // the whole subtree -- so a single false one loses the optimum, silently. The device runs
+          // the minimal driver on a warp, whose reductions reassociate, and on a degenerate LP that
+          // is enough to empty the ratio test's eligible set one pivot early. Measured on csched008:
+          // 4 of 63 node solves came back DUAL_UNBOUNDED where BOTH CPU drivers return OPTIMAL, and
+          // the resulting run reported "no integer feasible solution" for a problem whose optimum
+          // the CPU finds. Re-solve those on the CPU and let the full driver decide.
+          //
+          // NUMERICAL is rejected for a different reason: it must never reach on_numerical_issue,
+          // which does fetch_min(lower_bound_numerical_, node->lower_bound) into a value that is
+          // never reset, clamping the reported dual bound for the rest of the solve. It is also the
+          // device's normal answer when a node needs more than the MPF update cap (256) of pivots.
+          // CUTOFF is rejected for the same reason as DUAL_UNBOUNDED: it fathoms. The device stops
+          // as soon as its iterate's objective reaches settings.cut_off, which is only sound while
+          // that objective is a LOWER bound on the node's optimum -- true for a dual simplex holding
+          // a dual-feasible basis, by weak duality. Measured on nexp-150-20-8-5 it is not always
+          // true: the device cut off at obj = 430.31 against cut_off = 282.0 on a node whose true
+          // optimum is 41.64, i.e. it fathomed a subtree that could still improve the incumbent. The
+          // iterate had lost the invariant the test depends on; root cause still open. Until it is
+          // found, do not fathom on the device's word.
+          //
+          // Cost is small: CUTOFF is rare (1 of 334 solves on nexp, 4 of 239 on mcsched), so this
+          // buys correctness for a CPU re-solve on well under 2% of nodes.
+          if (lp_status == dual_status_t::DUAL_UNBOUNDED ||
+              lp_status == dual_status_t::NUMERICAL ||
+              lp_status == dual_status_t::CUTOFF) {
+            solved_on_gpu       = false;
+            worker->leaf_vstatus = vstatus_before_gpu;   // re-solve from the basis the node arrived with
+          }
+        }
+      }
+
+      if (!solved_on_gpu) {
+        // A GPU solve leaves worker->basis_factors describing some earlier basis, so the driver has
+        // to refactorize here even when the plunge would otherwise have reused it.
+        const bool initialize_basis = worker->recompute_basis || worker->host_basis_stale;
+        if (initialize_basis) { worker->host_basis_stale = false; }
+        // DIAGNOSTIC (CUOPT_BNB_ENSIZE_TRACE=1): the column count and carried-edge-norm length the
+        // node solve actually runs on. Used to explain why a dumped edge_norms.txt can be a
+        // different length from a dumped child LP.
+        static const bool ensize_trace = std::getenv("CUOPT_BNB_ENSIZE_TRACE") != nullptr;
+        if (ensize_trace) {
+          std::fprintf(stderr, "[ENSIZE] submip=%d depth=%d leaf_n=%d en=%d orig_n=%d\n",
+                       (int)settings_.inside_submip, (int)node_ptr->depth,
+                       (int)worker->leaf_problem.num_cols, (int)worker->leaf_edge_norms.size(),
+                       (int)original_lp_.num_cols);
+        }
+        lp_status = dual_phase2_with_advanced_basis(2,
                                                   0,
-                                                  worker->recompute_basis,
+                                                  initialize_basis,
                                                   lp_start_time,
                                                   worker->leaf_problem,
                                                   lp_settings,
@@ -1677,6 +1897,7 @@ dual_status_t branch_and_bound_t<i_t, f_t>::solve_node_lp(
                                                   worker->leaf_solution,
                                                   node_iter,
                                                   worker->leaf_edge_norms);
+      }
 
       if (lp_status == dual_status_t::NUMERICAL) {
         log.debug_format("Numerical issue node {}. Resolving from scratch.\n", node_ptr->node_id);
@@ -1696,6 +1917,7 @@ dual_status_t branch_and_bound_t<i_t, f_t>::solve_node_lp(
 
       stats.total_lp_solve_time += toc(lp_start_time);
       stats.total_simplex_iters += node_iter;
+      if (completed_iterations != nullptr) { *completed_iterations = node_iter; }
     }
   }
 
@@ -1704,6 +1926,790 @@ dual_status_t branch_and_bound_t<i_t, f_t>::solve_node_lp(
 #endif
 
   return lp_status;
+}
+
+// Count and log a CPU takeback: the device returned a certificate we never trust, so the node goes
+// back to the CPU full driver. Production rule (plan §3a), not the temporary recheck gate.
+// CUOPT_BNB_GPU_TAKEBACK_TRACE=1 prints every occurrence; the totals are always reported.
+template <typename i_t, typename f_t>
+void branch_and_bound_t<i_t, f_t>::record_gpu_takeback(simplex::dual_status_t st,
+                                                       const mip_node_t<i_t, f_t>* node_ptr,
+                                                       i_t node_iter,
+                                                       const char* where)
+{
+  using simplex::dual_status_t;
+  // One bucket per status, and an explicit `other`. The final `else` used to be a catch-all that
+  // incremented the CUTOFF bucket, so once ITERATION_LIMIT started being handed back it was reported
+  // as `cutoff=N` on a build where CUTOFF is TRUSTED and can never be handed back -- a diagnostic
+  // that contradicted the code it was describing.
+  if (st == dual_status_t::DUAL_UNBOUNDED) {
+    ++gpu_takeback_dual_unbounded_;
+  } else if (st == dual_status_t::NUMERICAL) {
+    ++gpu_takeback_numerical_;
+  } else if (st == dual_status_t::CUTOFF) {
+    ++gpu_takeback_cutoff_;
+  } else if (st == dual_status_t::ITERATION_LIMIT) {
+    ++gpu_takeback_iter_limit_;
+  } else {
+    ++gpu_takeback_other_;
+  }
+  static const bool trace = std::getenv("CUOPT_BNB_GPU_TAKEBACK_TRACE") != nullptr;
+  if (trace) {
+    std::fprintf(stderr,
+                 "[GPUTAKEBACK] %s status=%s node=%d depth=%d leg_iters=%d explored=%lld\n",
+                 where, simplex::dual_status_to_string(st).c_str(),
+                 node_ptr != nullptr ? (int)node_ptr->node_id : -1,
+                 node_ptr != nullptr ? (int)node_ptr->depth : -1,
+                 (int)node_iter,
+                 (long long)exploration_stats_.nodes_explored.load());
+  }
+}
+
+template <typename i_t, typename f_t>
+simplex_solver_settings_t<i_t, f_t>
+branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_settings(
+  const bfs_worker_t<i_t, f_t>* worker)
+{
+  simplex_solver_settings_t<i_t, f_t> result = settings_;
+  result.set_log(false);
+  f_t cutoff = upper_bound_.load();
+  if (worker->leaf_problem.objective_step.has_step()) {
+    const f_t step = worker->leaf_problem.objective_step.step_size;
+    const f_t bias = worker->leaf_problem.objective_step.bias;
+    const f_t k    = std::floor((cutoff - bias) / step + settings_.integer_tol);
+    result.cut_off = (k - 1) * step + bias + settings_.dual_tol;
+  } else if (worker->leaf_problem.objective_is_integral) {
+    result.cut_off = std::floor(cutoff + settings_.integer_tol) - 1 + settings_.dual_tol;
+  } else {
+    result.cut_off = cutoff + settings_.dual_tol;
+  }
+  result.concurrent_halt = &node_concurrent_halt_;
+  result.inside_mip      = 2;
+  result.time_limit      = settings_.time_limit - toc(exploration_stats_.start_time);
+  result.scale_columns   = false;
+  result.iteration_limit = gpu_batch_iter_limit();
+  if (gpu_pool_refac_freq() > 0) { result.refactor_frequency = gpu_pool_refac_freq(); }
+  return result;
+}
+
+template <typename i_t, typename f_t>
+void branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_update_lower_bound(
+  const bfs_worker_t<i_t, f_t>* worker)
+{
+  if (worker == nullptr || worker->worker_id < 0 ||
+      worker->worker_id >= static_cast<i_t>(gpu_batch_pools_.size())) {
+    return;
+  }
+  auto& pool = *gpu_batch_pools_[worker->worker_id];
+  f_t bound  = std::numeric_limits<f_t>::infinity();
+  for (const auto& context : pool.ctx) {
+    if (context.node != nullptr) { bound = std::min(bound, context.node->lower_bound); }
+  }
+  pool.lower_bound = bound;
+}
+
+template <typename i_t, typename f_t>
+bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_prepare_fresh(
+  bfs_worker_t<i_t, f_t>* worker,
+  mip_node_t<i_t, f_t>* node,
+  gpu_batch_node_t<i_t, f_t>& batch_node,
+  gpu_seat_ctx_t<i_t, f_t>& seat_ctx)
+{
+  assert(worker != nullptr);
+  assert(node != nullptr);
+  worker->recompute_bounds = true;
+  worker->recompute_basis  = true;
+  decompress_vstatus(node->packed_vstatus, worker->leaf_problem.num_cols, worker->leaf_vstatus);
+  worker->leaf_edge_norms = worker->root_edge_norm;
+  worker->ensure_orbital_fixing();
+
+  bool feasible = worker->set_lp_variable_bounds(node, settings_);
+  if (worker->orbital_fixing != nullptr) { worker->orbital_fixing->reset(symmetry_, node); }
+  if (feasible) { feasible = apply_symmetry_reductions(node, worker, exploration_stats_); }
+  if (!feasible) {
+    ++exploration_stats_.nodes_since_last_log;
+    ++exploration_stats_.nodes_explored;
+    --exploration_stats_.nodes_unexplored;
+    update_tree(node, search_tree_, worker, dual_status_t::DUAL_UNBOUNDED, settings_.log);
+    return false;
+  }
+
+  batch_node.settings = nondeterministic_gpu_pool_settings(worker);
+  batch_node.lower    = worker->leaf_problem.lower;
+  batch_node.upper    = worker->leaf_problem.upper;
+  batch_node.vstatus  = worker->leaf_vstatus;
+  batch_node.dy_se    = worker->leaf_edge_norms;
+  seat_ctx            = gpu_seat_ctx_t<i_t, f_t>{node, {}, {}, 0, true};
+  return true;
+}
+
+template <typename i_t, typename f_t>
+void branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_finish(
+  bfs_worker_t<i_t, f_t>* worker)
+{
+  if (worker == nullptr || worker->worker_id < 0 ||
+      worker->worker_id >= static_cast<i_t>(gpu_batch_pools_.size())) {
+    return;
+  }
+  auto& pool = *gpu_batch_pools_[worker->worker_id];
+  if (pool.device >= 0) { cudaSetDevice(pool.device); }
+  if (pool.run != nullptr) {
+    if (gpu_pool_logging()) {
+      const auto metrics = gpu_batch_run_get_metrics<i_t, f_t>(pool.run);
+      pool.upload_s += metrics.upload_s;
+      pool.kernel_s += metrics.kernel_s;
+      pool.copyback_s += metrics.copyback_s;
+      pool.host_factor_s += metrics.host_factor_s;
+    }
+    gpu_batch_run_end<i_t, f_t>(pool.run);
+    pool.run = nullptr;
+  }
+  // Publish ownership in the CPU heap before withdrawing the pool's bound.
+  for (size_t seat = pool.ctx.size(); seat > 0; --seat) {
+    if (pool.ctx[seat - 1].node != nullptr) {
+      worker->node_queue.push_atomic(pool.ctx[seat - 1].node);
+      pool.ctx[seat - 1].node = nullptr;
+    }
+  }
+  pool.lower_bound    = std::numeric_limits<f_t>::infinity();
+  pool.pending.clear();
+  pool.done.clear();
+  pool.batch.clear();
+  pool.ctx.clear();
+  pool.seat_state.clear();
+  pool.busy = false;
+  if (gpu_pool_logging()) {
+    ++pool.drains;
+    pool.available_since_s = toc(exploration_stats_.start_time);
+  }
+}
+
+template <typename i_t, typename f_t>
+bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_start(
+  bfs_worker_t<i_t, f_t>* worker)
+{
+  if (worker == nullptr || settings_.inside_submip != 0 || worker->worker_id < 0 ||
+      worker->worker_id >= static_cast<i_t>(gpu_batch_pools_.size())) {
+    return false;
+  }
+  auto& pool = *gpu_batch_pools_[worker->worker_id];
+  if (pool.busy || pool.disabled || pool.device < 0 || pool.seats <= 0) { return false; }
+  if (worker->node_queue.best_first_queue_size() < pool.seats) { return false; }
+  i_t iteration_p90 = 0;
+  if (!pool.iteration_gate_allows(gpu_batch_iter_limit(), iteration_p90)) { return false; }
+  if (cudaSetDevice(pool.device) != cudaSuccess) {
+    cudaGetLastError();
+    pool.disabled = true;
+    if (gpu_pool_logging()) {
+      ++pool.device_errors;
+      ++pool.allocation_disables;
+      settings_.log.printf("[GPUPOOL-ERROR] worker=%d gpu=%d operation=cudaSetDevice\n",
+                           (int)worker->worker_id,
+                           pool.device);
+    }
+    return false;
+  }
+
+  const bool telemetry = gpu_pool_logging();
+  const double prepare_t0 = telemetry ? tic() : 0.0;
+  worker_lp_continuation_guard_t<i_t, f_t> preserve_cpu_continuation(*worker);
+
+  pool.pending.clear();
+  pool.done.clear();
+  pool.batch.clear();
+  pool.ctx.clear();
+  pool.busy       = true;
+  pool.lower_bound = worker->node_queue.get_lower_bound();
+
+  while (static_cast<i_t>(pool.batch.size()) < pool.seats) {
+    mip_node_t<i_t, f_t>* node = worker->node_queue.pop_gpu_eligible();
+    if (node == nullptr) {
+      if (telemetry) { ++pool.refill_shortfalls; }
+      nondeterministic_gpu_pool_finish(worker);
+      return false;
+    }
+    if (node->lower_bound > upper_bound_.load()) {
+      search_tree_.graphviz_node(settings_.log, node, "cutoff", node->lower_bound);
+      search_tree_.update(node, node_status_t::FATHOMED);
+      --exploration_stats_.nodes_unexplored;
+      continue;
+    }
+
+    gpu_batch_node_t<i_t, f_t> batch_node(worker->leaf_problem.num_rows,
+                                           worker->leaf_problem.num_cols);
+    gpu_seat_ctx_t<i_t, f_t> seat_ctx;
+    if (!nondeterministic_gpu_pool_prepare_fresh(worker, node, batch_node, seat_ctx)) { continue; }
+    pool.batch.push_back(std::move(batch_node));
+    pool.ctx.push_back(std::move(seat_ctx));
+  }
+
+  nondeterministic_gpu_pool_update_lower_bound(worker);
+  ++gpu_batch_cycles_;
+  gpu_batch_stolen_ += static_cast<int64_t>(pool.batch.size());
+  if (telemetry) {
+    const double now = toc(exploration_stats_.start_time);
+    const double wait = std::max(0.0, now - pool.available_since_s);
+    pool.activation_wait_s += wait;
+    pool.activation_wait_max_s = std::max(pool.activation_wait_max_s, wait);
+    ++pool.activation_samples;
+    ++pool.starts;
+    pool.accounted_upload_s = 0.0;
+    pool.accounted_kernel_s = 0.0;
+    pool.host_service_s += toc(prepare_t0);
+    settings_.log.printf(
+      "[GPUPOOL-START] worker=%d gpu=%d seats=%d p90=%d threshold=%lld wait=%.6f queue=%zu\n",
+      (int)worker->worker_id,
+      pool.device,
+      pool.seats,
+      (int)iteration_p90,
+      (long long)((9LL * static_cast<int64_t>(gpu_batch_iter_limit())) / 10LL),
+      wait,
+      worker->node_queue.best_first_queue_size());
+  }
+  return nondeterministic_gpu_pool_step(worker, false);
+}
+
+template <typename i_t, typename f_t>
+bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_fill_fresh_seat(
+  bfs_worker_t<i_t, f_t>* worker, i_t seat)
+{
+  auto& pool = *gpu_batch_pools_[worker->worker_id];
+  while (solver_status_ == mip_status_t::UNSET && is_running_) {
+    // Publish the queue's current minimum before transferring ownership out of it. Keeping the
+    // lower value temporarily is conservative; missing the popped node even briefly is not.
+    pool.lower_bound = std::min(pool.lower_bound.load(), worker->node_queue.get_lower_bound());
+    mip_node_t<i_t, f_t>* node = worker->node_queue.pop_gpu_eligible();
+    if (node == nullptr) {
+      if (gpu_pool_logging()) { ++pool.refill_shortfalls; }
+      return false;
+    }
+    if (node->lower_bound > upper_bound_.load()) {
+      search_tree_.graphviz_node(settings_.log, node, "cutoff", node->lower_bound);
+      search_tree_.update(node, node_status_t::FATHOMED);
+      --exploration_stats_.nodes_unexplored;
+      continue;
+    }
+
+    gpu_batch_node_t<i_t, f_t> batch_node(worker->leaf_problem.num_rows,
+                                           worker->leaf_problem.num_cols);
+    gpu_seat_ctx_t<i_t, f_t> seat_ctx;
+    if (!nondeterministic_gpu_pool_prepare_fresh(worker, node, batch_node, seat_ctx)) { continue; }
+    pool.batch[seat] = std::move(batch_node);
+    pool.ctx[seat]   = std::move(seat_ctx);
+    nondeterministic_gpu_pool_update_lower_bound(worker);
+    return true;
+  }
+  return false;
+}
+
+template <typename i_t, typename f_t>
+dual_status_t branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_install_result(
+  bfs_worker_t<i_t, f_t>* worker,
+  mip_node_t<i_t, f_t>* node,
+  gpu_batch_node_t<i_t, f_t>& batch_node,
+  bool& gpu_answer_accepted)
+{
+  dual_status_t accepted_status = batch_node.status;
+  gpu_answer_accepted           = true;
+  worker->leaf_problem.lower    = batch_node.lower;
+  worker->leaf_problem.upper    = batch_node.upper;
+
+  std::vector<variable_status_t> accepted_vstatus = batch_node.vstatus;
+  std::vector<i_t> accepted_basic                 = batch_node.basic_list;
+  std::vector<i_t> accepted_nonbasic              = batch_node.nonbasic_list;
+  lp_solution_t<i_t, f_t> accepted_solution       = batch_node.sol;
+  std::vector<f_t> accepted_edge_norms            = batch_node.dy_se;
+  i_t accepted_iterations                         = batch_node.iters;
+
+  if (gpu_pool_recheck()) {
+    basis_update_mpf_t<i_t, f_t> cpu_factor(worker->leaf_problem.num_rows,
+                                             batch_node.settings.refactor_frequency);
+    std::vector<variable_status_t> cpu_vstatus = batch_node.vstatus_uploaded;
+    std::vector<i_t> cpu_basic(worker->leaf_problem.num_rows), cpu_nonbasic;
+    lp_solution_t<i_t, f_t> cpu_solution(worker->leaf_problem.num_rows,
+                                          worker->leaf_problem.num_cols);
+    std::vector<f_t> cpu_edge_norms = batch_node.dy_se_at_launch;
+    i_t cpu_iterations             = 0;
+    const dual_status_t cpu_status = dual_phase2_with_advanced_basis<i_t, f_t>(
+      2,
+      0,
+      true,
+      tic(),
+      worker->leaf_problem,
+      batch_node.settings,
+      cpu_vstatus,
+      cpu_factor,
+      cpu_basic,
+      cpu_nonbasic,
+      cpu_solution,
+      cpu_iterations,
+      cpu_edge_norms);
+
+    bool cpu_decided = false;
+    bool obj_differs = false;
+    const bool decision_differs = gpu_decision_differs<i_t, f_t>(batch_node.status,
+                                                                  cpu_status,
+                                                                  batch_node.sol.objective,
+                                                                  cpu_solution.objective,
+                                                                  batch_node.settings.cut_off,
+                                                                  cpu_decided,
+                                                                  obj_differs);
+    if (cpu_decided && (decision_differs || obj_differs)) {
+      if (decision_differs) { ++gpu_batch_corrected_decision_; }
+      else { ++gpu_batch_corrected_obj_; }
+      settings_.log.printf(
+        "[GPUPOOL-MISMATCH] node=%d %s gpu=%s/%.17g cpu=%s/%.17g\n",
+        (int)node->node_id,
+        decision_differs ? "DECISION" : "OBJECTIVE",
+        dual_status_to_string(batch_node.status).c_str(),
+        batch_node.sol.objective,
+        dual_status_to_string(cpu_status).c_str(),
+        cpu_solution.objective);
+      accepted_status     = cpu_status;
+      accepted_vstatus    = std::move(cpu_vstatus);
+      accepted_basic      = std::move(cpu_basic);
+      accepted_nonbasic   = std::move(cpu_nonbasic);
+      accepted_solution   = std::move(cpu_solution);
+      accepted_edge_norms = std::move(cpu_edge_norms);
+      accepted_iterations = cpu_iterations;
+      gpu_answer_accepted = false;
+    } else {
+      ++gpu_batch_agreed_;
+    }
+  }
+
+  worker->leaf_vstatus      = std::move(accepted_vstatus);
+  worker->basic_list        = std::move(accepted_basic);
+  worker->nonbasic_list     = std::move(accepted_nonbasic);
+  worker->leaf_solution     = std::move(accepted_solution);
+  worker->leaf_edge_norms   = std::move(accepted_edge_norms);
+  worker->host_basis_stale  = true;
+  worker->recompute_basis   = true;
+  worker->recompute_bounds  = true;
+  ++gpu_batch_hits_;
+  exploration_stats_.total_simplex_iters += accepted_iterations;
+  return accepted_status;
+}
+
+template <typename i_t, typename f_t>
+bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_ready(
+  const bfs_worker_t<i_t, f_t>* worker) const
+{
+  if (worker == nullptr || worker->worker_id < 0 ||
+      worker->worker_id >= static_cast<i_t>(gpu_batch_pools_.size())) {
+    return false;
+  }
+  const auto& pool = *gpu_batch_pools_[worker->worker_id];
+  return pool.busy && (pool.run == nullptr || gpu_batch_run_ready<i_t, f_t>(pool.run));
+}
+
+template <typename i_t, typename f_t>
+bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
+  bfs_worker_t<i_t, f_t>* worker, bool may_block)
+{
+  assert(worker != nullptr);
+  auto& pool  = *gpu_batch_pools_[worker->worker_id];
+  auto& batch = pool.batch;
+  auto& ctx   = pool.ctx;
+  const i_t nseats = static_cast<i_t>(batch.size());
+  if (!pool.busy || nseats == 0 || ctx.size() != batch.size()) {
+    nondeterministic_gpu_pool_finish(worker);
+    return false;
+  }
+  if (pool.device >= 0 && cudaSetDevice(pool.device) != cudaSuccess) {
+    cudaGetLastError();
+    pool.disabled = true;
+    if (gpu_pool_logging()) {
+      ++pool.device_errors;
+      ++pool.allocation_disables;
+      settings_.log.printf("[GPUPOOL-ERROR] worker=%d gpu=%d operation=cudaSetDevice\n",
+                           (int)worker->worker_id,
+                           pool.device);
+    }
+    nondeterministic_gpu_pool_finish(worker);
+    return false;
+  }
+  if (solver_status_ != mip_status_t::UNSET || !is_running_ ||
+      settings_.time_limit - toc(exploration_stats_.start_time) <= 0.0) {
+    nondeterministic_gpu_pool_finish(worker);
+    return false;
+  }
+
+  // A nonblocking poll of an in-flight launch does not borrow or modify the CPU worker scratch.
+  // Check readiness before snapshotting a reusable CPU continuation: copying the factorization on
+  // every not-ready poll defeats CPU/GPU overlap and can dominate the B&B worker's runtime.
+  if (pool.run != nullptr && !may_block && !gpu_batch_run_ready<i_t, f_t>(pool.run)) { return true; }
+
+  const bool telemetry = gpu_pool_logging();
+  const double service_t0 = telemetry ? tic() : 0.0;
+  scope_guard service_timer([&]() {
+    if (telemetry) { pool.host_service_s += toc(service_t0); }
+  });
+  worker_lp_continuation_guard_t<i_t, f_t> preserve_cpu_continuation(*worker);
+
+  using drop_t = typename gpu_batch_node_t<i_t, f_t>::drop_t;
+  auto count_drop = [&](i_t seat) {
+    const int reason = static_cast<int>(batch[seat].drop);
+    if (batch[seat].drop != drop_t::NONE && reason >= 0 &&
+        reason < static_cast<int>(gpu_batch_drops_.size())) {
+      ++gpu_batch_drops_[reason];
+    }
+  };
+  auto return_cpu_only = [&](i_t seat, dual_status_t reason, const char* where) {
+    mip_node_t<i_t, f_t>* node = ctx[seat].node;
+    if (node == nullptr) { return; }
+    count_drop(seat);
+    node->cpu_only = true;
+    worker->node_queue.push_atomic(node);
+    ctx[seat].node = nullptr;
+    ++gpu_batch_rejected_;
+    if (telemetry) { ++pool.cpu_only_nodes; }
+    record_gpu_takeback(reason, node, batch[seat].iters, where);
+  };
+  auto record_terminal = [&](dual_status_t status, i_t iterations) {
+    if (!telemetry) { return; }
+    ++pool.terminal_nodes;
+    pool.terminal_pivots += static_cast<uint64_t>(std::max<i_t>(iterations, 0));
+    if (status == dual_status_t::OPTIMAL) {
+      ++pool.optimal_nodes;
+    } else if (status == dual_status_t::CUTOFF) {
+      ++pool.cutoff_nodes;
+    } else if (status == dual_status_t::DUAL_UNBOUNDED) {
+      ++pool.dual_unbounded_nodes;
+    } else if (status == dual_status_t::NUMERICAL) {
+      ++pool.numerical_nodes;
+      ++pool.unhealthy_nodes;
+      pool.unhealthy_pivots += static_cast<uint64_t>(std::max<i_t>(iterations, 0));
+    } else if (status == dual_status_t::ITERATION_LIMIT) {
+      ++pool.iteration_limit_nodes;
+      ++pool.unhealthy_nodes;
+      pool.unhealthy_pivots += static_cast<uint64_t>(std::max<i_t>(iterations, 0));
+    } else {
+      ++pool.other_terminal_nodes;
+    }
+  };
+  auto fresh_factor_failure = [&](i_t seat) {
+    return batch[seat].drop == drop_t::FACTORIZE_FILL ||
+           batch[seat].drop == drop_t::SIZE_CONTRACT;
+  };
+  auto resume_failure = [&](i_t seat) {
+    return batch[seat].status == dual_status_t::ITERATION_LIMIT ||
+           batch[seat].drop == drop_t::FACTORIZE_RESUME ||
+           batch[seat].drop == drop_t::DUAL_INFEASIBLE_RESUME ||
+           batch[seat].drop == drop_t::LIVELOCK;
+  };
+
+  if (pool.run == nullptr) {
+    for (auto& node : batch) { node.settings = nondeterministic_gpu_pool_settings(worker); }
+    double launch_t0 = telemetry ? tic() : 0.0;
+    pool.run = gpu_persistent_batch_begin<i_t, f_t>(
+      worker->leaf_problem, batch, pool.stream.view(), pool.ro_cache, &pool.seat_state);
+
+    while (pool.run == nullptr) {
+      bool replaced = false;
+      bool failed   = false;
+      for (i_t seat = 0; seat < static_cast<i_t>(batch.size()); ++seat) {
+        if (!fresh_factor_failure(seat)) { continue; }
+        if (telemetry) {
+          ++pool.preparation_failures;
+          record_terminal(dual_status_t::NUMERICAL, batch[seat].iters);
+        }
+        return_cpu_only(seat, dual_status_t::NUMERICAL, "nondet-pool-initial-factor");
+        if (!nondeterministic_gpu_pool_fill_fresh_seat(worker, seat)) {
+          failed = true;
+          break;
+        }
+        replaced = true;
+      }
+      if (failed) {
+        nondeterministic_gpu_pool_finish(worker);
+        return false;
+      }
+      if (!replaced) { break; }
+      launch_t0 = telemetry ? tic() : 0.0;
+      pool.run = gpu_persistent_batch_begin<i_t, f_t>(
+        worker->leaf_problem, batch, pool.stream.view(), pool.ro_cache, &pool.seat_state);
+    }
+
+    if (pool.run == nullptr && batch.size() > 1 && !pool.halved) {
+      const size_t keep = batch.size() / 2;
+      for (size_t seat = keep; seat < ctx.size(); ++seat) {
+        if (ctx[seat].node != nullptr) { worker->node_queue.push_atomic(ctx[seat].node); }
+      }
+      batch.erase(batch.begin() + static_cast<std::ptrdiff_t>(keep), batch.end());
+      ctx.erase(ctx.begin() + static_cast<std::ptrdiff_t>(keep), ctx.end());
+      pool.seats  = static_cast<int>(keep);
+      pool.halved = true;
+      if (telemetry) { ++pool.allocation_halvings; }
+      nondeterministic_gpu_pool_update_lower_bound(worker);
+      launch_t0 = telemetry ? tic() : 0.0;
+      pool.run = gpu_persistent_batch_begin<i_t, f_t>(
+        worker->leaf_problem, batch, pool.stream.view(), pool.ro_cache, &pool.seat_state);
+    }
+    if (pool.run == nullptr) {
+      pool.disabled = true;
+      if (telemetry) {
+        ++pool.allocation_disables;
+        settings_.log.printf(
+          "[GPUPOOL-ERROR] worker=%d gpu=%d operation=initial-launch action=disable\n",
+          (int)worker->worker_id,
+          pool.device);
+      }
+      nondeterministic_gpu_pool_finish(worker);
+      return false;
+    }
+    ++gpu_batch_launches_;
+    gpu_batch_launched_ += static_cast<int64_t>(batch.size());
+    if (telemetry) {
+      ++pool.launches;
+      pool.launch_started_at = launch_t0;
+    }
+    if (!may_block) { return true; }
+  }
+
+  const bool ready_before_harvest = gpu_batch_run_ready<i_t, f_t>(pool.run);
+  const double harvest_t0 = telemetry ? tic() : 0.0;
+  if (!gpu_persistent_batch_harvest<i_t, f_t>(pool.run)) {
+    if (telemetry) {
+      ++pool.harvest_errors;
+      settings_.log.printf("[GPUPOOL-ERROR] worker=%d gpu=%d operation=harvest\n",
+                           (int)worker->worker_id,
+                           pool.device);
+    }
+    settings_.log.printf("[GPUPOOL] worker %d: harvest failed; draining to CPU\n",
+                         (int)worker->worker_id);
+    nondeterministic_gpu_pool_finish(worker);
+    return false;
+  }
+  if (telemetry) {
+    const double harvest_wall = toc(harvest_t0);
+    if (!ready_before_harvest) { pool.host_blocked_s += harvest_wall; }
+    const auto metrics = gpu_batch_run_get_metrics<i_t, f_t>(pool.run);
+    const double upload = std::max(0.0, metrics.upload_s - pool.accounted_upload_s);
+    const double kernel = std::max(0.0, metrics.kernel_s - pool.accounted_kernel_s);
+    const double flight_wall = pool.launch_started_at > 0.0 ? toc(pool.launch_started_at) : 0.0;
+    const double notice = std::max(0.0, flight_wall - upload - kernel);
+    pool.completion_notice_s += notice;
+    pool.completion_notice_max_s = std::max(pool.completion_notice_max_s, notice);
+    pool.accounted_upload_s = metrics.upload_s;
+    pool.accounted_kernel_s = metrics.kernel_s;
+  }
+
+  enum class next_t : unsigned char { FRESH, REFACTOR, CHILD };
+  std::vector<next_t> next(batch.size(), next_t::FRESH);
+  std::vector<std::vector<gds::gpu_bound_delta<i_t, f_t>>> deltas(batch.size());
+  i_t fresh_required = 0;
+  const int max_plunge = gpu_pool_plunge_depth();
+
+  for (i_t seat = 0; seat < static_cast<i_t>(batch.size()); ++seat) {
+    if (batch[seat].status == dual_status_t::REFACTOR_NEEDED) {
+      next[seat] = next_t::REFACTOR;
+      continue;
+    }
+    if (batch[seat].status == dual_status_t::NUMERICAL ||
+        batch[seat].status == dual_status_t::ITERATION_LIMIT) {
+      const dual_status_t reason = batch[seat].status;
+      record_terminal(reason, batch[seat].iters);
+      pool.record_completed_iterations(batch[seat].iters);
+      return_cpu_only(seat, reason, "nondet-pool-terminal");
+      ++fresh_required;
+      continue;
+    }
+
+    mip_node_t<i_t, f_t>* node = ctx[seat].node;
+    if (node == nullptr) {
+      ++fresh_required;
+      continue;
+    }
+    const std::vector<f_t> resident_lower = batch[seat].lower;
+    const std::vector<f_t> resident_upper = batch[seat].upper;
+    const std::vector<variable_status_t> resident_vstatus = batch[seat].vstatus;
+    const std::vector<f_t> resident_edge_norms = batch[seat].dy_se;
+    const f_t resident_objective = batch[seat].sol.objective;
+
+    record_terminal(batch[seat].status, batch[seat].iters);
+    pool.record_completed_iterations(batch[seat].iters);
+
+    bool gpu_answer_accepted = false;
+    const dual_status_t lp_status = nondeterministic_gpu_pool_install_result(
+      worker, node, batch[seat], gpu_answer_accepted);
+    ++exploration_stats_.nodes_since_last_log;
+    ++exploration_stats_.nodes_explored;
+    --exploration_stats_.nodes_unexplored;
+    auto [node_status, round_dir] =
+      update_tree(node, search_tree_, worker, lp_status, settings_.log);
+    ctx[seat].node = nullptr;
+
+    bool child_installed = false;
+    if (node_status == node_status_t::HAS_CHILDREN) {
+      exploration_stats_.nodes_unexplored += 2;
+      mip_node_t<i_t, f_t>* preferred = round_dir == branch_direction_t::UP
+                                          ? node->get_up_child()
+                                          : node->get_down_child();
+      mip_node_t<i_t, f_t>* sibling = round_dir == branch_direction_t::UP
+                                        ? node->get_down_child()
+                                        : node->get_up_child();
+
+      const bool parent_state_matches =
+        gpu_answer_accepted && worker->leaf_vstatus == resident_vstatus &&
+        worker->leaf_problem.lower == resident_lower &&
+        worker->leaf_problem.upper == resident_upper &&
+        std::memcmp(&worker->leaf_solution.objective, &resident_objective, sizeof(f_t)) == 0;
+      if (parent_state_matches && ctx[seat].plunge_depth < max_plunge) {
+        gpu_batch_node_t<i_t, f_t> child(worker->leaf_problem.num_rows,
+                                         worker->leaf_problem.num_cols);
+        child.settings = nondeterministic_gpu_pool_settings(worker);
+        child.lower    = resident_lower;
+        child.upper    = resident_upper;
+        std::fill(worker->bounds_changed.begin(), worker->bounds_changed.end(), false);
+        preferred->update_branched_variable_bounds(
+          child.lower, child.upper, worker->bounds_changed);
+        bool feasible = worker->node_presolver.bounds_strengthening(
+          child.settings, worker->bounds_changed, child.lower, child.upper);
+        if (feasible) {
+          worker->leaf_problem.lower = child.lower;
+          worker->leaf_problem.upper = child.upper;
+          feasible = apply_symmetry_reductions(preferred, worker, exploration_stats_);
+          child.lower = worker->leaf_problem.lower;
+          child.upper = worker->leaf_problem.upper;
+        }
+        if (feasible) {
+          decompress_vstatus(
+            preferred->packed_vstatus, worker->leaf_problem.num_cols, child.vstatus);
+          child.dy_se = resident_edge_norms;
+          if (child.vstatus == resident_vstatus) {
+            auto& child_deltas = deltas[seat];
+            child_deltas.reserve(static_cast<size_t>(worker->leaf_problem.num_cols));
+            for (i_t j = 0; j < worker->leaf_problem.num_cols; ++j) {
+              unsigned char mask = 0;
+              if (std::memcmp(&resident_lower[j], &child.lower[j], sizeof(f_t)) != 0) { mask |= 1u; }
+              if (std::memcmp(&resident_upper[j], &child.upper[j], sizeof(f_t)) != 0) { mask |= 2u; }
+              if (mask != 0) { child_deltas.push_back({j, child.lower[j], child.upper[j], mask}); }
+            }
+            pool.batch[seat] = std::move(child);
+            pool.ctx[seat]   = gpu_seat_ctx_t<i_t, f_t>{preferred,
+                                                       resident_lower,
+                                                       resident_upper,
+                                                       ctx[seat].plunge_depth + 1,
+                                                       true};
+            next[seat]       = next_t::CHILD;
+            child_installed  = true;
+            ++gpu_batch_plunged_;
+            worker->node_queue.push_atomic(sibling);
+          }
+        }
+      }
+      if (!child_installed) {
+        worker->node_queue.push_atomic(preferred);
+        worker->node_queue.push_atomic(sibling);
+      }
+    }
+
+    if (!child_installed) { ++fresh_required; }
+  }
+
+  // The owner ran out of CPU work and failed to steal. Harvest this generation, but retire the
+  // pool even if it produced children: those nodes now continue through the ordinary CPU heap.
+  if (may_block) {
+    nondeterministic_gpu_pool_finish(worker);
+    return false;
+  }
+
+  if (solver_status_ != mip_status_t::UNSET || !is_running_ ||
+      worker->node_queue.best_first_queue_size() < fresh_required) {
+    nondeterministic_gpu_pool_finish(worker);
+    return false;
+  }
+  for (i_t seat = 0; seat < static_cast<i_t>(batch.size()); ++seat) {
+    if (next[seat] == next_t::FRESH &&
+        !nondeterministic_gpu_pool_fill_fresh_seat(worker, seat)) {
+      nondeterministic_gpu_pool_finish(worker);
+      return false;
+    }
+  }
+
+  std::string stage_error;
+  for (i_t seat = 0; seat < static_cast<i_t>(batch.size()); ++seat) {
+    batch[seat].settings = nondeterministic_gpu_pool_settings(worker);
+    if (next[seat] != next_t::FRESH) { continue; }
+    while (!gpu_persistent_batch_stage_fresh<i_t, f_t>(pool.run, seat, stage_error)) {
+      if (!fresh_factor_failure(seat)) {
+        if (telemetry) { ++pool.fill_errors; }
+        nondeterministic_gpu_pool_finish(worker);
+        return false;
+      }
+      if (telemetry) {
+        ++pool.preparation_failures;
+        record_terminal(dual_status_t::NUMERICAL, batch[seat].iters);
+      }
+      return_cpu_only(seat, dual_status_t::NUMERICAL, "nondet-pool-fresh-factor");
+      if (!nondeterministic_gpu_pool_fill_fresh_seat(worker, seat)) {
+        nondeterministic_gpu_pool_finish(worker);
+        return false;
+      }
+      stage_error.clear();
+    }
+  }
+  for (i_t seat = 0; seat < static_cast<i_t>(batch.size()); ++seat) {
+    if (next[seat] != next_t::REFACTOR) { continue; }
+    if (gpu_persistent_batch_stage_refactor<i_t, f_t>(pool.run, seat, stage_error)) { continue; }
+    if (!resume_failure(seat)) {
+      if (telemetry) { ++pool.relaunch_errors; }
+      nondeterministic_gpu_pool_finish(worker);
+      return false;
+    }
+    const dual_status_t reason = batch[seat].status == dual_status_t::ITERATION_LIMIT
+                                   ? dual_status_t::ITERATION_LIMIT
+                                   : dual_status_t::NUMERICAL;
+    if (telemetry) {
+      ++pool.preparation_failures;
+      record_terminal(reason, batch[seat].iters);
+    }
+    pool.record_completed_iterations(batch[seat].iters);
+    return_cpu_only(seat, reason, "nondet-pool-resume-factor");
+    if (!nondeterministic_gpu_pool_fill_fresh_seat(worker, seat)) {
+      nondeterministic_gpu_pool_finish(worker);
+      return false;
+    }
+    stage_error.clear();
+    if (!gpu_persistent_batch_stage_fresh<i_t, f_t>(pool.run, seat, stage_error)) {
+      nondeterministic_gpu_pool_finish(worker);
+      return false;
+    }
+  }
+  for (i_t seat = 0; seat < static_cast<i_t>(batch.size()); ++seat) {
+    if (next[seat] == next_t::CHILD &&
+        !gpu_persistent_batch_stage_child<i_t, f_t>(
+          pool.run, seat, deltas[seat], stage_error)) {
+      if (telemetry) { ++pool.relaunch_errors; }
+      nondeterministic_gpu_pool_finish(worker);
+      return false;
+    }
+  }
+
+  nondeterministic_gpu_pool_update_lower_bound(worker);
+  const double relaunch_t0 = telemetry ? tic() : 0.0;
+  if (!gpu_persistent_batch_relaunch<i_t, f_t>(pool.run, stage_error)) {
+    if (telemetry) {
+      ++pool.relaunch_errors;
+      settings_.log.printf("[GPUPOOL-ERROR] worker=%d gpu=%d operation=relaunch detail=%s\n",
+                           (int)worker->worker_id,
+                           pool.device,
+                           stage_error.empty() ? "unknown" : stage_error.c_str());
+    }
+    settings_.log.printf("[GPUPOOL] worker %d: %s; draining to CPU\n",
+                         (int)worker->worker_id,
+                         stage_error.empty() ? "relaunch failed" : stage_error.c_str());
+    nondeterministic_gpu_pool_finish(worker);
+    return false;
+  }
+  ++gpu_batch_launches_;
+  gpu_batch_launched_ += static_cast<int64_t>(batch.size());
+  if (telemetry) {
+    ++pool.launches;
+    pool.launch_started_at = relaunch_t0;
+  }
+  return true;
 }
 
 template <typename i_t, typename f_t>
@@ -1740,8 +2746,24 @@ void branch_and_bound_t<i_t, f_t>::plunge_with(bfs_worker_t<i_t, f_t>* worker,
       launch_diving_worker(worker);
     }
 
+    // Recursively launching a new worker until the worker pool is full
     if (bfs_worker_pool_.num_idle() > 0 && worker->node_queue.best_first_queue_size() > 0) {
       launch_bfs_worker(worker);
+    }
+
+    if (worker->worker_id >= 0 &&
+        worker->worker_id < static_cast<i_t>(gpu_batch_pools_.size())) {
+      auto& pool = *gpu_batch_pools_[worker->worker_id];
+      i_t iteration_p90 = 0;
+      const bool iteration_gate = pool.iteration_gate_allows(gpu_batch_iter_limit(), iteration_p90);
+      if (!pool.busy && !pool.disabled && pool.seats > 0 &&
+          iteration_gate &&
+          gpu_pool_should_engage(worker->node_queue.best_first_queue_size(), pool.seats)) {
+        if (nondeterministic_gpu_pool_start(worker)) { continue; }
+      } else if (pool.busy && nondeterministic_gpu_pool_ready(worker)) {
+        nondeterministic_gpu_pool_step(worker, false);
+        continue;
+      }
     }
 
     assert(stack.size() <= 2);
@@ -1819,11 +2841,39 @@ void branch_and_bound_t<i_t, f_t>::plunge_with(bfs_worker_t<i_t, f_t>* worker,
       break;
     }
 
+    // Start of the node processing and LP solving
     decompress_vstatus(
       node_ptr->packed_vstatus, worker->leaf_problem.num_cols, worker->leaf_vstatus);
     assert(worker->leaf_vstatus.size() == worker->leaf_problem.num_cols);
-
-    dual_status_t lp_status = solve_node_lp(node_ptr, worker, exploration_stats_, settings_.log);
+    gpu_batch_pool_t<i_t, f_t>* active_pool = nullptr;
+    bool overlaps_gpu = false;
+    double overlap_t0 = 0.0;
+    if (worker->worker_id >= 0 &&
+        worker->worker_id < static_cast<i_t>(gpu_batch_pools_.size())) {
+      active_pool = gpu_batch_pools_[worker->worker_id].get();
+      overlaps_gpu = active_pool != nullptr && active_pool->busy && active_pool->run != nullptr &&
+                     !gpu_batch_run_ready<i_t, f_t>(active_pool->run);
+      if (overlaps_gpu && gpu_pool_logging()) { overlap_t0 = tic(); }
+    }
+    i_t completed_iterations = -1;
+    dual_status_t lp_status = solve_node_lp(node_ptr,
+                                            worker,
+                                            exploration_stats_,
+                                            settings_.log,
+                                            std::numeric_limits<i_t>::max(),
+                                            &completed_iterations);
+    if (active_pool != nullptr && completed_iterations >= 0 &&
+        lp_status != dual_status_t::TIME_LIMIT &&
+        lp_status != dual_status_t::CONCURRENT_LIMIT) {
+      active_pool->record_completed_iterations(completed_iterations);
+    }
+    if (overlaps_gpu) {
+      ++gpu_batch_overlap_nodes_;
+      if (gpu_pool_logging()) {
+        ++active_pool->cpu_overlap_nodes;
+        active_pool->cpu_overlap_s += toc(overlap_t0);
+      }
+    }
     ++exploration_stats_.nodes_since_last_log;
     ++exploration_stats_.nodes_explored;
     --exploration_stats_.nodes_unexplored;
@@ -1848,9 +2898,12 @@ void branch_and_bound_t<i_t, f_t>::plunge_with(bfs_worker_t<i_t, f_t>* worker,
     auto [node_status, round_dir] =
       update_tree(node_ptr, search_tree_, worker, lp_status, settings_.log);
 
-    worker->recompute_basis  = node_status != node_status_t::HAS_CHILDREN;
+    worker->recompute_basis =
+      (node_status != node_status_t::HAS_CHILDREN) || worker->host_basis_stale;
     worker->recompute_bounds = node_status != node_status_t::HAS_CHILDREN;
 
+    // In the context of plunging we favor the children of the current node over the siblings
+    // We already know if we should plunge on the up or down child
     if (node_status == node_status_t::HAS_CHILDREN) {
       if (can_launch_new_submip) {
         can_launch_new_submip = !launch_submip_worker(worker->leaf_solution.x);
@@ -1997,7 +3050,7 @@ void branch_and_bound_t<i_t, f_t>::best_first_search_with(bfs_worker_t<i_t, f_t>
   worker->update_diving_heuristic_list(diving_settings);
 
   while (solver_status_ == mip_status_t::UNSET && abs_gap > settings_.absolute_mip_gap_tol &&
-         rel_gap > settings_.relative_mip_gap_tol && node_queue.best_first_queue_size() > 0) {
+         rel_gap > settings_.relative_mip_gap_tol) {
     if (submip_halt_callback_) {
       // Stops the solver if the callback returns "true". This happens when the lower bound
       // in the sub-MIP solve is greater than the upper bound of the main solve (this can
@@ -2023,12 +3076,6 @@ void branch_and_bound_t<i_t, f_t>::best_first_search_with(bfs_worker_t<i_t, f_t>
       break;
     }
 
-    if (received_halt_signal()) {
-      solver_status_        = mip_status_t::HALT;
-      node_concurrent_halt_ = true;
-      break;
-    }
-
     // If the guided diving was disabled previously due to the lack of an incumbent solution,
     // re-enable as soon as a new incumbent is found.
     if (diving_worker_pool_.size() > 0 && settings_.diving_settings.guided_diving != 0 &&
@@ -2042,6 +3089,26 @@ void branch_and_bound_t<i_t, f_t>::best_first_search_with(bfs_worker_t<i_t, f_t>
     if (toc(exploration_stats_.start_time) > settings_.time_limit) {
       solver_status_ = mip_status_t::TIME_LIMIT;
       break;
+    }
+
+    if (node_queue.best_first_queue_size() == 0) {
+      work_stealing(worker);
+      if (node_queue.best_first_queue_size() == 0) {
+        const bool has_pool = worker->worker_id >= 0 &&
+                              worker->worker_id < static_cast<i_t>(gpu_batch_pools_.size()) &&
+                              gpu_batch_pools_[worker->worker_id] != nullptr &&
+                              gpu_batch_pools_[worker->worker_id]->busy;
+        if (has_pool) {
+          nondeterministic_gpu_pool_step(worker, true);
+          lower_bound = get_lower_bound();
+          user_obj    = compute_user_objective(worker->leaf_problem, upper_bound_.load());
+          user_lower  = compute_user_objective(worker->leaf_problem, lower_bound);
+          abs_gap     = compute_user_abs_gap(worker->leaf_problem, upper_bound_.load(), lower_bound);
+          rel_gap     = user_relative_gap(user_obj, user_lower);
+          if (node_queue.best_first_queue_size() > 0) { continue; }
+        }
+        break;
+      }
     }
 
     // Pre-emptively set the lower bound of the worker
@@ -2082,6 +3149,16 @@ void branch_and_bound_t<i_t, f_t>::best_first_search_with(bfs_worker_t<i_t, f_t>
     node_concurrent_halt_ = 1;
   }
 
+  // Global termination does not consume a result that landed after the stop decision. Wait for the
+  // non-preemptible launch, return every still-owned node to the CPU heap, then withdraw the pool
+  // lower bound. Normal heap starvation was handled inside the loop and harvested first.
+  if (worker->worker_id >= 0 &&
+      worker->worker_id < static_cast<i_t>(gpu_batch_pools_.size()) &&
+      gpu_batch_pools_[worker->worker_id] != nullptr &&
+      gpu_batch_pools_[worker->worker_id]->busy) {
+    nondeterministic_gpu_pool_finish(worker);
+  }
+
   // If the worker has still nodes in the queue (this can happen if it was stopped due to
   // time limit, small gap or other reason), then do not add back to the pool to avoid
   // constantly trying to start it again
@@ -2091,7 +3168,11 @@ void branch_and_bound_t<i_t, f_t>::best_first_search_with(bfs_worker_t<i_t, f_t>
 
   // We explored the entire tree and no worker is running. Set is_running_ to false to stop
   // the submip.
-  if (exploration_stats_.nodes_unexplored == 0 &&
+  bool any_gpu_pool_active = false;
+  for (const auto& pool : gpu_batch_pools_) {
+    any_gpu_pool_active = any_gpu_pool_active || (pool != nullptr && pool->busy);
+  }
+  if (exploration_stats_.nodes_unexplored == 0 && !any_gpu_pool_active &&
       bfs_worker_pool_.num_idle() == bfs_worker_pool_.size()) {
     is_running_ = false;
   }
@@ -4127,6 +5208,8 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
                                  num_bfs_workers + num_submip_workers);
       }
 
+      initialize_nondeterministic_gpu_pools(num_bfs_workers);
+
       bfs_worker_t<i_t, f_t>* initial_worker = bfs_worker_pool_.pop_idle_worker();
       node_queue_t<i_t, f_t>& node_queue     = initial_worker->node_queue;
       node_queue.push_lockfree(search_tree_.root.get_down_child());
@@ -4136,6 +5219,57 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
       best_first_search_with(initial_worker);
     }
   }  // Implicit barrier for all tasks created within the group (RINS, B&B workers)
+
+  if (!settings_.deterministic && gpu_batch_seats() != 0) {
+    log_nondeterministic_gpu_pool_telemetry();
+    settings_.log.printf(
+      "[GPUBATCH] launches=%ld seats_sent=%ld | consumed=%ld agreed=%ld corrected_decision=%ld "
+      "corrected_obj=%ld rejected=%ld stale_bounds=%ld absent=%ld\n"
+      "[GPUBATCH] cycles=%ld stolen=%ld no_seat=%ld (fathom=%ld strengthen_infeas=%ld deadline=%ld)"
+      " plunged=%ld overlap_cpu_nodes=%ld plunge_stop_heap=%ld\n",
+      (long)gpu_batch_launches_.load(),
+      (long)gpu_batch_launched_.load(),
+      (long)gpu_batch_hits_.load(),
+      (long)gpu_batch_agreed_.load(),
+      (long)gpu_batch_corrected_decision_.load(),
+      (long)gpu_batch_corrected_obj_.load(),
+      (long)gpu_batch_rejected_.load(),
+      (long)gpu_batch_stale_.load(),
+      (long)gpu_batch_absent_.load(),
+      (long)gpu_batch_cycles_.load(),
+      (long)gpu_batch_stolen_.load(),
+      (long)gpu_batch_noseat_.load(),
+      (long)gpu_batch_noseat_fathom_.load(),
+      (long)gpu_batch_noseat_infeas_.load(),
+      (long)gpu_batch_noseat_time_.load(),
+      (long)gpu_batch_plunged_.load(),
+      (long)gpu_batch_overlap_nodes_.load(),
+      (long)gpu_batch_plunge_stop_heap_.load());
+    settings_.log.printf(
+      "[GPUBATCH] seat drops: factorize_fill=%ld size_contract=%ld factorize_resume=%ld "
+      "livelock=%ld launch_failed=%ld dual_infeasible_resume=%ld | deadline=%ld "
+      "concurrent_halt=%ld\n",
+      (long)gpu_batch_drops_[1].load(),
+      (long)gpu_batch_drops_[2].load(),
+      (long)gpu_batch_drops_[3].load(),
+      (long)gpu_batch_drops_[4].load(),
+      (long)gpu_batch_drops_[5].load(),
+      (long)gpu_batch_drops_[6].load(),
+      (long)gpu_batch_drops_[7].load(),
+      (long)gpu_batch_drops_[8].load());
+    settings_.log.printf(
+      "[GPUBATCH] cpu takebacks: dual_unbounded=%ld numerical=%ld cutoff=%ld iter_limit=%ld "
+      "other=%ld | total=%ld\n",
+      (long)gpu_takeback_dual_unbounded_.load(),
+      (long)gpu_takeback_numerical_.load(),
+      (long)gpu_takeback_cutoff_.load(),
+      (long)gpu_takeback_iter_limit_.load(),
+      (long)gpu_takeback_other_.load(),
+      (long)(gpu_takeback_dual_unbounded_.load() + gpu_takeback_numerical_.load() +
+             gpu_takeback_cutoff_.load() + gpu_takeback_iter_limit_.load() +
+             gpu_takeback_other_.load()));
+  }
+  if (!settings_.deterministic) { destroy_nondeterministic_gpu_pools(); }
 
   is_running_ = false;
   settings_.log.printf("\n");
@@ -4301,6 +5435,249 @@ global pseudocosts are broadcast to the worker's pseudocost snapshots for the co
 */
 
 template <typename i_t, typename f_t>
+void branch_and_bound_t<i_t, f_t>::initialize_nondeterministic_gpu_pools(i_t num_bfs_workers)
+{
+  if (gpu_batch_seats() == 0 || settings_.inside_submip != 0) { return; }
+
+  destroy_nondeterministic_gpu_pools();
+  const std::vector<int> devmap = gpu_pool_device_map(num_bfs_workers);
+  int previous_device          = 0;
+  cudaGetDevice(&previous_device);
+  std::unordered_map<int, gds::gpu_ro_cache<i_t, f_t>*> ro_by_device;
+  std::unordered_map<int, i_t> workers_by_device;
+  std::unordered_map<int, i_t> next_worker_on_device;
+  for (int device : devmap) {
+    if (device >= 0) { ++workers_by_device[device]; }
+  }
+
+  // In nondeterministic B&B a positive CUOPT_BNB_GPU_BATCH is a PER-DEVICE target, not a
+  // per-worker multiplier. `auto` computes that target independently on each GPU from occupancy
+  // and free VRAM. Split the resulting target once, before any task starts, so round-robin worker
+  // assignment cannot change it (6/5 workers means 6 or 5 q/r slices, respectively). This is also
+  // important for the single-GPU test override: 10 means ten seats shared with heuristics, not ten
+  // seats for each of eight workers.
+  const i_t configured_seats = gpu_batch_seats();
+  std::unordered_map<int, i_t> seats_by_device;
+  for (const auto& entry : workers_by_device) {
+    const int device = entry.first;
+    seats_by_device[device] =
+      configured_seats > 0
+        ? configured_seats
+        : gpu_batch_auto_seats(device,
+                               original_lp_.num_rows,
+                               original_lp_.num_cols,
+                               original_lp_.A.nnz());
+  }
+
+  for (i_t worker_id = 0; worker_id < num_bfs_workers; ++worker_id) {
+    const int device = worker_id < static_cast<i_t>(devmap.size()) ? devmap[worker_id] : -1;
+    if (device >= 0) { cudaSetDevice(device); }
+
+    gpu_batch_pools_.emplace_back(std::make_unique<gpu_batch_pool_t<i_t, f_t>>());
+    auto& pool       = *gpu_batch_pools_.back();
+    pool.device      = device;
+    pool.available_since_s = toc(exploration_stats_.start_time);
+    if (device >= 0) {
+      const i_t workers = workers_by_device[device];
+      const i_t ordinal = next_worker_on_device[device]++;
+      const i_t seats = seats_by_device[device];
+      pool.seats = seats / workers + (ordinal < seats % workers ? 1 : 0);
+    }
+    pool.lower_bound = std::numeric_limits<f_t>::infinity();
+
+    if (device < 0) { continue; }
+    auto it = ro_by_device.find(device);
+    if (it == ro_by_device.end()) {
+      auto* cache = gds::gpu_ro_cache_create<i_t, f_t>();
+      gpu_ro_caches_.push_back(cache);
+      it = ro_by_device.emplace(device, cache).first;
+    }
+    pool.ro_cache = it->second;
+  }
+  cudaSetDevice(previous_device);
+
+  std::string split;
+  for (const auto& [device, count] : gpu_pool_device_load(devmap)) {
+    split += (split.empty() ? "" : " ") + std::string("gpu") + std::to_string(device) + ":" +
+             std::to_string(count);
+  }
+  if (split.empty()) { split = "none"; }
+  std::string device_seats;
+  for (const auto& [device, seats] : seats_by_device) {
+    device_seats += (device_seats.empty() ? "" : " ") + std::string("gpu") +
+                    std::to_string(device) + ":" + std::to_string(seats);
+  }
+  if (device_seats.empty()) { device_seats = "none"; }
+  std::string worker_seats;
+  for (i_t worker_id = 0; worker_id < static_cast<i_t>(gpu_batch_pools_.size()); ++worker_id) {
+    const auto& pool = gpu_batch_pools_[worker_id];
+    worker_seats += (worker_seats.empty() ? "" : " ") + std::string("w") +
+                    std::to_string(worker_id) + ":" +
+                    std::to_string(pool != nullptr ? pool->seats : 0);
+  }
+  settings_.log.print_format(
+    "[CONFIG] GPU batch pool: mode={} device_seats=[{}] across {} BFS workers, "
+    "worker_seats=[{}], cpu_recheck={}, plunge_depth={}, "
+    "async_overlap=1, pool_async=1, heap_factor={}, iter_limit={}, "
+    "iteration_gate=last64_p90_below_90pct, telemetry={}, pools_per_gpu=[{}], "
+    "bnb_mode=nondeterministic\n",
+    configured_seats > 0 ? "fixed" : "auto",
+    device_seats,
+    num_bfs_workers,
+    worker_seats,
+    gpu_pool_recheck() ? 1 : 0,
+    gpu_pool_plunge_depth(),
+    gpu_pool_heap_factor(),
+    gpu_batch_iter_limit(),
+    gpu_pool_logging() ? 1 : 0,
+    split);
+}
+
+template <typename i_t, typename f_t>
+void branch_and_bound_t<i_t, f_t>::destroy_nondeterministic_gpu_pools()
+{
+  for (auto& pool : gpu_batch_pools_) {
+    if (pool != nullptr) { pool->stream.synchronize(); }
+  }
+  for (auto* cache : gpu_ro_caches_) {
+    if (cache != nullptr) { gds::gpu_ro_cache_destroy<i_t, f_t>(cache); }
+  }
+  gpu_ro_caches_.clear();
+  gpu_batch_pools_.clear();
+}
+
+template <typename i_t, typename f_t>
+void branch_and_bound_t<i_t, f_t>::log_nondeterministic_gpu_pool_telemetry()
+{
+  if (!gpu_pool_logging()) { return; }
+
+  struct device_stats_t {
+    uint64_t workers{0}, seats{0}, starts{0}, launches{0}, nodes{0}, pivots{0};
+    uint64_t unhealthy_nodes{0}, unhealthy_pivots{0}, cpu_only{0}, overlap_nodes{0};
+    uint64_t errors{0}, shortfalls{0}, preparation_failures{0};
+    uint64_t halvings{0}, disables{0}, activation_samples{0};
+    double wait_s{0.0}, wait_max_s{0.0}, overlap_s{0.0};
+    double upload_s{0.0}, kernel_s{0.0}, copyback_s{0.0}, factor_s{0.0};
+    double service_s{0.0}, blocked_s{0.0}, notice_s{0.0}, notice_max_s{0.0};
+  };
+  std::unordered_map<int, device_stats_t> devices;
+
+  for (i_t worker_id = 0; worker_id < static_cast<i_t>(gpu_batch_pools_.size()); ++worker_id) {
+    const auto& ptr = gpu_batch_pools_[worker_id];
+    if (ptr == nullptr || ptr->device < 0) { continue; }
+    const auto& pool = *ptr;
+    i_t p90 = -1;
+    const bool gate_open = pool.iteration_gate_allows(gpu_batch_iter_limit(), p90);
+    const uint64_t errors = pool.fill_errors + pool.harvest_errors + pool.relaunch_errors +
+                            pool.device_errors;
+    const double host_other = std::max(0.0,
+      pool.host_service_s - pool.host_blocked_s - pool.upload_s - pool.copyback_s -
+      pool.host_factor_s);
+    const double unhealthy_node_pct = pool.terminal_nodes == 0
+                                        ? 0.0
+                                        : 100.0 * static_cast<double>(pool.unhealthy_nodes) /
+                                            static_cast<double>(pool.terminal_nodes);
+    const double unhealthy_pivot_pct = pool.terminal_pivots == 0
+                                         ? 0.0
+                                         : 100.0 * static_cast<double>(pool.unhealthy_pivots) /
+                                             static_cast<double>(pool.terminal_pivots);
+    const double average_wait = pool.activation_samples == 0
+                                  ? 0.0
+                                  : pool.activation_wait_s /
+                                      static_cast<double>(pool.activation_samples);
+    settings_.log.printf(
+      "[GPUPOOL-WORKER] worker=%d gpu=%d seats=%d starts=%llu launches=%llu drains=%llu "
+      "history=%zu p90=%d gate=%d wait_avg=%.6f wait_max=%.6f\n",
+      (int)worker_id, pool.device, pool.seats, (unsigned long long)pool.starts,
+      (unsigned long long)pool.launches, (unsigned long long)pool.drains,
+      pool.recent_iteration_count, (int)p90, gate_open ? 1 : 0, average_wait,
+      pool.activation_wait_max_s);
+    settings_.log.printf(
+      "[GPUPOOL-WORKER] worker=%d terminal=%llu optimal=%llu cutoff=%llu unbounded=%llu "
+      "numerical=%llu iter_limit=%llu other=%llu pivots=%llu unhealthy_nodes=%.2f%% "
+      "unhealthy_pivots=%.2f%% cpu_only=%llu\n",
+      (int)worker_id, (unsigned long long)pool.terminal_nodes,
+      (unsigned long long)pool.optimal_nodes, (unsigned long long)pool.cutoff_nodes,
+      (unsigned long long)pool.dual_unbounded_nodes, (unsigned long long)pool.numerical_nodes,
+      (unsigned long long)pool.iteration_limit_nodes,
+      (unsigned long long)pool.other_terminal_nodes,
+      (unsigned long long)pool.terminal_pivots, unhealthy_node_pct, unhealthy_pivot_pct,
+      (unsigned long long)pool.cpu_only_nodes);
+    settings_.log.printf(
+      "[GPUPOOL-WORKER] worker=%d time upload=%.6f kernel=%.6f copyback=%.6f factor=%.6f "
+      "host_other=%.6f host_blocked=%.6f completion_notice=%.6f notice_max=%.6f "
+      "overlap_nodes=%llu overlap_time=%.6f errors=%llu refill_shortfalls=%llu "
+      "prep_failures=%llu halvings=%llu disables=%llu\n",
+      (int)worker_id, pool.upload_s, pool.kernel_s, pool.copyback_s, pool.host_factor_s,
+      host_other, pool.host_blocked_s, pool.completion_notice_s,
+      pool.completion_notice_max_s, (unsigned long long)pool.cpu_overlap_nodes,
+      pool.cpu_overlap_s, (unsigned long long)errors,
+      (unsigned long long)pool.refill_shortfalls,
+      (unsigned long long)pool.preparation_failures,
+      (unsigned long long)pool.allocation_halvings,
+      (unsigned long long)pool.allocation_disables);
+
+    auto& device = devices[pool.device];
+    ++device.workers;
+    device.seats += static_cast<uint64_t>(std::max(pool.seats, 0));
+    device.starts += pool.starts;
+    device.launches += pool.launches;
+    device.nodes += pool.terminal_nodes;
+    device.pivots += pool.terminal_pivots;
+    device.unhealthy_nodes += pool.unhealthy_nodes;
+    device.unhealthy_pivots += pool.unhealthy_pivots;
+    device.cpu_only += pool.cpu_only_nodes;
+    device.overlap_nodes += pool.cpu_overlap_nodes;
+    device.errors += errors;
+    device.shortfalls += pool.refill_shortfalls;
+    device.preparation_failures += pool.preparation_failures;
+    device.halvings += pool.allocation_halvings;
+    device.disables += pool.allocation_disables;
+    device.activation_samples += pool.activation_samples;
+    device.wait_s += pool.activation_wait_s;
+    device.wait_max_s = std::max(device.wait_max_s, pool.activation_wait_max_s);
+    device.overlap_s += pool.cpu_overlap_s;
+    device.upload_s += pool.upload_s;
+    device.kernel_s += pool.kernel_s;
+    device.copyback_s += pool.copyback_s;
+    device.factor_s += pool.host_factor_s;
+    device.service_s += pool.host_service_s;
+    device.blocked_s += pool.host_blocked_s;
+    device.notice_s += pool.completion_notice_s;
+    device.notice_max_s = std::max(device.notice_max_s, pool.completion_notice_max_s);
+  }
+
+  for (const auto& [gpu, device] : devices) {
+    const double host_other = std::max(0.0,
+      device.service_s - device.blocked_s - device.upload_s - device.copyback_s - device.factor_s);
+    const double wait_avg = device.activation_samples == 0
+                              ? 0.0
+                              : device.wait_s / static_cast<double>(device.activation_samples);
+    settings_.log.printf(
+      "[GPUPOOL-GPU] gpu=%d workers=%llu seats=%llu starts=%llu launches=%llu nodes=%llu "
+      "pivots=%llu unhealthy_nodes=%llu unhealthy_pivots=%llu cpu_only=%llu "
+      "wait_avg=%.6f wait_max=%.6f\n",
+      gpu, (unsigned long long)device.workers, (unsigned long long)device.seats,
+      (unsigned long long)device.starts, (unsigned long long)device.launches,
+      (unsigned long long)device.nodes, (unsigned long long)device.pivots,
+      (unsigned long long)device.unhealthy_nodes,
+      (unsigned long long)device.unhealthy_pivots, (unsigned long long)device.cpu_only,
+      wait_avg, device.wait_max_s);
+    settings_.log.printf(
+      "[GPUPOOL-GPU] gpu=%d time upload=%.6f kernel=%.6f copyback=%.6f factor=%.6f "
+      "host_other=%.6f host_blocked=%.6f completion_notice=%.6f notice_max=%.6f "
+      "overlap_nodes=%llu overlap_time=%.6f errors=%llu refill_shortfalls=%llu "
+      "prep_failures=%llu halvings=%llu disables=%llu\n",
+      gpu, device.upload_s, device.kernel_s, device.copyback_s, device.factor_s, host_other,
+      device.blocked_s, device.notice_s, device.notice_max_s,
+      (unsigned long long)device.overlap_nodes, device.overlap_s,
+      (unsigned long long)device.errors, (unsigned long long)device.shortfalls,
+      (unsigned long long)device.preparation_failures, (unsigned long long)device.halvings,
+      (unsigned long long)device.disables);
+  }
+}
+
+template <typename i_t, typename f_t>
 void branch_and_bound_t<i_t, f_t>::run_deterministic_coordinator(const csr_matrix_t<i_t, f_t>& Arow)
 {
   raft::common::nvtx::range scope("BB::deterministic_coordinator");
@@ -4385,6 +5762,91 @@ void branch_and_bound_t<i_t, f_t>::run_deterministic_coordinator(const csr_matri
     deterministic_broadcast_snapshots(*deterministic_diving_workers_, incumbent_snapshot);
   }
 
+  // One GPU batch pool per BFS worker, each with its own stream. Allocated here, after the worker
+  // count is known and before any worker starts, so no worker ever creates one on the fly.
+  if (gpu_batch_seats() > 0) {
+  // SHUTDOWN ORDER. Every worker's kernels run on its own pool stream, and the read-only block they
+  // read lives on the cache's stream. Nothing may be freed while a launch could still touch it, so:
+  // drain every pool stream first, then free the caches, then the pools. The caches own their own
+  // streams now, so this order is about IN-FLIGHT WORK, not about stream ownership.
+  for (auto& p : gpu_batch_pools_) {
+    if (p != nullptr) { p->stream.synchronize(); }
+  }
+    for (auto* c : gpu_ro_caches_) {
+      if (c != nullptr) { gds::gpu_ro_cache_destroy<i_t, f_t>(c); }
+    }
+    gpu_ro_caches_.clear();
+    gpu_batch_pools_.clear();
+    // #4 -- decide the whole pool->device assignment ONCE, here, where both inputs are known and no
+    // worker has started. Each pool's stream is then created ON its own device, which requires
+    // setting the current device first (per-thread state, and rmm::cuda_stream binds at construction).
+    const std::vector<int> devmap = gpu_pool_device_map(num_bfs_workers);
+    int prev_device = 0;
+    cudaGetDevice(&prev_device);
+    // ONE read-only cache per DEVICE, created here -- single-threaded, before any worker starts --
+    // so the pools can share it without any locking. Every pool on a device is solving nodes of the
+    // same MIP, so a per-pool cache held one identical copy of A per worker.
+    std::unordered_map<int, gds::gpu_ro_cache<i_t, f_t>*> ro_by_device;
+    for (int w = 0; w < num_bfs_workers; ++w) {
+      const int dev = (w < static_cast<int>(devmap.size())) ? devmap[w] : -1;
+      if (dev >= 0) { cudaSetDevice(dev); }
+      gpu_batch_pools_.emplace_back(std::make_unique<gpu_batch_pool_t<i_t, f_t>>());
+      auto& pool  = *gpu_batch_pools_.back();
+      pool.device = dev;
+      pool.seats  = gpu_batch_seats();   // requested; may shrink on first fit
+      // CUOPT_BNB_GPU_SHARE_RO=0 gives each pool its OWN cache (the old behaviour), for isolating
+      // whether a fault belongs to the sharing or to something else.
+      static const bool share_ro = [] {
+        const char* e = std::getenv("CUOPT_BNB_GPU_SHARE_RO");
+        return e == nullptr || std::string(e) != "0";
+      }();
+      if (dev >= 0) {
+        auto it = share_ro ? ro_by_device.find(dev) : ro_by_device.end();
+        if (it == ro_by_device.end()) {
+          // CUOPT_BNB_GPU_RO_BORROW_STREAM=1 restores the pre-fix layout for A/B only.
+          static const bool borrow_stream = [] {
+            const char* e = std::getenv("CUOPT_BNB_GPU_RO_BORROW_STREAM");
+            return e != nullptr && std::string(e) != "0";
+          }();
+          auto* cache = borrow_stream
+                          ? gds::gpu_ro_cache_create_borrowed<i_t, f_t>(pool.stream.view())
+                          : gds::gpu_ro_cache_create<i_t, f_t>();
+          gpu_ro_caches_.push_back(cache);
+          if (share_ro) {
+            it = ro_by_device.emplace(dev, cache).first;
+          } else {
+            pool.ro_cache = cache;
+          }
+        }
+        if (share_ro) { pool.ro_cache = it->second; }
+      }
+    }
+    cudaSetDevice(prev_device);
+
+    std::string split;
+    for (const auto& [dev, n] : gpu_pool_device_load(devmap)) {
+      split += (split.empty() ? "" : " ") + std::string("gpu") + std::to_string(dev) + ":" +
+               std::to_string(n);
+    }
+    if (split.empty()) { split = "none"; }
+    settings_.log.print_format(
+      // EVERY switch that changes the pool's behaviour must appear here. `async_overlap` is the
+      // in-round CPU overlap; `pool_async` is the worker-loop drive (#2); `heap_factor` is the
+      // engagement gate (#3). A mode that cannot be read back from the log makes a sweep
+      // unfalsifiable -- the run looks the same whichever way it was configured.
+      "[CONFIG] GPU batch pool: {} seats x {} BFS workers, cpu_recheck={}, plunge_depth={}, "
+      "async_overlap={}, pool_async={}, heap_factor={}, iter_limit={}, pools_per_gpu=[{}]\n",
+      gpu_batch_seats(),
+      num_bfs_workers,
+      gpu_pool_recheck() ? 1 : 0,
+      gpu_pool_plunge_depth(),
+      gpu_pool_overlap() ? 1 : 0,
+      gpu_pool_async() ? 1 : 0,
+      gpu_pool_heap_factor(),
+      gpu_batch_iter_limit(),
+      split);
+  }
+
   const int total_thread_count = num_bfs_workers + num_diving_workers;
 
 #pragma omp parallel num_threads(total_thread_count)
@@ -4402,6 +5864,63 @@ void branch_and_bound_t<i_t, f_t>::run_deterministic_coordinator(const csr_matri
       run_deterministic_diving_loop(worker);
       worker.total_runtime += toc(worker_start_time);
     }
+  }
+
+  if (gpu_batch_seats() > 0) {
+    settings_.log.printf(
+      "[GPUBATCH] launches=%ld seats_sent=%ld | consumed=%ld agreed=%ld corrected_decision=%ld "
+      "corrected_obj=%ld rejected=%ld stale_bounds=%ld absent=%ld\n"
+      "[GPUBATCH] cycles=%ld stolen=%ld no_seat=%ld (fathom=%ld strengthen_infeas=%ld deadline=%ld)"
+      " plunged=%ld overlap_cpu_nodes=%ld plunge_stop_heap=%ld\n",
+      (long)gpu_batch_launches_.load(),
+      (long)gpu_batch_launched_.load(),
+      (long)gpu_batch_hits_.load(),
+      (long)gpu_batch_agreed_.load(),
+      (long)gpu_batch_corrected_decision_.load(),
+      (long)gpu_batch_corrected_obj_.load(),
+      (long)gpu_batch_rejected_.load(),
+      (long)gpu_batch_stale_.load(),
+      (long)gpu_batch_absent_.load(),
+      (long)gpu_batch_cycles_.load(),
+      (long)gpu_batch_stolen_.load(),
+      (long)gpu_batch_noseat_.load(),
+      (long)gpu_batch_noseat_fathom_.load(),
+      (long)gpu_batch_noseat_infeas_.load(),
+      (long)gpu_batch_noseat_time_.load(),
+      (long)gpu_batch_plunged_.load(),
+      (long)gpu_batch_overlap_nodes_.load(),
+      (long)gpu_batch_plunge_stop_heap_.load());
+    // `deadline` is NOT a failure: every seat still in flight when the run hits its wall clock
+    // reports TIME_LIMIT_RETURN at once, which is what the CPU driver maps to TIME_LIMIT. It is
+    // printed separately from the real failures for exactly that reason.
+    settings_.log.printf(
+      "[GPUBATCH] seat drops: factorize_fill=%ld size_contract=%ld factorize_resume=%ld "
+      "livelock=%ld launch_failed=%ld dual_infeasible_resume=%ld | deadline=%ld "
+      "concurrent_halt=%ld\n",
+      (long)gpu_batch_drops_[1].load(),
+      (long)gpu_batch_drops_[2].load(),
+      (long)gpu_batch_drops_[3].load(),
+      (long)gpu_batch_drops_[4].load(),
+      (long)gpu_batch_drops_[5].load(),
+      (long)gpu_batch_drops_[6].load(),
+      (long)gpu_batch_drops_[7].load(),
+      (long)gpu_batch_drops_[8].load());
+    // How often the CPU had to take a node back because the device produced a certificate we never
+    // trust. This is the production safety net of plan §3a, NOT the temporary recheck gate, so it
+    // is reported even when the recheck is off. A non-zero NUMERICAL count is the one to chase:
+    // untaken, it would clamp lower_bound_numerical_ for the rest of the solve.
+    // CUOPT_BNB_GPU_TAKEBACK_TRACE=1 prints each occurrence with node id, depth and iteration.
+    settings_.log.printf(
+      "[GPUBATCH] cpu takebacks: dual_unbounded=%ld numerical=%ld cutoff=%ld iter_limit=%ld "
+      "other=%ld | total=%ld\n",
+      (long)gpu_takeback_dual_unbounded_.load(),
+      (long)gpu_takeback_numerical_.load(),
+      (long)gpu_takeback_cutoff_.load(),
+      (long)gpu_takeback_iter_limit_.load(),
+      (long)gpu_takeback_other_.load(),
+      (long)(gpu_takeback_dual_unbounded_.load() + gpu_takeback_numerical_.load() +
+             gpu_takeback_cutoff_.load() + gpu_takeback_iter_limit_.load() +
+             gpu_takeback_other_.load()));
   }
 
   settings_.log.printf("\n");
@@ -4456,6 +5975,19 @@ void branch_and_bound_t<i_t, f_t>::run_deterministic_coordinator(const csr_matri
     }
   }
 
+  // SHUTDOWN ORDER. Every worker's kernels run on its own pool stream, and the read-only block they
+  // read lives on the cache's stream. Nothing may be freed while a launch could still touch it, so:
+  // drain every pool stream first, then free the caches, then the pools. The caches own their own
+  // streams now, so this order is about IN-FLIGHT WORK, not about stream ownership.
+  for (auto& p : gpu_batch_pools_) {
+    if (p != nullptr) { p->stream.synchronize(); }
+  }
+  for (auto* c : gpu_ro_caches_) {
+    if (c != nullptr) { gds::gpu_ro_cache_destroy<i_t, f_t>(c); }
+  }
+  gpu_ro_caches_.clear();
+  gpu_batch_pools_.clear();
+
   if (producer_sync_.num_producers() > 0 || producer_wait_count_ > 0) {
     double avg_wait =
       (producer_wait_count_ > 0) ? total_producer_wait_time_ / producer_wait_count_ : 0.0;
@@ -4476,7 +6008,54 @@ void branch_and_bound_t<i_t, f_t>::run_deterministic_bfs_loop(
   raft::common::nvtx::range scope("BB::worker_loop");
 
   while (deterministic_global_termination_status_ == mip_status_t::UNSET) {
-    if (worker.has_work()) {
+    // The branch-and-bound worker loop, in the shape of the design sketch:
+    //
+    //   if this_worker.no_gpu_worker() and heap.size() > threshold:  summon_gpu_worker()
+    //   elif gpu_worker_done():                                      process_gpu_pool()
+    //   else:                                                        process_cpu_node()
+    //
+    // no_gpu_worker() IS LOAD-BEARING. Without it a worker whose launch is still in flight re-enters
+    // gpu_pool_cycle, which clears the batch, steals fresh nodes and overwrites the live run. The
+    // in-flight nodes are then in no queue and no pool, the tree looks drained, and the solver
+    // reports OPTIMAL at the wrong objective -- measured on neos5: 16 at gap 0.00% against a true
+    // optimum of 15. The synchronous drive never needed the guard because it could not return to
+    // this loop with a run outstanding.
+    //
+    // heap.size() > threshold is gpu_pool_should_engage(): the pool takes `seats` nodes OUT of this
+    // queue, so engaging when the queue barely holds that many empties it. Waiting for
+    // seats * CUOPT_BNB_GPU_HEAP_FACTOR leaves the queue with work to overlap the launch with. No
+    // ramp-up escape is needed -- when the gate blocks, control falls to the CPU-node branch below,
+    // and each node solved there pushes two children onto the queue until the gate opens.
+    //
+    // NEVER past the deadline. refactor_basis returns TIME_LIMIT_RETURN once the remaining time is
+    // negative, so every seat would be dropped and the cycle would burn through the queue with
+    // failing solves. That drains the tree, and `!any_has_work()` is evaluated LAST in
+    // deterministic_sync_callback and overrides TIME_LIMIT -- so with no incumbent yet the run
+    // reports INFEASIBLE for a problem that has solutions. Measured on dano3_5 and neos-662469.
+    const bool no_gpu_worker = !worker.gpu_pool_busy;
+    const int pool_seats =
+      (worker.worker_id >= 0 && worker.worker_id < static_cast<i_t>(gpu_batch_pools_.size()) &&
+       gpu_batch_pools_[worker.worker_id] != nullptr &&
+       !gpu_batch_pools_[worker.worker_id]->disabled)
+        ? gpu_batch_pools_[worker.worker_id]->seats
+        : 0;
+    if (no_gpu_worker && pool_seats > 0 && worker.has_queued_work() &&
+        gpu_pool_should_engage(worker.queue_size(), pool_seats) &&
+        settings_.time_limit - toc(exploration_stats_.start_time) > 0.0) {
+      if (gpu_pool_cycle(worker, search_tree)) {
+        continue;   // summon_gpu_worker(): steal, prepare, ONE launch
+      }
+    }
+    // gpu_worker_done(): the launch this worker issued has landed. Harvest it, process the results,
+    // refill the seats and issue ONE more launch -- then straight back round the loop. If it has
+    // NOT landed we do not wait here; we fall through and carry on with our own work.
+    if (worker.gpu_pool_busy && gpu_pool_ready(worker)) {
+      gpu_pool_step(worker, search_tree, /*may_block=*/false);   // process_gpu_pool()
+      continue;
+    }
+    // has_queued_work(), not has_work(): has_work() reports the GPU pool too, and this branch
+    // dequeues. See the note on the two predicates in deterministic_workers.hpp.
+    if (worker.has_queued_work()) {
       mip_node_t<i_t, f_t>* node = worker.dequeue_node();
       if (node == nullptr) { continue; }
 
@@ -4501,6 +6080,13 @@ void branch_and_bound_t<i_t, f_t>::run_deterministic_bfs_loop(
       continue;
     }
 
+    // Pool still holding nodes and no CPU work left: now, and only now, wait on the device. Going
+    // to the barrier instead would break the invariant deterministic_sync_callback() asserts.
+    if (worker.gpu_pool_busy) {
+      gpu_pool_step(worker, search_tree, /*may_block=*/true);
+      continue;
+    }
+
     // No work - advance to sync point to participate in barrier
     f_t nowork_start = tic();
     deterministic_scheduler_->wait_for_next_sync(worker.work_context);
@@ -4512,6 +6098,18 @@ template <typename i_t, typename f_t>
 void branch_and_bound_t<i_t, f_t>::deterministic_sync_callback()
 {
   raft::common::nvtx::range scope("BB::deterministic_sync_callback");
+
+  // INVARIANT. A GPU pool cycle is synchronous, so a worker inside one has not reached the barrier
+  // and this callback cannot run while a pool holds nodes. Everything below depends on it:
+  // deterministic_compute_lower_bound(), any_has_work() and the determinism state hash all scan
+  // current_node / plunge_stack / backlog only. The day the cycle becomes asynchronous this fires,
+  // and all three need a pool term added -- a pool-held node left out of the lower bound makes the
+  // reported bound run too HIGH, which lets the solver declare OPTIMAL early.
+  for (const auto& p : gpu_batch_pools_) {
+    cuopt_assert(p == nullptr || p->pending.empty(),
+                 "GPU pool holds nodes at a sync point; lower bound / termination / state hash "
+                 "would miss them");
+  }
 
   ++deterministic_horizon_number_;
   double horizon_end = deterministic_current_horizon_;
@@ -4663,6 +6261,676 @@ void branch_and_bound_t<i_t, f_t>::deterministic_sync_callback()
 }
 
 template <typename i_t, typename f_t>
+bool branch_and_bound_t<i_t, f_t>::gpu_pool_cycle(deterministic_bfs_worker_t<i_t, f_t>& worker,
+                                                  search_tree_t<i_t, f_t>& search_tree)
+{
+  const i_t wid = worker.worker_id;
+  if (gpu_batch_seats() <= 0 || wid < 0 || wid >= static_cast<i_t>(gpu_batch_pools_.size())) {
+    return false;
+  }
+  // This pool's OWN seat count, which may have been halved after a VRAM refusal, and which is 0
+  // once the pool has been disabled for good.
+  const int seats = gpu_batch_pools_[wid]->disabled ? 0 : gpu_batch_pools_[wid]->seats;
+  if (seats <= 0) { return false; }
+  // STRUCTURAL GUARD, production rule: the GPU dual simplex serves the MAIN branch-and-bound plunge
+  // ONLY. A sub-MIP (RINS / RENS / recursive_submip) is a DIFFERENT problem -- its own matrix, its
+  // own column count, its own root cut passes -- which breaks the pool's founding premise that one
+  // lp_problem_t is shared by every seat and that A/rhs/objective are uploaded once per solve.
+  // Measured sizes on the same run: main tree m=617 n=2078 against sub-MIPs m=586 n=873 and
+  // m=725 n=1397. Today the deterministic path never launches a sub-MIP worker
+  // (launch_submip_worker's only caller is the non-deterministic plunge_with), so this is belt and
+  // braces -- but it must not depend on that staying true.
+  if (settings_.inside_submip != 0) { return false; }
+  auto& pool = *gpu_batch_pools_[wid];
+  // #4 -- bind THIS thread to the pool's device. The CUDA current device is per-thread, and a BFS
+  // worker thread has never set one, so without this every pool would launch on device 0 whatever
+  // its stream belongs to. Claimed once per thread: the map is static, so a worker always lands on
+  // the same device and the assignment stays reproducible.
+  if (pool.device >= 0) {
+    thread_local int bound_device = -1;
+    if (bound_device != pool.device) {
+      if (cudaSetDevice(pool.device) != cudaSuccess) {
+        cudaGetLastError();
+        return false;   // cannot serve this pool on this thread; fall through to the CPU path
+      }
+      bound_device = pool.device;
+    }
+  }
+
+  // ---- steal -------------------------------------------------------------------------------
+  // The nodes come OUT of the worker's queue and this pool owns them until the cycle ends. That is
+  // safe only because the cycle is SYNCHRONOUS: a worker inside it has not reached the barrier, and
+  // the sync callback runs only once every worker has. The assertion in
+  // deterministic_sync_callback() is what protects this, and it must fail loudly the day the cycle
+  // goes asynchronous -- the lower bound, the termination test and the determinism state hash all
+  // scan the worker queues, and would silently miss nodes parked here.
+  pool.pending.clear();
+  pool.done.clear();
+  pool.pending = worker.dequeue_gpu_nodes(static_cast<size_t>(seats));
+  // The engagement threshold counts all queued nodes, including CPU-only takebacks. If no node is
+  // GPU-eligible, report that no cycle started so the worker loop falls through and processes its
+  // CPU queue instead of repeatedly trying to build an empty pool.
+  if (pool.pending.empty()) { return false; }
+  ++gpu_batch_cycles_;
+  gpu_batch_stolen_ += static_cast<int64_t>(pool.pending.size());
+
+  const f_t remaining_time = settings_.time_limit - toc(exploration_stats_.start_time);
+
+  // Per-seat context the batch item itself does not carry. `parent_*` is what makes an in-seat plunge
+  // possible: a dived child's bounds are its PARENT's strengthened bounds plus one branch bound, and
+  // `solve_node_deterministic` must be handed the same starting point or the two disagree and the
+  // bounds guard throws the device's answer away.
+  // Hoisted to gpu_node_pool.hpp so the round state can live on the POOL across worker-loop
+  // iterations (#2). The alias keeps the body below reading exactly as it did.
+  using seat_ctx_t = gpu_seat_ctx_t<i_t, f_t>;
+
+  auto make_settings = [&]() {
+    simplex_solver_settings_t<i_t, f_t> s = settings_;
+    s.set_log(false);
+    s.cut_off       = worker.local_upper_bound + settings_.dual_tol;
+    s.inside_mip    = 2;
+    s.time_limit    = remaining_time;
+    s.scale_columns = false;
+    // PER-NODE GPU BUDGET. settings_ carries iteration_limit = INT_MAX, so without this a node that
+    // makes no progress pivots forever and never returns -- and ITERATION_LIMIT, the status the
+    // consume path now uses to hand a hard node back to the CPU, would be unreachable.
+    // Bounds the work a seat can spend; it is NOT a correctness device.
+    s.iteration_limit = gpu_batch_iter_limit();
+    if (gpu_pool_refac_freq() > 0) { s.refactor_frequency = gpu_pool_refac_freq(); }
+    return s;
+  };
+
+  // REFERENCES into the pool, not locals: with CUOPT_BNB_GPU_ASYNC the round outlives this call.
+  // Bound as references so the body below is untouched and the synchronous path stays byte-for-byte
+  // the behaviour it had.
+  auto& batch = pool.batch;
+  auto& ctx   = pool.ctx;
+  std::vector<size_t> batch_ctx;
+  batch.clear();
+  ctx.clear();
+
+  // ---- fill: the stolen nodes, reconstructed from the root -----------------------------------
+  // EVERY stolen node gets a ctx entry, seated or not, so `ctx[i].node == pool.pending[i]` and the
+  // processing loop below retires them in order. Skipping the unseatable ones here instead made ctx
+  // shorter than pending, and the index-based put-back at the end then re-queued nodes that had
+  // already been processed -- a use-after-free once search_tree.update had freed one (segfault on
+  // mcsched).
+  for (auto* nd : pool.pending) {
+    ctx.push_back(seat_ctx_t{nd, {}, {}, 0, false});
+    if (nd->lower_bound > worker.local_upper_bound) { ++gpu_batch_noseat_fathom_; continue; }
+
+    gpu_batch_node_t<i_t, f_t> bn(worker.leaf_problem.num_rows, worker.leaf_problem.num_cols);
+    bn.settings = make_settings();
+    bn.lower    = original_lp_.lower;
+    bn.upper    = original_lp_.upper;
+    std::fill(worker.bounds_changed.begin(), worker.bounds_changed.end(), false);
+    nd->get_variable_bounds(bn.lower, bn.upper, worker.bounds_changed);
+#ifndef DETERMINISM_DISABLE_BOUNDS_STRENGTHENING
+    // Work units are deliberately NOT recorded here; solve_node_deterministic runs this same pass
+    // when it processes the node and records it there. Recording twice would change the
+    // deterministic work accounting, and with it the horizon schedule -- i.e. the search itself.
+    if (!worker.node_presolver.bounds_strengthening(
+          bn.settings, worker.bounds_changed, bn.lower, bn.upper)) {
+      ++gpu_batch_noseat_infeas_;
+      continue;
+    }
+#endif
+    decompress_vstatus(nd->packed_vstatus, worker.leaf_problem.num_cols, bn.vstatus);
+    bn.dy_se = edge_norms_;
+    batch.push_back(std::move(bn));
+    batch_ctx.push_back(ctx.size() - 1);
+    ctx.back().seated = true;
+  }
+  gpu_batch_noseat_ += static_cast<int64_t>(pool.pending.size() - batch.size());
+
+  // The persistent array contains active seats only: there is no DONE/no-op command. Deal with
+  // nodes that could not be seated on the CPU now, then compact the host context so seat s is
+  // always ctx[s] for the lifetime of the persistent allocation.
+  std::vector<seat_ctx_t> compact_ctx;
+  compact_ctx.reserve(batch.size());
+  for (size_t k = 0; k < ctx.size(); ++k) {
+    if (ctx[k].seated) { continue; }
+    mip_node_t<i_t, f_t>* nd = ctx[k].node;
+    worker.current_node                = nd;
+    worker.recompute_bounds_and_basis = true;
+    const node_status_t status = solve_node_deterministic(worker, nd, search_tree);
+    worker.last_solved_node = nd;
+    worker.current_node     = nullptr;
+    if (status == node_status_t::PENDING) {
+      --exploration_stats_.nodes_explored;
+      ++exploration_stats_.nodes_unexplored;
+      worker.plunge_stack.push_front(nd);
+    }
+  }
+  for (size_t s = 0; s < batch_ctx.size(); ++s) {
+    compact_ctx.push_back(std::move(ctx[batch_ctx[s]]));
+    compact_ctx.back().seated = true;
+  }
+  ctx = std::move(compact_ctx);
+  // From here persistent-seat ownership is represented solely by ctx. This avoids retaining stale
+  // pointers to initial nodes after CPU disposition deletes/fathoms them.
+  pool.pending.clear();
+  if (batch.empty()) { return true; }
+
+  // ---- launch / process / plunge ----------------------------------------------------------------
+  // One round per launch. A seat whose node branches is REFILLED IN PLACE with the child the search
+  // would have dived next, and the round repeats. The child's bounds come from its parent's
+  // strengthened bounds plus one branch bound -- the incremental route a CPU plunge takes -- instead
+  // of a fresh from-root reconstruction.
+  // #2 -- SYNCHRONOUS DRIVE (default). Identical to the behaviour this function always had: run
+  // every round back to back, overlapping CPU nodes inside gpu_pool_step while the device is busy,
+  // and return only once the pool is empty. CUOPT_BNB_GPU_ASYNC=1 hands the driving to the worker
+  // loop instead, which lets the worker do anything else between rounds.
+  worker.gpu_pool_busy = true;
+  pool.busy            = true;
+  if (gpu_pool_async()) { return true; }
+  while (pool.busy) {
+    // Same overlap as ever, now expressed with the same primitives the async driver uses: if the
+    // device has not landed and this worker has queued nodes, solve one of them instead of waiting.
+    const bool can_overlap = gpu_pool_overlap() && worker.has_queued_work() &&
+                             deterministic_global_termination_status_ == mip_status_t::UNSET;
+    if (can_overlap && !gpu_pool_ready(worker)) {
+      gpu_pool_overlap_node(worker, search_tree);
+      continue;
+    }
+    if (!gpu_pool_step(worker, search_tree, /*may_block=*/true)) { break; }
+  }
+  return true;
+}
+
+// Is a step going to make progress WITHOUT waiting on the device? Either there is no live run (so
+// the step will launch one or process the last one), or the run has already landed. This is the
+// "is the GPU worker done?" test the worker loop asks before deciding to service the pool.
+template <typename i_t, typename f_t>
+bool branch_and_bound_t<i_t, f_t>::gpu_pool_ready(deterministic_bfs_worker_t<i_t, f_t>& worker)
+{
+  auto& pool = *gpu_batch_pools_[worker.worker_id];
+  if (!pool.busy) { return false; }
+  if (pool.run == nullptr) { return true; }
+  return gpu_batch_run_ready<i_t, f_t>(pool.run);
+}
+
+// Solve ONE of this worker's own queued nodes on the CPU. Used while the device is busy, by both
+// drivers, so the two cannot drift apart in what "overlap" means.
+template <typename i_t, typename f_t>
+void branch_and_bound_t<i_t, f_t>::gpu_pool_overlap_node(deterministic_bfs_worker_t<i_t, f_t>& worker,
+                                                         search_tree_t<i_t, f_t>& search_tree)
+{
+  mip_node_t<i_t, f_t>* ov = worker.dequeue_node();
+  if (ov == nullptr) { return; }
+  ++gpu_batch_overlap_nodes_;
+  worker.current_node = ov;
+  if (ov->lower_bound > worker.local_upper_bound) {
+    worker.current_node = nullptr;
+    worker.record_fathomed(ov, ov->lower_bound);
+    search_tree.update(ov, node_status_t::FATHOMED);
+    --exploration_stats_.nodes_unexplored;
+    return;
+  }
+  // From the root: this node is unrelated to whatever the seats are doing, and `leaf_problem`
+  // currently holds some seat's bounds.
+  worker.recompute_bounds_and_basis = true;
+  solve_node_deterministic(worker, ov, search_tree);
+  worker.last_solved_node = ov;
+  worker.current_node     = nullptr;
+}
+
+// One slice of a pool cycle: launch a round if one is pending, drive it, and when it finishes
+// process the results and refill the seats with plunge children. Returns false when the pool has
+// drained (pool.busy is then clear) or when there is nothing left to do.
+template <typename i_t, typename f_t>
+simplex_solver_settings_t<i_t, f_t> branch_and_bound_t<i_t, f_t>::gpu_pool_settings(
+  const deterministic_bfs_worker_t<i_t, f_t>& worker) const
+{
+  simplex_solver_settings_t<i_t, f_t> result = settings_;
+  result.set_log(false);
+  result.cut_off = std::min(upper_bound_.load(), worker.local_upper_bound) + settings_.dual_tol;
+  result.inside_mip      = 2;
+  result.time_limit      = settings_.time_limit - toc(exploration_stats_.start_time);
+  result.scale_columns   = false;
+  result.iteration_limit = gpu_batch_iter_limit();
+  if (gpu_pool_refac_freq() > 0) { result.refactor_frequency = gpu_pool_refac_freq(); }
+  return result;
+}
+
+template <typename i_t, typename f_t>
+bool branch_and_bound_t<i_t, f_t>::gpu_pool_prepare_fresh(
+  deterministic_bfs_worker_t<i_t, f_t>& worker,
+  mip_node_t<i_t, f_t>* node,
+  gpu_batch_node_t<i_t, f_t>& batch_node,
+  gpu_seat_ctx_t<i_t, f_t>& seat_ctx)
+{
+  batch_node.settings = gpu_pool_settings(worker);
+  batch_node.lower    = original_lp_.lower;
+  batch_node.upper    = original_lp_.upper;
+  std::fill(worker.bounds_changed.begin(), worker.bounds_changed.end(), false);
+  node->get_variable_bounds(batch_node.lower, batch_node.upper, worker.bounds_changed);
+#ifndef DETERMINISM_DISABLE_BOUNDS_STRENGTHENING
+  if (!worker.node_presolver.bounds_strengthening(
+        batch_node.settings, worker.bounds_changed, batch_node.lower, batch_node.upper)) {
+    return false;
+  }
+#endif
+  decompress_vstatus(node->packed_vstatus, worker.leaf_problem.num_cols, batch_node.vstatus);
+  batch_node.dy_se = edge_norms_;
+  seat_ctx         = gpu_seat_ctx_t<i_t, f_t>{node, {}, {}, 0, true};
+  return true;
+}
+
+template <typename i_t, typename f_t>
+bool branch_and_bound_t<i_t, f_t>::gpu_pool_fill_fresh_seat(
+  deterministic_bfs_worker_t<i_t, f_t>& worker,
+  search_tree_t<i_t, f_t>& search_tree,
+  i_t seat)
+{
+  auto& pool = *gpu_batch_pools_[worker.worker_id];
+  while (deterministic_global_termination_status_ == mip_status_t::UNSET) {
+    auto gpu_nodes = worker.dequeue_gpu_nodes(1);
+    mip_node_t<i_t, f_t>* node = gpu_nodes.empty() ? nullptr : gpu_nodes.front();
+    if (node == nullptr) { return false; }
+    if (node->lower_bound > worker.local_upper_bound) {
+      worker.record_fathomed(node, node->lower_bound);
+      search_tree.update(node, node_status_t::FATHOMED);
+      --exploration_stats_.nodes_unexplored;
+      continue;
+    }
+    gpu_batch_node_t<i_t, f_t> fresh(worker.leaf_problem.num_rows,
+                                     worker.leaf_problem.num_cols);
+    gpu_seat_ctx_t<i_t, f_t> fresh_ctx;
+    if (gpu_pool_prepare_fresh(worker, node, fresh, fresh_ctx)) {
+      pool.batch[seat] = std::move(fresh);
+      pool.ctx[seat]   = std::move(fresh_ctx);
+      return true;
+    }
+
+    worker.current_node                = node;
+    worker.recompute_bounds_and_basis = true;
+    const node_status_t status = solve_node_deterministic(worker, node, search_tree);
+    worker.last_solved_node = node;
+    worker.current_node     = nullptr;
+    if (status == node_status_t::PENDING) {
+      --exploration_stats_.nodes_explored;
+      ++exploration_stats_.nodes_unexplored;
+      worker.plunge_stack.push_front(node);
+      return false;
+    }
+  }
+  return false;
+}
+
+template <typename i_t, typename f_t>
+bool branch_and_bound_t<i_t, f_t>::gpu_pool_step(
+  deterministic_bfs_worker_t<i_t, f_t>& worker,
+  search_tree_t<i_t, f_t>& search_tree,
+  bool may_block)
+{
+  auto& pool      = *gpu_batch_pools_[worker.worker_id];
+  auto& batch     = pool.batch;
+  auto& ctx       = pool.ctx;
+  const i_t N     = static_cast<i_t>(batch.size());
+  if (!pool.busy || N == 0 || ctx.size() != batch.size()) {
+    gpu_pool_finish(worker);
+    return false;
+  }
+  if (deterministic_global_termination_status_ != mip_status_t::UNSET ||
+      settings_.time_limit - toc(exploration_stats_.start_time) <= 0.0) {
+    gpu_pool_finish(worker);
+    return false;
+  }
+
+  using gpu_drop_t = typename gpu_batch_node_t<i_t, f_t>::drop_t;
+  auto count_drop  = [&](i_t seat) {
+    const int reason = static_cast<int>(batch[seat].drop);
+    if (batch[seat].drop != gpu_drop_t::NONE && reason >= 0 &&
+        reason < static_cast<int>(gpu_batch_drops_.size())) {
+      ++gpu_batch_drops_[reason];
+    }
+  };
+  auto return_cpu_only = [&](i_t seat, dual_status_t reason, const char* where) {
+    mip_node_t<i_t, f_t>* node = ctx[seat].node;
+    if (node == nullptr) { return; }
+    count_drop(seat);
+    node->cpu_only = true;
+    worker.plunge_stack.push_front(node);
+    ctx[seat].node = nullptr;
+    ++gpu_batch_rejected_;
+    record_gpu_takeback(reason, node, batch[seat].iters, where);
+  };
+  auto is_fresh_node_failure = [&](i_t seat) {
+    return batch[seat].drop == gpu_drop_t::FACTORIZE_FILL ||
+           batch[seat].drop == gpu_drop_t::SIZE_CONTRACT;
+  };
+  auto is_resume_node_failure = [&](i_t seat) {
+    return batch[seat].status == dual_status_t::ITERATION_LIMIT ||
+           batch[seat].drop == gpu_drop_t::FACTORIZE_RESUME ||
+           batch[seat].drop == gpu_drop_t::DUAL_INFEASIBLE_RESUME ||
+           batch[seat].drop == gpu_drop_t::LIVELOCK;
+  };
+
+  if (pool.run == nullptr) {
+    bool resized_pool = false;
+    const f_t launch_cutoff =
+      std::min(upper_bound_.load(), worker.local_upper_bound) + settings_.dual_tol;
+    for (auto& node : batch) { node.settings.cut_off = launch_cutoff; }
+    gpu_batch_launched_ += static_cast<int64_t>(batch.size());
+    ++gpu_batch_launches_;
+    pool.run = gpu_persistent_batch_begin<i_t, f_t>(
+      worker.leaf_problem, batch, pool.stream.view(), pool.ro_cache, &pool.seat_state);
+
+    // Initial factorization happens before the persistent run exists. A seat whose warm-start basis
+    // still cannot be factorized after repair is a per-node CPU fallback, not a reason to discard
+    // every other prepared seat. Replace only those seats and retry the initial launch.
+    while (pool.run == nullptr) {
+      bool replaced_node = false;
+      bool refill_failed = false;
+      for (i_t s = 0; s < static_cast<i_t>(batch.size()); ++s) {
+        if (!is_fresh_node_failure(s)) { continue; }
+        return_cpu_only(s, dual_status_t::NUMERICAL, "pool-initial-factor");
+        if (!gpu_pool_fill_fresh_seat(worker, search_tree, s)) {
+          refill_failed = true;
+          break;
+        }
+        replaced_node = true;
+      }
+      if (refill_failed) {
+        gpu_pool_finish(worker);
+        return false;
+      }
+      if (!replaced_node) { break; }
+      pool.run = gpu_persistent_batch_begin<i_t, f_t>(
+        worker.leaf_problem, batch, pool.stream.view(), pool.ro_cache, &pool.seat_state);
+    }
+
+    if (pool.run == nullptr && batch.size() > 1 && !pool.halved) {
+      const size_t keep = batch.size() / 2;
+      for (size_t s = batch.size(); s > keep; --s) {
+        worker.plunge_stack.push_front(ctx[s - 1].node);
+      }
+      batch.erase(batch.begin() + static_cast<std::ptrdiff_t>(keep), batch.end());
+      ctx.erase(ctx.begin() + static_cast<std::ptrdiff_t>(keep), ctx.end());
+      pool.halved  = true;
+      pool.seats   = static_cast<int>(keep);
+      resized_pool = true;
+      pool.run     = gpu_persistent_batch_begin<i_t, f_t>(
+        worker.leaf_problem, batch, pool.stream.view(), pool.ro_cache, &pool.seat_state);
+    }
+    if (pool.run == nullptr) {
+      pool.disabled = true;
+      gpu_pool_finish(worker);
+      return false;
+    }
+    if (resized_pool) { return true; }
+    if (!may_block) { return true; }
+  }
+
+  if (!may_block && !gpu_batch_run_ready<i_t, f_t>(pool.run)) { return true; }
+  if (!gpu_persistent_batch_harvest<i_t, f_t>(pool.run)) {
+    settings_.log.printf("[GPUPOOL] worker %d: harvest failed; draining pool to CPU\n",
+                         (int)worker.worker_id);
+    gpu_pool_finish(worker);
+    return false;
+  }
+
+  enum class next_t : unsigned char { FRESH, REFACTOR, CHILD };
+  std::vector<next_t> next(static_cast<size_t>(N), next_t::FRESH);
+  std::vector<std::vector<gds::gpu_bound_delta<i_t, f_t>>> bound_deltas(
+    static_cast<size_t>(N));
+  const int max_plunge = gpu_pool_plunge_depth();
+
+  bool can_fill = true;
+  for (i_t s = 0; s < N; ++s) {
+    batch[s].settings.cut_off =
+      std::min(upper_bound_.load(), worker.local_upper_bound) + settings_.dual_tol;
+    if (batch[s].status == dual_status_t::REFACTOR_NEEDED) {
+      next[s] = next_t::REFACTOR;
+      continue;
+    }
+
+    // These are not B&B dispositions. Return the unresolved node to this worker and prevent a
+    // later pool fill from selecting it again; the worker's normal CPU branch will solve it while
+    // this or a later GPU generation is in flight.
+    if (batch[s].status == dual_status_t::NUMERICAL ||
+        batch[s].status == dual_status_t::ITERATION_LIMIT) {
+      const dual_status_t reason = batch[s].status;
+      return_cpu_only(s, reason, "pool-terminal");
+      next[s] = next_t::FRESH;
+      if (!gpu_pool_fill_fresh_seat(worker, search_tree, s)) { can_fill = false; }
+      continue;
+    }
+
+    mip_node_t<i_t, f_t>* nd = ctx[s].node;
+    if (nd == nullptr) {
+      can_fill = false;
+      continue;
+    }
+    const std::vector<f_t> resident_lower = batch[s].lower;
+    const std::vector<f_t> resident_upper = batch[s].upper;
+    const std::vector<variable_status_t> resident_vstatus = batch[s].vstatus;
+    const std::vector<f_t> resident_dy_se = batch[s].dy_se;
+    const dual_status_t resident_status = batch[s].status;
+    const f_t resident_objective        = batch[s].sol.objective;
+
+    pool.done.emplace(nd, batch[s]);
+    if (ctx[s].parent_lower.empty()) {
+      worker.recompute_bounds_and_basis = true;
+    } else {
+      worker.leaf_problem.lower         = ctx[s].parent_lower;
+      worker.leaf_problem.upper         = ctx[s].parent_upper;
+      worker.recompute_bounds_and_basis = false;
+    }
+    worker.current_node = nd;
+    node_status_t node_status;
+    if (nd->lower_bound > worker.local_upper_bound) {
+      pool.done.erase(nd);
+      worker.record_fathomed(nd, nd->lower_bound);
+      search_tree.update(nd, node_status_t::FATHOMED);
+      --exploration_stats_.nodes_unexplored;
+      node_status = node_status_t::FATHOMED;
+    } else {
+      node_status = solve_node_deterministic(worker, nd, search_tree);
+      worker.last_solved_node = nd;
+    }
+    worker.current_node = nullptr;
+    if (node_status == node_status_t::PENDING) {
+      // The host hit a global/work limit while disposing this LP. It remains unexplored and must be
+      // part of the pool drain; do not replace its seat and silently lose it.
+      ctx[s].node = nd;
+      --exploration_stats_.nodes_explored;
+      ++exploration_stats_.nodes_unexplored;
+      can_fill = false;
+      continue;
+    }
+    ctx[s].node = nullptr;  // the parent has been fully disposed on the CPU
+
+    const bool gpu_parent_accepted =
+      resident_status == dual_status_t::OPTIMAL && worker.leaf_vstatus == resident_vstatus &&
+      worker.leaf_problem.lower == resident_lower && worker.leaf_problem.upper == resident_upper &&
+      std::memcmp(&worker.leaf_solution.objective, &resident_objective, sizeof(f_t)) == 0;
+
+    bool installed_child = false;
+    const bool within_plunge = ctx[s].plunge_depth < max_plunge;
+    if (node_status == node_status_t::HAS_CHILDREN && within_plunge &&
+        !worker.plunge_stack.empty()) {
+      mip_node_t<i_t, f_t>* child = worker.plunge_stack.front();
+      if (child->parent == nd) {
+        worker.plunge_stack.pop_front();
+        gpu_batch_node_t<i_t, f_t> cb(worker.leaf_problem.num_rows,
+                                      worker.leaf_problem.num_cols);
+        cb.settings = gpu_pool_settings(worker);
+        gpu_seat_ctx_t<i_t, f_t> cctx{child,
+                                      worker.leaf_problem.lower,
+                                      worker.leaf_problem.upper,
+                                      ctx[s].plunge_depth + 1,
+                                      true};
+        cb.lower = cctx.parent_lower;
+        cb.upper = cctx.parent_upper;
+        std::fill(worker.bounds_changed.begin(), worker.bounds_changed.end(), false);
+        child->update_branched_variable_bounds(cb.lower, cb.upper, worker.bounds_changed);
+        bool child_feasible = true;
+#ifndef DETERMINISM_DISABLE_BOUNDS_STRENGTHENING
+        child_feasible = worker.node_presolver.bounds_strengthening(
+          cb.settings, worker.bounds_changed, cb.lower, cb.upper);
+#endif
+        if (child_feasible) {
+          decompress_vstatus(child->packed_vstatus, worker.leaf_problem.num_cols, cb.vstatus);
+          cb.dy_se = resident_dy_se;
+          const bool same_basis = gpu_parent_accepted && cb.vstatus == resident_vstatus;
+          if (same_basis) {
+            auto& d = bound_deltas[s];
+            d.reserve(static_cast<size_t>(worker.leaf_problem.num_cols));
+            for (i_t j = 0; j < worker.leaf_problem.num_cols; ++j) {
+              unsigned char mask = 0;
+              if (std::memcmp(&resident_lower[j], &cb.lower[j], sizeof(f_t)) != 0) { mask |= 1u; }
+              if (std::memcmp(&resident_upper[j], &cb.upper[j], sizeof(f_t)) != 0) { mask |= 2u; }
+              if (mask != 0) { d.push_back({j, cb.lower[j], cb.upper[j], mask}); }
+            }
+            next[s] = next_t::CHILD;
+          } else {
+            // A CPU takeback/recheck changed the accepted basis. The child is valid, but the live
+            // device factor is not its basis, so it must enter as a full fresh node.
+            next[s] = next_t::FRESH;
+          }
+          batch[s] = std::move(cb);
+          ctx[s]   = std::move(cctx);
+          installed_child = true;
+          ++gpu_batch_plunged_;
+        } else {
+          worker.plunge_stack.push_front(child);
+        }
+      }
+    }
+    if (!installed_child) {
+      next[s] = next_t::FRESH;
+      if (!gpu_pool_fill_fresh_seat(worker, search_tree, s)) { can_fill = false; }
+    }
+  }
+
+  // The host is the only owner of global termination/time/gap checks. If the heap cannot refill
+  // every released seat, or a limit arrived during disposition, drain all still-owned LP nodes and
+  // destroy the pool. There is no partial launch and no DONE/no-op seat.
+  if (!can_fill || deterministic_global_termination_status_ != mip_status_t::UNSET ||
+      settings_.time_limit - toc(exploration_stats_.start_time) <= 0.0) {
+    gpu_pool_finish(worker);
+    return false;
+  }
+
+  std::string stage_error;
+  const f_t relaunch_cutoff =
+    std::min(upper_bound_.load(), worker.local_upper_bound) + settings_.dual_tol;
+  const f_t relaunch_time = settings_.time_limit - toc(exploration_stats_.start_time);
+  for (auto& node : batch) {
+    node.settings.cut_off    = relaunch_cutoff;
+    node.settings.time_limit = relaunch_time;
+  }
+  // Required ordering: enqueue complete fresh-node copies first, then spend host time on LU
+  // refactors, then enqueue the small child diffs. The one stream preserves visibility; no kernel
+  // is launched until all N seats have been staged.
+  auto stage_fresh_with_takeback = [&](i_t seat) {
+    while (true) {
+      stage_error.clear();
+      if (gpu_persistent_batch_stage_fresh<i_t, f_t>(pool.run, seat, stage_error)) { return true; }
+      if (!is_fresh_node_failure(seat)) { return false; }
+
+      return_cpu_only(seat, dual_status_t::NUMERICAL, "pool-fresh-factor");
+      if (!gpu_pool_fill_fresh_seat(worker, search_tree, seat)) { return false; }
+    }
+  };
+  for (i_t s = 0; s < N; ++s) {
+    if (next[s] == next_t::FRESH && !stage_fresh_with_takeback(s)) {
+      can_fill = false;
+      break;
+    }
+  }
+  if (can_fill) {
+    for (i_t s = 0; s < N; ++s) {
+      if (next[s] == next_t::REFACTOR &&
+          !gpu_persistent_batch_stage_refactor<i_t, f_t>(pool.run, s, stage_error)) {
+        if (!is_resume_node_failure(s)) {
+          can_fill = false;
+          break;
+        }
+
+        const dual_status_t reason = batch[s].status == dual_status_t::ITERATION_LIMIT
+                                       ? dual_status_t::ITERATION_LIMIT
+                                       : dual_status_t::NUMERICAL;
+        return_cpu_only(s, reason, "pool-resume-factor");
+        next[s] = next_t::FRESH;
+        if (!gpu_pool_fill_fresh_seat(worker, search_tree, s) ||
+            !stage_fresh_with_takeback(s)) {
+          can_fill = false;
+          break;
+        }
+      }
+    }
+  }
+  if (can_fill) {
+    for (i_t s = 0; s < N; ++s) {
+      if (next[s] == next_t::CHILD &&
+          !gpu_persistent_batch_stage_child<i_t, f_t>(pool.run, s, bound_deltas[s], stage_error)) {
+        can_fill = false;
+        break;
+      }
+    }
+  }
+  if (can_fill &&
+      (deterministic_global_termination_status_ != mip_status_t::UNSET ||
+       settings_.time_limit - toc(exploration_stats_.start_time) <= 0.0)) {
+    can_fill    = false;
+    stage_error = "host termination reached while preparing the next pool generation";
+  }
+  if (can_fill) {
+    const f_t latest_cutoff =
+      std::min(upper_bound_.load(), worker.local_upper_bound) + settings_.dual_tol;
+    for (auto& node : batch) { node.settings.cut_off = latest_cutoff; }
+  }
+  if (!can_fill || !gpu_persistent_batch_relaunch<i_t, f_t>(pool.run, stage_error)) {
+    settings_.log.printf("[GPUPOOL] worker %d: %s; draining pool to CPU\n",
+                         (int)worker.worker_id,
+                         stage_error.empty() ? "seat preparation failed" : stage_error.c_str());
+    gpu_pool_finish(worker);
+    return false;
+  }
+  ++gpu_batch_launches_;
+  gpu_batch_launched_ += N;
+  return true;
+}
+
+// copy_rest_to_cpu: every node the pool still holds goes back on the queue. These are unexplored
+// and currently in NO queue, so dropping them would shrink the tree -- which the termination test
+// cannot tell apart from having finished it.
+template <typename i_t, typename f_t>
+void branch_and_bound_t<i_t, f_t>::gpu_pool_finish(deterministic_bfs_worker_t<i_t, f_t>& worker)
+{
+  auto& pool  = *gpu_batch_pools_[worker.worker_id];
+  auto& batch = pool.batch;
+  auto& ctx   = pool.ctx;
+
+  // END ANY LIVE RUN FIRST. A run owns device allocations and is freed by gpu_batch_run_end; the
+  // synchronous drive could not reach here with one outstanding, but the async drive can -- a
+  // deadline or a termination can finish the pool mid-flight. Dropping the handle leaks the run's
+  // device memory, and with one pool per worker that exhausts VRAM within a minute:
+  // `rmm::out_of_memory` on neos5. Ending it also publishes the results into the batch, which is
+  // what the put-back below wants anyway.
+  if (pool.run != nullptr) {
+    gpu_batch_run_end<i_t, f_t>(pool.run);
+    pool.run = nullptr;
+  }
+  // ctx contains exactly the node currently owned by each live seat. Parents already disposed by
+  // the CPU are nulled before replacement, so every non-null entry is an unexplored LP that must
+  // return to the worker. This is also the only global-limit/time-limit response: the host drains;
+  // the device never independently declares a MIP timeout.
+  for (size_t s = ctx.size(); s > 0; --s) {
+    if (ctx[s - 1].node != nullptr) { worker.plunge_stack.push_front(ctx[s - 1].node); }
+  }
+  pool.pending.clear();
+  pool.done.clear();
+  batch.clear();
+  ctx.clear();
+  pool.busy            = false;
+  worker.gpu_pool_busy = false;
+}
+
+template <typename i_t, typename f_t>
 node_status_t branch_and_bound_t<i_t, f_t>::solve_node_deterministic(
   deterministic_bfs_worker_t<i_t, f_t>& worker,
   mip_node_t<i_t, f_t>* node_ptr,
@@ -4691,6 +6959,7 @@ node_status_t branch_and_bound_t<i_t, f_t>::solve_node_deterministic(
   lp_settings.set_log(false);
 
   lp_settings.cut_off       = worker.local_upper_bound + settings_.dual_tol;
+  if (gpu_pool_refac_freq() > 0) { lp_settings.refactor_frequency = gpu_pool_refac_freq(); }
   lp_settings.inside_mip    = 2;
   lp_settings.time_limit    = remaining_time;
   lp_settings.scale_columns = false;
@@ -4724,20 +6993,268 @@ node_status_t branch_and_bound_t<i_t, f_t>::solve_node_deterministic(
   f_t lp_start_time                = tic();
   std::vector<f_t> leaf_edge_norms = edge_norms_;
 
-  dual_status_t lp_status = dual_phase2_with_advanced_basis(2,
-                                                            0,
-                                                            worker.recompute_bounds_and_basis,
-                                                            lp_start_time,
-                                                            worker.leaf_problem,
-                                                            lp_settings,
-                                                            worker.leaf_vstatus,
-                                                            worker.basis_factors,
-                                                            worker.basic_list,
-                                                            worker.nonbasic_list,
-                                                            worker.leaf_solution,
-                                                            node_iter,
-                                                            leaf_edge_norms,
-                                                            &worker.work_context);
+  dual_status_t lp_status = dual_status_t::DUAL_UNBOUNDED;
+
+  // TEST PATH (CUOPT_BNB_GPU_SERIAL=1): the SAME serial substitution solve_node_lp does, repeated
+  // here because the deterministic coordinator does NOT go through solve_node_lp -- it calls
+  // dual_phase2_with_advanced_basis directly. Without this the GPU is silently absent from every
+  // deterministic run: a full 10-instance sweep in deterministic mode produced solves=0 on every
+  // instance and still reported OK, because that is 0 mismatches out of 0 solves.
+  //
+  // See solve_node_lp for why a device DUAL_UNBOUNDED / NUMERICAL / CUTOFF is never trusted.
+  bool solved_on_gpu = false;
+  std::vector<variable_status_t> vstatus_before_gpu;
+
+  // WHOLE-BATCH POOL (CUOPT_BNB_GPU_BATCH=<seats>): this node's LP was already solved on the device
+  // when its seat was filled, so there is nothing to launch here -- just take the answer.
+  if (!gpu_batch_pools_.empty() && worker.worker_id >= 0 &&
+      worker.worker_id < static_cast<i_t>(gpu_batch_pools_.size()) &&
+      lp_settings.inside_submip == 0) {
+    auto& pool = *gpu_batch_pools_[worker.worker_id];
+    auto found = pool.done.find(node_ptr);
+    if (found == pool.done.end()) { ++gpu_batch_absent_; }
+    if (found != pool.done.end()) {
+      auto& bn = found->second;
+      // The cached answer is for the LP AS IT WAS AT FILL TIME. Bound strengthening reads
+      // `cut_off`, so an incumbent that improved since then yields tighter bounds and a strictly
+      // different LP -- accepting the stale answer would be solving the wrong node. Compare the
+      // bounds exactly and fall through to a normal solve when they moved.
+      if (bn.lower == worker.leaf_problem.lower && bn.upper == worker.leaf_problem.upper) {
+        vstatus_before_gpu  = worker.leaf_vstatus;
+        worker.leaf_vstatus = bn.vstatus;
+        worker.basic_list   = bn.basic_list;
+        worker.nonbasic_list = bn.nonbasic_list;
+        worker.leaf_solution.x              = bn.sol.x;
+        worker.leaf_solution.objective      = bn.sol.objective;
+        worker.leaf_solution.user_objective = bn.sol.user_objective;
+        worker.leaf_solution.iterations     = bn.iters;
+        leaf_edge_norms                     = bn.dy_se;
+        node_iter                           = bn.iters;
+        lp_status                           = bn.status;
+        solved_on_gpu                       = true;
+        ++gpu_batch_hits_;
+        // The device pivoted its OWN copy of the factorization when the seat ran, so
+        // worker.basis_factors does not match worker.leaf_vstatus.
+        worker.host_basis_stale = true;
+        // ---- TEMPORARY CORRECTNESS GATE (CUOPT_BNB_GPU_POOL_RECHECK, default 1) ----------------
+        //
+        // Re-solve this node on the CPU with the FULL driver branch-and-bound would otherwise have
+        // used, from the basis the node ARRIVED with, and compare the two. This is what makes the
+        // milestone a correctness experiment: the GPU drives the search, but a GPU answer that
+        // disagrees with the CPU can never be acted on.
+        //
+        // It is also what keeps the deterministic schedule sane. The work clock advances from
+        // `phase2_work_estimate` inside the simplex driver, and a GPU-solved node records none --
+        // measured as a worker clock of 1.00 against 394.50 for the same instance on the CPU path.
+        // Passing `&worker.work_context` here restores that accounting exactly.
+        //
+        // ORDER MATTERS. The hand-back test runs BEFORE the recheck and independently of it.
+        // ITERATION_LIMIT is a NON-TERMINAL status: if it is installed as a node result it reaches
+        // update_tree_impl's final else, which calls on_numerical_issue and fetch_min's
+        // lower_bound_numerical_ -- never reset, so one such node clamps the reported dual bound for
+        // the rest of the solve. Making this an `else if` on the recheck would hide it whenever the
+        // recheck is on, which is exactly the configuration the correctness sweeps use.
+        const bool hand_back_to_cpu = (lp_status == dual_status_t::NUMERICAL ||
+                                       lp_status == dual_status_t::ITERATION_LIMIT);
+        if (hand_back_to_cpu) {
+          solved_on_gpu       = false;
+          worker.leaf_vstatus = vstatus_before_gpu;
+          ++gpu_batch_rejected_;
+          record_gpu_takeback(lp_status, node_ptr, node_iter, "pool");
+        } else if (gpu_pool_recheck()) {
+          basis_update_mpf_t<i_t, f_t> ft_cpu(worker.leaf_problem.num_rows,
+                                              lp_settings.refactor_frequency);
+          std::vector<variable_status_t> vstatus_cpu = vstatus_before_gpu;
+          std::vector<i_t> basic_cpu(worker.leaf_problem.num_rows), nonbasic_cpu;
+          lp_solution_t<i_t, f_t> sol_cpu(worker.leaf_problem.num_rows,
+                                          worker.leaf_problem.num_cols);
+          std::vector<f_t> dy_se_cpu = bn.dy_se_at_launch;
+          i_t iter_cpu               = 0;
+          const dual_status_t status_cpu =
+            dual_phase2_with_advanced_basis<i_t, f_t>(2,
+                                                      0,
+                                                      true,   // factorize vstatus_cpu ourselves
+                                                      lp_start_time,
+                                                      worker.leaf_problem,
+                                                      lp_settings,
+                                                      vstatus_cpu,
+                                                      ft_cpu,
+                                                      basic_cpu,
+                                                      nonbasic_cpu,
+                                                      sol_cpu,
+                                                      iter_cpu,
+                                                      dy_se_cpu,
+                                                      &worker.work_context);
+
+          bool cpu_decided = false, obj_differs = false;
+          const bool decision_differs = gpu_decision_differs<i_t, f_t>(lp_status,
+                                                                      status_cpu,
+                                                                      worker.leaf_solution.objective,
+                                                                      sol_cpu.objective,
+                                                                      lp_settings.cut_off,
+                                                                      cpu_decided,
+                                                                      obj_differs);
+          if (cpu_decided && (decision_differs || obj_differs)) {
+            if (decision_differs) { ++gpu_batch_corrected_decision_; } else { ++gpu_batch_corrected_obj_; }
+            settings_.log.printf(
+              "[GPUPOOL-MISMATCH] node=%d %s gpu=%s/%.17g cpu=%s/%.17g\n",
+              (int)node_ptr->node_id,
+              decision_differs ? "DECISION" : "OBJECTIVE",
+              dual_status_to_string(lp_status).c_str(), worker.leaf_solution.objective,
+              dual_status_to_string(status_cpu).c_str(), sol_cpu.objective);
+
+            // Record the node so the failure can be REPLAYED. These are rare and the tree is not
+            // reproducible across configurations, so a node that mis-decides once is usually never
+            // revisited -- without a dump the only honest report is "it did not reproduce".
+            // `vstatus_uploaded` / `dy_se_at_launch`, not the live vectors: the solve overwrote
+            // those, and a replay from the wrong entry state manufactures a divergence.
+            if (dump_bad_nodes_dir() != nullptr) {
+              static std::atomic<int> seq{0};
+              char path[1024];
+              std::snprintf(path, sizeof(path), "%s/poolnode_m%d_n%d_%04d.bin",
+                            dump_bad_nodes_dir(), (int)worker.leaf_problem.num_rows,
+                            (int)worker.leaf_problem.num_cols, seq.fetch_add(1));
+              const bool ok = bad_node::write<i_t, f_t>(
+                path, worker.leaf_problem, bn.lower, bn.upper, bn.vstatus_uploaded,
+                bn.dy_se_at_launch, bn.x_at_launch, bn.y_at_launch, bn.z_at_launch,
+                lp_settings, static_cast<int>(lp_status),
+                static_cast<int>(status_cpu), worker.leaf_solution.objective, sol_cpu.objective,
+                node_iter, iter_cpu);
+              settings_.log.printf("[GPUPOOL-DUMP] %s %s\n", ok ? "wrote" : "FAILED to write", path);
+              // Host-side counterpart of the device's [GCUT] bound fingerprint. If these differ,
+              // the device solved a differently-constrained LP than the CPU rechecked -- which is
+              // the only way c'x can exceed the node optimum in a dual simplex.
+              {
+                f_t hl = 0.0, hu = 0.0;
+                i_t hlf = 0, huf = 0;
+                for (i_t j = 0; j < worker.leaf_problem.num_cols; ++j) {
+                  if (std::isfinite(bn.lower[j])) { hl += bn.lower[j]; ++hlf; }
+                  if (std::isfinite(bn.upper[j])) { hu += bn.upper[j]; ++huf; }
+                }
+                f_t wl = 0.0, wu = 0.0;
+                for (i_t j = 0; j < worker.leaf_problem.num_cols; ++j) {
+                  if (std::isfinite(worker.leaf_problem.lower[j])) { wl += worker.leaf_problem.lower[j]; }
+                  if (std::isfinite(worker.leaf_problem.upper[j])) { wu += worker.leaf_problem.upper[j]; }
+                }
+                settings_.log.printf(
+                  "[GPUPOOL-BOUNDS] bn losum=%.17g lofin=%d upsum=%.17g upfin=%d | leaf losum=%.17g upsum=%.17g\n",
+                  hl, (int)hlf, hu, (int)huf, wl, wu);
+              }
+            }
+
+            // The CPU answer wins. Install it wholesale -- a half-installed mixture of the two
+            // would be neither driver's result.
+            worker.leaf_vstatus                 = vstatus_cpu;
+            worker.basic_list                   = basic_cpu;
+            worker.nonbasic_list                = nonbasic_cpu;
+            worker.leaf_solution.x              = sol_cpu.x;
+            worker.leaf_solution.objective      = sol_cpu.objective;
+            worker.leaf_solution.user_objective = sol_cpu.user_objective;
+            worker.leaf_solution.iterations     = iter_cpu;
+            leaf_edge_norms                     = dy_se_cpu;
+            node_iter                           = iter_cpu;
+            lp_status                           = status_cpu;
+          } else {
+            ++gpu_batch_agreed_;
+          }
+        } else {
+          // Recheck disabled and the status was not handed back above, so the device's answer is
+          // ACCEPTED as-is -- including CUTOFF and DUAL_UNBOUNDED, both of which fathom.
+          //
+          // Only two device outcomes are re-solved on the CPU (see hand_back_to_cpu above):
+          //   NUMERICAL       -- the device says it does not trust its own answer.
+          //   ITERATION_LIMIT -- the node exceeded the per-node GPU budget (gpu_batch_iter_limit()).
+          //                      It MUST be caught here: left alone it reaches update_tree_impl's
+          //                      final else, which calls on_numerical_issue and fetch_min's
+          //                      lower_bound_numerical_ -- a value that is never reset, so one such
+          //                      node would clamp the reported dual bound for the whole solve.
+          //
+          // CUTOFF and DUAL_UNBOUNDED were BOTH in this list and have been removed.
+          //
+          // CUTOFF was here because of a wrong fathom on nexp-150-20-8-5 (the device cut off at
+          // obj = 430.31 against cut_off = 282.0 on a node whose true optimum is 41.64). Its root
+          // cause is now closed: the ratio test took a NEGATIVE dual step when a reduced cost had
+          // drifted one ULP past the tolerance, which destroys dual feasibility and with it the
+          // "tracked objective is a lower bound" invariant the cutoff test rests on. gpu_phase2.cu
+          // now clamps that ratio at zero AND re-tests the invariant (dual_feasible_within_tol)
+          // before fathoming on the cutoff.
+          //
+          // DUAL_UNBOUNDED was here from the Layer-2 bring-up, when the device produced false
+          // infeasibilities on csched008 -- root-caused to get_basis_from_vstatus push_back'ing into
+          // a reused nonbasic_list, and fixed. It has not been observed wrong since.
+          //
+          // The evidence for trusting both: the milestone-C sweep re-solves EVERY seat on the CPU
+          // and compares the FATHOM DECISION (gpu_decision_differs), which is exactly what a wrong
+          // CUTOFF or DUAL_UNBOUNDED would trip -- 0 mismatches over 16,229 seats on 9 MIPLIB
+          // instances. Keep that sweep green; it is what this rule stands on.
+        }
+      } else {
+        ++gpu_batch_stale_;
+      }
+      pool.done.erase(found);
+    }
+  }
+
+  if (!solved_on_gpu && !node_ptr->cpu_only && gpu_serial_enabled() &&
+      lp_settings.inside_submip == 0) {
+    vstatus_before_gpu = worker.leaf_vstatus;
+    solved_on_gpu      = gpu_solve_node_serial<i_t, f_t>(worker.leaf_problem,
+                                                    Arow_,
+                                                    var_types_,
+                                                    lp_settings,
+                                                    worker.leaf_problem.lower,
+                                                    worker.leaf_problem.upper,
+                                                    worker.leaf_vstatus,
+                                                    worker.basic_list,
+                                                    worker.nonbasic_list,
+                                                    worker.leaf_solution,
+                                                    leaf_edge_norms,
+                                                    node_iter,
+                                                    lp_status);
+    if (solved_on_gpu) {
+      // The device pivoted its OWN copy of the factorization, so worker.basis_factors no longer
+      // matches worker.leaf_vstatus. On this path the flag that forces a rebuild is
+      // recompute_bounds_and_basis, so host_basis_stale is OR-ed into it below and at the next node.
+      worker.host_basis_stale = true;
+      // Same rule as the pool path above -- see the comment there for why CUTOFF and
+      // DUAL_UNBOUNDED are trusted. Two copies of this test must never disagree about what the
+      // device is trusted for.
+      if (lp_status == dual_status_t::NUMERICAL ||
+          lp_status == dual_status_t::ITERATION_LIMIT) {
+        solved_on_gpu       = false;
+        worker.leaf_vstatus = vstatus_before_gpu;   // re-solve from the basis the node arrived with
+        record_gpu_takeback(lp_status, node_ptr, node_iter, "serial");
+      }
+    }
+  }
+
+  if (!solved_on_gpu) {
+    const bool initialize_basis = worker.recompute_bounds_and_basis || worker.host_basis_stale;
+    if (initialize_basis) { worker.host_basis_stale = false; }
+    // DIAGNOSTIC (CUOPT_BNB_ENSIZE_TRACE=1): the column count and carried-edge-norm length the
+    // deterministic node solve actually runs on.
+    static const bool ensize_trace = std::getenv("CUOPT_BNB_ENSIZE_TRACE") != nullptr;
+        if (ensize_trace) {
+      std::fprintf(stderr, "[ENSIZE] det submip=%d depth=%d leaf_n=%d en=%d orig_n=%d\n",
+                   (int)settings_.inside_submip, (int)node_ptr->depth,
+                   (int)worker.leaf_problem.num_cols, (int)leaf_edge_norms.size(),
+                   (int)original_lp_.num_cols);
+    }
+    lp_status = dual_phase2_with_advanced_basis(2,
+                                                0,
+                                                initialize_basis,
+                                                lp_start_time,
+                                                worker.leaf_problem,
+                                                lp_settings,
+                                                worker.leaf_vstatus,
+                                                worker.basis_factors,
+                                                worker.basic_list,
+                                                worker.nonbasic_list,
+                                                worker.leaf_solution,
+                                                node_iter,
+                                                leaf_edge_norms,
+                                                &worker.work_context);
+  }
 
   if (lp_status == dual_status_t::NUMERICAL) {
     settings_.log.print_format("Numerical issue node {}. Resolving from scratch.\n",
@@ -5306,6 +7823,7 @@ void branch_and_bound_t<i_t, f_t>::deterministic_dive(
     simplex_solver_settings_t<i_t, f_t> lp_settings = settings_;
     lp_settings.set_log(false);
     lp_settings.cut_off       = worker.local_upper_bound + settings_.dual_tol;
+  if (gpu_pool_refac_freq() > 0) { lp_settings.refactor_frequency = gpu_pool_refac_freq(); }
     lp_settings.inside_mip    = 2;
     lp_settings.time_limit    = remaining_time;
     lp_settings.scale_columns = false;

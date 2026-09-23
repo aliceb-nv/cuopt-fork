@@ -1,0 +1,2051 @@
+/* clang-format off */
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+/* clang-format on */
+
+#include <branch_and_bound/bad_node_dump.hpp>
+#include <branch_and_bound/gpu_node_pool.hpp>
+
+#include <dual_simplex/basis_solves.hpp>
+#include <dual_simplex/initial_basis.hpp>
+#include <dual_simplex/phase2.hpp>
+
+#include <math_optimization/tic_toc.hpp>
+
+#include <raft/core/error.hpp>
+
+#include <atomic>
+#include <cassert>
+#include <omp.h>
+
+#include <cstring>
+#include <mutex>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
+#include <utility>
+#include <vector>
+#include <algorithm>
+#include <string>
+
+namespace cuopt::mathematical_optimization::mip {
+
+namespace {
+
+// Test hook. On a single-GPU development machine there is no spare device, so the pool can never
+// engage and none of the branch-and-bound wiring can be exercised. Setting this to a device index
+// forces the pool onto that device even when it is the only one. NOT a production path: it puts the
+// dual simplex on the same device as the heuristics, which is exactly what the design forbids.
+int forced_device()
+{
+  const char* e = std::getenv("CUOPT_BNB_GPU_DEVICE");
+  return (e != nullptr) ? std::atoi(e) : -1;
+}
+
+}  // namespace
+
+// `get_basis_from_vstatus` INDEXES basic_list but PUSH_BACKS into nonbasic_list and
+// superbasic_list -- it does not clear them. Callers that reuse their vectors (the worker's
+// basic_list/nonbasic_list live for the whole solve, and a pool seat's live for the whole run) must
+// therefore reset them first, or the lists GROW by (n-m) on every node and every consumer that
+// iterates the first n-m entries silently reads the FIRST node's basis forever after.
+template <typename i_t>
+static void basis_from_vstatus_reset(i_t m,
+                                     i_t n,
+                                     const std::vector<simplex::variable_status_t>& vstatus,
+                                     std::vector<i_t>& basic_list,
+                                     std::vector<i_t>& nonbasic_list,
+                                     std::vector<i_t>& superbasic_list)
+{
+  basic_list.assign(static_cast<size_t>(m), 0);
+  nonbasic_list.clear();
+  nonbasic_list.reserve(static_cast<size_t>(n - m));
+  superbasic_list.clear();
+  simplex::get_basis_from_vstatus<i_t>(m, vstatus, basic_list, nonbasic_list, superbasic_list);
+}
+
+template <typename f_t>
+static bool gpu_resume_dual_feasible(const std::vector<simplex::variable_status_t>& vstatus,
+                                     const std::vector<f_t>& z,
+                                     f_t dual_tol)
+{
+  if (z.size() < vstatus.size()) { return false; }
+  f_t infeasibility = 0.0;
+  for (size_t j = 0; j < vstatus.size(); ++j) {
+    if (!std::isfinite(z[j])) { return false; }
+    if (vstatus[j] == simplex::variable_status_t::NONBASIC_LOWER && z[j] < -dual_tol) {
+      infeasibility += -z[j];
+    } else if (vstatus[j] == simplex::variable_status_t::NONBASIC_UPPER && z[j] > dual_tol) {
+      infeasibility += z[j];
+    } else if (vstatus[j] == simplex::variable_status_t::NONBASIC_FREE) {
+      infeasibility += std::abs(z[j]);
+    }
+    if (infeasibility > dual_tol) { return false; }
+  }
+  return true;
+}
+
+
+// Devices available to the dual simplex. Not a template: it depends on nothing but the driver and
+// the CUOPT_BNB_GPU_DEVICE override.
+std::vector<int> gpu_usable_devices()
+{
+  int count = 0;
+  if (cudaGetDeviceCount(&count) != cudaSuccess) { return {}; }
+
+  const int forced = forced_device();
+  if (forced >= 0) {
+    if (forced >= count) { return {}; }
+    return {forced};
+  }
+  // Device 0 runs PDLP, feasibility jump and probing. Only the extra devices are ours, so a
+  // single-GPU machine yields nothing and the pool stays disabled.
+  std::vector<int> devices;
+  for (int d = 1; d < count; ++d) { devices.push_back(d); }
+  return devices;
+}
+
+
+// #4 -- STATIC POOL->DEVICE MAP, computed ONCE before any worker starts.
+//
+// Workers do not all start at the same moment, so "claim the least-used GPU when you arrive" would
+// hand out devices in thread-arrival order -- which is not reproducible and would make the device a
+// worker is on vary run to run. Instead the assignment is computed up front from two numbers that
+// are both known at that point: the usable devices and the BFS worker count. Each worker then
+// claims its pre-assigned slot on first use, so the outcome is identical whatever order they arrive
+// in.
+//
+// Round-robin by worker id: with 11 workers on 2 GPUs this gives 6/5 and is independent of thread
+// arrival order.
+std::vector<int> gpu_pool_device_map(int num_workers)
+{
+  const auto devices = gpu_usable_devices();
+  std::vector<int> map(static_cast<size_t>(std::max(num_workers, 0)), -1);
+  if (devices.empty() || num_workers <= 0) { return map; }
+  const int nd = static_cast<int>(devices.size());
+  for (int w = 0; w < num_workers; ++w) {
+    map[static_cast<size_t>(w)] = devices[static_cast<size_t>(w % nd)];
+  }
+  return map;
+}
+
+// How many pools land on each usable device, for the [CONFIG] line. Reporting it is the only way to
+// see that the split is what was intended without instrumenting a run.
+std::vector<std::pair<int, int>> gpu_pool_device_load(const std::vector<int>& map)
+{
+  std::vector<std::pair<int, int>> load;
+  for (int d : map) {
+    if (d < 0) { continue; }
+    auto it = std::find_if(load.begin(), load.end(), [d](const auto& e) { return e.first == d; });
+    if (it == load.end()) { load.emplace_back(d, 1); } else { ++it->second; }
+  }
+  std::sort(load.begin(), load.end());
+  return load;
+}
+
+bool gpu_serial_enabled()
+{
+  static const bool on = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_SERIAL");
+    const bool enabled = e != nullptr && std::string(e) != "0";
+    // Announce it once. A run that silently did NOT use the GPU would otherwise look like a clean
+    // pass, which is the failure mode this whole test path exists to avoid.
+    if (enabled) {
+      const auto devs = gpu_usable_devices();
+      std::fprintf(stderr,
+                   "[CONFIG] branch-and-bound node LPs -> GPU (serial substitution, batch of 1); "
+                   "usable devices=%zu%s\n",
+                   devs.size(),
+                   devs.empty() ? " -- NONE, falling back to the CPU driver" : "");
+    }
+    return enabled;
+  }();
+  return on;
+}
+
+// TEST-ONLY diagnostic (CUOPT_BNB_GPU_VERIFY=1), meaningful only together with the serial
+// substitution above. Every node is solved TWICE -- once on the device, once on the CPU with the
+// FULL driver the branch-and-bound would otherwise have used -- and any node where the two reach a
+// different FATHOM decision is reported. This is what turns "the tree came out different" into "node
+// X disagrees", which is the only tractable way to debug a search-level divergence.
+// 0 = off. 1 = the GATE only: re-solve each node with the CPU FULL driver (what production uses)
+// and compare the prune decision. 2 = also the two DIAGNOSTIC legs -- the CPU SIMPLIFIED driver
+// (separates "the port is wrong" from "the minimal algorithm is too weak") and a re-solve from the
+// basis the device returned. Level 2 costs three extra CPU solves per node, so it roughly triples
+// the run; use it when investigating, not when sweeping.
+int gpu_serial_verify_level()
+{
+  static const int level = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_VERIFY");
+    return (e != nullptr) ? std::atoi(e) : 0;
+  }();
+  return level;
+}
+bool gpu_serial_verify() { return gpu_serial_verify_level() > 0; }
+
+// Directory for wrong-decision node dumps, or nullptr when disabled. Off by default: these are
+// multi-megabyte binary images and only wanted while a defect is being chased.
+const char* dump_bad_nodes_dir()
+{
+  static const char* dir = std::getenv("CUOPT_BNB_DUMP_BAD_NODES");
+  return (dir != nullptr && dir[0] != '\0') ? dir : nullptr;
+}
+
+
+// FNV-1a over a double array's raw bits. Used only to localise WHERE a vector changes between two
+// points in this function; a checksum answers "did it change", and printing the vector does not.
+static unsigned long long dbg_hash_vs(const std::vector<simplex::variable_status_t>& v)
+{
+  unsigned long long h = 1469598103934665603ull;
+  for (size_t k = 0; k < v.size(); ++k) {
+    h ^= static_cast<unsigned long long>(static_cast<int>(v[k]));
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+
+template <typename f_t>
+static unsigned long long dbg_hash(const std::vector<f_t>& v)
+{
+  unsigned long long h = 1469598103934665603ull;
+  for (size_t k = 0; k < v.size(); ++k) {
+    unsigned long long bits;
+    std::memcpy(&bits, &v[k], sizeof(bits));
+    h ^= bits;
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+
+// Shared by the serial verify leg and the pool's CPU recheck gate. Documented in the header.
+template <typename i_t, typename f_t>
+bool gpu_decision_differs(simplex::dual_status_t gpu_status,
+                          simplex::dual_status_t cpu_status,
+                          f_t gpu_objective,
+                          f_t cpu_objective,
+                          f_t cut_off,
+                          bool& cpu_decided,
+                          bool& objective_differs)
+{
+  // Both statuses that make branch-and-bound PRUNE count, not just infeasibility: a spurious CUTOFF
+  // fathoms exactly as destructively as a spurious DUAL_UNBOUNDED.
+  auto prunes = [](simplex::dual_status_t st) {
+    return st == simplex::dual_status_t::DUAL_UNBOUNDED || st == simplex::dual_status_t::CUTOFF;
+  };
+  // The CPU leg must actually have REACHED a verdict. ITERATION_LIMIT / TIME_LIMIT / NUMERICAL mean
+  // it ran out of budget and returned obj=nan, so counting the difference is a false positive.
+  // Measured: every flagged mismatch on csched008, seymour and wachplan after the basis-list fix was
+  // this case.
+  cpu_decided = cpu_status == simplex::dual_status_t::OPTIMAL ||
+                cpu_status == simplex::dual_status_t::DUAL_UNBOUNDED ||
+                cpu_status == simplex::dual_status_t::CUTOFF;
+
+  const bool both_optimal = gpu_status == simplex::dual_status_t::OPTIMAL &&
+                            cpu_status == simplex::dual_status_t::OPTIMAL;
+  const f_t obj_tol = f_t{1e-6} * std::max(f_t{1.0}, std::fabs(cpu_objective));
+  objective_differs = both_optimal && std::fabs(gpu_objective - cpu_objective) > obj_tol;
+
+  // CUTOFF is an EARLY EXIT, not a verdict about the subtree: the driver stops the moment its
+  // tracked objective reaches cut_off. So CUTOFF on one side and OPTIMAL on the other is a DEFECT
+  // only when the side that solved to optimality would NOT itself have been cut off -- i.e. the
+  // other side pruned a node still capable of improving the incumbent. When both values sit past
+  // the cutoff, branch-and-bound fathoms either way and the two agree.
+  auto cutoff_vs_optimal_disagrees = [&](simplex::dual_status_t cut_side,
+                                         simplex::dual_status_t opt_side,
+                                         f_t opt_objective) {
+    if (cut_side != simplex::dual_status_t::CUTOFF ||
+        opt_side != simplex::dual_status_t::OPTIMAL) {
+      return false;   // not this pair; the generic prune test applies
+    }
+    if (!std::isfinite(cut_off)) { return true; }   // an infinite cutoff can never fire
+    return opt_objective < cut_off;                 // still promising -> the prune lost a subtree
+  };
+
+  const bool gpu_prunes = prunes(gpu_status);
+  const bool cpu_prunes = prunes(cpu_status);
+  if (gpu_prunes != cpu_prunes && (gpu_status == simplex::dual_status_t::CUTOFF ||
+                                   cpu_status == simplex::dual_status_t::CUTOFF)) {
+    return cutoff_vs_optimal_disagrees(gpu_status, cpu_status, cpu_objective) ||
+           cutoff_vs_optimal_disagrees(cpu_status, gpu_status, gpu_objective);
+  }
+  return gpu_prunes != cpu_prunes;
+}
+
+template bool gpu_decision_differs<int, double>(
+  simplex::dual_status_t, simplex::dual_status_t, double, double, double, bool&, bool&);
+
+template <typename i_t, typename f_t>
+bool gpu_solve_node_serial(const simplex::lp_problem_t<i_t, f_t>& lp,
+                           const csr_matrix_t<i_t, f_t>& /*Arow*/,
+                           const std::vector<simplex::variable_type_t>& /*var_types*/,
+                           const simplex::simplex_solver_settings_t<i_t, f_t>& settings,
+                           const std::vector<f_t>& lower,
+                           const std::vector<f_t>& upper,
+                           std::vector<simplex::variable_status_t>& vstatus,
+                           std::vector<i_t>& basic_list,
+                           std::vector<i_t>& nonbasic_list,
+                           simplex::lp_solution_t<i_t, f_t>& sol,
+                           std::vector<f_t>& dy_se,
+                           i_t& iters,
+                           simplex::dual_status_t& status)
+{
+  static const std::vector<int> devices = gpu_usable_devices();
+  if (devices.empty()) { return false; }
+
+  // DIAGNOSTIC (CUOPT_BNB_GPU_ONE_THREAD=1): let only the FIRST worker thread that gets here use
+  // the device; every other thread takes the CPU driver. Several workers otherwise interleave their
+  // trace output, and lines from different threads cannot be paired -- which would make a device
+  // line and an unrelated CPU line look like a divergence. Not a production path: it serialises the
+  // offload.
+  static const bool one_thread = std::getenv("CUOPT_BNB_GPU_ONE_THREAD") != nullptr;
+  if (one_thread) {
+    static std::atomic<bool> claimed{false};
+    thread_local bool decided  = false;
+    thread_local bool is_owner = false;
+    if (!decided) {
+      bool expected = false;
+      is_owner      = claimed.compare_exchange_strong(expected, true);
+      decided       = true;
+    }
+    if (!is_owner) { return false; }
+  }
+
+  const i_t m = lp.num_rows;
+
+  // Every B&B LP starts from the root steepest-edge vector. An empty vector is the generic dual
+  // simplex cold-start signal and must not be used by this path (basis repair is rejected below).
+  assert(dy_se.size() == static_cast<size_t>(lp.num_cols));
+
+  // Snapshot the warm start BEFORE anything touches it: `refactor_basis` may repair `vstatus`, and
+  // the batch overwrites it with the FINAL basis. The cross-check needs the inputs as they arrived.
+  const bool verify = gpu_serial_verify();
+  std::vector<simplex::variable_status_t> vstatus_ref;
+  std::vector<f_t> dy_se_ref;
+  if (verify) {
+    vstatus_ref = vstatus;
+    dy_se_ref   = dy_se;
+    if (dump_bad_nodes_dir() != nullptr) {
+      std::fprintf(stderr, "[DYSEWHERE] tid=%d entry %016llx ptr=%p\n", omp_get_thread_num(), dbg_hash(dy_se), (const void*)&dy_se);
+    }
+  }
+
+  // The batch requires a FRESH factorization of THIS node's basis: pure MPF stacking on the device,
+  // no on-device refactorization. `ft` is function-local so nothing stale can leak into it.
+  simplex::basis_update_mpf_t<i_t, f_t> ft(m, settings.refactor_frequency);
+  std::vector<i_t> superbasic_list;
+  basis_from_vstatus_reset<i_t>(m, lp.num_cols, vstatus, basic_list, nonbasic_list, superbasic_list);
+
+  const f_t t0 = cuopt::mathematical_optimization::tic();
+  // Factorize the current basis. Periodic and terminal-certificate resumes are independently priced
+  // and rejected if the returned basis is not dual feasible. A rejected-update resume is exempt:
+  // its negative-step/cutoff path has its own clamp+tolerance guard and preserves the established
+  // recovery trajectory.
+  auto refactorize = [&](simplex::lp_solution_t<i_t, f_t>& s,
+                         bool initialize_basis,
+                         bool certify_resume) {
+    // FILL ONLY -- see the batch path. On a resume the device has already returned the lists in the
+    // order it maintains them; rebuilding them from `vstatus` re-sorts both and changes both the LU
+    // and the order the ratio test scans the nonbasics in.
+    if (initialize_basis) {
+      basis_from_vstatus_reset<i_t>(
+        m, lp.num_cols, vstatus, basic_list, nonbasic_list, superbasic_list);
+    }
+    bool repaired = false;
+    if (ft.refactor_basis(
+          lp.A, settings, lower, upper, t0, basic_list, nonbasic_list, vstatus, &repaired) != 0 ||
+        repaired) {
+      return false;   // singular / repaired basis: let the CPU driver handle this node
+    }
+    // The device consumes the duals as INPUTS; the simplified driver it ports has no dual prologue.
+    // On fill, price them into the solution. On certified resumes, fresh pricing is an independent
+    // check: reject a dual-infeasible basis, but preserve the maintained duals and their trajectory.
+    f_t work = 0.0;
+    if (initialize_basis) {
+      simplex::phase2::compute_dual_solution_from_basis(
+        lp, ft, basic_list, nonbasic_list, s.y, s.z, work);
+    } else if (certify_resume) {
+      std::vector<f_t> fresh_y(m, 0.0), fresh_z(lp.num_cols, 0.0);
+      simplex::phase2::compute_dual_solution_from_basis(
+        lp, ft, basic_list, nonbasic_list, fresh_y, fresh_z, work);
+      if (!gpu_resume_dual_feasible(vstatus, fresh_z, settings.dual_tol)) { return false; }
+    }
+    return true;
+  };
+
+  // The driver expects a CLEAN solution object -- it starts the primal point from the basis and the
+  // bounds, and accumulates the iteration count. `sol` is the worker's `leaf_solution`, reused for
+  // every node it ever solves, so handing it over directly would start this node from the PREVIOUS
+  // node's primal point. Solve into a clean one and publish only the outputs.
+  simplex::lp_solution_t<i_t, f_t> node_sol(m, lp.num_cols);
+  if (!refactorize(node_sol, /*initialize_basis*/ true, /*certify_resume*/ false)) {
+    return false;
+  }
+  if (verify && dump_bad_nodes_dir() != nullptr) {
+    std::fprintf(stderr, "[DYSEWHERE] tid=%d after-price %016llx\n", omp_get_thread_num(), dbg_hash(dy_se));
+  }
+
+  // DIAGNOSTIC (CUOPT_BNB_DY_PROBE=<column index>): recompute delta_y = B^-T e_r on the HOST, from
+  // the very factorization that is about to be uploaded, for the basic position of that column.
+  // The device reports its own delta_y nnz in the [GMIN] trace, so this says whether the device's
+  // BTran agrees with the CPU's on identical input -- which is the whole question behind a false
+  // infeasibility certificate: an empty ratio test is only valid if delta_y is right.
+  {
+    static const int probe_col = [] {
+      const char* e = std::getenv("CUOPT_BNB_DY_PROBE");
+      return (e != nullptr) ? std::atoi(e) : -1;
+    }();
+    if (probe_col >= 0) {
+      for (i_t k = 0; k < m; ++k) {
+        if (basic_list[k] != probe_col) { continue; }
+        sparse_vector_t<i_t, f_t> ei(m, 1), dy(m, 0), utsol(m, 0);
+        ei.i[0] = k;
+        ei.x[0] = -1;   // -direction for direction = +1, as compute_delta_y builds it
+        ft.b_transpose_solve(ei, dy, utsol);
+        std::fprintf(stderr,
+                     "[DYPROBE] col=%d basic_pos=%d host_dy_nz=%d\n",
+                     probe_col, (int)k, (int)dy.i.size());
+        break;
+      }
+    }
+  }
+
+  // The basis EXACTLY as uploaded. `refactor_basis` may repair vstatus, so the entry snapshot is
+  // not what the device was given -- comparing against that snapshot would make the CPU start from
+  // a different basis and manufacture a divergence that is not there.
+  std::vector<simplex::variable_status_t> vstatus_uploaded;
+  if (verify) { vstatus_uploaded = vstatus; }
+  // x / y / z are INPUTS to the device (`a.x/.y/.z = upload(sol.x/.y/.z)`), so a replay that
+  // rebuilds them instead of reproducing them is not replaying the same solve. Snapshot them here,
+  // at the state the first launch uploads.
+  std::vector<f_t> x_uploaded, y_uploaded, z_uploaded;
+  std::vector<f_t> dy_se_at_launch, x_at_launch, y_at_launch, z_at_launch;
+  // The LU factor is the last input a replay REBUILDS instead of reproducing: everything else is an
+  // array the dump copies verbatim. Snapshot what the first launch actually uploads, so a replay
+  // that disagrees can be tested against the factorization rather than assumed identical to it.
+  std::vector<f_t> l0x_uploaded, u0x_uploaded;
+  std::vector<i_t> l0cs_uploaded, u0cs_uploaded, rowperm_uploaded;
+  if (verify) {
+    x_uploaded       = node_sol.x;
+    y_uploaded       = node_sol.y;
+    z_uploaded       = node_sol.z;
+    l0x_uploaded     = ft.L0().x;
+    u0x_uploaded     = ft.U0().x;
+    l0cs_uploaded    = ft.L0().col_start;
+    u0cs_uploaded    = ft.U0().col_start;
+    rowperm_uploaded = ft.row_permutation();
+  }
+
+  gds::gpu_batch_item<i_t, f_t> it{};
+  it.lp            = &lp;
+  it.lower         = &lower;      // per-node bounds; the shared lp carries A/rhs/objective
+  it.upper         = &upper;
+  it.settings      = &settings;
+  it.vstatus       = &vstatus;
+  it.ft            = &ft;
+  it.basic_list    = &basic_list;
+  it.nonbasic_list = &nonbasic_list;
+  it.sol           = &node_sol;
+  // Why a REFACTOR_NEEDED leg stopped: 0 = periodic schedule, 1 = rejected rank-1 update.
+  int refactor_reason = 0;
+  it.refactor_reason  = &refactor_reason;
+  it.dy_se         = &dy_se;
+
+  // Size contract for everything the marshal uploads. The kernel indexes these by column/row index
+  // with no bounds check, so a short vector is not a wrong answer -- it is an out-of-bounds device
+  // read, which surfaces far away as `cudaErrorIllegalAddress` on the next synchronising call and
+  // says nothing about which array was wrong. Check here, where the answer is one line.
+  {
+    const i_t n_cols = lp.num_cols;
+    const char* bad  = nullptr;
+    if (static_cast<i_t>(vstatus.size()) != n_cols) { bad = "vstatus"; }
+    else if (static_cast<i_t>(basic_list.size()) != m) { bad = "basic_list"; }
+    else if (static_cast<i_t>(nonbasic_list.size()) != n_cols - m) { bad = "nonbasic_list"; }
+    else if (static_cast<i_t>(dy_se.size()) != n_cols) { bad = "dy_se"; }
+    else if (static_cast<i_t>(node_sol.x.size()) != n_cols) { bad = "sol.x"; }
+    else if (static_cast<i_t>(node_sol.y.size()) != m) { bad = "sol.y"; }
+    else if (static_cast<i_t>(node_sol.z.size()) != n_cols) { bad = "sol.z"; }
+    if (bad != nullptr) {
+      std::fprintf(stderr,
+                   "[GPUSIZE] refusing launch: %s has the wrong length "
+                   "(m=%d n=%d vstatus=%zu basic=%zu nonbasic=%zu dy_se=%zu x=%zu y=%zu z=%zu)\n",
+                   bad, (int)m, (int)n_cols, vstatus.size(), basic_list.size(),
+                   nonbasic_list.size(), dy_se.size(), node_sol.x.size(), node_sol.y.size(),
+                   node_sol.z.size());
+      return false;   // fall back to the CPU driver rather than corrupt device memory
+    }
+  }
+
+  std::vector<gds::gpu_batch_item<i_t, f_t>> items{it};
+  std::vector<simplex::dual_status_t> out;
+  gds::gpu_batch_timing timing;
+  // EXPLICIT STREAM, one per worker thread. The synchronous batch entry runs on the LEGACY default
+  // stream, and cuOpt captures CUDA graphs elsewhere in the solver -- once a capture is live, any
+  // legacy-stream work fails with cudaErrorStreamCaptureImplicit ("would make the legacy stream
+  // depend on a capturing blocking stream") and aborts the process. It is intermittent, because it
+  // needs a capture to be in flight on another thread at the same moment.
+  //
+  // thread_local, not static: several branch-and-bound workers call this concurrently and each must
+  // own its stream, exactly as the pool gives every slice its own.
+  static thread_local rmm::cuda_stream worker_stream;
+
+  // REFACTOR-AND-RESUME. The device stops with REFACTOR_NEEDED when its rank-1 update is unsafe or
+  // its preallocated update store is full -- the same condition the CPU full driver answers by
+  // refactorizing IN PLACE and continuing. The device cannot: it has no LU of its own. So the host
+  // does that rebuild and calls it straight back.
+  //
+  // Without this the node was abandoned to a full CPU re-solve at the 256-update cap, which on
+  // csched008 is most long nodes -- so the GPU never finished the very solves it needs to be
+  // measured on, and no GPU-vs-CPU comparison of a long node was possible.
+  //
+  // The resume is exact, not a restart: the device hands back the basis it reached (vstatus), its
+  // primal point, its objective and its steepest-edge norms, and every one of those is fed
+  // straight back in. Only the factorization is rebuilt.
+  //
+  // The node is bounded by its CUMULATIVE iteration count (see the check in the loop), which is the
+  // same bound the CPU plunging worker gets. A leg count is deliberately NOT the bound: a
+  // legitimate long node needs many legs -- one per `refactor_frequency` pivots -- and capping legs
+  // gives up on nodes the CPU would simply keep solving. The only leg-based guard is on legs that
+  // take ZERO pivots, which is a genuine livelock and cannot be caught by an iteration count.
+  // DIAGNOSTIC (CUOPT_BNB_GPU_LOCK=1): serialise every worker's device work behind one mutex. Each
+  // worker owns its stream and its buffers, so if a defect disappears under this lock it is
+  // cross-worker interference, and if it survives the lock it is not. Nothing else distinguishes
+  // the two, because a wrong objective looks the same either way.
+  static const bool serialize_gpu = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_LOCK");
+    return e != nullptr && std::string(e) != "0";
+  }();
+  static std::mutex gpu_lock;
+  std::unique_lock<std::mutex> gpu_guard(gpu_lock, std::defer_lock);
+  if (serialize_gpu) { gpu_guard.lock(); }
+
+  i_t total_iters           = 0;
+  int resumes               = 0;
+  int zero_pivot_legs       = 0;
+  // Set when the loop stops on an iteration bound rather than on a device answer. Needed as a
+  // separate flag because `status` is overwritten from out[0] after the loop, which would turn
+  // this into a leaked non-terminal REFACTOR_NEEDED.
+  bool stopped_on_iter_limit = false;
+  while (true) {
+    // The steepest-edge vector AS UPLOADED by the first launch. Everything else the dump records is
+    // snapshotted at function entry, which is only the same thing if nothing touches it in between.
+    if (verify && resumes == 0 && dump_bad_nodes_dir() != nullptr) {
+      std::fprintf(stderr, "[DYSEWHERE] tid=%d at-launch %016llx ptr=%p\n", omp_get_thread_num(),
+                   dbg_hash(*items[0].dy_se), (const void*)items[0].dy_se);
+    }
+    if (verify && resumes == 0) {
+      dy_se_at_launch = *items[0].dy_se;
+      x_at_launch     = node_sol.x;
+      y_at_launch     = node_sol.y;
+      z_at_launch     = node_sol.z;
+    }
+    auto* handle = gds::gpu_simplified_dual_phase2_batch_launch<i_t, f_t>(
+      items, 0, timing, worker_stream.view(), /*allow_refactor_exit*/ true);
+    if (handle == nullptr) { return false; }   // rejected: timing.message says needed-vs-free
+    gds::gpu_simplified_dual_phase2_batch_finish<i_t, f_t>(handle, out, timing);
+    if (timing.rejected || out.empty()) { return false; }
+
+    // ASSIGN, not accumulate: the device carries `iter` across a resume now, so what comes back
+    // is already this node's running total. Accumulating would count every leg twice.
+    total_iters = node_sol.iterations;
+    // Per-leg trace while capturing bad nodes: a replay that disagrees with the live solve has to
+    // be pinned to a LEG before it can be pinned to a cause, and the node-level numbers alone
+    // cannot say whether the two paths parted at the first launch or after a resume.
+    if (dump_bad_nodes_dir() != nullptr) {
+      // The BASIS hash is the point. A node that pivots without moving the objective is either
+      // CYCLING -- the hash repeats, so the solve revisits a basis it already had -- or STALLING on
+      // degeneracy, where the hash keeps changing while the objective does not. Those have different
+      // causes and the objective alone cannot tell them apart.
+      const unsigned long long vs_h = dbg_hash_vs(vstatus);
+      static thread_local std::vector<unsigned long long> seen_bases;
+      if (resumes == 0) { seen_bases.clear(); }
+      int repeat_of = -1;
+      for (size_t k = 0; k < seen_bases.size(); ++k) {
+        if (seen_bases[k] == vs_h) { repeat_of = static_cast<int>(k); break; }
+      }
+      seen_bases.push_back(vs_h);
+      std::fprintf(stderr,
+                   "[BADNODE-LEG] %d %s it=%d cum=%d obj=%.17g vs=%016llx x=%016llx dyse=%016llx\n",
+                   resumes, simplex::dual_status_to_string(out[0]).c_str(), node_sol.iterations,
+                   (int)total_iters, node_sol.objective, vs_h, dbg_hash(node_sol.x),
+                   dbg_hash(*items[0].dy_se));
+      if (repeat_of >= 0) {
+        std::fprintf(stderr, "[BADNODE-CYCLE] leg %d repeats the basis of leg %d\n",
+                     resumes, repeat_of);
+      }
+    }
+    if (out[0] != simplex::dual_status_t::REFACTOR_NEEDED) { break; }
+
+    // SAME BOUND AS THE CPU PLUNGING WORKER: the node's cumulative iteration count, not a count of
+    // resume legs. `settings.iteration_limit` is exactly what solve_node_lp was handed, so the two
+    // workers read the same number -- today that is INT_MAX for a main-tree plunge node, so this
+    // check is inert and the node is bounded only by the time limit, like the CPU's.
+    //
+    // It is deliberately not a LEG count: the CPU refactorizes in place an unbounded number of
+    // times, so capping legs would give up on a node the CPU would keep solving -- measured
+    // elsewhere at ~68 legs for greenbeb and ~218 for dfl001 at the default refactor frequency.
+    //
+    // Returning ITERATION_LIMIT (rather than false) is what makes this the same behaviour: the node
+    // goes back on the queue exactly as a CPU ITERATION_LIMIT node does, instead of being re-solved
+    // from scratch on the CPU.
+    // DIAGNOSTIC (CUOPT_BNB_GPU_ITER_CAP=<n>, 0 = off): a second, much tighter cap, so a node that
+    // STALLS can be made to terminate and therefore reach the verification block below. Without it a
+    // stalling node never completes, never emits a [GPUVERIFY] line, and so can never be compared
+    // against the CPU drivers -- which is exactly the node we most need to compare.
+    static const i_t diag_iter_cap = [] {
+      const char* e = std::getenv("CUOPT_BNB_GPU_ITER_CAP");
+      return (e != nullptr) ? static_cast<i_t>(std::atoi(e)) : i_t{0};
+    }();
+    const bool hit_cap = (diag_iter_cap > 0 && total_iters >= diag_iter_cap);
+
+    if (hit_cap || total_iters >= settings.iteration_limit) {
+      stopped_on_iter_limit = true;
+      // BREAK, not return: the verification block after this loop is the whole point of the
+      // diagnostic cap. Returning here would skip it.
+      break;
+    }
+
+    // Livelock guard, and the ONLY thing a leg count is good for: a leg that takes zero pivots has
+    // made no progress, so `total_iters` would never reach the cap above. One is normal; several in
+    // a row is a stuck node.
+    if (node_sol.iterations == 0) {
+      if (++zero_pivot_legs >= 8) { return false; }
+    } else {
+      zero_pivot_legs = 0;
+    }
+    ++resumes;
+    // Rebuild the factorization of the basis the device stopped on, and re-derive the duals from
+    // it. node_sol.x / .objective and dy_se already hold the device's state and are passed back
+    // unchanged, so the next launch continues rather than restarts.
+    // A/B KNOB ONLY (CUOPT_BNB_GPU_RESUME_PRICE=1), default OFF. The CPU never re-prices at a
+    // refactorization, so neither do we: the device now CONTINUES the solve instead of restarting
+    // it, which is what makes the maintained duals valid across a resume. Kept because it was the
+    // measurement that localised the defect.
+    //
+    // WHY, and why this differs from the CPU. The CPU refactorizes IN PLACE and keeps iterating, so
+    // carrying its incrementally maintained y/z across a refactorization is continuous and correct.
+    // A GPU resume is not that: the device exits, and the next launch runs setup() again, which
+    // recomputes the primal infeasibilities, the objective and the working set from scratch. The
+    // device has NO dual prologue -- setup() never computes y/z, it consumes whatever the host
+    // uploads -- so feeding maintained duals into that restart mixes two representations: a basis
+    // freshly factorized on the host against reduced costs accumulated against the old one.
+    //
+    // Measured on csched008: carrying them, one node pivoted 686 times over 69,972 iterations
+    // without terminating, already sitting at its optimum (obj=173), the basis never repeating --
+    // so not cycling, just never satisfying the optimality test. Re-pricing: the same instance goes
+    // from 0 solves / 2 nodes to 8 / 20. germanrr 28 -> 32, mcsched 1086 -> 1202, zero mismatches.
+    //
+    // It is NOT drift. The same probe shows germanrr, which converges, carrying the same
+    // 5e-06..1.4e-04 dual error as csched008 does.
+    //
+    // Cost is one BTRAN plus a pass over the nonbasics per resume, against a kernel launch.
+    if (!refactorize(node_sol,
+                     /*initialize_basis*/ false,
+                     /*certify_resume*/ refactor_reason != 1)) {
+      return false;
+    }
+
+    // Rebuild the primal point the way the CPU's in-place refactor does, and tell the device not to
+    // redo it with its cold-start formula. Without this the two part at the first refactor.
+    //
+    // This calls the CPU function ITSELF, not a GPU copy of it -- the solver's own resume path calls
+    // the same one, so there is no second formula to keep in step.
+    //
+    // It reads the bounds from `lp`, which is correct HERE because this entry is handed
+    // `worker->leaf_problem`, whose lower/upper are this node's. A POOL that shares one
+    // lp_problem_t across seats and carries per-seat bounds cannot call it this way -- it will need
+    // a bounds-explicit overload.
+    std::vector<f_t> xB_workspace(m, 0.0);
+    f_t work = 0.0;
+    simplex::phase2::compute_primal_solution_from_basis(
+      lp, ft, basic_list, nonbasic_list, vstatus, node_sol.x, xB_workspace, work);
+    items[0].refactor_resume = true;
+  }
+
+  status = stopped_on_iter_limit ? simplex::dual_status_t::ITERATION_LIMIT : out[0];
+  iters  = total_iters;
+  sol.x              = node_sol.x;
+  sol.objective      = node_sol.objective;
+  sol.user_objective = node_sol.user_objective;
+  // total_iters, not the last leg's count: a node interrupted by REFACTOR_NEEDED is ONE solve, and
+  // the out-param `iters` already reports it that way. Publishing the last leg here made the verify
+  // line and the bad-node dumps understate a resumed solve (142 rather than 142 of 175).
+  sol.iterations     = total_iters;
+  // `basic_list` / `nonbasic_list` already hold the FINAL basis: the batch copies them back next to
+  // `vstatus`, in the order the device maintains them (in-place swap, i.e. pivot history).
+  //
+  // Do NOT re-derive them from `vstatus` here. get_basis_from_vstatus scans j ascending, so it
+  // returns the same basis SET in SORTED order -- a different permutation. That matters twice: the
+  // caller's next refactorization factorizes A(:, basic_list), and the ratio test scans
+  // nonbasic_list IN ORDER with an order-dependent near-tie rule (see warp_rt_body). Re-sorting
+  // here silently changes both on every node the device solves.
+
+  if (verify) {
+    // The two DIAGNOSTIC legs below cost three extra CPU solves per node. They answered their
+    // questions during bring-up, so they are opt-in now (CUOPT_BNB_GPU_VERIFY=2) and a plain
+    // sweep runs only the gate.
+    const bool deep = gpu_serial_verify_level() >= 2;
+
+    // Fourth leg, run FIRST because it is the one that separates "the device computed the wrong
+    // answer" from "the device computed the right answer and labelled it wrong": take the basis the
+    // device RETURNED and re-solve from it on the CPU. If that comes back OPTIMAL in zero
+    // iterations, the device had the optimal basis in hand when it reported infeasible.
+    std::vector<simplex::variable_status_t> vstatus_out = vstatus;
+    std::vector<f_t> dy_se_out                          = dy_se_ref;
+    simplex::basis_update_mpf_t<i_t, f_t> ft_out(m, settings.refactor_frequency);
+    std::vector<i_t> basic_out(m), nonbasic_out, superbasic_out;
+    simplex::lp_solution_t<i_t, f_t> sol_out(m, lp.num_cols);
+    simplex::dual_status_t status_out = simplex::dual_status_t::UNSET;
+    if (deep) {
+      simplex::get_basis_from_vstatus<i_t>(m, vstatus_out, basic_out, nonbasic_out, superbasic_out);
+      const f_t tout = cuopt::mathematical_optimization::tic();
+      if (ft_out.refactor_basis(
+            lp.A, settings, lower, upper, tout, basic_out, nonbasic_out, vstatus_out) == 0) {
+        f_t work_out = 0.0;
+        simplex::phase2::compute_dual_solution_from_basis(
+          lp, ft_out, basic_out, nonbasic_out, sol_out.y, sol_out.z, work_out);
+        status_out = simplex::simplified_dual_phase2<i_t, f_t>(
+          lp, settings, vstatus_out, ft_out, basic_out, nonbasic_out, sol_out, dy_se_out);
+      }
+    }
+
+    // Third leg: the CPU SIMPLIFIED driver -- the exact algorithm the device ports. Running it on
+    // the same inputs separates "the GPU port is wrong" from "the minimal algorithm is too weak for
+    // this node", which need completely different fixes.
+    std::vector<simplex::variable_status_t> vstatus_min = vstatus_uploaded;
+    std::vector<f_t> dy_se_min                          = dy_se_ref;
+    simplex::basis_update_mpf_t<i_t, f_t> ft_min(m, settings.refactor_frequency);
+    std::vector<i_t> basic_min(m), nonbasic_min, superbasic_min;
+    simplex::lp_solution_t<i_t, f_t> sol_min(m, lp.num_cols);
+    simplex::dual_status_t status_min = simplex::dual_status_t::UNSET;
+    if (deep) {
+      simplex::get_basis_from_vstatus<i_t>(
+        m, vstatus_min, basic_min, nonbasic_min, superbasic_min);
+      const f_t tmin = cuopt::mathematical_optimization::tic();
+      if (ft_min.refactor_basis(
+            lp.A, settings, lower, upper, tmin, basic_min, nonbasic_min, vstatus_min) == 0) {
+        f_t work_min = 0.0;
+        simplex::phase2::compute_dual_solution_from_basis(
+          lp, ft_min, basic_min, nonbasic_min, sol_min.y, sol_min.z, work_min);
+        status_min = simplex::simplified_dual_phase2<i_t, f_t>(
+          lp, settings, vstatus_min, ft_min, basic_min, nonbasic_min, sol_min, dy_se_min);
+      }
+    }
+
+    simplex::basis_update_mpf_t<i_t, f_t> ft_ref(m, settings.refactor_frequency);
+    // `get_basis_from_vstatus` INDEXES basic_list (it only push_backs the other two), so the caller
+    // owns its sizing.
+    std::vector<i_t> basic_ref(m), nonbasic_ref;
+    simplex::lp_solution_t<i_t, f_t> sol_ref(m, lp.num_cols);
+    i_t iter_ref = 0;
+    // `dual_phase2_with_advanced_basis` takes the steepest-edge vector by NON-CONST reference and
+    // updates it in place. Passing `dy_se_ref` handed it the very snapshot this function records as
+    // the node's input, so a captured dump held a vector the CPU reference solve had rewritten --
+    // and a replay from it started somewhere the device never was. Give the reference solve its own
+    // copy; the snapshot has to stay the input.
+    std::vector<f_t> dy_se_ref_scratch = dy_se_ref;
+    const simplex::dual_status_t status_ref =
+      simplex::dual_phase2_with_advanced_basis<i_t, f_t>(2,
+                                                         0,
+                                                         true,  // factorize vstatus_ref ourselves
+                                                         cuopt::mathematical_optimization::tic(),
+                                                         lp,
+                                                         settings,
+                                                         vstatus_ref,
+                                                         ft_ref,
+                                                         basic_ref,
+                                                         nonbasic_ref,
+                                                         sol_ref,
+                                                         iter_ref,
+                                                         dy_se_ref_scratch);
+
+    // ONE implementation of the decision test, shared with the pool's recheck gate -- see
+    // gpu_decision_differs. A second copy would drift from this one, and the two would then disagree
+    // about what counts as a divergence.
+    bool cpu_decided = false, obj_differs = false;
+    const bool decision_differs = gpu_decision_differs<i_t, f_t>(
+      status, status_ref, sol.objective, sol_ref.objective, settings.cut_off, cpu_decided,
+      obj_differs);
+    const f_t obj_gap = obj_differs ? std::fabs(sol.objective - sol_ref.objective) : f_t{0.0};
+    const f_t obj_tol = f_t{0.0};
+
+    // Capture the node whenever the decision differs. These failures are rare and the tree is
+    // non-deterministic, so a node that mis-decides once is usually never revisited -- without a
+    // dump the only honest report is "it did not reproduce". Written under
+    // CUOPT_BNB_DUMP_BAD_NODES=<dir>; replay with `test_netlib --replay-node <file>`.
+    // Also capture a node stopped by the DIAGNOSTIC cap. That node is a STALL -- the device pivots
+    // without moving the objective -- and it is the one we most need as a replayable artifact,
+    // precisely because it never terminates on its own and so never reaches the normal dump test.
+    const bool capped = (status == simplex::dual_status_t::ITERATION_LIMIT);
+    if ((capped || (cpu_decided && (decision_differs || obj_gap > obj_tol))) &&
+        dump_bad_nodes_dir() != nullptr) {
+      static std::atomic<int> seq{0};
+      char path[1024];
+      std::snprintf(path, sizeof(path), "%s/badnode_m%d_n%d_%04d.bin",
+                    dump_bad_nodes_dir(), (int)m, (int)lp.num_cols, seq.fetch_add(1));
+      // vstatus_uploaded, not the entry snapshot: refactor_basis may have repaired it, and what the
+      // drivers consumed is what has to be reproduced. Same for `lower`/`upper`, which are already
+      // bound-strengthened.
+      const bool ok = bad_node::write<i_t, f_t>(
+        path, lp, lower, upper, vstatus_uploaded, dy_se_at_launch,
+        x_at_launch, y_at_launch, z_at_launch, settings,
+        static_cast<int>(status), static_cast<int>(status_ref),
+        sol.objective, sol_ref.objective, sol.iterations, iter_ref);
+      std::fprintf(stderr, "[BADNODE] %s %s\n", ok ? "wrote" : "FAILED to write", path);
+      // SELF-CHECK. A dump is only worth having if replaying it reproduces the failure, and a dump
+      // that silently omits an input reproduces nothing -- which reads exactly like "the defect did
+      // not reproduce" and sends the investigation the wrong way. So read the file straight back
+      // and re-solve it here, in the same process, through the same refactor-and-resume loop. If
+      // this does not reproduce the status just observed, the dump is lossy and the replay tool
+      // cannot be trusted; say so at the moment of capture rather than hours later.
+      if (ok) {
+        bad_node::header_t rh{};
+        simplex::lp_problem_t<i_t, f_t> rlp(lp.handle_ptr, 1, 1, 1);
+        std::vector<f_t> rlower, rupper, rdy_se, rx, ry, rz;
+        std::vector<simplex::variable_status_t> rvstatus;
+        std::string why;
+        if (!bad_node::read<i_t, f_t>(path, rh, rlp, rlower, rupper, rvstatus, rdy_se, rx, ry, rz, why)) {
+          std::fprintf(stderr, "[BADNODE-SELFCHECK] cannot read back: %s\n", why.c_str());
+        } else {
+          simplex::simplex_solver_settings_t<i_t, f_t> rs = settings;
+          bad_node::apply_settings<i_t, f_t>(rh, rs);
+          // Split "the FILE lost something" from "the recorded entry state is not what the live
+          // solve actually started from". Compare the reconstructed arrays against the live ones
+          // before re-solving: if they are identical the file is faithful, and the divergence has
+          // to come from somewhere the dump does not reach.
+          {
+            auto cmp = [](const char* what, const auto& a, const auto& b) {
+              if (a.size() != b.size()) {
+                std::fprintf(stderr, "[BADNODE-SELFCHECK] %s SIZE %zu vs %zu\n", what, a.size(),
+                             b.size());
+                return;
+              }
+              size_t diff = 0;
+              for (size_t k = 0; k < a.size(); ++k) { diff += (a[k] != b[k]); }
+              if (diff != 0) {
+                std::fprintf(stderr, "[BADNODE-SELFCHECK] %s DIFFERS in %zu entries\n", what, diff);
+              }
+            };
+            cmp("A.col_start", rlp.A.col_start, lp.A.col_start);
+            cmp("A.i", rlp.A.i, lp.A.i);
+            cmp("A.x", rlp.A.x, lp.A.x);
+            cmp("rhs", rlp.rhs, lp.rhs);
+            cmp("objective", rlp.objective, lp.objective);
+            cmp("lower", rlower, lower);
+            cmp("upper", rupper, upper);
+            cmp("vstatus", rvstatus, vstatus_uploaded);
+            cmp("dy_se", rdy_se, dy_se_ref);
+            if (rlp.num_rows != lp.num_rows || rlp.num_cols != lp.num_cols ||
+                rlp.obj_scale != lp.obj_scale || rlp.obj_constant != lp.obj_constant) {
+              std::fprintf(stderr, "[BADNODE-SELFCHECK] scalar lp fields DIFFER\n");
+            }
+          }
+          const i_t rm = rlp.num_rows;
+          std::vector<i_t> rbasic(rm), rnonbasic, rsuper;
+          simplex::basis_update_mpf_t<i_t, f_t> rft(rm, rs.refactor_frequency);
+          simplex::lp_solution_t<i_t, f_t> rsol(rm, rlp.num_cols);
+          const f_t rt0 = cuopt::mathematical_optimization::tic();
+          auto rprice   = [&]() {
+            basis_from_vstatus_reset<i_t>(rm, rlp.num_cols, rvstatus, rbasic, rnonbasic, rsuper);
+            if (rft.refactor_basis(rlp.A, rs, rlower, rupper, rt0, rbasic, rnonbasic, rvstatus) !=
+                0) {
+              return false;
+            }
+            f_t w = 0.0;
+            simplex::phase2::compute_dual_solution_from_basis(
+              rlp, rft, rbasic, rnonbasic, rsol.y, rsol.z, w);
+            return true;
+          };
+          // BISECT. The reconstructed arrays are element-wise identical to the live ones, so if the
+          // replay still answers differently the cause is not in the arrays. Run ONE more leg-0
+          // launch that reuses the LIVE `lp`, `lower`, `upper` and `settings` objects and differs
+          // from the live call only in taking fresh basis/solution containers. Whichever of the two
+          // replays matches the live result names the half the cause is in.
+          for (int brep = 0; brep < 3; ++brep) {
+            std::vector<simplex::variable_status_t> bvs = vstatus_uploaded;
+            std::vector<f_t> bse                        = dy_se_at_launch;
+            std::vector<i_t> bbasic(m), bnonbasic, bsuper;
+            simplex::basis_update_mpf_t<i_t, f_t> bft(m, settings.refactor_frequency);
+            simplex::lp_solution_t<i_t, f_t> bsol(m, lp.num_cols);
+            basis_from_vstatus_reset<i_t>(m, lp.num_cols, bvs, bbasic, bnonbasic, bsuper);
+            const f_t bt0 = cuopt::mathematical_optimization::tic();
+            if (bft.refactor_basis(lp.A, settings, lower, upper, bt0, bbasic, bnonbasic, bvs) == 0) {
+              f_t bw = 0.0;
+              simplex::phase2::compute_dual_solution_from_basis(
+                lp, bft, bbasic, bnonbasic, bsol.y, bsol.z, bw);
+              if (brep == 0) {
+                auto cmpv = [](const char* what, const std::vector<f_t>& a,
+                               const std::vector<f_t>& b) {
+                  if (a.size() != b.size()) {
+                    std::fprintf(stderr, "[BADNODE-SOLCMP] %s SIZE %zu vs %zu\n", what, a.size(),
+                                 b.size());
+                    return;
+                  }
+                  size_t d = 0;
+                  for (size_t k = 0; k < a.size(); ++k) { d += (a[k] != b[k]); }
+                  std::fprintf(stderr, "[BADNODE-SOLCMP] %s differs in %zu of %zu\n", what, d,
+                               a.size());
+                };
+                cmpv("entry-vs-launch dy_se", dy_se_ref, dy_se_at_launch);
+                cmpv("entry-vs-launch x", x_uploaded, x_at_launch);
+                cmpv("entry-vs-launch y", y_uploaded, y_at_launch);
+                cmpv("entry-vs-launch z", z_uploaded, z_at_launch);
+                cmpv("sol.x", bsol.x, x_uploaded);
+                cmpv("sol.y", bsol.y, y_uploaded);
+                cmpv("sol.z", bsol.z, z_uploaded);
+                cmpv("L0.x", bft.L0().x, l0x_uploaded);
+                cmpv("U0.x", bft.U0().x, u0x_uploaded);
+                auto cmpi = [](const char* what, const std::vector<i_t>& a,
+                               const std::vector<i_t>& b) {
+                  if (a.size() != b.size()) {
+                    std::fprintf(stderr, "[BADNODE-SOLCMP] %s SIZE %zu vs %zu\n", what, a.size(),
+                                 b.size());
+                    return;
+                  }
+                  size_t d = 0;
+                  for (size_t k = 0; k < a.size(); ++k) { d += (a[k] != b[k]); }
+                  std::fprintf(stderr, "[BADNODE-SOLCMP] %s differs in %zu of %zu\n", what, d,
+                               a.size());
+                };
+                cmpi("L0.col_start", bft.L0().col_start, l0cs_uploaded);
+                cmpi("U0.col_start", bft.U0().col_start, u0cs_uploaded);
+                cmpi("row_perm", bft.row_permutation(), rowperm_uploaded);
+              }
+              // Replay the uploaded values, not a fresh reconstruction of them.
+              bsol.x = x_at_launch;
+              bsol.y = y_at_launch;
+              bsol.z = z_at_launch;
+              bse    = dy_se_at_launch;
+              gds::gpu_batch_item<i_t, f_t> bit{};
+              bit.lp            = &lp;
+              bit.lower         = &lower;
+              bit.upper         = &upper;
+              bit.settings      = &settings;
+              bit.vstatus       = &bvs;
+              bit.ft            = &bft;
+              bit.basic_list    = &bbasic;
+              bit.nonbasic_list = &bnonbasic;
+              bit.sol           = &bsol;
+              bit.dy_se         = &bse;
+              std::vector<gds::gpu_batch_item<i_t, f_t>> bbatch{bit};
+              std::vector<simplex::dual_status_t> bout;
+              gds::gpu_batch_timing btiming;
+              auto* bh = gds::gpu_simplified_dual_phase2_batch_launch<i_t, f_t>(
+                bbatch, 0, btiming, worker_stream.view(), /*allow_refactor_exit*/ true);
+              if (bh != nullptr) {
+                gds::gpu_simplified_dual_phase2_batch_finish<i_t, f_t>(bh, bout, btiming);
+                if (!bout.empty()) {
+                  std::fprintf(stderr, "[BADNODE-LIVEOBJ] rep=%d leg0 %s it=%d obj=%.17g\n", brep,
+                               simplex::dual_status_to_string(bout[0]).c_str(), bsol.iterations,
+                               bsol.objective);
+                }
+              }
+            }
+          }
+
+          simplex::dual_status_t rstatus = simplex::dual_status_t::UNSET;
+          i_t rtotal                     = 0;
+          if (!rprice()) {
+            std::fprintf(stderr, "[BADNODE-SELFCHECK] reconstruction failed to factorize\n");
+          } else {
+            for (int rres = 0; rres <= 64; ++rres) {   // diagnostic replay only; bound is arbitrary
+              gds::gpu_batch_item<i_t, f_t> rit{};
+              rit.lp            = &rlp;
+              rit.lower         = &rlower;
+              rit.upper         = &rupper;
+              rit.settings      = &rs;
+              rit.vstatus       = &rvstatus;
+              rit.ft            = &rft;
+              rit.basic_list    = &rbasic;
+              rit.nonbasic_list = &rnonbasic;
+              rit.sol           = &rsol;
+              rit.dy_se         = &rdy_se;
+              std::vector<gds::gpu_batch_item<i_t, f_t>> rbatch{rit};
+              std::vector<simplex::dual_status_t> rout;
+              gds::gpu_batch_timing rtiming;
+              auto* rh2 = gds::gpu_simplified_dual_phase2_batch_launch<i_t, f_t>(
+                rbatch, 0, rtiming, worker_stream.view(), /*allow_refactor_exit*/ true);
+              if (rh2 == nullptr) { break; }
+              gds::gpu_simplified_dual_phase2_batch_finish<i_t, f_t>(rh2, rout, rtiming);
+              if (rtiming.rejected || rout.empty()) { break; }
+              rtotal += rsol.iterations;
+              rstatus = rout[0];
+              std::fprintf(stderr, "[BADNODE-RLEG] %d %s it=%d cum=%d obj=%.17g\n", rres,
+                           simplex::dual_status_to_string(rstatus).c_str(), rsol.iterations,
+                           (int)rtotal, rsol.objective);
+              if (rstatus != simplex::dual_status_t::REFACTOR_NEEDED) { break; }
+              if (!rprice()) { break; }
+            }
+          }
+          const bool same = (rstatus == status);
+          std::fprintf(stderr,
+                       "[BADNODE-SELFCHECK] %s live=%s obj=%.17g it=%d | replay=%s obj=%.17g it=%d\n",
+                       same ? "REPRODUCES" : "DOES NOT REPRODUCE -- the dump is missing an input",
+                       simplex::dual_status_to_string(status).c_str(), sol.objective, iters,
+                       simplex::dual_status_to_string(rstatus).c_str(), rsol.objective, rtotal);
+        }
+      }
+    }
+
+    if (cpu_decided && (decision_differs || obj_gap > obj_tol)) {
+      std::fprintf(stderr,
+                   "[GPUVERIFY] MISMATCH m=%d n=%d se=%zu | gpu=%s obj=%.17g it=%d | cpumin=%s obj=%.17g "
+                   "it=%d | cpufull=%s obj=%.17g it=%d | fromgpubasis=%s obj=%.17g it=%d | objgap=%.3e "
+                   "cut_off=%.17g\n",
+                   m,
+                   lp.num_cols,
+                   dy_se_ref.size(),
+                   simplex::dual_status_to_string(status).c_str(),
+                   sol.objective,
+                   sol.iterations,
+                   simplex::dual_status_to_string(status_min).c_str(),
+                   sol_min.objective,
+                   sol_min.iterations,
+                   simplex::dual_status_to_string(status_ref).c_str(),
+                   sol_ref.objective,
+                   iter_ref,
+                   simplex::dual_status_to_string(status_out).c_str(),
+                   sol_out.objective,
+                   sol_out.iterations,
+                   obj_gap,
+                   // The threshold the CUTOFF decision was taken against. Without it a
+                   // gpu=CUTOFF/cpu=OPTIMAL line cannot be classified at all -- which is exactly why
+                   // the three nexp-150-20-8-5 cases stayed unresolved.
+                   settings.cut_off);
+    } else {
+      // Emit a line per AGREEING node too. Without it the log gives a mismatch count with no
+      // denominator, and "12 mismatches" out of 20 nodes and out of 2000 nodes are very different
+      // results.
+      // Carry the objectives and the cutoff on the AGREEING line as well. A gate that got quieter
+      // must not also get blinder: a CUTOFF that now resolves to agreement still leaves its
+      // evidence in the log, so the decision can be re-checked after the fact.
+      std::fprintf(stderr,
+                   "[GPUVERIFY] OK %s it=%d obj=%.17g cpu=%s obj=%.17g cut_off=%.17g\n",
+                   simplex::dual_status_to_string(status).c_str(),
+                   sol.iterations,
+                   sol.objective,
+                   simplex::dual_status_to_string(status_ref).c_str(),
+                   sol_ref.objective,
+                   settings.cut_off);
+    }
+  }
+  return true;
+}
+
+template bool gpu_solve_node_serial<int, double>(
+  const simplex::lp_problem_t<int, double>&, const csr_matrix_t<int, double>&,
+  const std::vector<simplex::variable_type_t>&,
+  const simplex::simplex_solver_settings_t<int, double>&,
+  const std::vector<double>&, const std::vector<double>&,
+  std::vector<simplex::variable_status_t>&, std::vector<int>&, std::vector<int>&,
+  simplex::lp_solution_t<int, double>&, std::vector<double>&, int&,
+  simplex::dual_status_t&);
+
+// ===========================================================================================
+// WHOLE-BATCH POOL
+// ===========================================================================================
+
+// TEMPORARY CORRECTNESS GATE, default ON. Every answer the pool produces is re-solved by the CPU
+// full driver and compared; on disagreement the CPU answer is used and the node is dumped. This
+// makes the run a correctness experiment, not a performance one -- it roughly doubles the LP work.
+// Set CUOPT_BNB_GPU_POOL_RECHECK=0 once the pool is trusted.
+bool gpu_pool_recheck()
+{
+  static const bool on = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_POOL_RECHECK");
+    return e == nullptr || std::string(e) != "0";
+  }();
+  return on;
+}
+
+// How many times a seat may be refilled with the child the PLUNGE would continue with, before the
+// node goes back to the queue. 0 = off (every node reconstructed from the root).
+int gpu_pool_plunge_depth()
+{
+  static const int d = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_PLUNGE");
+    return (e != nullptr) ? std::atoi(e) : 8;
+  }();
+  return d;
+}
+
+// Overlap CPU work with an in-flight round (CUOPT_BNB_GPU_ASYNC, default on). Off = the worker
+// blocks on the device, which is the synchronous behaviour the correctness sweeps were built on.
+// Validate an OPTIMAL against freshly priced reduced costs before accepting it
+// (CUOPT_BNB_GPU_VALIDATE_OPTIMAL, default on).
+bool gpu_pool_overlap()
+{
+  static const bool on = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_ASYNC");
+    return e == nullptr || std::string(e) != "0";
+  }();
+  return on;
+}
+
+// Per-node iteration budget for a GPU-seated node LP. settings_ carries INT_MAX, which is right for
+// the CPU plunge path but wrong for a seat: a node that stalls would hold its seat forever, and the
+// ITERATION_LIMIT status the consume path uses to hand hard nodes back to the CPU would never fire.
+// 5000 is ~20x the p99 of the measured per-node distribution (min 0 / p50 10 / p90 126 / p99 234 /
+// max 256 over 3,156 real node solves), so it bounds pathology without touching normal nodes.
+// CUOPT_BNB_GPU_ITER_LIMIT=<n> overrides; 0 restores the unbounded behaviour.
+int gpu_batch_iter_limit()
+{
+  static const int lim = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_ITER_LIMIT");
+    if (e == nullptr) { return 5000; }
+    const int v = std::atoi(e);
+    return (v > 0) ? v : std::numeric_limits<int>::max();
+  }();
+  return lim;
+}
+
+bool gpu_pool_logging()
+{
+  static const bool on = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_LOG");
+    return e != nullptr && std::string(e) != "0";
+  }();
+  return on;
+}
+
+// #3 -- how full this worker's queue must be before the pool engages, as a MULTIPLE of the seat
+// count. The pool takes `seats` nodes OUT of the queue; firing when the queue barely holds that
+// many empties it, and the worker then has nothing to overlap with and nothing to steal next cycle.
+// Waiting for seats*N leaves the queue with (N-1)*seats after a fill.
+//
+// N=5 by default, per the design note: with a 1K working queue and a 200-seat pool you want ~5K
+// before engaging. CUOPT_BNB_GPU_HEAP_FACTOR=<n> overrides; 0 disables the gate entirely (the old
+// behaviour -- engage whenever there is any work at all).
+//
+// There is deliberately no root/depth escape: CPU search grows the queue until this threshold is
+// reached. A worker that never accumulates enough GPU-eligible nodes simply remains CPU-only.
+// DIAGNOSTIC (CUOPT_BNB_REFAC_FREQ=<n>, 0 = off): force refactorizations to be frequent, so the
+// REFACTOR_NEEDED resume path -- where a node's state round-trips through the host, and therefore
+// where a carried-state bug would live -- is exercised far above its natural rate. Applied to BOTH
+// the device settings and the CPU recheck's, so the two legs stay comparable.
+// NOT a fix and not for production: it changes the refactor schedule, which is the search itself.
+int gpu_pool_refac_freq()
+{
+  static const int v = [] {
+    const char* e = std::getenv("CUOPT_BNB_REFAC_FREQ");
+    return e != nullptr ? std::atoi(e) : 0;
+  }();
+  return v;
+}
+
+int gpu_pool_heap_factor()
+{
+  static const int f = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_HEAP_FACTOR");
+    if (e == nullptr) { return 5; }
+    const int v = std::atoi(e);
+    return (v > 0) ? v : 0;
+  }();
+  return f;
+}
+
+bool gpu_pool_should_engage(size_t queue_size, int seats)
+{
+  if (seats <= 0) { return false; }
+  const int factor = gpu_pool_heap_factor();
+  if (factor <= 0) { return queue_size > 0; }   // gate disabled
+  return queue_size >= static_cast<size_t>(seats) * static_cast<size_t>(factor);
+}
+
+// #2 -- drive the pool from the WORKER LOOP. The loop asks "is the GPU done?" by atomically loading
+// the mapped pinned completion word published by the last resident block; if it is not, the worker
+// RETURNS to its loop and carries on with its own work instead of waiting. It blocks on the device
+// only when it has nothing else left to do, at the bottom of the loop -- spinning there instead
+// would burn a core and starve the other workers' threads.
+//
+// DEFAULT ON. CUOPT_BNB_GPU_ASYNC=0 restores the old drive-to-completion behaviour for A/B.
+bool gpu_pool_async()
+{
+  static const bool on = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_ASYNC");
+    return e == nullptr || std::string(e) != "0";   // DEFAULT ON
+  }();
+  return on;
+}
+
+int gpu_batch_seats()
+{
+  static const int seats = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_BATCH");
+    if (e == nullptr) { return 0; }
+    if (std::string(e) == "auto") { return -1; }
+    const int v = std::atoi(e);
+    return (v > 0) ? v : 0;
+  }();
+  return seats;
+}
+
+int gpu_batch_auto_seats(int device, int num_rows, int num_cols, std::size_t num_nonzeros)
+{
+  if (device < 0 || num_rows <= 0 || num_cols <= 0) { return 0; }
+
+  int previous_device = 0;
+  if (cudaGetDevice(&previous_device) != cudaSuccess || cudaSetDevice(device) != cudaSuccess) {
+    return 0;
+  }
+
+  cudaDeviceProp properties{};
+  size_t free_bytes = 0;
+  size_t total_bytes = 0;
+  const int blocks_per_sm = gds::gpu_max_blocks_per_sm();
+  const bool valid = blocks_per_sm > 0 &&
+                     cudaGetDeviceProperties(&properties, device) == cudaSuccess &&
+                     cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess;
+  cudaSetDevice(previous_device);
+  if (!valid) { return 0; }
+
+  // The queue absorbs the long tail after the resident waves diverge in pivot count. Two waves
+  // gave enough tail coverage in the original pool sizing without allocating an unbounded queue.
+  constexpr int oversubscription = 2;
+  const int64_t occupancy_limit = oversubscription *
+                                  static_cast<int64_t>(properties.multiProcessorCount) *
+                                  static_cast<int64_t>(blocks_per_sm);
+
+  // This is deliberately conservative and only chooses the initial target. The batch allocator's
+  // exact preflight remains authoritative and halves the target if the complete allocation does
+  // not fit.
+  const size_t per_seat_bytes =
+    static_cast<size_t>(num_rows + num_cols) * 64 + num_nonzeros * sizeof(double);
+  if (per_seat_bytes == 0) { return 0; }
+  const int64_t memory_limit = static_cast<int64_t>((free_bytes / 2) / per_seat_bytes);
+  return static_cast<int>(std::max<int64_t>(0, std::min(occupancy_limit, memory_limit)));
+}
+
+namespace {
+
+// Per-seat host state for one node in flight. Everything the batch item points at must outlive the
+// launch, so these live in one vector for the whole call and are never reallocated.
+// batch_seat_state_t now lives in gpu_node_pool.hpp: the POOL owns one per seat so the
+// factorization and its MPF stack survive across rounds and across plunge children.
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// A batch RUN, resumable across host loop iterations.
+//
+// The solve of one pool-full of nodes is a sequence of rounds: launch the active seats, read their
+// statuses, host-refactorize the ones that came back REFACTOR_NEEDED, relaunch those. This object
+// holds the state between rounds so the caller can LAUNCH, go and do CPU work, and come back when
+// the device is ready -- which is what the asynchronous pool needs. The synchronous entry point
+// below is the same thing with the waiting inlined.
+//
+// `nodes` is BORROWED and must outlive the run; the pool owns it.
+// ---------------------------------------------------------------------------
+template <typename i_t, typename f_t>
+struct gpu_batch_run_t {
+  const simplex::lp_problem_t<i_t, f_t>& lp;
+  std::vector<gpu_batch_node_t<i_t, f_t>>& nodes;
+  rmm::cuda_stream_view stream;
+  gds::gpu_ro_cache<i_t, f_t>* ro_cache{nullptr};
+
+  i_t m{0}, n{0}, N{0};
+  f_t t0{0.0};
+  // BORROWED from the pool. One-shot rounds keep their host factor here; the persistent pool keeps the live LU+MPF
+  // representation on the device and uses this host factor only for fresh/refactor commands.
+  std::vector<batch_seat_state_t<i_t, f_t>>& st;
+
+  std::vector<gds::gpu_batch_item<i_t, f_t>> items;
+  std::vector<i_t> seat_of_item;
+  std::vector<simplex::dual_status_t> out;
+  gds::gpu_batch_timing timing;
+  gds::gpu_batch_handle<i_t, f_t>* handle{nullptr};
+  i_t rounds{0};
+  std::size_t terminal_noop_seats{0};
+  i_t periodic_refactors{0}, rejected_refactors{0}, certificate_refactors{0};
+  double upload_s{0.0}, kernel_s{0.0}, copyback_s{0.0}, host_factor_s{0.0};
+  bool persistent_seats{false};
+
+  gpu_batch_run_t(const simplex::lp_problem_t<i_t, f_t>& lp_,
+                  std::vector<gpu_batch_node_t<i_t, f_t>>& nodes_,
+                  rmm::cuda_stream_view s,
+                  gds::gpu_ro_cache<i_t, f_t>* ro,
+                  std::vector<batch_seat_state_t<i_t, f_t>>& seat_state,
+                  bool persistent = false)
+    : lp(lp_), nodes(nodes_), stream(s), ro_cache(ro),
+      m(lp_.num_rows), n(lp_.num_cols), N(static_cast<i_t>(nodes_.size())),
+      t0(cuopt::mathematical_optimization::tic()), st(seat_state), persistent_seats(persistent)
+  {
+    // Grow to cover this round's seats; existing entries KEEP their factorization.
+    while (static_cast<i_t>(st.size()) < N) {
+      st.emplace_back(m, nodes[st.size()].settings.refactor_frequency);
+    }
+    // A seat whose node is NOT a plunge continuation starts clean: fresh counters, and prepare()
+    // will refactorize it. A continuing seat keeps everything, which is the point.
+    for (i_t s2 = 0; s2 < N; ++s2) {
+      if (nodes[s2].continue_basis) { continue; }
+      auto& w                     = st[s2];
+      w.total_iters               = 0;
+      w.leg_iters                 = 0;
+      w.zero_pivot_legs           = 0;
+      w.refactor_resume           = false;
+      w.terminal_certificate_retry = false;
+      w.refactor_reason           = 0;
+      w.fail                      = gpu_batch_node_t<i_t, f_t>::drop_t::NONE;
+      if (persistent_seats) { w.active = false; }
+    }
+  }
+
+  gds::gpu_batch_item<i_t, f_t> make_item(i_t s,
+                                          gds::gpu_batch_seat_command command) const
+  {
+    auto& node = nodes[s];
+    auto& w    = st[s];
+    gds::gpu_batch_item<i_t, f_t> it{};
+    it.lp              = &lp;
+    it.lower           = &node.lower;
+    it.upper           = &node.upper;
+    it.settings        = &node.settings;
+    it.vstatus         = &node.vstatus;
+    it.ft              = &w.ft;
+    it.basic_list      = &w.basic_list;
+    it.nonbasic_list   = &w.nonbasic_list;
+    it.sol             = &node.sol;
+    it.dy_se           = &node.dy_se;
+    it.refactor_resume = command == gds::gpu_batch_seat_command::REFACTOR_RESUME;
+    it.terminal_certificate_retry = w.terminal_certificate_retry;
+    it.refactor_reason            = &w.refactor_reason;
+    it.continue_basis             = command == gds::gpu_batch_seat_command::CHILD_CONTINUE;
+    it.command                    = command;
+    return it;
+  }
+
+  // Factorize and price seat `s` from its CURRENT basis. A resume proceeds only when fresh pricing
+  // confirms that the returned basis/status pair is dual feasible.
+  bool refactorize(i_t s, bool initialize_basis)
+  {
+    auto& w    = st[s];
+    auto& node = nodes[s];
+    // A genuine rank deficiency is reported against the phase it happened in; the clock and halt
+    // codes are phase-independent.
+    const auto deficient_drop = initialize_basis ? gpu_batch_node_t<i_t, f_t>::drop_t::FACTORIZE_FILL
+                                      : gpu_batch_node_t<i_t, f_t>::drop_t::FACTORIZE_RESUME;
+    // FILL ONLY. On a RESUME the device has already handed back `basic_list` / `nonbasic_list` as it
+    // maintains them -- by in-place swap, so their order is the pivot history. Rebuilding them from
+    // `vstatus` here would re-sort both lists on every leg, which changes the LU that
+    // `refactor_basis` produces (it factorizes A(:, basic_list)) and changes the order the
+    // order-dependent ratio test scans the nonbasics in. Both make the resume diverge from an
+    // uninterrupted solve, and from the CPU's in-place refactorization.
+    if (initialize_basis) {
+      basis_from_vstatus_reset<i_t>(
+        m, n, node.vstatus, w.basic_list, w.nonbasic_list, w.superbasic_list);
+    }
+    // Record WHICH return code stopped us. refactor_basis has three distinct failure modes and they
+    // mean completely different things -- out of time, halted, or genuinely rank-deficient.
+    auto classify = [&](i_t code) {
+      w.fail = (code == TIME_LIMIT_RETURN)        ? gpu_batch_node_t<i_t, f_t>::drop_t::DEADLINE
+               : (code == CONCURRENT_HALT_RETURN) ? gpu_batch_node_t<i_t, f_t>::drop_t::CONCURRENT_HALT
+                                                  : deficient_drop;
+      return false;
+    };
+    // RETRY EXACTLY AS THE CPU DRIVER DOES (phase2.cpp:3631-3660): a rank-deficient basis is
+    // repaired by substituting slacks, and if it is still deficient the CPU loosens the
+    // partial-pivoting threshold and tries again, up to 10 times, before giving up as NUMERICAL.
+    const f_t refactor_start =
+      persistent_seats ? cuopt::mathematical_optimization::tic() : t0;
+    bool repaired = false;
+    i_t rc = w.ft.refactor_basis(lp.A, node.settings, node.lower, node.upper, refactor_start,
+                                 w.basic_list, w.nonbasic_list, node.vstatus, &repaired);
+    if (rc == CONCURRENT_HALT_RETURN || rc == TIME_LIMIT_RETURN) { return classify(rc); }
+    // A repair during RESUME changes the basis underneath maintained device state, so that node
+    // must leave the GPU and restart on the CPU. A fresh repair retains the incoming steepest-edge
+    // vector, matching the CPU driver.
+    if (repaired && !initialize_basis) { return classify(rc); }
+    if (rc > 0) {
+      i_t count = 0;
+      while (true) {
+        repaired = false;
+        rc = w.ft.refactor_basis(lp.A, node.settings, node.lower, node.upper, refactor_start,
+                                 w.basic_list, w.nonbasic_list, node.vstatus, &repaired);
+        if (rc == CONCURRENT_HALT_RETURN || rc == TIME_LIMIT_RETURN) { return classify(rc); }
+        if (repaired && !initialize_basis) { return classify(rc); }
+        if (rc <= 0) { break; }
+        node.settings.threshold_partial_pivoting_tol = 1.0;
+        if (++count > 10) { return classify(rc); }
+      }
+    }
+    if (rc < 0) { return classify(rc); }
+    f_t work = 0.0;
+    if (initialize_basis) {
+      simplex::phase2::compute_dual_solution_from_basis(
+        lp, w.ft, w.basic_list, w.nonbasic_list, node.sol.y, node.sol.z, work);
+    } else if (persistent_seats || w.refactor_reason != 1) {
+      std::vector<f_t> fresh_y(m, 0.0), fresh_z(n, 0.0);
+      simplex::phase2::compute_dual_solution_from_basis(
+        lp, w.ft, w.basic_list, w.nonbasic_list, fresh_y, fresh_z, work);
+      if (!gpu_resume_dual_feasible(node.vstatus, fresh_z, node.settings.dual_tol)) {
+        w.fail = gpu_batch_node_t<i_t, f_t>::drop_t::DUAL_INFEASIBLE_RESUME;
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void prepare()
+  {
+  // ---- fill ------------------------------------------------------------------------------
+  // A seat that fails preparation is simply never activated; its `solved` stays false and the
+  // caller takes it on the CPU. One bad seat must not cost the whole batch.
+  for (i_t s = 0; s < N; ++s) {
+    auto& node = nodes[s];
+    // Every B&B node carries a size-n root or parent steepest-edge vector, including after repair.
+    assert(node.dy_se.size() == static_cast<size_t>(n));
+    node.sol.resize(m, n);
+    node.status = simplex::dual_status_t::UNSET;
+    node.solved = false;
+    node.drop   = gpu_batch_node_t<i_t, f_t>::drop_t::NONE;
+    // PLUNGE CONTINUATION: reuse the parent's factorization exactly as the CPU does. `recompute_basis`
+    // there is `node_status != HAS_CHILDREN`, so a dived child is handed basis_factors as they stand
+    // -- LU plus the accumulated MPF updates -- and the driver refactorizes only when its own
+    // predicate fires, in place, mid-solve. Refactorizing here would pay an LU the CPU never pays and
+    // would reset the update count, disabling the refactor schedule down the dive.
+    if (node.continue_basis) {
+      st[s].active = true;
+      continue;
+    }
+    const double factor_t0 = cuopt::mathematical_optimization::tic();
+    const bool factor_ok   = refactorize(s, /*initialize_basis*/ true);
+    host_factor_s += cuopt::mathematical_optimization::toc(factor_t0);
+    if (!factor_ok) {
+      node.drop = st[s].fail;
+      if (std::getenv("CUOPT_BNB_GPU_DROP_TRACE") != nullptr) {
+        i_t nb = 0, nfree = 0;
+        for (i_t j = 0; j < n; ++j) {
+          nb += (node.vstatus[j] == simplex::variable_status_t::BASIC);
+          nfree += (node.vstatus[j] == simplex::variable_status_t::NONBASIC_FREE);
+        }
+        std::fprintf(stderr,
+                     "[DROPTRACE] factorize_fill m=%d n=%d basic=%d free=%d vstatus_sz=%zu "
+                     "basic_sz=%zu nonbasic_sz=%zu\n",
+                     (int)m, (int)n, (int)nb, (int)nfree, node.vstatus.size(),
+                     st[s].basic_list.size(), st[s].nonbasic_list.size());
+      }
+      continue;
+    }
+
+    // Size contract. The kernel indexes these with no bounds check, so a short vector is an
+    // out-of-bounds DEVICE read that surfaces far away as cudaErrorIllegalAddress on an unrelated
+    // synchronising call. Check here, where the answer is one line -- and here it matters more than
+    // on the serial path, because one malformed seat would corrupt the whole batch.
+    const char* bad = nullptr;
+    if (static_cast<i_t>(node.vstatus.size()) != n) { bad = "vstatus"; }
+    else if (static_cast<i_t>(node.lower.size()) != n) { bad = "lower"; }
+    else if (static_cast<i_t>(node.upper.size()) != n) { bad = "upper"; }
+    else if (static_cast<i_t>(st[s].basic_list.size()) != m) { bad = "basic_list"; }
+    else if (static_cast<i_t>(st[s].nonbasic_list.size()) != n - m) { bad = "nonbasic_list"; }
+    else if (static_cast<i_t>(node.dy_se.size()) != n) { bad = "dy_se"; }
+    if (bad != nullptr) {
+      std::fprintf(stderr,
+                   "[GPUBATCH] seat %d not launched: %s has the wrong length (m=%d n=%d)\n",
+                   (int)s, bad, (int)m, (int)n);
+      node.drop = gpu_batch_node_t<i_t, f_t>::drop_t::SIZE_CONTRACT;
+      continue;
+    }
+    // SNAPSHOT for a replayable dump. Taken here, AFTER refactorize() -- `refactor_basis` may have
+    // repaired the basis, and what the device consumes is what a replay has to reproduce. `vstatus`
+    // itself is overwritten with the FINAL basis by the solve, so it cannot serve.
+    node.vstatus_uploaded = node.vstatus;
+    st[s].active          = true;
+  }
+  }
+
+  // Relaunch the SAME fixed seat array every round. Active seats run normally; a seat that already
+  // reached a terminal status carries that status in the item and its block exits immediately.
+  // This deliberately avoids compaction, dynamic refill, or an asynchronous scheduling policy:
+  // mark terminal seats done, host-refactor the requests, and rerun the whole batch.
+  bool launch_round()
+  {
+    items.clear();
+    seat_of_item.clear();
+    bool any_active = false;
+    for (i_t s = 0; s < N; ++s) {
+      auto& node = nodes[s];
+      gds::gpu_batch_item<i_t, f_t> it{};
+      if (st[s].active) {
+        any_active         = true;
+        it.lp              = &lp;
+        it.lower           = &node.lower;   // per-node bounds; shared lp carries A/rhs/objective
+        it.upper           = &node.upper;
+        it.settings        = &node.settings;
+        it.continue_basis  = node.continue_basis;
+        // Snapshot what the device is about to consume, before the launch overwrites it in place.
+        if (node.dy_se_at_launch.empty()) {
+          node.dy_se_at_launch = node.dy_se;
+          node.x_at_launch     = node.sol.x;
+          node.y_at_launch     = node.sol.y;
+          node.z_at_launch     = node.sol.z;
+        }
+        it.vstatus         = &node.vstatus;
+        it.ft              = &st[s].ft;
+        it.basic_list      = &st[s].basic_list;
+        it.nonbasic_list   = &st[s].nonbasic_list;
+        it.sol             = &node.sol;
+        it.dy_se           = &node.dy_se;
+        it.refactor_resume = st[s].refactor_resume;
+        it.terminal_certificate_retry = st[s].terminal_certificate_retry;
+        it.refactor_reason = &st[s].refactor_reason;
+        // Before the FIRST launch only: `dy_se` is in/out and the solve rewrites it, so a snapshot
+        // taken later is not what was uploaded.
+        if (!st[s].refactor_resume) { node.dy_se_at_launch = node.dy_se; }
+      } else {
+        // Preparation/drop failures are also no-op seats, but remain unsolved so the caller still
+        // sends them to the CPU. NUMERICAL here is only the no-op marker returned by this round.
+        it.terminal_status = node.solved ? node.status : simplex::dual_status_t::NUMERICAL;
+      }
+      items.push_back(it);
+      seat_of_item.push_back(s);
+    }
+    if (!any_active) { return false; }
+
+    i_t active_count = 0;
+    for (const auto& w : st) { active_count += w.active ? 1 : 0; }
+
+    handle = gds::gpu_simplified_dual_phase2_batch_launch<i_t, f_t>(
+      items, 0, timing, stream, /*allow_refactor_exit*/ true, ro_cache, persistent_seats);
+    if (handle == nullptr) {
+      // Rejected before launch (VRAM pre-flight); timing.message says needed-vs-free. Every seat
+      // still active goes to the CPU rather than being silently lost.
+      std::fprintf(stderr, "[GPUBATCH] launch rejected: %s\n", timing.message.c_str());
+      for (i_t s = 0; s < N; ++s) {
+        if (st[s].active) { nodes[s].drop = gpu_batch_node_t<i_t, f_t>::drop_t::LAUNCH_FAILED; }
+      }
+      return false;
+    }
+    ++rounds;
+    terminal_noop_seats += static_cast<std::size_t>(N - active_count);
+    return true;
+  }
+
+  // Non-blocking: has the launched round finished on the device?
+  bool ready() const
+  {
+    return handle == nullptr ||
+           gds::gpu_simplified_dual_phase2_batch_ready<i_t, f_t>(handle);
+  }
+
+  // The persistent pool harvests exactly one complete N-seat launch and keeps the device handle/allocations alive.
+  // No refactorization or B&B disposition is hidden here: the caller must classify every seat,
+  // stage one replacement/resume command for each, and only then issue one full relaunch.
+  bool harvest_persistent()
+  {
+    if (!persistent_seats || handle == nullptr) { return false; }
+    gds::gpu_simplified_dual_phase2_batch_harvest<i_t, f_t>(handle, out, timing);
+    upload_s += timing.upload_s;
+    kernel_s += timing.kernel_s;
+    copyback_s += timing.copyback_s;
+    if (timing.rejected || out.size() != static_cast<size_t>(N)) { return false; }
+    for (i_t s = 0; s < N; ++s) {
+      auto& w    = st[s];
+      auto& node = nodes[s];
+      w.leg_iters   = node.sol.iterations - w.total_iters;
+      w.total_iters = node.sol.iterations;
+      node.status = out[s];
+      node.iters  = w.total_iters;
+      node.solved = out[s] != simplex::dual_status_t::REFACTOR_NEEDED;
+      // Publish the exact pivot-history order before CPU B&B handling creates children.
+      node.basic_list    = w.basic_list;
+      node.nonbasic_list = w.nonbasic_list;
+    }
+    return true;
+  }
+
+  bool stage_persistent_fresh(i_t s, std::string& error)
+  {
+    auto& node = nodes[s];
+    auto& w    = st[s];
+    // Fresh basis repair retains the incoming vector, matching the CPU driver.
+    assert(node.dy_se.size() == static_cast<size_t>(n));
+    node.sol.resize(m, n);
+    node.solved = false;
+    node.drop   = gpu_batch_node_t<i_t, f_t>::drop_t::NONE;
+    w.total_iters                = 0;
+    w.leg_iters                  = 0;
+    w.zero_pivot_legs            = 0;
+    w.refactor_resume            = false;
+    w.terminal_certificate_retry = false;
+    w.refactor_reason            = 0;
+    w.fail                       = gpu_batch_node_t<i_t, f_t>::drop_t::NONE;
+    const double factor_t0 = cuopt::mathematical_optimization::tic();
+    const bool ok          = refactorize(s, /*initialize_basis=*/true);
+    host_factor_s += cuopt::mathematical_optimization::toc(factor_t0);
+    if (!ok) {
+      node.drop = w.fail;
+      error     = "fresh-node factorization failed";
+      return false;
+    }
+    node.vstatus_uploaded = node.vstatus;
+    node.dy_se_at_launch  = node.dy_se;
+    node.x_at_launch      = node.sol.x;
+    node.y_at_launch      = node.sol.y;
+    node.z_at_launch      = node.sol.z;
+    const auto item = make_item(s, gds::gpu_batch_seat_command::FRESH_NODE);
+    static const std::vector<gds::gpu_bound_delta<i_t, f_t>> none;
+    return gds::gpu_simplified_dual_phase2_batch_stage<i_t, f_t>(
+      handle, static_cast<size_t>(s), item, gds::gpu_batch_seat_command::FRESH_NODE, none, error);
+  }
+
+  bool stage_persistent_refactor(i_t s, std::string& error)
+  {
+    auto& node = nodes[s];
+    auto& w    = st[s];
+    assert(node.dy_se.size() == static_cast<size_t>(n));
+    if (w.total_iters >= node.settings.iteration_limit) {
+      node.status = simplex::dual_status_t::ITERATION_LIMIT;
+      node.iters  = w.total_iters;
+      node.solved = true;
+      error = "GPU per-node iteration limit reached";
+      return false;
+    }
+    if (w.leg_iters <= 0 && ++w.zero_pivot_legs >= 8) {
+      node.drop = gpu_batch_node_t<i_t, f_t>::drop_t::LIVELOCK;
+      error     = "GPU refactor-resume livelock";
+      return false;
+    }
+    if (w.leg_iters > 0) { w.zero_pivot_legs = 0; }
+    w.terminal_certificate_retry = (w.refactor_reason == 2);
+    if (w.refactor_reason == 1) { ++rejected_refactors; }
+    else if (w.refactor_reason == 2) { ++certificate_refactors; }
+    else { ++periodic_refactors; }
+    const double factor_t0 = cuopt::mathematical_optimization::tic();
+    const bool ok          = refactorize(s, /*initialize_basis=*/false);
+    host_factor_s += cuopt::mathematical_optimization::toc(factor_t0);
+    if (!ok) {
+      node.drop = w.fail;
+      error     = "refactor-resume factorization/certificate failed";
+      return false;
+    }
+    f_t work = 0.0;
+    simplex::phase2::compute_primal_solution_from_basis(lp,
+                                                        node.lower,
+                                                        node.upper,
+                                                        w.ft,
+                                                        w.basic_list,
+                                                        w.nonbasic_list,
+                                                        node.vstatus,
+                                                        node.sol.x,
+                                                        w.xB_workspace,
+                                                        work);
+    w.refactor_resume = true;
+    const auto item = make_item(s, gds::gpu_batch_seat_command::REFACTOR_RESUME);
+    static const std::vector<gds::gpu_bound_delta<i_t, f_t>> none;
+    return gds::gpu_simplified_dual_phase2_batch_stage<i_t, f_t>(handle,
+                                                                 static_cast<size_t>(s),
+                                                                 item,
+                                                                 gds::gpu_batch_seat_command::REFACTOR_RESUME,
+                                                                 none,
+                                                                 error);
+  }
+
+  bool stage_persistent_child(i_t s,
+                      const std::vector<gds::gpu_bound_delta<i_t, f_t>>& deltas,
+                      std::string& error)
+  {
+    auto& node = nodes[s];
+    auto& w    = st[s];
+    assert(node.dy_se.size() == static_cast<size_t>(n));
+    node.sol.resize(m, n);  // host output destination only; device x/y/z remain the parent's
+    node.solved = false;
+    node.drop   = gpu_batch_node_t<i_t, f_t>::drop_t::NONE;
+    w.total_iters                = 0;
+    w.leg_iters                  = 0;
+    w.zero_pivot_legs            = 0;
+    w.refactor_resume            = false;
+    w.terminal_certificate_retry = false;
+    w.refactor_reason            = 0;
+    node.vstatus_uploaded = node.vstatus;
+    node.dy_se_at_launch  = node.dy_se;
+    node.x_at_launch.clear();
+    node.y_at_launch.clear();
+    node.z_at_launch.clear();
+    const auto item = make_item(s, gds::gpu_batch_seat_command::CHILD_CONTINUE);
+    return gds::gpu_simplified_dual_phase2_batch_stage<i_t, f_t>(
+      handle, static_cast<size_t>(s), item, gds::gpu_batch_seat_command::CHILD_CONTINUE, deltas,
+      error);
+  }
+
+  bool relaunch_persistent(std::string& error)
+  {
+    if (!persistent_seats || handle == nullptr) { return false; }
+    const bool ok = gds::gpu_simplified_dual_phase2_batch_relaunch<i_t, f_t>(
+      handle, timing, error);
+    if (ok) { ++rounds; }
+    return ok;
+  }
+
+  void destroy_persistent()
+  {
+    if (handle != nullptr) {
+      gds::gpu_simplified_dual_phase2_batch_destroy<i_t, f_t>(handle);
+      handle = nullptr;
+    }
+  }
+
+  // Read back the finished round, service every REFACTOR_NEEDED seat, and launch the next round.
+  // Returns true while a round is in flight.
+  // HARVEST ONLY. Finishes the launch that is in flight, classifies every seat, and host-refactors
+  // the ones that came back REFACTOR_NEEDED. It does NOT relaunch -- that is `relaunch()`, so the
+  // caller sees one kernel launch per call and can go and do other work between them.
+  //
+  // Splitting these two was the point: while they were fused, a batch's REFACTOR_NEEDED legs were
+  // invisible to the branch-and-bound worker loop, so "is the GPU done?" could not be answered with
+  // a single test and the worker could not return to its own work between legs.
+  bool harvest()
+  {
+    if (handle == nullptr) { return false; }
+    gds::gpu_simplified_dual_phase2_batch_finish<i_t, f_t>(handle, out, timing);
+    handle = nullptr;
+    upload_s += timing.upload_s;
+    kernel_s += timing.kernel_s;
+    copyback_s += timing.copyback_s;
+    if (timing.rejected || out.size() != items.size()) {
+      std::fprintf(stderr, "[GPUBATCH] batch did not return a status per seat (%zu of %zu)\n",
+                   out.size(), items.size());
+      for (i_t s = 0; s < N; ++s) {
+        if (st[s].active) { nodes[s].drop = gpu_batch_node_t<i_t, f_t>::drop_t::LAUNCH_FAILED; }
+      }
+      return false;
+    }
+    for (size_t k = 0; k < items.size(); ++k) {
+      const i_t s = seat_of_item[k];
+      auto& w     = st[s];
+      auto& node  = nodes[s];
+
+      // This item was already terminal before this fixed-seat relaunch. Its block was a no-op and
+      // its host state must remain untouched.
+      if (!w.active) { continue; }
+
+      // ASSIGN, not accumulate: the device carries `iter` across a resume, so what comes back is
+      // already this seat's running total.
+      w.total_iters = node.sol.iterations;
+
+      if (out[k] != simplex::dual_status_t::REFACTOR_NEEDED) {
+        node.status = out[k];
+        node.iters  = w.total_iters;
+        node.solved = true;
+        w.active    = false;
+        continue;
+      }
+
+      // Same bound as the CPU plunging worker: the node's CUMULATIVE iteration count, not a count
+      // of resume legs. A legitimate long node needs one leg per refactor_frequency pivots.
+      if (w.total_iters >= node.settings.iteration_limit) {
+        node.status = simplex::dual_status_t::ITERATION_LIMIT;
+        node.iters  = w.total_iters;
+        node.solved = true;
+        w.active    = false;
+        continue;
+      }
+      // Livelock guard, and the only thing a leg count is good for: a leg that takes zero pivots
+      // makes no progress, so the iteration bound above would never be reached.
+      if (node.sol.iterations == 0 && ++w.zero_pivot_legs >= 8) {
+        node.drop = gpu_batch_node_t<i_t, f_t>::drop_t::LIVELOCK;
+        w.active  = false;       // solved stays false -> the caller re-solves this node on the CPU
+        continue;
+      }
+      if (node.sol.iterations != 0) { w.zero_pivot_legs = 0; }
+
+      // Rebuild the factorization of the basis the device stopped on. No re-pricing: the device
+      // CONTINUES the solve, and a freshly priced z can violate the dual-feasibility signs the
+      // ratio test established against the maintained one.
+      //
+      // Snapshot the basis FIRST: refactor_basis repairs in place, so after a failure `node.vstatus`
+      // is no longer the basis that failed and a dump taken then would not reproduce it.
+      std::vector<simplex::variable_status_t> vs_before_refactor = node.vstatus;
+      w.terminal_certificate_retry = (w.refactor_reason == 2);
+      if (w.refactor_reason == 1) { ++rejected_refactors; }
+      else if (w.refactor_reason == 2) { ++certificate_refactors; }
+      else { ++periodic_refactors; }
+      const double factor_t0 = cuopt::mathematical_optimization::tic();
+      const bool factor_ok   = refactorize(s, /*initialize_basis*/ false);
+      host_factor_s += cuopt::mathematical_optimization::toc(factor_t0);
+      if (!factor_ok) {
+        node.drop = w.fail;
+        w.active  = false;       // solved stays false -> CPU
+        // Capture the basis the DEVICE handed back, so it can be examined offline. The CPU driver
+        // never fails this call on these instances, so every such basis is one only the device
+        // reaches.
+        if (dump_bad_nodes_dir() != nullptr) {
+          static std::atomic<int> rseq{0};
+          char path[1024];
+          std::snprintf(path, sizeof(path), "%s/refacfail_m%d_n%d_%04d.bin",
+                        dump_bad_nodes_dir(), (int)m, (int)n, rseq.fetch_add(1));
+          const bool ok = bad_node::write<i_t, f_t>(
+            path, lp, node.lower, node.upper, vs_before_refactor, node.dy_se_at_launch,
+            node.x_at_launch, node.y_at_launch, node.z_at_launch, node.settings, static_cast<int>(out[k]), -1, node.sol.objective, 0.0,
+            node.sol.iterations, 0);
+          std::fprintf(stderr, "[REFACFAIL-GPU] leg_iters=%d cum=%d %s %s\n",
+                       (int)node.sol.iterations, (int)w.total_iters,
+                       ok ? "wrote" : "FAILED to write", path);
+        }
+        continue;
+      }
+
+      // Rebuild the primal point the way the CPU's in-place refactor does, and tell the device not
+      // to redo it with its cold-start formula. THIS is the call that needs the bounds-explicit
+      // overload: `lp` is shared across seats and its own bounds are not this node's.
+      f_t work = 0.0;
+      simplex::phase2::compute_primal_solution_from_basis(lp,
+                                                          node.lower,
+                                                          node.upper,
+                                                          w.ft,
+                                                          w.basic_list,
+                                                          w.nonbasic_list,
+                                                          node.vstatus,
+                                                          node.sol.x,
+                                                          w.xB_workspace,
+                                                          work);
+      w.refactor_resume = true;
+    }
+    // Any seat still active needs another launch; the caller decides when to issue it.
+    for (i_t s = 0; s < N; ++s) {
+      if (st[s].active) { return true; }
+    }
+    return false;
+  }
+
+  // Issue the next launch for whatever seats are still active. Separated from harvest() so one
+  // worker-loop pass equals one kernel launch.
+  bool relaunch() { return launch_round(); }
+
+  // Broadcast the newest incumbent to every seat that is about to run. Called before EVERY launch,
+  // whatever the seats' statuses were: the host has been back in the worker loop since the last
+  // one, so an incumbent may have arrived from this worker or from any other. cut_off is unpacked
+  // into a per-block copy at launch and never re-read, so a seat runs its whole leg on whatever
+  // value was current when it started -- this is the only moment it can be updated.
+  void set_cut_off(f_t cut_off)
+  {
+    for (i_t s = 0; s < N; ++s) { nodes[s].settings.cut_off = cut_off; }
+  }
+
+  // Backwards-compatible composition for the synchronous callers (the batch entry point used by
+  // test_netlib), which have no worker loop to return to.
+  bool advance()
+  {
+    if (!harvest()) { return false; }
+    return relaunch();
+  }
+
+  void publish()
+  {
+  // ---- publish ---------------------------------------------------------------------------
+  for (i_t s = 0; s < N; ++s) {
+    if (!nodes[s].solved) { continue; }
+    // total_iters, not the last leg's count: a node interrupted by REFACTOR_NEEDED is ONE solve.
+    nodes[s].sol.iterations = nodes[s].iters;
+    // The device returns `basic_list` / `nonbasic_list` for its FINAL basis, in the order it
+    // maintains them (in-place swap, i.e. pivot history). Re-deriving them from `vstatus` here would
+    // hand the caller a SORTED permutation instead -- a different order for the same basis set,
+    // which the order-dependent ratio test would then scan differently on the node's next solve.
+    nodes[s].basic_list    = st[s].basic_list;
+    nodes[s].nonbasic_list = st[s].nonbasic_list;
+  }
+  if (std::getenv("CUOPT_BNB_GPU_BATCH_TIMING") != nullptr) {
+    std::fprintf(stderr,
+                 "[GPUBATCH-TIMING] seats=%d rounds=%d terminal_noops=%zu periodic_refactors=%d "
+                 "rejected_refactors=%d certificate_refactors=%d upload=%.6f kernel=%.6f "
+                 "copyback=%.6f host_factor=%.6f wall=%.6f\n",
+                 (int)N, (int)rounds, terminal_noop_seats, (int)periodic_refactors,
+                 (int)rejected_refactors, (int)certificate_refactors, upload_s, kernel_s,
+                 copyback_s, host_factor_s, cuopt::mathematical_optimization::toc(t0));
+  }
+  }
+};
+
+// ---- asynchronous interface ---------------------------------------------------------------
+template <typename i_t, typename f_t>
+gpu_batch_run<i_t, f_t>* gpu_batch_begin(const simplex::lp_problem_t<i_t, f_t>& lp,
+                                         std::vector<gpu_batch_node_t<i_t, f_t>>& nodes,
+                                         rmm::cuda_stream_view stream,
+                                         gds::gpu_ro_cache<i_t, f_t>* ro_cache,
+                                         std::vector<batch_seat_state_t<i_t, f_t>>* seat_state)
+{
+  static const std::vector<int> devices = gpu_usable_devices();
+  if (devices.empty() || nodes.empty()) { return nullptr; }
+  auto* run = new gpu_batch_run_t<i_t, f_t>(lp, nodes, stream, ro_cache, *seat_state);
+  run->prepare();
+  if (!run->launch_round()) {   // nothing seatable at all
+    run->publish();
+    delete run;
+    return nullptr;
+  }
+  return run;
+}
+
+template <typename i_t, typename f_t>
+gpu_batch_run<i_t, f_t>* gpu_persistent_batch_begin(
+  const simplex::lp_problem_t<i_t, f_t>& lp,
+  std::vector<gpu_batch_node_t<i_t, f_t>>& nodes,
+  rmm::cuda_stream_view stream,
+  gds::gpu_ro_cache<i_t, f_t>* ro_cache,
+  std::vector<batch_seat_state_t<i_t, f_t>>* seat_state)
+{
+  static const std::vector<int> devices = gpu_usable_devices();
+  if (devices.empty() || nodes.empty() || seat_state == nullptr) { return nullptr; }
+  auto* run = new gpu_batch_run_t<i_t, f_t>(lp, nodes, stream, ro_cache, *seat_state, true);
+  run->prepare();
+  // The persistent pool never launches terminal/no-op seats. The caller replaces per-node preparation failures and
+  // retries; nullptr here also represents pool-wide launch failures that require a drain.
+  for (i_t s = 0; s < run->N; ++s) {
+    if (!run->st[s].active) {
+      run->publish();
+      delete run;
+      return nullptr;
+    }
+  }
+  if (!run->launch_round()) {
+    run->publish();
+    delete run;
+    return nullptr;
+  }
+  return run;
+}
+
+template <typename i_t, typename f_t>
+bool gpu_persistent_batch_harvest(gpu_batch_run<i_t, f_t>* run)
+{
+  return run != nullptr && run->harvest_persistent();
+}
+
+template <typename i_t, typename f_t>
+bool gpu_persistent_batch_stage_fresh(gpu_batch_run<i_t, f_t>* run, i_t seat, std::string& error)
+{
+  return run != nullptr && run->stage_persistent_fresh(seat, error);
+}
+
+template <typename i_t, typename f_t>
+bool gpu_persistent_batch_stage_refactor(gpu_batch_run<i_t, f_t>* run, i_t seat, std::string& error)
+{
+  return run != nullptr && run->stage_persistent_refactor(seat, error);
+}
+
+template <typename i_t, typename f_t>
+bool gpu_persistent_batch_stage_child(
+  gpu_batch_run<i_t, f_t>* run,
+  i_t seat,
+  const std::vector<gds::gpu_bound_delta<i_t, f_t>>& deltas,
+  std::string& error)
+{
+  return run != nullptr && run->stage_persistent_child(seat, deltas, error);
+}
+
+template <typename i_t, typename f_t>
+bool gpu_persistent_batch_relaunch(gpu_batch_run<i_t, f_t>* run, std::string& error)
+{
+  return run != nullptr && run->relaunch_persistent(error);
+}
+
+template <typename i_t, typename f_t>
+bool gpu_batch_run_ready(gpu_batch_run<i_t, f_t>* run)
+{
+  return run == nullptr || run->ready();
+}
+
+template <typename i_t, typename f_t>
+gpu_batch_run_metrics gpu_batch_run_get_metrics(const gpu_batch_run<i_t, f_t>* run)
+{
+  gpu_batch_run_metrics result;
+  if (run == nullptr) { return result; }
+  result.seats                   = static_cast<int>(run->N);
+  result.rounds                  = static_cast<int>(run->rounds);
+  result.terminal_noop_seats     = run->terminal_noop_seats;
+  result.periodic_refactors      = static_cast<int>(run->periodic_refactors);
+  result.rejected_refactors      = static_cast<int>(run->rejected_refactors);
+  result.certificate_refactors   = static_cast<int>(run->certificate_refactors);
+  result.upload_s                = run->upload_s;
+  result.kernel_s                = run->kernel_s;
+  result.copyback_s              = run->copyback_s;
+  result.host_factor_s           = run->host_factor_s;
+  result.wall_s = cuopt::mathematical_optimization::toc(run->t0);
+  return result;
+}
+
+// Harvest the launch in flight (results + host refactor). True => seats remain, so the caller
+// should process them and then call gpu_batch_run_relaunch.
+template <typename i_t, typename f_t>
+bool gpu_batch_run_harvest(gpu_batch_run<i_t, f_t>* run)
+{
+  return run != nullptr && run->harvest();
+}
+
+// Issue the next launch. True => a launch is now in flight.
+template <typename i_t, typename f_t>
+bool gpu_batch_run_relaunch(gpu_batch_run<i_t, f_t>* run)
+{
+  return run != nullptr && run->relaunch();
+}
+
+template <typename i_t, typename f_t>
+void gpu_batch_run_set_cut_off(gpu_batch_run<i_t, f_t>* run, f_t cut_off)
+{
+  if (run != nullptr) { run->set_cut_off(cut_off); }
+}
+
+template <typename i_t, typename f_t>
+bool gpu_batch_run_advance(gpu_batch_run<i_t, f_t>* run)
+{
+  return run != nullptr && run->advance();
+}
+
+template <typename i_t, typename f_t>
+void gpu_batch_run_end(gpu_batch_run<i_t, f_t>* run)
+{
+  if (run == nullptr) { return; }
+  if (run->persistent_seats) { run->destroy_persistent(); }
+  run->publish();
+  delete run;
+}
+
+// ---- synchronous entry point (unchanged behaviour) ----------------------------------------
+template <typename i_t, typename f_t>
+void gpu_solve_nodes_batch(const simplex::lp_problem_t<i_t, f_t>& lp,
+                           std::vector<gpu_batch_node_t<i_t, f_t>>& nodes,
+                           rmm::cuda_stream_view stream,
+                           gds::gpu_ro_cache<i_t, f_t>* ro_cache)
+{
+  // No pool here, so the seat state is local and the factorization is not carried anywhere -- this
+  // entry solves one batch and returns.
+  std::vector<batch_seat_state_t<i_t, f_t>> local_seat_state;
+  auto* run = gpu_batch_begin<i_t, f_t>(lp, nodes, stream, ro_cache, &local_seat_state);
+  if (run == nullptr) { return; }
+  while (gpu_batch_run_advance<i_t, f_t>(run)) {}
+  gpu_batch_run_end<i_t, f_t>(run);
+}
+
+template void gpu_solve_nodes_batch<int, double>(const simplex::lp_problem_t<int, double>&,
+                                                 std::vector<gpu_batch_node_t<int, double>>&,
+                                                 rmm::cuda_stream_view,
+                                                 gds::gpu_ro_cache<int, double>*);
+template gpu_batch_run<int, double>* gpu_batch_begin<int, double>(
+  const simplex::lp_problem_t<int, double>&, std::vector<gpu_batch_node_t<int, double>>&,
+  rmm::cuda_stream_view, gds::gpu_ro_cache<int, double>*,
+  std::vector<batch_seat_state_t<int, double>>*);
+template gpu_batch_run<int, double>* gpu_persistent_batch_begin<int, double>(
+  const simplex::lp_problem_t<int, double>&, std::vector<gpu_batch_node_t<int, double>>&,
+  rmm::cuda_stream_view, gds::gpu_ro_cache<int, double>*,
+  std::vector<batch_seat_state_t<int, double>>*);
+template bool gpu_persistent_batch_harvest<int, double>(gpu_batch_run<int, double>*);
+template bool gpu_persistent_batch_stage_fresh<int, double>(
+  gpu_batch_run<int, double>*, int, std::string&);
+template bool gpu_persistent_batch_stage_refactor<int, double>(
+  gpu_batch_run<int, double>*, int, std::string&);
+template bool gpu_persistent_batch_stage_child<int, double>(
+  gpu_batch_run<int, double>*, int,
+  const std::vector<gds::gpu_bound_delta<int, double>>&, std::string&);
+template bool gpu_persistent_batch_relaunch<int, double>(gpu_batch_run<int, double>*, std::string&);
+template bool gpu_batch_run_ready<int, double>(gpu_batch_run<int, double>*);
+template gpu_batch_run_metrics gpu_batch_run_get_metrics<int, double>(
+  const gpu_batch_run<int, double>*);
+template bool gpu_batch_run_advance<int, double>(gpu_batch_run<int, double>*);
+template bool gpu_batch_run_harvest<int, double>(gpu_batch_run<int, double>*);
+template bool gpu_batch_run_relaunch<int, double>(gpu_batch_run<int, double>*);
+template void gpu_batch_run_set_cut_off<int, double>(gpu_batch_run<int, double>*, double);
+template void gpu_batch_run_end<int, double>(gpu_batch_run<int, double>*);
+
+
+}  // namespace cuopt::mathematical_optimization::mip

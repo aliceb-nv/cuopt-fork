@@ -45,7 +45,19 @@
 #include <map>
 #include <string>
 
+// Debug-only, OFF by default: set to 1 and rebuild to have the minimal driver print its
+// iteration-0 ratio-test state, for diffing against the GPU driver's [GMIN] line.
+#ifndef MIN_ITER0_TRACE
+#define MIN_ITER0_TRACE 0
+#endif
+
 namespace cuopt::mathematical_optimization::simplex {
+
+
+
+
+
+
 
 constexpr int FEATURE_LOG_INTERVAL = 100;
 
@@ -748,6 +760,25 @@ i_t compute_primal_solution_from_basis(const lp_problem_t<i_t, f_t>& lp,
                                        std::vector<f_t>& xB_workspace,
                                        f_t& work_estimate)
 {
+  // The one-argument form is the bounds-explicit one applied to the problem's own bounds. There is
+  // deliberately only ONE implementation: a second copy of this formula would have to be kept in
+  // step with the first, and the GPU resume path depends on matching it exactly.
+  return compute_primal_solution_from_basis(
+    lp, lp.lower, lp.upper, ft, basic_list, nonbasic_list, vstatus, x, xB_workspace, work_estimate);
+}
+
+template <typename i_t, typename f_t>
+i_t compute_primal_solution_from_basis(const lp_problem_t<i_t, f_t>& lp,
+                                       const std::vector<f_t>& lower,
+                                       const std::vector<f_t>& upper,
+                                       basis_update_mpf_t<i_t, f_t>& ft,
+                                       const std::vector<i_t>& basic_list,
+                                       const std::vector<i_t>& nonbasic_list,
+                                       const std::vector<variable_status_t>& vstatus,
+                                       std::vector<f_t>& x,
+                                       std::vector<f_t>& xB_workspace,
+                                       f_t& work_estimate)
+{
   const i_t m          = lp.num_rows;
   const i_t n          = lp.num_cols;
   std::vector<f_t> rhs = lp.rhs;
@@ -757,9 +788,9 @@ i_t compute_primal_solution_from_basis(const lp_problem_t<i_t, f_t>& lp,
     const i_t j = nonbasic_list[k];
     if (vstatus[j] == variable_status_t::NONBASIC_LOWER ||
         vstatus[j] == variable_status_t::NONBASIC_FIXED) {
-      x[j] = lp.lower[j];
+      x[j] = lower[j];
     } else if (vstatus[j] == variable_status_t::NONBASIC_UPPER) {
-      x[j] = lp.upper[j];
+      x[j] = upper[j];
     } else if (vstatus[j] == variable_status_t::NONBASIC_FREE) {
       x[j] = 0.0;
     }
@@ -2796,6 +2827,7 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
   i_t num_refactors         = 0;
   i_t total_bound_flips     = 0;
   f_t delta_y_nz_percentage = 0.0;
+  i_t last_cutoff_check     = -1;
   phase2::phase2_timers_t<i_t, f_t> timers(false);
 
   // Sparse vectors for main loop (declared outside loop for instrumentation)
@@ -3609,6 +3641,12 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
         if (refactor_status == TIME_LIMIT_RETURN) { return dual_status_t::TIME_LIMIT; }
         if (refactor_status > 0) {
           should_recompute_x = true;
+          // Independent of settings.log: node LPs run with logging OFF, so the message below is
+          // invisible in a branch-and-bound run and the failure cannot be counted.
+          if (std::getenv("CUOPT_DS_REFACTOR_FAIL_TRACE") != nullptr) {
+            std::fprintf(stderr, "[REFACFAIL] full iter=%d status=%d\n", (int)iter,
+                         (int)refactor_status);
+          }
           settings.log.printf("Failed to factorize basis. Iteration %d\n", iter);
           if (toc(start_time) > settings.time_limit) { return dual_status_t::TIME_LIMIT; }
           i_t count          = 0;
@@ -3740,9 +3778,54 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
       }
     }
 
-    if (obj >= settings.cut_off) {
-      settings.log.printf("Solve cutoff. Current objecive %e. Cutoff %e\n", obj, settings.cut_off);
-      return dual_status_t::CUTOFF;
+    // Use the pivotal BTRAN density already measured in this iteration. Always
+    // attempt the first cutoff; subsequent checks are spaced 1 to 100 iterations apart.
+    const i_t cutoff_check_frequency =
+      static_cast<i_t>(100.0 / std::clamp(delta_y_nz_percentage, f_t{1}, f_t{100}));
+    if (obj >= settings.cut_off &&
+        (last_cutoff_check == -1 || iter - last_cutoff_check >= cutoff_check_frequency)) {
+      last_cutoff_check       = iter;
+      const f_t unperturb_obj = compute_objective(lp, x);
+      if (unperturb_obj >= settings.cut_off) {
+        // Validate the cutoff using the original objective, not the perturbed costs.
+        std::vector<f_t> trial_y = y;
+        if (phase2::amount_of_perturbation(lp, objective) != 0.0) {
+          std::vector<f_t> original_basic_cost(m);
+          for (i_t k = 0; k < m; ++k) {
+            original_basic_cost[k] = lp.objective[basic_list[k]];
+          }
+          phase2_work_estimate += 5 * m;
+          ft.b_transpose_solve(original_basic_cost, trial_y);
+        }
+        // Include residual reduced costs for basic variables in the dual bound.
+        std::vector<f_t> reduced_cost = lp.objective;
+        matrix_transpose_vector_multiply(lp.A, -1.0, trial_y, 1.0, reduced_cost);
+        f_t dual_objective = dot<i_t, f_t>(lp.rhs, trial_y);
+        for (i_t j = 0; j < n; j++) {
+          const bool missing_bound = (reduced_cost[j] > 0.0 && lp.lower[j] == -inf) ||
+                                     (reduced_cost[j] < 0.0 && lp.upper[j] == inf);
+          // Tolerate roundoff at infinite bounds only; this is an approximate certificate.
+          if (missing_bound && std::abs(reduced_cost[j]) <= settings.zero_tol) { continue; }
+          if (reduced_cost[j] > 0.0) {
+            dual_objective += reduced_cost[j] * lp.lower[j];
+          } else if (reduced_cost[j] < 0.0) {
+            dual_objective += reduced_cost[j] * lp.upper[j];
+          }
+        }
+        phase2_work_estimate += 3 * lp.A.col_start[n] + 12 * n + 2 * m;
+        if (std::isfinite(dual_objective) && dual_objective >= settings.cut_off) {
+          settings.log.printf(
+            "Solve cutoff. Current objecive %e. Cutoff %e\n", obj, settings.cut_off);
+          // Preserve the basic reduced-cost convention only after evaluating the bound.
+          for (const i_t j : basic_list)
+            reduced_cost[j] = 0.0;
+          phase2_work_estimate += m;
+          z = std::move(reduced_cost);
+          y = trial_y;
+          return dual_status_t::CUTOFF;
+        }
+      }
+      phase2_work_estimate += 2 * n;
     }
 
     if (work_unit_context && work_unit_context->global_work_units_elapsed >= settings.work_limit) {
@@ -4109,6 +4192,59 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
       entering = phase2::phase2_ratio_test(
         lp, settings, vstatus, nonbasic_list, z, delta_z, step_length, nonbasic_entering);
     }
+#if MIN_ITER0_TRACE
+    // TEST-ONLY, compile-time gated (default 0). Prints the SAME fields as the GPU driver's [GMIN]
+    // line, at iteration 0 only -- the one point where the device and this driver are guaranteed to
+    // start from identical state, so any difference is a defect and not warp reassociation.
+    if (iter == 0) {
+      double max_abs_dz = 0.0;
+      int dz_above = 0, lo_ok = 0, lo_bad = 0, up_ok = 0, up_bad = 0, fixed_big = 0, other_big = 0;
+      for (i_t kk = 0; kk < static_cast<i_t>(nonbasic_list.size()); ++kk) {
+        const i_t j = nonbasic_list[kk];
+        const f_t d = delta_z[j];
+        if (std::abs(d) > max_abs_dz) { max_abs_dz = std::abs(d); }
+        if (std::abs(d) > settings.dual_tol) { dz_above++; }
+        if (std::abs(d) <= settings.pivot_tol) { continue; }
+        if (vstatus[j] == variable_status_t::NONBASIC_LOWER) { (d < 0.0 ? lo_ok : lo_bad)++; }
+        else if (vstatus[j] == variable_status_t::NONBASIC_UPPER) { (d > 0.0 ? up_ok : up_bad)++; }
+        else if (vstatus[j] == variable_status_t::NONBASIC_FIXED) { fixed_big++; }
+        else { other_big++; }
+      }
+      // Same column the GPU-side probe uses, so the two primal points can be compared entry for
+      // entry on the ONE variable that matters -- the row the device chose to leave on.
+      static const int probe_col = [] {
+        const char* e = std::getenv("CUOPT_BNB_DY_PROBE");
+        return (e != nullptr) ? std::atoi(e) : -1;
+      }();
+      double z_abs = 0.0, z_signed = 0.0;
+      for (i_t kk = 0; kk < static_cast<i_t>(nonbasic_list.size()); ++kk) {
+        const f_t zv = z[nonbasic_list[kk]];
+        z_abs += std::abs(zv); z_signed += zv;
+      }
+      double lo_sum = 0.0, up_sum = 0.0;
+      for (i_t jj = 0; jj < n; ++jj) {
+        if (std::isfinite(lp.lower[jj])) { lo_sum += std::abs(lp.lower[jj]); }
+        if (std::isfinite(lp.upper[jj])) { up_sum += std::abs(lp.upper[jj]); }
+      }
+      double xn_sum = 0.0; int xn_nz = 0;
+      for (i_t kk = 0; kk < static_cast<i_t>(nonbasic_list.size()); ++kk) {
+        const f_t v = x[nonbasic_list[kk]];
+        xn_sum += std::abs(v);
+        if (v != 0.0) { xn_nz++; }
+      }
+      const double probe_x  = (probe_col >= 0 && probe_col < n) ? x[probe_col] : 0.0;
+      const double probe_lo = (probe_col >= 0 && probe_col < n) ? lp.lower[probe_col] : 0.0;
+      const double probe_up = (probe_col >= 0 && probe_col < n) ? lp.upper[probe_col] : 0.0;
+      std::fprintf(stderr,
+                   "[CMIN0] iter=0 leave=%d dir=%d leave_x=%.6e max|dz|=%.3e dz>dual_tol=%d "
+                   "dz_nnz=%d dy_nz=%d entering=%d loOK=%d loBAD=%d upOK=%d upBAD=%d fixed=%d "
+                   "other=%d probe_x=%.6e xn_sum=%.17g xn_nz=%d losum=%.17g upsum=%.17g zabs=%.17g zsig=%.17g\n",
+                   (int)leaving, (int)direction, x[leaving], max_abs_dz, dz_above,
+                   (int)delta_z_indices.size(), (int)delta_y_sparse.i.size(), (int)entering,
+                   lo_ok, lo_bad, up_ok, up_bad, fixed_big, other_big,
+                   probe_x, xn_sum, xn_nz, lo_sum, up_sum, z_abs, z_signed);
+    }
+#endif
     if (entering == -1) {
       // Would-be DUAL_UNBOUNDED. If we perturbed, the unboundedness may be an
       // artifact of the perturbed objective: recompute the true reduced costs and,
@@ -4302,7 +4438,13 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
           lp.A, settings, lp.lower, lp.upper, start_time, basic_list, nonbasic_list, vstatus);
         refactor_work = ft.work_estimate() - refactor_start_work;
         solve_work    = 0.0;
-        if (refactor_status != 0) { return dual::status_t::NUMERICAL; }
+        if (refactor_status != 0) {
+          if (std::getenv("CUOPT_DS_REFACTOR_FAIL_TRACE") != nullptr) {
+            std::fprintf(stderr, "[REFACFAIL] simplified iter=%d status=%d\n", (int)iter,
+                         (int)refactor_status);
+          }
+          return dual::status_t::NUMERICAL;
+        }
         // Basis repair may have changed the lists; rebuild basic_mark and recompute
         // the primal point from the fresh factorization. Reduced costs y/z stay as
         // maintained (the basis is unchanged for a healthy refactorization).
@@ -4355,6 +4497,41 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
         primal_inf,
         static_cast<int>(infeas_idx.size()),
         ft.num_updates());
+      // ORDER-INDEPENDENT checksums of the three vectors the pivot is built from. XOR of the raw
+      // bit patterns: it does not depend on traversal order, so a mismatch means the VECTOR differs,
+      // not that the two sides summed it in a different order. This is what localises which
+      // operation seeds the CPU/GPU divergence -- BTRAN (delta_y), the reduced-cost SpMV (delta_z),
+      // or FTRAN (delta_x).
+      {
+        auto xorbits = [&](const std::vector<f_t>& v) {
+          unsigned long long h = 0;
+          for (const f_t e : v) { if (e != 0.0) { h ^= dbits(e); } }
+          return h;
+        };
+        auto nnz = [](const std::vector<f_t>& v) {
+          int c = 0; for (const f_t e : v) { c += (e != 0.0); } return c;
+        };
+        std::printf("[CVEC] iter=%d dy=%016llx dynz=%d dz=%016llx dznz=%d dx=%016llx dxnz=%d\n",
+                    iter, xorbits(delta_y), nnz(delta_y), xorbits(delta_z), nnz(delta_z),
+                    xorbits(delta_x), nnz(delta_x));
+      }
+      // DIAGNOSTIC: dual infeasibility of the MAINTAINED z at this pivot. The dual simplex holds
+      // dual feasibility as an INVARIANT and never re-tests it, so a drift here is invisible to the
+      // driver yet decides the final answer -- it is what makes the objective stop being a lower
+      // bound, which is what the CUTOFF test rests on. Printed per iteration so the growth can be
+      // read as smooth (accumulated drift) or as a jump at one pivot (a specific bad operation).
+      {
+        f_t dinf_maintained = 0.0;
+        for (i_t q = 0; q < n - m; ++q) {
+          const i_t j = nonbasic_list[q];
+          if (vstatus[j] == variable_status_t::NONBASIC_LOWER) {
+            dinf_maintained = std::max(dinf_maintained, -z[j]);
+          } else if (vstatus[j] == variable_status_t::NONBASIC_UPPER) {
+            dinf_maintained = std::max(dinf_maintained, z[j]);
+          }
+        }
+        std::printf("[CDINF] iter=%d dinf=%.17g\n", iter, dinf_maintained);
+      }
       std::printf(
         "[CMP] iter=%d leave=%d dir=%d enter=%d step=%016llx obj=%016llx p_inf=%016llx nInf=%d "
         "nupd=%d\n",
@@ -4374,6 +4551,45 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,         
     // (SE-reset line ~4057, perturbation-removal line ~4158) jump back to `while`
     // without counting, so `iter` counts pivots, not every loop pass.
     iter++;
+
+    // CUOPT_DS_DRIFT_PROBE=<n>: every n pivots, price the CURRENT basis fresh and compare against
+    // the incrementally maintained y/z. A dual simplex keeps dual feasibility as an INVARIANT and
+    // never re-tests it, so a maintained dual point that drifts away from its own basis is invisible
+    // to the driver and silently decides the final answer. This exposes the drift curve so the host
+    // and the device can be compared on the same node.
+    if (const char* pv = std::getenv("CUOPT_DS_DRIFT_PROBE")) {
+      const i_t every = std::max(1, std::atoi(pv));
+      if (iter % every == 0) {
+        basis_update_mpf_t<i_t, f_t> ft_p(m, settings.refactor_frequency);
+        std::vector<i_t> b_p(static_cast<size_t>(m), 0), nb_p, sb_p;
+        get_basis_from_vstatus<i_t>(m, vstatus, b_p, nb_p, sb_p);
+        const f_t tp = tic();
+        if (ft_p.refactor_basis(lp.A, settings, lp.lower, lp.upper, tp, b_p, nb_p, vstatus) == 0) {
+          std::vector<f_t> y_p(static_cast<size_t>(m), 0.0), z_p(static_cast<size_t>(n), 0.0);
+          f_t w_p = 0.0;
+          phase2::compute_dual_solution_from_basis(lp, ft_p, b_p, nb_p, y_p, z_p, w_p);
+          // NONBASIC positions only. compute_dual_solution_from_basis writes z=0 for every basic
+          // column, while the maintained z keeps whatever that column had when it was last
+          // nonbasic -- and the driver never reads z at a basic column. Taking the max over ALL j
+          // therefore measures stale values nobody consumes: it reported drifts of 1e3 on a solve
+          // that converges perfectly. Only the nonbasic entries drive the ratio test.
+          f_t dz = 0.0, dy = 0.0;
+          for (i_t k = 0; k < static_cast<i_t>(nb_p.size()); ++k) {
+            const i_t j = nb_p[k];
+            dz          = std::max(dz, std::abs(z_p[j] - z[j]));
+          }
+          for (i_t i2 = 0; i2 < m; ++i2) { dy = std::max(dy, std::abs(y_p[i2] - y[i2])); }
+          std::fprintf(stderr,
+                       "[CDRIFT] iter=%d nupd=%d max|dz_nonbasic|=%.6e max|dy|=%.6e "
+                       "dinf(kept)=%.3e dinf(fresh)=%.3e\n",
+                       (int)iter, (int)ft.num_updates(), dz, dy,
+                       phase2::dual_infeasibility(lp, settings, vstatus, z, settings.tight_tol,
+                                          settings.dual_tol),
+                       phase2::dual_infeasibility(lp, settings, vstatus, z_p, settings.tight_tol,
+                                          settings.dual_tol));
+        }
+      }
+    }
 
     // Objective cutoff (dual bound), checked AFTER the pivot/iter++ — mirrors the
     // advanced driver's placement (phase2.cpp:~3742) AND its comparand: the
@@ -4478,6 +4694,27 @@ template int phase2::compute_primal_solution_from_basis<int, double>(
   std::vector<double>&,
   std::vector<double>&,
   double&);
+
+template int phase2::compute_primal_solution_from_basis<int, double>(
+  const lp_problem_t<int, double>&,
+  const std::vector<double>&,
+  const std::vector<double>&,
+  basis_update_mpf_t<int, double>&,
+  const std::vector<int>&,
+  const std::vector<int>&,
+  const std::vector<variable_status_t>&,
+  std::vector<double>&,
+  std::vector<double>&,
+  double&);
+
+template void phase2::compute_dual_solution_from_basis<int, double>(
+  const lp_problem_t<int, double>& lp,
+  basis_update_mpf_t<int, double>& ft,
+  const std::vector<int>& basic_list,
+  const std::vector<int>& nonbasic_list,
+  std::vector<double>& y,
+  std::vector<double>& z,
+  double& work_estimate);
 #endif
 
 }  // namespace cuopt::mathematical_optimization::simplex

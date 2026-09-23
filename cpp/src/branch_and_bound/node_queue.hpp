@@ -108,6 +108,32 @@ class node_queue_t {
     return node;
   }
 
+  // GPU extraction may look past CPU-only takebacks, but it must leave them in this worker's heap
+  // for the ordinary CPU path. A bounded scan avoids repeatedly popping the same ineligible top
+  // entry when every remaining node is CPU-only.
+  mip_node_t<i_t, f_t>* pop_gpu_eligible()
+  {
+    std::lock_guard lock(mutex_);
+    std::vector<std::shared_ptr<heap_entry_t>> cpu_only_entries;
+    const size_t scan_limit = best_first_heap_.size();
+    mip_node_t<i_t, f_t>* node{nullptr};
+
+    for (size_t i = 0; i < scan_limit; ++i) {
+      auto entry = best_first_heap_.pop();
+      if (entry->node->cpu_only) {
+        cpu_only_entries.push_back(std::move(entry));
+        continue;
+      }
+      node = std::exchange(entry->node, nullptr);
+      break;
+    }
+
+    for (auto& entry : cpu_only_entries) { best_first_heap_.push(std::move(entry)); }
+    lower_bound_ = best_first_heap_.empty() ? std::numeric_limits<f_t>::infinity()
+                                            : best_first_heap_.top()->lower_bound;
+    return node;
+  }
+
   bool diving_init(const simplex::lp_problem_t<i_t, f_t>& lp,
                    mip_node_t<i_t, f_t>& start_node,
                    std::vector<f_t>& start_lower,

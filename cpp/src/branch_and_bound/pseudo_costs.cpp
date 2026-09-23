@@ -465,6 +465,20 @@ void strong_branch_helper(i_t start,
   }
 }
 
+// MEASUREMENT ONLY (CUOPT_SB_TRACE=1) -- remove when the strong-branching study is done.
+// Both facts below are already computed and already logged through `settings.log.debug`, but that
+// routes to CUOPT_LOG_TRACE, which is gated at COMPILE time by CUOPT_LOG_ACTIVE_LEVEL -- enabling
+// it means a global flag and a full rebuild. Emitting them directly costs one TU, and is silent
+// unless the env var is set.
+static bool sb_trace_enabled()
+{
+  static const bool on = [] {
+    const char* e = std::getenv("CUOPT_SB_TRACE");
+    return e != nullptr && std::string(e) != "0";
+  }();
+  return on;
+}
+
 template <typename i_t, typename f_t>
 std::pair<f_t, dual_status_t> trial_branching(const lp_problem_t<i_t, f_t>& original_lp,
                                               const simplex_solver_settings_t<i_t, f_t>& settings,
@@ -520,6 +534,14 @@ std::pair<f_t, dual_status_t> trial_branching(const lp_problem_t<i_t, f_t>& orig
                                                                   iter,
                                                                   child_edge_norms);
 
+  if (sb_trace_enabled()) {
+    // One fprintf per line: these run inside OpenMP tasks, so a split write would interleave.
+    std::fprintf(stderr,
+                 "[SBTRIAL] var=%d iter=%d status=%s\n",
+                 static_cast<int>(branch_var),
+                 static_cast<int>(iter),
+                 simplex::dual_status_to_string(status).c_str());
+  }
   settings.log.debug("Trial branching on variable %d. Lo: %e Up: %e. Iter %d. Status %s. Obj %e\n",
                      branch_var,
                      child_problem.lower[branch_var],
@@ -1699,6 +1721,14 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
   assert(num_candidates > 0);
   assert(num_tasks > 0);
 
+  if (sb_trace_enabled()) {
+    std::fprintf(stderr,
+                 "[SBRB] rb_iters=%lld bb_iters=%lld unreliable=%zu threshold=%d\n",
+                 static_cast<long long>(strong_branching_lp_iter),
+                 static_cast<long long>(branch_and_bound_lp_iters),
+                 unreliable_list.size(),
+                 static_cast<int>(reliable_threshold));
+  }
   settings.log.debug(
     "RB iters = %d, B&B iters = %d, unreliable = %d, num_tasks = %d, reliable_threshold = %d\n",
     static_cast<int64_t>(strong_branching_lp_iter),

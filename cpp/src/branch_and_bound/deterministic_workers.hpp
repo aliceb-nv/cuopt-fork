@@ -159,10 +159,26 @@ class deterministic_bfs_worker_t
   {
   }
 
-  bool has_work_impl() const
+  // #2 -- `gpu_pool_busy` is set while an asynchronous GPU round holds this worker's nodes. Those
+  // nodes are in NO queue, so without this term the worker would look idle, reach the barrier, and
+  // deterministic_compute_lower_bound() / any_has_work() would both miss them. The lower bound would
+  // then run too HIGH and the solver could declare OPTIMAL early -- a wrong answer, not a slowdown.
+  // Reporting the pool here is what keeps the worker in its loop until the pool drains, which is
+  // also what keeps the assert in deterministic_sync_callback() true.
+  bool has_work_impl() const { return has_queued_work() || gpu_pool_busy; }
+
+  // QUEUE ONLY -- deliberately excludes gpu_pool_busy. Every caller that is about to DEQUEUE must
+  // use this, not has_work(): with the pool term included, a worker whose nodes are all on the
+  // device reports work, dequeues nullptr, and spins. has_work() answers "should this worker stay
+  // out of the barrier"; has_queued_work() answers "is there a node I can pop right now".
+  bool has_queued_work() const
   {
     return current_node != nullptr || !plunge_stack.empty() || !backlog.empty();
   }
+
+  // Set by gpu_pool_cycle while an async round is in flight. Plain bool: only this worker's thread
+  // writes it, and only this worker's thread reads it.
+  bool gpu_pool_busy{false};
 
   void enqueue_node(mip_node_t<i_t, f_t>* node)
   {
@@ -211,6 +227,33 @@ class deterministic_bfs_worker_t
     }
 
     return !backlog.empty() ? backlog.pop() : nullptr;
+  }
+
+  // Remove up to `max_nodes` GPU-eligible nodes while leaving CPU-only nodes on this worker.
+  // CPU-only nodes are temporarily popped so eligible work behind them remains reachable, then
+  // restored at the front in their original pop order. This also makes them the next work handled
+  // by the CPU while an asynchronous GPU generation is in flight.
+  std::vector<mip_node_t<i_t, f_t>*> dequeue_gpu_nodes(size_t max_nodes)
+  {
+    std::vector<mip_node_t<i_t, f_t>*> result;
+    std::vector<mip_node_t<i_t, f_t>*> cpu_only_nodes;
+    result.reserve(max_nodes);
+
+    const size_t scan_limit = queue_size();
+    for (size_t i = 0; i < scan_limit && result.size() < max_nodes; ++i) {
+      mip_node_t<i_t, f_t>* node = dequeue_node();
+      if (node == nullptr) { break; }
+      if (node->cpu_only) {
+        cpu_only_nodes.push_back(node);
+      } else {
+        result.push_back(node);
+      }
+    }
+
+    for (auto it = cpu_only_nodes.rbegin(); it != cpu_only_nodes.rend(); ++it) {
+      plunge_stack.push_front(*it);
+    }
+    return result;
   }
 
   size_t queue_size() const

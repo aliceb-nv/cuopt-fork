@@ -12,6 +12,9 @@
 #include <raft/core/nvtx.hpp>
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 
 namespace cuopt::mathematical_optimization::simplex {
@@ -2227,6 +2230,41 @@ i_t basis_update_mpf_t<i_t, f_t>::update(const sparse_vector_t<i_t, f_t>& utilde
                                   S_.col_start[S_start + 2] - S_.col_start[S_start + 1]);
   work_estimate_ += 3 * std::min(nz, static_cast<i_t>(etilde.i.size()));
 
+  // CUOPT_DS_MU_TRACE=1: the same fields as the device's [GMU], printed BEFORE the guard so a
+  // REJECTED update is visible too -- otherwise the very update that forces a refactorization is the
+  // one missing from the trace.
+  if (std::getenv("CUOPT_DS_MU_TRACE") != nullptr) {
+    const i_t unz_t = S_.col_start[S_start + 1] - S_.col_start[S_start];
+    const i_t vnz_t = S_.col_start[S_start + 2] - S_.col_start[S_start + 1];
+    f_t usum = 0.0, vsum = 0.0;
+    unsigned long long uh = 1469598103934665603ULL, vh = 1469598103934665603ULL;
+    auto bits = [](f_t v) { unsigned long long b; std::memcpy(&b, &v, sizeof(b)); return b; };
+    for (i_t q = 0; q < unz_t; ++q) {
+      const f_t xv = S_.x[S_.col_start[S_start] + q];
+      usum += std::abs(xv);
+      uh = (uh ^ bits(xv)) * 1099511628211ULL;
+      uh = (uh ^ (unsigned long long)S_.i[S_.col_start[S_start] + q]) * 1099511628211ULL;
+    }
+    for (i_t q = 0; q < vnz_t; ++q) {
+      const f_t xv = S_.x[S_.col_start[S_start + 1] + q];
+      vsum += std::abs(xv);
+      vh = (vh ^ bits(xv)) * 1099511628211ULL;
+      vh = (vh ^ (unsigned long long)S_.i[S_.col_start[S_start + 1] + q]) * 1099511628211ULL;
+    }
+    std::fprintf(stderr,
+                 "[CMU] nupd=%d mu=%.17g unz=%d vnz=%d usum=%.17g vsum=%.17g uh=%016llx vh=%016llx\n",
+                 (int)num_updates_, mu, (int)unz_t, (int)vnz_t, usum, vsum, uh, vh);
+    // CUOPT_DS_MU_DUMP=<nupd>: every (index, value) of the u column at that update, so it can be
+    // diffed against the device's. Sums and counts say the vectors differ; only the entries say how.
+    if (const char* dmp = std::getenv("CUOPT_DS_MU_DUMP")) {
+      if (std::atoi(dmp) == static_cast<int>(num_updates_)) {
+        for (i_t q = 0; q < unz_t; ++q) {
+          std::fprintf(stderr, "[CUENT] %d %.17g\n", (int)S_.i[S_.col_start[S_start] + q],
+                       S_.x[S_.col_start[S_start] + q]);
+        }
+      }
+    }
+  }
   if (std::abs(mu) < 1E-8 || std::abs(mu) > 1E+8) {
     // Force a refactor. Otherwise we will get numerical issues when dividing by mu.
     return 1;
@@ -2346,9 +2384,16 @@ int basis_update_mpf_t<i_t, f_t>::refactor_basis(
   f_t start_time,
   std::vector<i_t>& basic_list,
   std::vector<i_t>& nonbasic_list,
-  std::vector<variable_status_t>& vstatus)
+  std::vector<variable_status_t>& vstatus,
+  bool* repaired)
 {
   raft::common::nvtx::range scope("LU::refactor_basis");
+  if (repaired != nullptr) { *repaired = false; }
+  // DIAGNOSTIC ONLY (CUOPT_DS_REPAIR_TRACE=1): count the refactorization OPPORTUNITIES, so the
+  // repair rate can be read per refactor instead of per node.
+  if (std::getenv("CUOPT_DS_REPAIR_TRACE") != nullptr) {
+    std::fprintf(stderr, "[REFAC] m=%d\n", (int)A.m);
+  }
   std::vector<i_t> deficient;
   std::vector<i_t> slacks_needed;
   std::vector<i_t> superbasic_list;  // Empty superbasic list
@@ -2374,6 +2419,14 @@ int basis_update_mpf_t<i_t, f_t>::refactor_basis(
   if (status == TIME_LIMIT_RETURN) { return TIME_LIMIT_RETURN; }
   if (status == -1) {
     settings.log.debug("Initial factorization failed\n");
+    if (repaired != nullptr) { *repaired = true; }
+    // DIAGNOSTIC ONLY (CUOPT_DS_REPAIR_TRACE=1). basis_repair substitutes slacks for the deficient
+    // columns, so it CHANGES the basis while refactor_basis still returns 0. Every caller that
+    // carries y/z across this call is then holding duals priced for a basis that no longer exists.
+    // Counting it here measures BOTH drivers in one run, because they share this function.
+    if (std::getenv("CUOPT_DS_REPAIR_TRACE") != nullptr) {
+      std::fprintf(stderr, "[REPAIR] deficient=%d m=%d\n", (int)deficient.size(), (int)A.m);
+    }
     basis_repair(A,
                  settings,
                  lower,
