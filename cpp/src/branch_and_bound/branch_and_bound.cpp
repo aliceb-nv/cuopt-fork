@@ -46,7 +46,9 @@
 #include <cstring>
 #include <limits>
 #include <list>
+#include <span>
 #include <string>
+#include <type_traits>
 #include <utilities/scope_guard.hpp>
 #include <vector>
 
@@ -170,7 +172,7 @@ bool is_fractional(f_t x, variable_type_t var_type, f_t integer_tol)
 
 template <typename i_t, typename f_t>
 i_t fractional_variables(const simplex_solver_settings_t<i_t, f_t>& settings,
-                         const std::vector<f_t>& x,
+                         std::type_identity_t<std::span<const f_t>> x,
                          const std::vector<variable_type_t>& var_types,
                          std::vector<i_t>& fractional)
 {
@@ -1023,7 +1025,7 @@ void branch_and_bound_t<i_t, f_t>::set_final_solution(mip_solution_t<i_t, f_t>& 
 template <typename i_t, typename f_t>
 void branch_and_bound_t<i_t, f_t>::add_feasible_solution(const lp_problem_t<i_t, f_t>& lp,
                                                          f_t leaf_objective,
-                                                         const std::vector<f_t>& leaf_solution,
+                                                         std::span<const f_t> leaf_solution,
                                                          i_t leaf_depth,
                                                          search_strategy_t thread_type)
 {
@@ -1034,7 +1036,8 @@ void branch_and_bound_t<i_t, f_t>::add_feasible_solution(const lp_problem_t<i_t,
   std::vector<f_t> sol;
   if (leaf_solution.size() != original_lp_.num_cols) {
     std::vector<f_t> uncrushed_incumbent;
-    uncrush_primal_solution(original_problem_, lp, leaf_solution, uncrushed_incumbent);
+    const std::vector<f_t> different_shape(leaf_solution.begin(), leaf_solution.end());
+    uncrush_primal_solution(original_problem_, lp, different_shape, uncrushed_incumbent);
     crush_primal_solution(original_problem_, original_lp_, uncrushed_incumbent, new_slacks_, sol);
   }
   mutex_original_lp_.unlock();
@@ -1046,7 +1049,8 @@ void branch_and_bound_t<i_t, f_t>::add_feasible_solution(const lp_problem_t<i_t,
 
   mutex_upper_.lock();
   if (!incumbent_.has_incumbent || leaf_objective < incumbent_.objective) {
-    incumbent_.set_incumbent_solution(leaf_objective, sol.empty() ? leaf_solution : sol);
+    incumbent_.set_incumbent_solution(
+      leaf_objective, sol.empty() ? leaf_solution : std::span<const f_t>(sol));
     upper_bound_ = std::min(upper_bound_.load(), leaf_objective);
 
     char symbol = feasible_solution_symbol(thread_type, settings_.diving_settings.show_type);
@@ -1215,11 +1219,39 @@ struct nondeterministic_policy_t : tree_update_policy_t<i_t, f_t> {
     bnb.add_feasible_solution(worker->leaf_problem, obj, x, node->depth, worker->search_strategy);
   }
 
+  void handle_integer_solution_view(mip_node_t<i_t, f_t>* node,
+                                    f_t obj,
+                                    std::span<const f_t> x)
+  {
+    bnb.add_feasible_solution(worker->leaf_problem, obj, x, node->depth, worker->search_strategy);
+  }
+
   branch_variable_t<i_t> select_branch_variable(mip_node_t<i_t, f_t>* node,
                                                 const std::vector<i_t>& fractional,
                                                 const std::vector<f_t>&) override
   {
     return bnb.variable_selection(node, fractional, worker);
+  }
+
+  branch_variable_t<i_t> select_branch_variable_view(
+    mip_node_t<i_t, f_t>* node,
+    const std::vector<i_t>& fractional,
+    const gds::gpu_batch_result_view<i_t, f_t>& result)
+  {
+    assert(worker->search_strategy == search_strategy_t::BEST_FIRST);
+    i_t var = bnb.settings_.reliability_branching != 0
+      ? bnb.pc_.reliable_variable_selection(node,
+                                            fractional,
+                                            worker,
+                                            worker->var_types,
+                                            bnb.exploration_stats_,
+                                            bnb.upper_bound_,
+                                            bnb.bfs_worker_pool_.num_idle(),
+                                            bnb.new_slacks_,
+                                            bnb.original_lp_,
+                                            &result)
+      : worker->pseudo_costs.variable_selection(fractional, result.x);
+    return {var, martin_criteria(result.x[var], worker->root_solution[var])};
   }
 
   void update_objective_estimate(mip_node_t<i_t, f_t>* node,
@@ -1230,6 +1262,14 @@ struct nondeterministic_policy_t : tree_update_policy_t<i_t, f_t> {
       node->objective_estimate =
         worker->pseudo_costs.obj_estimate(fractional, x, node->lower_bound);
     }
+  }
+
+  void update_objective_estimate_view(mip_node_t<i_t, f_t>* node,
+                                      const std::vector<i_t>& fractional,
+                                      std::span<const f_t> x)
+  {
+    node->objective_estimate = worker->pseudo_costs.obj_estimate(
+      fractional, x, node->lower_bound);
   }
 
   void on_numerical_issue(mip_node_t<i_t, f_t>* node) override
@@ -1484,11 +1524,17 @@ std::pair<node_status_t, branch_direction_t> branch_and_bound_t<i_t, f_t>::updat
   search_tree_t<i_t, f_t>& search_tree,
   WorkerT* worker,
   dual_status_t lp_status,
-  Policy& policy)
+  Policy& policy,
+  const gds::gpu_batch_result_view<i_t, f_t>* gpu_result)
 {
   const f_t abs_fathom_tol               = settings_.absolute_mip_gap_tol / 10;
   lp_problem_t<i_t, f_t>& leaf_problem   = worker->leaf_problem;
-  lp_solution_t<i_t, f_t>& leaf_solution = worker->leaf_solution;
+  const std::span<const f_t> leaf_x = gpu_result != nullptr
+                                       ? std::span<const f_t>(gpu_result->x)
+                                       : std::span<const f_t>(worker->leaf_solution.x);
+  const std::span<const variable_status_t> leaf_vstatus = gpu_result != nullptr
+    ? std::span<const variable_status_t>(gpu_result->vstatus)
+    : std::span<const variable_status_t>(worker->leaf_vstatus);
   const f_t upper_bound                  = policy.upper_bound();
   node_status_t status                   = node_status_t::PENDING;
   branch_direction_t round_dir           = branch_direction_t::NONE;
@@ -1503,7 +1549,7 @@ std::pair<node_status_t, branch_direction_t> branch_and_bound_t<i_t, f_t>::updat
     status = node_status_t::INFEASIBLE;
 
   } else if (lp_status == dual_status_t::CUTOFF) {
-    f_t leaf_obj          = compute_objective(leaf_problem, leaf_solution.x);
+    f_t leaf_obj          = compute_objective(leaf_problem, leaf_x);
     node_ptr->lower_bound = upper_bound;
     policy.graphviz(search_tree, node_ptr, "cut off", leaf_obj);
     search_tree.update(node_ptr, node_status_t::FATHOMED);
@@ -1512,7 +1558,7 @@ std::pair<node_status_t, branch_direction_t> branch_and_bound_t<i_t, f_t>::updat
   } else if (lp_status == dual_status_t::OPTIMAL) {
     std::vector<i_t> leaf_fractional;
     i_t num_frac =
-      fractional_variables(settings_, leaf_solution.x, worker->var_types, leaf_fractional);
+      fractional_variables(settings_, leaf_x, worker->var_types, leaf_fractional);
 
 #ifdef DEBUG_FRACTIONAL_FIXED
     for (i_t j : leaf_fractional) {
@@ -1522,7 +1568,7 @@ std::pair<node_status_t, branch_direction_t> branch_and_bound_t<i_t, f_t>::updat
           "status %d\n",
           node_ptr->node_id,
           j,
-          leaf_solution.x[j],
+          leaf_x[j],
           leaf_problem.lower[j],
           leaf_problem.upper[j],
           node_ptr->vstatus[j]);
@@ -1530,7 +1576,7 @@ std::pair<node_status_t, branch_direction_t> branch_and_bound_t<i_t, f_t>::updat
     }
 #endif
 
-    f_t leaf_obj = compute_objective(leaf_problem, leaf_solution.x);
+    f_t leaf_obj = compute_objective(leaf_problem, leaf_x);
 
     policy.graphviz(search_tree, node_ptr, "lower bound", leaf_obj);
     policy.update_pseudo_costs(node_ptr, leaf_obj);
@@ -1538,21 +1584,43 @@ std::pair<node_status_t, branch_direction_t> branch_and_bound_t<i_t, f_t>::updat
     snap_to_lattice(leaf_problem, node_ptr, leaf_obj);
 
     if (num_frac == 0) {
-      policy.handle_integer_solution(node_ptr, leaf_obj, leaf_solution.x);
+      if constexpr (std::is_same_v<Policy, nondeterministic_policy_t<i_t, f_t>>) {
+        if (gpu_result != nullptr) { policy.handle_integer_solution_view(node_ptr, leaf_obj, leaf_x); }
+        else { policy.handle_integer_solution(node_ptr, leaf_obj, worker->leaf_solution.x); }
+      } else {
+        policy.handle_integer_solution(node_ptr, leaf_obj, worker->leaf_solution.x);
+      }
       policy.graphviz(search_tree, node_ptr, "integer feasible", leaf_obj);
       search_tree.update(node_ptr, node_status_t::INTEGER_FEASIBLE);
       status = node_status_t::INTEGER_FEASIBLE;
 
     } else if (node_ptr->lower_bound <= upper_bound + abs_fathom_tol) {
-      auto [branch_var, dir] =
-        policy.select_branch_variable(node_ptr, leaf_fractional, leaf_solution.x);
+      branch_variable_t<i_t> selected;
+      if constexpr (std::is_same_v<Policy, nondeterministic_policy_t<i_t, f_t>>) {
+        selected = gpu_result != nullptr
+                     ? policy.select_branch_variable_view(node_ptr, leaf_fractional, *gpu_result)
+                     : policy.select_branch_variable(node_ptr, leaf_fractional,
+                                                     worker->leaf_solution.x);
+      } else {
+        selected = policy.select_branch_variable(node_ptr, leaf_fractional,
+                                                 worker->leaf_solution.x);
+      }
+      auto [branch_var, dir] = selected;
       round_dir = dir;
 
-      assert(worker->leaf_vstatus.size() == leaf_problem.num_cols);
+      assert(leaf_vstatus.size() == static_cast<size_t>(leaf_problem.num_cols));
       assert(branch_var >= 0);
       assert(dir != branch_direction_t::NONE);
 
-      policy.update_objective_estimate(node_ptr, leaf_fractional, leaf_solution.x);
+      if constexpr (std::is_same_v<Policy, nondeterministic_policy_t<i_t, f_t>>) {
+        if (gpu_result != nullptr) {
+          policy.update_objective_estimate_view(node_ptr, leaf_fractional, leaf_x);
+        } else {
+          policy.update_objective_estimate(node_ptr, leaf_fractional, worker->leaf_solution.x);
+        }
+      } else {
+        policy.update_objective_estimate(node_ptr, leaf_fractional, worker->leaf_solution.x);
+      }
       worker->recompute_basis  = worker->host_basis_stale;
       worker->recompute_bounds = false;
 
@@ -1560,9 +1628,9 @@ std::pair<node_status_t, branch_direction_t> branch_and_bound_t<i_t, f_t>::updat
       log.log = false;
       search_tree.branch(node_ptr,
                          branch_var,
-                         leaf_solution.x[branch_var],
+                         leaf_x[branch_var],
                          num_frac,
-                         worker->leaf_vstatus,
+                         leaf_vstatus,
                          leaf_problem,
                          log);
       search_tree.update(node_ptr, node_status_t::HAS_CHILDREN);
@@ -2159,19 +2227,14 @@ dual_status_t branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_install_re
   bfs_worker_t<i_t, f_t>* worker,
   mip_node_t<i_t, f_t>* node,
   gpu_batch_node_t<i_t, f_t>& batch_node,
+  const gds::gpu_batch_result_view<i_t, f_t>& result,
   bool& gpu_answer_accepted)
 {
-  dual_status_t accepted_status = batch_node.status;
+  dual_status_t accepted_status = result.status;
   gpu_answer_accepted           = true;
   worker->leaf_problem.lower    = batch_node.lower;
   worker->leaf_problem.upper    = batch_node.upper;
-
-  std::vector<variable_status_t> accepted_vstatus = batch_node.vstatus;
-  std::vector<i_t> accepted_basic                 = batch_node.basic_list;
-  std::vector<i_t> accepted_nonbasic              = batch_node.nonbasic_list;
-  lp_solution_t<i_t, f_t> accepted_solution       = batch_node.sol;
-  std::vector<f_t> accepted_edge_norms            = batch_node.dy_se;
-  i_t accepted_iterations                         = batch_node.iters;
+  i_t accepted_iterations = result.iterations;
 
   if (gpu_pool_recheck()) {
     basis_update_mpf_t<i_t, f_t> cpu_factor(worker->leaf_problem.num_rows,
@@ -2199,9 +2262,9 @@ dual_status_t branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_install_re
 
     bool cpu_decided = false;
     bool obj_differs = false;
-    const bool decision_differs = gpu_decision_differs<i_t, f_t>(batch_node.status,
+    const bool decision_differs = gpu_decision_differs<i_t, f_t>(result.status,
                                                                   cpu_status,
-                                                                  batch_node.sol.objective,
+                                                                  result.objective,
                                                                   cpu_solution.objective,
                                                                   batch_node.settings.cut_off,
                                                                   cpu_decided,
@@ -2213,16 +2276,16 @@ dual_status_t branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_install_re
         "[GPUPOOL-MISMATCH] node=%d %s gpu=%s/%.17g cpu=%s/%.17g\n",
         (int)node->node_id,
         decision_differs ? "DECISION" : "OBJECTIVE",
-        dual_status_to_string(batch_node.status).c_str(),
-        batch_node.sol.objective,
+        dual_status_to_string(result.status).c_str(),
+        result.objective,
         dual_status_to_string(cpu_status).c_str(),
         cpu_solution.objective);
       accepted_status     = cpu_status;
-      accepted_vstatus    = std::move(cpu_vstatus);
-      accepted_basic      = std::move(cpu_basic);
-      accepted_nonbasic   = std::move(cpu_nonbasic);
-      accepted_solution   = std::move(cpu_solution);
-      accepted_edge_norms = std::move(cpu_edge_norms);
+      worker->leaf_vstatus    = std::move(cpu_vstatus);
+      worker->basic_list      = std::move(cpu_basic);
+      worker->nonbasic_list   = std::move(cpu_nonbasic);
+      worker->leaf_solution   = std::move(cpu_solution);
+      worker->leaf_edge_norms = std::move(cpu_edge_norms);
       accepted_iterations = cpu_iterations;
       gpu_answer_accepted = false;
     } else {
@@ -2230,11 +2293,6 @@ dual_status_t branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_install_re
     }
   }
 
-  worker->leaf_vstatus      = std::move(accepted_vstatus);
-  worker->basic_list        = std::move(accepted_basic);
-  worker->nonbasic_list     = std::move(accepted_nonbasic);
-  worker->leaf_solution     = std::move(accepted_solution);
-  worker->leaf_edge_norms   = std::move(accepted_edge_norms);
   worker->host_basis_stale  = true;
   worker->recompute_basis   = true;
   worker->recompute_bounds  = true;
@@ -2363,7 +2421,7 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     for (auto& node : batch) { node.settings = nondeterministic_gpu_pool_settings(worker); }
     double launch_t0 = telemetry ? tic() : 0.0;
     pool.run = gpu_persistent_batch_begin<i_t, f_t>(
-      worker->leaf_problem, batch, pool.stream.view(), pool.ro_cache, &pool.seat_state);
+      worker->leaf_problem, batch, pool.stream.view(), pool.ro_cache, &pool.seat_state, true);
 
     while (pool.run == nullptr) {
       bool replaced = false;
@@ -2393,7 +2451,7 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
       if (!replaced) { break; }
       launch_t0 = telemetry ? tic() : 0.0;
       pool.run = gpu_persistent_batch_begin<i_t, f_t>(
-        worker->leaf_problem, batch, pool.stream.view(), pool.ro_cache, &pool.seat_state);
+        worker->leaf_problem, batch, pool.stream.view(), pool.ro_cache, &pool.seat_state, true);
     }
 
     if (pool.run == nullptr && batch.size() > 1 && !pool.halved) {
@@ -2409,7 +2467,7 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
       nondeterministic_gpu_pool_update_lower_bound(worker);
       launch_t0 = telemetry ? tic() : 0.0;
       pool.run = gpu_persistent_batch_begin<i_t, f_t>(
-        worker->leaf_problem, batch, pool.stream.view(), pool.ro_cache, &pool.seat_state);
+        worker->leaf_problem, batch, pool.stream.view(), pool.ro_cache, &pool.seat_state, true);
     }
     if (pool.run == nullptr) {
       pool.disabled = true;
@@ -2488,16 +2546,14 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     }
     const std::vector<f_t> resident_lower = batch[seat].lower;
     const std::vector<f_t> resident_upper = batch[seat].upper;
-    const std::vector<variable_status_t> resident_vstatus = batch[seat].vstatus;
-    const std::vector<f_t> resident_edge_norms = batch[seat].dy_se;
-    const f_t resident_objective = batch[seat].sol.objective;
+    const auto result = gpu_persistent_batch_result<i_t, f_t>(pool.run, seat);
 
     record_terminal(batch[seat].status, batch[seat].iters);
     pool.record_completed_iterations(batch[seat].iters);
 
     bool gpu_answer_accepted = false;
     const dual_status_t lp_status = nondeterministic_gpu_pool_install_result(
-      worker, node, batch[seat], gpu_answer_accepted);
+      worker, node, batch[seat], result, gpu_answer_accepted);
     if (trace_gpu_results && gpu_answer_accepted) {
       std::fprintf(stderr,
                    "[GPU-SB-NODE] worker=%d node=%d\n",
@@ -2507,8 +2563,9 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     ++exploration_stats_.nodes_since_last_log;
     ++exploration_stats_.nodes_explored;
     --exploration_stats_.nodes_unexplored;
-    auto [node_status, round_dir] =
-      update_tree(node, search_tree_, worker, lp_status, settings_.log);
+    nondeterministic_policy_t<i_t, f_t> policy{*this, worker, settings_.log};
+    auto [node_status, round_dir] = update_tree_impl(
+      node, search_tree_, worker, lp_status, policy, gpu_answer_accepted ? &result : nullptr);
     ctx[seat].node = nullptr;
 
     bool child_installed = false;
@@ -2521,11 +2578,13 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
                                         ? node->get_down_child()
                                         : node->get_up_child();
 
+      // Strong branching may rebuild a host LU, but it uses owning CPU basis arrays. The
+      // harvested spans still describe the resident GPU basis, so that work does not prevent
+      // this seat from continuing with the preferred child.
       const bool parent_state_matches =
-        gpu_answer_accepted && worker->leaf_vstatus == resident_vstatus &&
+        gpu_answer_accepted &&
         worker->leaf_problem.lower == resident_lower &&
-        worker->leaf_problem.upper == resident_upper &&
-        std::memcmp(&worker->leaf_solution.objective, &resident_objective, sizeof(f_t)) == 0;
+        worker->leaf_problem.upper == resident_upper;
       if (parent_state_matches && ctx[seat].plunge_depth < max_plunge) {
         gpu_batch_node_t<i_t, f_t> child(worker->leaf_problem.num_rows,
                                          worker->leaf_problem.num_cols);
@@ -2547,8 +2606,19 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
         if (feasible) {
           decompress_vstatus(
             preferred->packed_vstatus, worker->leaf_problem.num_cols, child.vstatus);
-          child.dy_se = resident_edge_norms;
-          if (child.vstatus == resident_vstatus) {
+          if (gpu_pool_recheck() || dump_bad_nodes_dir() != nullptr) {
+            child.dy_se.assign(result.dy_se.begin(), result.dy_se.end());
+          }
+          // The tree's two-bit packed status represents NONBASIC_FIXED as NONBASIC_LOWER. That is
+          // the same nonbasic column at a fixed bound; the device may keep the more precise status.
+          bool same_basis = child.vstatus.size() == result.vstatus.size();
+          for (size_t j = 0; same_basis && j < result.vstatus.size(); ++j) {
+            if (child.vstatus[j] == result.vstatus[j]) { continue; }
+            same_basis = child.vstatus[j] == variable_status_t::NONBASIC_LOWER &&
+                         result.vstatus[j] == variable_status_t::NONBASIC_FIXED &&
+                         std::abs(resident_upper[j] - resident_lower[j]) < child.settings.fixed_tol;
+          }
+          if (same_basis) {
             auto& child_deltas = deltas[seat];
             child_deltas.reserve(static_cast<size_t>(worker->leaf_problem.num_cols));
             for (i_t j = 0; j < worker->leaf_problem.num_cols; ++j) {

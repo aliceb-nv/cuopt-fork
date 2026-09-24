@@ -45,6 +45,7 @@
 #include <future>
 #include <list>
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace cuopt::mathematical_optimization::mip {
@@ -339,7 +340,7 @@ class branch_and_bound_t {
   // found during branch and bound.
   void add_feasible_solution(const simplex::lp_problem_t<i_t, f_t>& lp,
                              f_t leaf_objective,
-                             const std::vector<f_t>& leaf_solution,
+                             std::span<const f_t> leaf_solution,
                              i_t leaf_depth,
                              search_strategy_t thread_type);
 
@@ -436,7 +437,8 @@ class branch_and_bound_t {
     search_tree_t<i_t, f_t>& search_tree,
     WorkerT* worker,
     simplex::dual_status_t lp_status,
-    Policy& policy);
+    Policy& policy,
+    const gds::gpu_batch_result_view<i_t, f_t>* gpu_result = nullptr);
 
   // Opportunistic tree update wrapper.
   std::pair<node_status_t, branch_direction_t> update_tree(
@@ -520,6 +522,7 @@ class branch_and_bound_t {
     bfs_worker_t<i_t, f_t>* worker,
     mip_node_t<i_t, f_t>* node,
     gpu_batch_node_t<i_t, f_t>& batch_node,
+    const gds::gpu_batch_result_view<i_t, f_t>& result,
     bool& gpu_answer_accepted);
 
   // Executed when all workers reach barrier

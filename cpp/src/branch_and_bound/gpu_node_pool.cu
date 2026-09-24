@@ -68,8 +68,8 @@ static void basis_from_vstatus_reset(i_t m,
 }
 
 template <typename f_t>
-static bool gpu_resume_dual_feasible(const std::vector<simplex::variable_status_t>& vstatus,
-                                     const std::vector<f_t>& z,
+static bool gpu_resume_dual_feasible(std::span<const simplex::variable_status_t> vstatus,
+                                     std::span<const f_t> z,
                                      f_t dual_tol)
 {
   if (z.size() < vstatus.size()) { return false; }
@@ -370,7 +370,7 @@ bool gpu_solve_node_serial(const simplex::lp_problem_t<i_t, f_t>& lp,
       std::vector<f_t> fresh_y(m, 0.0), fresh_z(lp.num_cols, 0.0);
       simplex::phase2::compute_dual_solution_from_basis(
         lp, ft, basic_list, nonbasic_list, fresh_y, fresh_z, work);
-      if (!gpu_resume_dual_feasible(vstatus, fresh_z, settings.dual_tol)) { return false; }
+      if (!gpu_resume_dual_feasible<f_t>(vstatus, fresh_z, settings.dual_tol)) { return false; }
     }
     return true;
   };
@@ -1261,16 +1261,19 @@ struct gpu_batch_run_t {
   i_t periodic_refactors{0}, rejected_refactors{0}, certificate_refactors{0};
   double upload_s{0.0}, kernel_s{0.0}, copyback_s{0.0}, host_factor_s{0.0};
   bool persistent_seats{false};
+  bool result_views{false};
 
   gpu_batch_run_t(const simplex::lp_problem_t<i_t, f_t>& lp_,
                   std::vector<gpu_batch_node_t<i_t, f_t>>& nodes_,
                   rmm::cuda_stream_view s,
                   gds::gpu_ro_cache<i_t, f_t>* ro,
                   std::vector<batch_seat_state_t<i_t, f_t>>& seat_state,
-                  bool persistent = false)
+                  bool persistent = false,
+                  bool views = false)
     : lp(lp_), nodes(nodes_), stream(s), ro_cache(ro),
       m(lp_.num_rows), n(lp_.num_cols), N(static_cast<i_t>(nodes_.size())),
-      t0(cuopt::mathematical_optimization::tic()), st(seat_state), persistent_seats(persistent)
+      t0(cuopt::mathematical_optimization::tic()), st(seat_state), persistent_seats(persistent),
+      result_views(views)
   {
     // Grow to cover this round's seats; existing entries KEEP their factorization.
     while (static_cast<i_t>(st.size()) < N) {
@@ -1322,6 +1325,18 @@ struct gpu_batch_run_t {
   {
     auto& w    = st[s];
     auto& node = nodes[s];
+    const auto result = result_views && !initialize_basis
+                          ? gds::gpu_simplified_dual_phase2_batch_result<i_t, f_t>(handle, s)
+                          : gds::gpu_batch_result_view<i_t, f_t>{};
+    std::span<simplex::variable_status_t> vstatus = result_views && !initialize_basis
+                                                      ? result.vstatus
+                                                      : std::span(node.vstatus);
+    std::span<i_t> basic_list = result_views && !initialize_basis
+                                  ? result.basic_list
+                                  : std::span(w.basic_list);
+    std::span<i_t> nonbasic_list = result_views && !initialize_basis
+                                     ? result.nonbasic_list
+                                     : std::span(w.nonbasic_list);
     // A genuine rank deficiency is reported against the phase it happened in; the clock and halt
     // codes are phase-independent.
     const auto deficient_drop = initialize_basis ? gpu_batch_node_t<i_t, f_t>::drop_t::FACTORIZE_FILL
@@ -1351,7 +1366,7 @@ struct gpu_batch_run_t {
       persistent_seats ? cuopt::mathematical_optimization::tic() : t0;
     bool repaired = false;
     i_t rc = w.ft.refactor_basis(lp.A, node.settings, node.lower, node.upper, refactor_start,
-                                 w.basic_list, w.nonbasic_list, node.vstatus, &repaired);
+                                 basic_list, nonbasic_list, vstatus, &repaired);
     if (rc == CONCURRENT_HALT_RETURN || rc == TIME_LIMIT_RETURN) { return classify(rc); }
     // A repair during RESUME changes the basis underneath maintained device state, so that node
     // must leave the GPU and restart on the CPU. A fresh repair retains the incoming steepest-edge
@@ -1362,7 +1377,7 @@ struct gpu_batch_run_t {
       while (true) {
         repaired = false;
         rc = w.ft.refactor_basis(lp.A, node.settings, node.lower, node.upper, refactor_start,
-                                 w.basic_list, w.nonbasic_list, node.vstatus, &repaired);
+                                 basic_list, nonbasic_list, vstatus, &repaired);
         if (rc == CONCURRENT_HALT_RETURN || rc == TIME_LIMIT_RETURN) { return classify(rc); }
         if (repaired && !initialize_basis) { return classify(rc); }
         if (rc <= 0) { break; }
@@ -1378,8 +1393,8 @@ struct gpu_batch_run_t {
     } else if (persistent_seats || w.refactor_reason != 1) {
       std::vector<f_t> fresh_y(m, 0.0), fresh_z(n, 0.0);
       simplex::phase2::compute_dual_solution_from_basis(
-        lp, w.ft, w.basic_list, w.nonbasic_list, fresh_y, fresh_z, work);
-      if (!gpu_resume_dual_feasible(node.vstatus, fresh_z, node.settings.dual_tol)) {
+        lp, w.ft, basic_list, nonbasic_list, fresh_y, fresh_z, work);
+      if (!gpu_resume_dual_feasible<f_t>(vstatus, fresh_z, node.settings.dual_tol)) {
         w.fail = gpu_batch_node_t<i_t, f_t>::drop_t::DUAL_INFEASIBLE_RESUME;
         return false;
       }
@@ -1517,6 +1532,7 @@ struct gpu_batch_run_t {
       }
       return false;
     }
+    if (result_views) { gds::gpu_simplified_dual_phase2_batch_use_views<i_t, f_t>(handle); }
     ++rounds;
     terminal_noop_seats += static_cast<std::size_t>(N - active_count);
     return true;
@@ -1543,14 +1559,20 @@ struct gpu_batch_run_t {
     for (i_t s = 0; s < N; ++s) {
       auto& w    = st[s];
       auto& node = nodes[s];
-      w.leg_iters   = node.sol.iterations - w.total_iters;
-      w.total_iters = node.sol.iterations;
+      const auto result = result_views
+                            ? gds::gpu_simplified_dual_phase2_batch_result<i_t, f_t>(handle, s)
+                            : gds::gpu_batch_result_view<i_t, f_t>{};
+      const i_t iterations = result_views ? result.iterations : node.sol.iterations;
+      w.leg_iters   = iterations - w.total_iters;
+      w.total_iters = iterations;
+      if (result_views) { w.refactor_reason = result.refactor_reason; }
       node.status = out[s];
       node.iters  = w.total_iters;
       node.solved = out[s] != simplex::dual_status_t::REFACTOR_NEEDED;
-      // Publish the exact pivot-history order before CPU B&B handling creates children.
-      node.basic_list    = w.basic_list;
-      node.nonbasic_list = w.nonbasic_list;
+      if (!result_views) {
+        node.basic_list    = w.basic_list;
+        node.nonbasic_list = w.nonbasic_list;
+      }
     }
     return true;
   }
@@ -1594,7 +1616,7 @@ struct gpu_batch_run_t {
   {
     auto& node = nodes[s];
     auto& w    = st[s];
-    assert(node.dy_se.size() == static_cast<size_t>(n));
+    assert(result_views || node.dy_se.size() == static_cast<size_t>(n));
     if (w.total_iters >= node.settings.iteration_limit) {
       node.status = simplex::dual_status_t::ITERATION_LIMIT;
       node.iters  = w.total_iters;
@@ -1621,14 +1643,17 @@ struct gpu_batch_run_t {
       return false;
     }
     f_t work = 0.0;
+    const auto result = result_views
+                          ? gds::gpu_simplified_dual_phase2_batch_result<i_t, f_t>(handle, s)
+                          : gds::gpu_batch_result_view<i_t, f_t>{};
     simplex::phase2::compute_primal_solution_from_basis(lp,
                                                         node.lower,
                                                         node.upper,
                                                         w.ft,
-                                                        w.basic_list,
-                                                        w.nonbasic_list,
-                                                        node.vstatus,
-                                                        node.sol.x,
+                                                        result_views ? std::span<const i_t>(result.basic_list) : std::span<const i_t>(w.basic_list),
+                                                        result_views ? std::span<const i_t>(result.nonbasic_list) : std::span<const i_t>(w.nonbasic_list),
+                                                        result_views ? std::span<const simplex::variable_status_t>(result.vstatus) : std::span<const simplex::variable_status_t>(node.vstatus),
+                                                        result_views ? result.x : std::span(node.sol.x),
                                                         w.xB_workspace,
                                                         work);
     w.refactor_resume = true;
@@ -1648,7 +1673,7 @@ struct gpu_batch_run_t {
   {
     auto& node = nodes[s];
     auto& w    = st[s];
-    assert(node.dy_se.size() == static_cast<size_t>(n));
+    assert(result_views || node.dy_se.size() == static_cast<size_t>(n));
     node.sol.resize(m, n);  // host output destination only; device x/y/z remain the parent's
     node.solved = false;
     node.drop   = gpu_batch_node_t<i_t, f_t>::drop_t::NONE;
@@ -1883,11 +1908,13 @@ gpu_batch_run<i_t, f_t>* gpu_persistent_batch_begin(
   std::vector<gpu_batch_node_t<i_t, f_t>>& nodes,
   rmm::cuda_stream_view stream,
   gds::gpu_ro_cache<i_t, f_t>* ro_cache,
-  std::vector<batch_seat_state_t<i_t, f_t>>* seat_state)
+  std::vector<batch_seat_state_t<i_t, f_t>>* seat_state,
+  bool result_views)
 {
   static const std::vector<int> devices = gpu_usable_devices();
   if (devices.empty() || nodes.empty() || seat_state == nullptr) { return nullptr; }
-  auto* run = new gpu_batch_run_t<i_t, f_t>(lp, nodes, stream, ro_cache, *seat_state, true);
+  auto* run = new gpu_batch_run_t<i_t, f_t>(lp, nodes, stream, ro_cache, *seat_state, true,
+                                            result_views);
   run->prepare();
   // The persistent pool never launches terminal/no-op seats. The caller replaces per-node preparation failures and
   // retries; nullptr here also represents pool-wide launch failures that require a drain.
@@ -1910,6 +1937,14 @@ template <typename i_t, typename f_t>
 bool gpu_persistent_batch_harvest(gpu_batch_run<i_t, f_t>* run)
 {
   return run != nullptr && run->harvest_persistent();
+}
+
+template <typename i_t, typename f_t>
+gds::gpu_batch_result_view<i_t, f_t> gpu_persistent_batch_result(
+  gpu_batch_run<i_t, f_t>* run, i_t seat)
+{
+  return gds::gpu_simplified_dual_phase2_batch_result<i_t, f_t>(run->handle,
+                                                                  static_cast<size_t>(seat));
 }
 
 template <typename i_t, typename f_t>
@@ -2028,8 +2063,10 @@ template gpu_batch_run<int, double>* gpu_batch_begin<int, double>(
 template gpu_batch_run<int, double>* gpu_persistent_batch_begin<int, double>(
   const simplex::lp_problem_t<int, double>&, std::vector<gpu_batch_node_t<int, double>>&,
   rmm::cuda_stream_view, gds::gpu_ro_cache<int, double>*,
-  std::vector<batch_seat_state_t<int, double>>*);
+  std::vector<batch_seat_state_t<int, double>>*, bool);
 template bool gpu_persistent_batch_harvest<int, double>(gpu_batch_run<int, double>*);
+template gds::gpu_batch_result_view<int, double> gpu_persistent_batch_result<int, double>(
+  gpu_batch_run<int, double>*, int);
 template bool gpu_persistent_batch_stage_fresh<int, double>(
   gpu_batch_run<int, double>*, int, std::string&);
 template bool gpu_persistent_batch_stage_refactor<int, double>(

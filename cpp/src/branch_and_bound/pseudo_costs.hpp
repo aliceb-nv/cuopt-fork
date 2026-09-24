@@ -24,6 +24,12 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <span>
+
+namespace cuopt::linear_programming::dual_simplex {
+template <typename i_t, typename f_t>
+struct gpu_batch_result_view;
+}
 
 namespace cuopt::mathematical_optimization::mip {
 
@@ -225,10 +231,10 @@ class pseudo_costs_t {
                                 simplex::basis_update_mpf_t<i_t, f_t>& basis_factors);
 
   f_t obj_estimate(const std::vector<i_t>& fractional,
-                   const std::vector<f_t>& solution,
+                   std::span<const f_t> solution,
                    f_t lower_bound);
 
-  i_t variable_selection(const std::vector<i_t>& fractional, const std::vector<f_t>& solution);
+  i_t variable_selection(const std::vector<i_t>& fractional, std::span<const f_t> solution);
 
   i_t reliable_variable_selection(const mip_node_t<i_t, f_t>* node_ptr,
                                   const std::vector<i_t>& fractional,
@@ -238,7 +244,9 @@ class pseudo_costs_t {
                                   f_t upper_bound,
                                   int max_num_tasks,
                                   const std::vector<i_t>& new_slacks,
-                                  const simplex::lp_problem_t<i_t, f_t>& original_lp);
+                                  const simplex::lp_problem_t<i_t, f_t>& original_lp,
+                                  const cuopt::linear_programming::dual_simplex::gpu_batch_result_view<i_t, f_t>*
+                                    gpu_result = nullptr);
 
   void update_pseudo_costs_from_strong_branching(const std::vector<i_t>& fractional,
                                                  const std::vector<f_t>& strong_branch_down,
@@ -252,7 +260,7 @@ class pseudo_costs_t {
   }
 
   f_t calculate_pseudocost_score(i_t j,
-                                 const std::vector<f_t>& solution,
+                                 std::span<const f_t> solution,
                                  f_t avg_down,
                                  f_t avg_up) const;
 

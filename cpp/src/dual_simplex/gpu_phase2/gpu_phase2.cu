@@ -40,26 +40,33 @@
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/device_uvector.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cuda/atomic>
+#include <cuda/buffer>
+#include <cuda/stream>
 #include <cuda/std/limits>
 #include <cuda/std/span>
 
 #include <new>  // placement new: construct the per-slot persistent state in host-allocated memory
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 static_assert(std::atomic_ref<std::uint32_t>::is_always_lock_free,
@@ -4335,7 +4342,106 @@ struct marshal_storage {
   rmm::cuda_stream_view stream{rmm::cuda_stream_default};
   explicit marshal_storage(rmm::cuda_stream_view s = rmm::cuda_stream_default) : stream(s)
   {
-    bufs.reserve(111);   // ~34 uploads + 67 slot buffers; avoid vector churn
+    bufs.reserve(111);  // The single-problem path still uses per-field buffers.
+  }
+};
+
+// One device allocation per fixed-capacity field, with seat b at b * stride. The byte vector is
+// intentional: it permits the slot_state header to use its own alignment while retaining a single
+// allocation for that field. Each field is separately allocated, never a mixed-type slab.
+enum class fixed_field_id : size_t {
+  lower, upper,
+  L0_col_start, U0_col_start, L0t_col_start, U0t_col_start,
+  row_perm, inv_row_perm, xi_workspace, x_workspace, reach_mark,
+  vstatus, basic_list, nonbasic_list, x, y, z, dy_se,
+  out_status, out_objective, out_user_objective, out_iterations, slot,
+  xB_workspace, delta_y, delta_z, delta_x, v, squared_infeas, setup_rhs,
+  basic_mark, delta_z_mark, delta_z_indices, nonbasic_pos, infeas_idx,
+  ft_dense_scratch, ft_dense_scratch2, ft_sort_bucket, ft_sort_x, ft_sort_i, ft_sort_perm,
+  lvl_lev0, lvl_ls0, lvl_co0, lvl_lev1, lvl_ls1, lvl_co1,
+  lvl_lev2, lvl_ls2, lvl_co2, lvl_lev3, lvl_ls3, lvl_co3,
+  sp_ls_v, sp_co_v, sp_pos_v, lvl_pos_v,
+  ft_recover_rhs, ft_recover_sol, S_col_start, S_i, S_x, mu_values,
+  delta_y_sparse_i, delta_y_sparse_x, UTsol_sparse_i, UTsol_sparse_x,
+  utilde_sparse_i, utilde_sparse_x, scaled_dxB_sparse_i, scaled_dxB_sparse_x,
+  rhs_sparse_i, rhs_sparse_x, v_sparse_i, v_sparse_x,
+  se_dy_i, se_dy_x, se_UTsol_i, se_UTsol_x, se_ei_i, se_ei_x,
+  ft_sparse_scratch_i, ft_sparse_scratch_x, ft_ei_scratch_i, ft_ei_scratch_x,
+  count
+};
+static_assert(static_cast<size_t>(fixed_field_id::count) == 85);
+
+struct packed_fixed_storage {
+  struct field {
+    std::optional<rmm::device_uvector<std::uint8_t>> device;
+    std::vector<std::uint8_t> upload;
+    size_t stride_bytes{0};
+  };
+  std::array<field, static_cast<size_t>(fixed_field_id::count)> fields;
+  size_t seats{0};
+  rmm::cuda_stream_view stream{rmm::cuda_stream_default};
+
+  template <typename T>
+  T* seat_ptr(fixed_field_id id,
+              size_t seat,
+              size_t elements,
+              bool zeroed = false,
+              bool staged_upload = false,
+              size_t alignment = alignof(T))
+  {
+    if (seat >= seats || alignment == 0) { throw std::runtime_error("invalid packed seat"); }
+    auto& f = fields[static_cast<size_t>(id)];
+    const size_t count = std::max<size_t>(elements, 1);
+    if (count > std::numeric_limits<size_t>::max() / sizeof(T)) {
+      throw std::runtime_error("packed field size overflow");
+    }
+    const size_t raw = count * sizeof(T);
+    if (raw > std::numeric_limits<size_t>::max() - (alignment - 1)) {
+      throw std::runtime_error("packed field alignment overflow");
+    }
+    const size_t stride = ((raw + alignment - 1) / alignment) * alignment;
+    if (!f.device) {
+      if (seats > std::numeric_limits<size_t>::max() / stride) {
+        throw std::runtime_error("packed batch size overflow");
+      }
+      f.stride_bytes = stride;
+      f.device.emplace(seats * stride, stream);
+      if (zeroed) {
+        RAFT_CUDA_TRY(cudaMemsetAsync(f.device->data(), 0, seats * stride, stream.value()));
+      }
+      if (staged_upload) { f.upload.resize(seats * stride); }
+    } else if (f.stride_bytes != stride) {
+      throw std::runtime_error("packed field stride changed within a batch");
+    }
+    return reinterpret_cast<T*>(f.device->data() + seat * stride);
+  }
+
+  template <typename T>
+  T* stage(fixed_field_id id, size_t seat, const T* src, size_t count)
+  {
+    T* dst = seat_ptr<T>(id, seat, count, false, true);
+    auto& f = fields[static_cast<size_t>(id)];
+    if (count != 0) {
+      std::memcpy(f.upload.data() + seat * f.stride_bytes, src, count * sizeof(T));
+    }
+    return dst;
+  }
+
+  template <typename T>
+  T* data(fixed_field_id id)
+  {
+    auto& f = fields[static_cast<size_t>(id)];
+    return f.device ? reinterpret_cast<T*>(f.device->data()) : nullptr;
+  }
+
+  void flush_uploads()
+  {
+    for (auto& f : fields) {
+      if (!f.upload.empty()) {
+        RAFT_CUDA_TRY(cudaMemcpyAsync(f.device->data(), f.upload.data(), f.upload.size(),
+                                      cudaMemcpyHostToDevice, stream.value()));
+      }
+    }
   }
 };
 
@@ -4417,6 +4523,29 @@ static T* alloc_zeroed(size_t count, marshal_storage& st)
   // serialise. It also breaks any CUDA graph capture live on another thread.
   RAFT_CUDA_TRY(cudaMemsetAsync(d, 0, bytes, st.stream.value()));
   return static_cast<T*>(d);
+}
+
+template <typename T>
+static T* upload_fixed(const std::vector<T>& src,
+                       marshal_storage& st,
+                       packed_fixed_storage* fixed,
+                       fixed_field_id id,
+                       size_t seat)
+{
+  return fixed ? fixed->stage<T>(id, seat, src.data(), src.size()) : upload(src, st);
+}
+
+template <typename T>
+static T* alloc_fixed(size_t count,
+                      marshal_storage& st,
+                      packed_fixed_storage* fixed,
+                      fixed_field_id id,
+                      size_t seat,
+                      bool zeroed = false,
+                      size_t alignment = alignof(T))
+{
+  if (fixed) { return fixed->seat_ptr<T>(id, seat, count, zeroed, false, alignment); }
+  return zeroed ? alloc_zeroed<T>(count, st) : alloc_uninit<T>(count, st);
 }
 
 
@@ -4699,7 +4828,9 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
                                    bool refactor_resume  = false,
                                    bool terminal_certificate_retry = false,
                                    const std::vector<f_t>* lower_ovr = nullptr,
-                                   const std::vector<f_t>* upper_ovr = nullptr)
+                                   const std::vector<f_t>* upper_ovr = nullptr,
+                                   packed_fixed_storage* fixed = nullptr,
+                                   size_t seat = 0)
 {
   const int m = lp.num_rows;
   const int n = lp.num_cols;
@@ -4745,29 +4876,38 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
     a.Arow_x         = upload(Arow_host.x, st);
   }
   // Per-node (basis- or branch-dependent), always uploaded per item: bounds, the LU factor, row perm.
-  a.lower       = upload(lower_ovr != nullptr ? *lower_ovr : lp.lower, st);
-  a.upper       = upload(upper_ovr != nullptr ? *upper_ovr : lp.upper, st);
+  a.lower       = upload_fixed(lower_ovr != nullptr ? *lower_ovr : lp.lower,
+                               st, fixed, fixed_field_id::lower, seat);
+  a.upper       = upload_fixed(upper_ovr != nullptr ? *upper_ovr : lp.upper,
+                               st, fixed, fixed_field_id::upper, seat);
   // Allocated lazily only when the persistent path first continues a child. Keeping it null for
   // one-shot launches preserves their allocation footprint exactly.
   a.bound_deltas      = nullptr;
   a.bound_delta_count = 0;
-  a.L0_col_start = upload(L0.col_start, st); a.L0_nz = L0.nnz();
+  a.L0_col_start = upload_fixed(L0.col_start, st, fixed, fixed_field_id::L0_col_start, seat);
+  a.L0_nz = L0.nnz();
   a.L0_i = upload_factor_indices<FactorIndex>(L0.i.data(), L0.nnz(), m, st);
   a.L0_x = upload_n(L0.x.data(), L0.nnz(), st);
-  a.U0_col_start = upload(U0.col_start, st); a.U0_nz = U0.nnz();
+  a.U0_col_start = upload_fixed(U0.col_start, st, fixed, fixed_field_id::U0_col_start, seat);
+  a.U0_nz = U0.nnz();
   a.U0_i = upload_factor_indices<FactorIndex>(U0.i.data(), U0.nnz(), m, st);
   a.U0_x = upload_n(U0.x.data(), U0.nnz(), st);
-  a.L0t_col_start = upload(L0t.col_start, st); a.L0t_nz = L0t.nnz();
+  a.L0t_col_start = upload_fixed(L0t.col_start, st, fixed, fixed_field_id::L0t_col_start, seat);
+  a.L0t_nz = L0t.nnz();
   a.L0t_i = upload_factor_indices<FactorIndex>(L0t.i.data(), L0t.nnz(), m, st);
   a.L0t_x = upload_n(L0t.x.data(), L0t.nnz(), st);
-  a.U0t_col_start = upload(U0t.col_start, st); a.U0t_nz = U0t.nnz();
+  a.U0t_col_start = upload_fixed(U0t.col_start, st, fixed, fixed_field_id::U0t_col_start, seat);
+  a.U0t_nz = U0t.nnz();
   a.U0t_i = upload_factor_indices<FactorIndex>(U0t.i.data(), U0t.nnz(), m, st);
   a.U0t_x = upload_n(U0t.x.data(), U0t.nnz(), st);
-  a.row_perm     = upload(ft.row_permutation(), st);
-  a.inv_row_perm = upload(ft.inverse_row_permutation(), st);
-  a.xi_workspace = alloc_zeroed<int>(2 * m, st);
-  a.x_workspace  = alloc_zeroed<double>(m, st);
-  a.reach_mark   = alloc_zeroed<unsigned char>(m, st);
+  a.row_perm     = upload_fixed(ft.row_permutation(), st, fixed, fixed_field_id::row_perm, seat);
+  a.inv_row_perm = upload_fixed(ft.inverse_row_permutation(), st, fixed,
+                                fixed_field_id::inv_row_perm, seat);
+  a.xi_workspace = alloc_fixed<int>(2 * m, st, fixed, fixed_field_id::xi_workspace, seat, true);
+  a.x_workspace  = alloc_fixed<double>(m, st, fixed, fixed_field_id::x_workspace, seat, true);
+  // The warp reach solver views these bytes as reach_mark_word entries.
+  a.reach_mark   = alloc_fixed<unsigned char>(m, st, fixed, fixed_field_id::reach_mark, seat,
+                                               true, alignof(reach_mark_word));
   a.num_updates  = 0;
   a.refactor_frequency = settings.refactor_frequency;
   a.mpf_update_cap     = mpf_update_cap();
@@ -4777,8 +4917,8 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   a.terminal_certificate_retry = terminal_certificate_retry ? 1 : 0;
   a.resume_obj      = sol.objective;
   a.resume_iter     = static_cast<i_t>(sol.iterations);
-  a.vstatus       = upload(vstatus, st);
-  a.basic_list    = upload(basic_list, st);
+  a.vstatus       = upload_fixed(vstatus, st, fixed, fixed_field_id::vstatus, seat);
+  a.basic_list    = upload_fixed(basic_list, st, fixed, fixed_field_id::basic_list, seat);
   // REACHABILITY CHECK for the nonbasic_list length contract. get_basis_from_vstatus routes
   // SUPERBASIC variables to superbasic_list, NOT nonbasic_list (basis_solves.cpp:53), so
   // nonbasic_list holds n - m - |superbasic| entries -- while the device's ratio test iterates
@@ -4790,11 +4930,11 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
                  nonbasic_list.size(), (int)(n - m), (int)m, (int)n,
                  (int)(n - m - static_cast<i_t>(nonbasic_list.size())));
   }
-  a.nonbasic_list = upload(nonbasic_list, st);
-  a.x             = upload(sol.x, st);
-  a.y             = upload(sol.y, st);
-  a.z             = upload(sol.z, st);
-  a.dy_se = upload(delta_y_steepest_edge, st);
+  a.nonbasic_list = upload_fixed(nonbasic_list, st, fixed, fixed_field_id::nonbasic_list, seat);
+  a.x             = upload_fixed(sol.x, st, fixed, fixed_field_id::x, seat);
+  a.y             = upload_fixed(sol.y, st, fixed, fixed_field_id::y, seat);
+  a.z             = upload_fixed(sol.z, st, fixed, fixed_field_id::z, seat);
+  a.dy_se         = upload_fixed(delta_y_steepest_edge, st, fixed, fixed_field_id::dy_se, seat);
 
   a.primal_tol = settings.primal_tol;
   a.dual_tol   = settings.dual_tol;
@@ -4808,14 +4948,16 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   a.start_time          = tic();
 
   // TWO ints: [0] = status, [1] = the REFACTOR_NEEDED reason (0 periodic / 1 rejected update).
-  a.out_status         = alloc_zeroed<int>(2, st);
-  a.out_objective      = alloc_zeroed<double>(1, st);
-  a.out_user_objective = alloc_zeroed<double>(1, st);
-  a.out_iterations     = alloc_zeroed<int>(1, st);
+  a.out_status         = alloc_fixed<int>(2, st, fixed, fixed_field_id::out_status, seat, true);
+  a.out_objective      = alloc_fixed<double>(1, st, fixed, fixed_field_id::out_objective, seat, true);
+  a.out_user_objective = alloc_fixed<double>(1, st, fixed, fixed_field_id::out_user_objective, seat, true);
+  a.out_iterations     = alloc_fixed<int>(1, st, fixed, fixed_field_id::out_iterations, seat, true);
 
   // Persistent per-slot solve state. Allocated ZEROED (the kernel's placement-new relies on that
   // here.
-  a.slot = alloc_zeroed<char>(sizeof(slot_state<gpu_basis_update_mpf_t<FactorIndex>>), st);
+  a.slot = alloc_fixed<char>(sizeof(slot_state<gpu_basis_update_mpf_t<FactorIndex>>),
+                             st, fixed, fixed_field_id::slot, seat, true,
+                             alignof(slot_state<gpu_basis_update_mpf_t<FactorIndex>>));
 
   // The slot's flat buffer: every gpu_span in the kernel is a slice of this, wired at a fixed
   // offset by attach_all_buffers. Deliberately NOT zeroed -- every consumer resize/assign-fills
@@ -4827,57 +4969,48 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
     const size_t ucap = static_cast<size_t>(mpf_update_cap());
     const size_t eta  = static_cast<size_t>(mpf_eta_nnz_cap());
     slot_buffers& b   = a.buf;
-    b.xB_workspace = alloc_uninit<f_t>(mn, st);
-    b.delta_y = alloc_uninit<f_t>(mn, st);
-    b.delta_z = alloc_uninit<f_t>(mn, st);
-    b.delta_x = alloc_uninit<f_t>(mn, st);
-    b.v = alloc_uninit<f_t>(mn, st);
-    b.squared_infeas = alloc_uninit<f_t>(mn, st);
-    b.setup_rhs = alloc_uninit<f_t>(mn, st);
-    b.basic_mark = alloc_uninit<i_t>(mn, st);
-    b.delta_z_mark = alloc_uninit<i_t>(mn, st);
-    b.delta_z_indices = alloc_uninit<i_t>(mn, st);
-    b.nonbasic_pos = alloc_uninit<i_t>(mn, st);
-    b.infeas_idx = alloc_uninit<i_t>(mn, st);
-    b.ft_dense_scratch = alloc_uninit<f_t>(mn, st);
-    b.ft_dense_scratch2 = alloc_uninit<f_t>(mn, st);
-    b.ft_sort_bucket = alloc_uninit<f_t>(mn, st);
-    b.ft_sort_x = alloc_uninit<f_t>(mn, st);
-    b.ft_sort_i = alloc_uninit<i_t>(mn, st);
-    b.ft_sort_perm = alloc_uninit<i_t>(mn, st);
-    b.lvl_lev0 = alloc_uninit<i_t>(m1, st);
-    b.lvl_ls0 = alloc_uninit<i_t>(m1, st);
-    b.lvl_co0 = alloc_uninit<i_t>(m1, st);
-    b.lvl_lev1 = alloc_uninit<i_t>(m1, st);
-    b.lvl_ls1 = alloc_uninit<i_t>(m1, st);
-    b.lvl_co1 = alloc_uninit<i_t>(m1, st);
-    b.lvl_lev2 = alloc_uninit<i_t>(m1, st);
-    b.lvl_ls2 = alloc_uninit<i_t>(m1, st);
-    b.lvl_co2 = alloc_uninit<i_t>(m1, st);
-    b.lvl_lev3 = alloc_uninit<i_t>(m1, st);
-    b.lvl_ls3 = alloc_uninit<i_t>(m1, st);
-    b.lvl_co3 = alloc_uninit<i_t>(m1, st);
-    b.sp_ls_v = alloc_uninit<i_t>(m1, st);
-    b.sp_co_v = alloc_uninit<i_t>(m1, st);
-    b.sp_pos_v = alloc_uninit<i_t>(m1, st);
-    b.lvl_pos_v = alloc_uninit<i_t>(m1, st);
-    b.ft_recover_rhs = alloc_uninit<f_t>(m, st);
-    b.ft_recover_sol = alloc_uninit<f_t>(m, st);
-    b.S_col_start = alloc_uninit<i_t>(2 * ucap + 1, st);
-    b.S_i = alloc_uninit<i_t>(eta, st);
-    b.S_x = alloc_uninit<f_t>(eta, st);
-    b.mu_values = alloc_uninit<f_t>(ucap, st);
-    b.delta_y_sparse_i = alloc_uninit<i_t>(mn, st); b.delta_y_sparse_x = alloc_uninit<f_t>(mn, st);
-    b.UTsol_sparse_i = alloc_uninit<i_t>(mn, st); b.UTsol_sparse_x = alloc_uninit<f_t>(mn, st);
-    b.utilde_sparse_i = alloc_uninit<i_t>(mn, st); b.utilde_sparse_x = alloc_uninit<f_t>(mn, st);
-    b.scaled_dxB_sparse_i = alloc_uninit<i_t>(mn, st); b.scaled_dxB_sparse_x = alloc_uninit<f_t>(mn, st);
-    b.rhs_sparse_i = alloc_uninit<i_t>(mn, st); b.rhs_sparse_x = alloc_uninit<f_t>(mn, st);
-    b.v_sparse_i = alloc_uninit<i_t>(mn, st); b.v_sparse_x = alloc_uninit<f_t>(mn, st);
-    b.se_dy_i = alloc_uninit<i_t>(mn, st); b.se_dy_x = alloc_uninit<f_t>(mn, st);
-    b.se_UTsol_i = alloc_uninit<i_t>(mn, st); b.se_UTsol_x = alloc_uninit<f_t>(mn, st);
-    b.se_ei_i = alloc_uninit<i_t>(mn, st); b.se_ei_x = alloc_uninit<f_t>(mn, st);
-    b.ft_sparse_scratch_i = alloc_uninit<i_t>(mn, st); b.ft_sparse_scratch_x = alloc_uninit<f_t>(mn, st);
-    b.ft_ei_scratch_i = alloc_uninit<i_t>(mn, st); b.ft_ei_scratch_x = alloc_uninit<f_t>(mn, st);
+#define PACK_F(name, count) b.name = alloc_fixed<f_t>(count, st, fixed, fixed_field_id::name, seat)
+#define PACK_I(name, count) b.name = alloc_fixed<i_t>(count, st, fixed, fixed_field_id::name, seat)
+    PACK_F(xB_workspace, mn);
+    PACK_F(delta_y, mn);
+    PACK_F(delta_z, mn);
+    PACK_F(delta_x, mn);
+    PACK_F(v, mn);
+    PACK_F(squared_infeas, mn);
+    PACK_F(setup_rhs, mn);
+    PACK_I(basic_mark, mn);
+    PACK_I(delta_z_mark, mn);
+    PACK_I(delta_z_indices, mn);
+    PACK_I(nonbasic_pos, mn);
+    PACK_I(infeas_idx, mn);
+    PACK_F(ft_dense_scratch, mn);
+    PACK_F(ft_dense_scratch2, mn);
+    PACK_F(ft_sort_bucket, mn);
+    PACK_F(ft_sort_x, mn);
+    PACK_I(ft_sort_i, mn);
+    PACK_I(ft_sort_perm, mn);
+    PACK_I(lvl_lev0, m1); PACK_I(lvl_ls0, m1); PACK_I(lvl_co0, m1);
+    PACK_I(lvl_lev1, m1); PACK_I(lvl_ls1, m1); PACK_I(lvl_co1, m1);
+    PACK_I(lvl_lev2, m1); PACK_I(lvl_ls2, m1); PACK_I(lvl_co2, m1);
+    PACK_I(lvl_lev3, m1); PACK_I(lvl_ls3, m1); PACK_I(lvl_co3, m1);
+    PACK_I(sp_ls_v, m1); PACK_I(sp_co_v, m1);
+    PACK_I(sp_pos_v, m1); PACK_I(lvl_pos_v, m1);
+    PACK_F(ft_recover_rhs, m); PACK_F(ft_recover_sol, m);
+    PACK_I(S_col_start, 2 * ucap + 1);
+    PACK_I(S_i, eta); PACK_F(S_x, eta); PACK_F(mu_values, ucap);
+    PACK_I(delta_y_sparse_i, mn); PACK_F(delta_y_sparse_x, mn);
+    PACK_I(UTsol_sparse_i, mn); PACK_F(UTsol_sparse_x, mn);
+    PACK_I(utilde_sparse_i, mn); PACK_F(utilde_sparse_x, mn);
+    PACK_I(scaled_dxB_sparse_i, mn); PACK_F(scaled_dxB_sparse_x, mn);
+    PACK_I(rhs_sparse_i, mn); PACK_F(rhs_sparse_x, mn);
+    PACK_I(v_sparse_i, mn); PACK_F(v_sparse_x, mn);
+    PACK_I(se_dy_i, mn); PACK_F(se_dy_x, mn);
+    PACK_I(se_UTsol_i, mn); PACK_F(se_UTsol_x, mn);
+    PACK_I(se_ei_i, mn); PACK_F(se_ei_x, mn);
+    PACK_I(ft_sparse_scratch_i, mn); PACK_F(ft_sparse_scratch_x, mn);
+    PACK_I(ft_ei_scratch_i, mn); PACK_F(ft_ei_scratch_x, mn);
+#undef PACK_I
+#undef PACK_F
   }
   return a;
 }
@@ -4988,6 +5121,7 @@ struct gpu_batch_handle_t {
   std::vector<gpu_batch_item<i_t, f_t>> items;
   std::vector<kernel_args> h_args;
   std::vector<marshal_storage> store;
+  packed_fixed_storage fixed;
   marshal_storage ro_store;
   std::unordered_map<const void*, ro_upload> ro_cache;
   kernel_args* d_args{nullptr};
@@ -5006,24 +5140,32 @@ struct gpu_batch_handle_t {
   // with a resume loop consumes them, and for everyone else it is m + n doubles of D2H for nothing.
   bool allow_refactor_exit{false};
   bool persistent_mode{false};
+  bool view_mode{false};  // Nondeterministic pool consumes the host slabs without per-seat scatter.
   bool use_uint16_factors{true};
   std::vector<unsigned char> staged;
   // Pool-owned pinned host staging for sparse child bound deltas. Capacity grows per seat to the
   // largest diff that seat has seen; it is not an N*n slab (which would pin hundreds of MB for the
   // usual one-column branch updates).
-  std::vector<gpu_bound_delta<i_t, f_t>*> pinned_bound_deltas;
+  std::vector<std::optional<cuda::host_buffer<gpu_bound_delta<i_t, f_t>>>> pinned_bound_deltas;
   std::vector<size_t> pinned_bound_caps;
   std::vector<std::vector<std::uint16_t>> factor_index16_scratch;
   struct factor_caps_t {
     size_t L0{0}, U0{0}, L0t{0}, U0t{0};
   };
   std::vector<factor_caps_t> factor_caps;
+  i_t rows{0}, cols{0};
+  size_t active_seats{0};
+  // Scalars are pinned; large returned vectors remain pageable and are reused across generations.
+  std::optional<cuda::host_buffer<i_t>> h_status;
+  std::optional<cuda::host_buffer<i_t>> h_iterations;
+  std::optional<cuda::host_buffer<f_t>> h_objective;
+  std::optional<cuda::host_buffer<f_t>> h_user_objective;
+  std::vector<f_t> h_x, h_y, h_z, h_dy_se;
+  std::vector<variable_status_t> h_vstatus;
+  std::vector<i_t> h_basic_list, h_nonbasic_list;
 
   ~gpu_batch_handle_t()
   {
-    for (auto* p : pinned_bound_deltas) {
-      if (p != nullptr) { cudaFreeHost(p); }
-    }
     if (h_completion_flag != nullptr) { cudaFreeHost(h_completion_flag); }
   }
 };
@@ -5238,6 +5380,8 @@ gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batc
   // A launch has one compile-time factor-index type. If any node exceeds uint16 capacity,
   // use the int32 specialization for the entire batch.
   bool use_uint16_factors = true;
+  i_t batch_m = -1, batch_n = -1;
+  size_t active_seats = 0;
   // Every ft must be a fresh factorization (pure MPF stacking port, no on-device refactor).
   for (size_t b = 0; b < N; ++b) {
     if (items[b].terminal_status != dual::status_t::UNSET) { continue; }
@@ -5254,6 +5398,14 @@ gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batc
     }
     const i_t m = items[b].lp->num_rows;
     const i_t n = items[b].lp->num_cols;
+    if (active_seats == 0) {
+      batch_m = m;
+      batch_n = n;
+    } else if (m != batch_m || n != batch_n) {
+      reject_item("has dimensions different from the first active batch item");
+      return nullptr;
+    }
+    ++active_seats;
     assert(items[b].dy_se->size() == static_cast<size_t>(n));
     if (m < 0 || n < m || items[b].vstatus->size() != static_cast<size_t>(n) ||
         items[b].basic_list->size() != static_cast<size_t>(m) ||
@@ -5353,6 +5505,11 @@ gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batc
   H->allow_refactor_exit = allow_refactor_exit;
   H->persistent_mode     = persistent_seats;
   H->use_uint16_factors  = use_uint16_factors;
+  H->rows = active_seats == 0 ? 0 : batch_m;
+  H->cols = active_seats == 0 ? 0 : batch_n;
+  H->active_seats = active_seats;
+  H->fixed.seats = N;
+  H->fixed.stream = stream;
   H->ro_store.stream = stream;
   // One cache-line-aligned mapped word is the asynchronous host/device completion handshake for
   // this handle. It is logically a bool, but a 32-bit word has well-defined CUDA and CPU atomic
@@ -5363,6 +5520,11 @@ gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batc
   RAFT_CUDA_TRY(cudaHostGetDevicePointer(
     reinterpret_cast<void**>(&H->d_completion_flag), H->h_completion_flag, 0));
   new (H->h_completion_flag) std::uint32_t{0u};
+  const cuda::stream_ref host_stream{stream.value()};
+  H->h_status.emplace(cuda::make_pinned_buffer<i_t>(host_stream, N * 2, cuda::no_init));
+  H->h_iterations.emplace(cuda::make_pinned_buffer<i_t>(host_stream, N, cuda::no_init));
+  H->h_objective.emplace(cuda::make_pinned_buffer<f_t>(host_stream, N, cuda::no_init));
+  H->h_user_objective.emplace(cuda::make_pinned_buffer<f_t>(host_stream, N, cuda::no_init));
   // marshal_storage owns rmm::device_buffers and is move-only, so construct in place.
   H->store.reserve(N);
   for (size_t k = 0; k < N; ++k) { H->store.emplace_back(stream); }
@@ -5422,12 +5584,14 @@ gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batc
                   ? marshal_problem<std::uint16_t>(
                       *it.lp, *it.settings, *it.vstatus, *it.ft, *it.basic_list,
                       *it.nonbasic_list, *it.sol, *it.dy_se, ro, store[b], it.refactor_resume,
-                      it.terminal_certificate_retry, it.lower, it.upper)
+                      it.terminal_certificate_retry, it.lower, it.upper, &H->fixed, b)
                   : marshal_problem<i_t>(
                       *it.lp, *it.settings, *it.vstatus, *it.ft, *it.basic_list,
                       *it.nonbasic_list, *it.sol, *it.dy_se, ro, store[b], it.refactor_resume,
-                      it.terminal_certificate_retry, it.lower, it.upper);
+                      it.terminal_certificate_retry, it.lower, it.upper, &H->fixed, b);
   }
+
+  H->fixed.flush_uploads();
 
   // d_args comes from the pool on this batch's stream. It used to be a raw cudaMalloc plus a
   // BLOCKING cudaMemcpy, which is a device-wide synchronisation point in the middle of the launch
@@ -5566,7 +5730,41 @@ void gpu_simplified_dual_phase2_batch_harvest(
   out_status.assign(N, dual::status_t::UNSET);
   auto& h_args = H->h_args;
 
-  RAFT_CUDA_TRY(cudaEventSynchronize(H->ev_stop));
+  // All returned fields are contiguous across seats. Queue one copy per field after the kernel on
+  // the same stream, synchronize once, and only then inspect statuses or scatter into node state.
+  const double cb_t0 = tic();
+  if (H->active_seats != 0) {
+    const size_t m = static_cast<size_t>(H->rows);
+    const size_t n = static_cast<size_t>(H->cols);
+    H->h_x.resize(N * n);
+    H->h_y.resize(N * m);
+    H->h_z.resize(N * n);
+    H->h_dy_se.resize(N * n);
+    H->h_vstatus.resize(N * n);
+    H->h_basic_list.resize(N * m);
+    H->h_nonbasic_list.resize(N * (n - m));
+    const cudaStream_t cs = H->stream.value();
+    auto copy = [cs](void* dst, const void* src, size_t bytes) {
+      if (bytes != 0) {
+        RAFT_CUDA_TRY(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, cs));
+      }
+    };
+    copy(H->h_status->data(), H->fixed.template data<i_t>(fixed_field_id::out_status), N * 2 * sizeof(i_t));
+    copy(H->h_objective->data(), H->fixed.template data<f_t>(fixed_field_id::out_objective), N * sizeof(f_t));
+    copy(H->h_user_objective->data(), H->fixed.template data<f_t>(fixed_field_id::out_user_objective), N * sizeof(f_t));
+    copy(H->h_iterations->data(), H->fixed.template data<i_t>(fixed_field_id::out_iterations), N * sizeof(i_t));
+    copy(H->h_x.data(), H->fixed.template data<f_t>(fixed_field_id::x), N * n * sizeof(f_t));
+    copy(H->h_vstatus.data(), H->fixed.template data<variable_status_t>(fixed_field_id::vstatus),
+         N * n * sizeof(variable_status_t));
+    copy(H->h_basic_list.data(), H->fixed.template data<i_t>(fixed_field_id::basic_list),
+         N * m * sizeof(i_t));
+    copy(H->h_nonbasic_list.data(), H->fixed.template data<i_t>(fixed_field_id::nonbasic_list),
+         N * (n - m) * sizeof(i_t));
+    copy(H->h_dy_se.data(), H->fixed.template data<f_t>(fixed_field_id::dy_se), N * n * sizeof(f_t));
+    copy(H->h_y.data(), H->fixed.template data<f_t>(fixed_field_id::y), N * m * sizeof(f_t));
+    copy(H->h_z.data(), H->fixed.template data<f_t>(fixed_field_id::z), N * n * sizeof(f_t));
+  }
+  H->stream.synchronize();
   float kernel_ms = 0.0f;
   RAFT_CUDA_TRY(cudaEventElapsedTime(&kernel_ms, H->ev_start, H->ev_stop));
   timing.kernel_s = kernel_ms / 1000.0;
@@ -5575,103 +5773,84 @@ void gpu_simplified_dual_phase2_batch_harvest(
   H->ev_start = nullptr;
   H->ev_stop  = nullptr;
   H->launched = false;
-
-  // ---- Copy each problem's result back (host-timed) ----
-  const double cb_t0 = tic();
   for (size_t b = 0; b < N; ++b) {
     if (items[b].terminal_status != dual::status_t::UNSET) {
       out_status[b] = items[b].terminal_status;
       continue;
     }
-    const auto& a  = h_args[b];
-    auto& sol      = *items[b].sol;
-    auto& vstatus  = *items[b].vstatus;
-    const int n    = a.n;
-    int h_status[2] = {0, 0};  // [0] status, [1] REFACTOR_NEEDED reason
-    int h_iters     = 0;
-    double h_obj = 0.0, h_uobj = 0.0;
-    const cudaStream_t cs = H->stream.value();
-    RAFT_CUDA_TRY(
-      cudaMemcpyAsync(h_status, a.out_status, 2 * sizeof(int), cudaMemcpyDeviceToHost, cs));
-    RAFT_CUDA_TRY(cudaMemcpyAsync(&h_obj, a.out_objective, sizeof(double), cudaMemcpyDeviceToHost, cs));
-    RAFT_CUDA_TRY(cudaMemcpyAsync(&h_uobj, a.out_user_objective, sizeof(double), cudaMemcpyDeviceToHost, cs));
-    RAFT_CUDA_TRY(cudaMemcpyAsync(&h_iters, a.out_iterations, sizeof(int), cudaMemcpyDeviceToHost, cs));
-    RAFT_CUDA_TRY(cudaMemcpyAsync(sol.x.data(), a.x, n * sizeof(double), cudaMemcpyDeviceToHost, cs));
-    // The FINAL basis. Branch-and-bound cannot use a result without it: search_tree_t::branch packs
-    // the parent's vstatus into BOTH children, and the child that is not kept for the dive leaves
-    // the device entirely, so it needs that basis to warm-start when it is popped again later.
-    // n bytes, so it is not worth making conditional on the status.
-    RAFT_CUDA_TRY(cudaMemcpyAsync(vstatus.data(), a.vstatus, n * sizeof(variable_status_t),
-                                  cudaMemcpyDeviceToHost, cs));
-    // The basis LISTS, not just the membership. Both drivers maintain them by an IN-PLACE swap
-    //     basic_list[basic_leaving] = entering;  nonbasic_list[nonbasic_entering] = leaving;
-    // so their ORDER is the pivot history. Rebuilding them on the host from `vstatus` instead
-    // (get_basis_from_vstatus scans j ascending) yields a SORTED order, which re-permutes both lists
-    // on every resume. That is not cosmetic:
-    //   - refactor_basis factorizes B = A(:, basic_list), so permuted columns give a different LU
-    //     than the CPU's in-place refactorization produces, and the resume no longer continues from
-    //     the same numerical state;
-    //   - the ratio test scans nonbasic_list IN ORDER and its near-tie rule is order-dependent (see
-    //     warp_rt_body), so a re-permuted list can change the entering choice after every resume.
-    // Only a caller with a resume loop reads these, hence the same gate as the duals.
-    if (H->allow_refactor_exit) {
-      RAFT_CUDA_TRY(cudaMemcpyAsync(items[b].basic_list->data(), a.basic_list,
-                                    a.m * sizeof(i_t), cudaMemcpyDeviceToHost, cs));
-      RAFT_CUDA_TRY(cudaMemcpyAsync(items[b].nonbasic_list->data(), a.nonbasic_list,
-                                    (n - a.m) * sizeof(i_t), cudaMemcpyDeviceToHost, cs));
+    out_status[b] = static_cast<dual::status_t>(H->h_status->data()[2 * b]);
+    if (H->view_mode) { continue; }
+    const size_t m = static_cast<size_t>(H->rows);
+    const size_t n = static_cast<size_t>(H->cols);
+    auto& sol = *items[b].sol;
+    if (n != 0) {
+      std::copy_n(H->h_x.data() + b * n, n, sol.x.data());
+      std::copy_n(H->h_vstatus.data() + b * n, n, items[b].vstatus->data());
     }
-    // The steepest-edge norms, which the driver updates every pivot exactly as the CPU driver
-    // updates its `delta_y_steepest_edge` in place. Two callers need them back:
-    //   - a REFACTOR_NEEDED resume, which would otherwise restart pricing from the norms it was
-    //     first given and take a different pivot path than one uninterrupted solve;
-    //   - branch-and-bound, whose CPU path leaves the worker's norms updated, so leaving them
-    //     untouched here would make a GPU-solved node and a CPU-solved node behave differently.
-    {
-      auto& dy_se = *items[b].dy_se;
-      dy_se.resize(static_cast<size_t>(n));   // no-op once carried; sizes a cold-started node
-      RAFT_CUDA_TRY(cudaMemcpyAsync(dy_se.data(), a.dy_se, n * sizeof(f_t),
-                                    cudaMemcpyDeviceToHost, cs));
+    if (m != 0) {
+      std::copy_n(H->h_basic_list.data() + b * m, m, items[b].basic_list->data());
     }
-    // The scalars above are read immediately below, so this per-item sync is required. It is on the
-    // batch's own stream, so it does not stall any other worker's batch.
-    RAFT_CUDA_TRY(cudaStreamSynchronize(cs));
-    // THE DUALS. Copied back only when the caller can resume, because only a resume consumes them.
-    //
-    // This is not an optimisation detail, it is the resume CONTRACT. The CPU driver's in-place
-    // refactorization (phase2.cpp) does exactly three things: refactor_basis, rebuild x via
-    // compute_primal_solution_from_basis, recompute the primal infeasibilities. It NEVER recomputes
-    // the duals -- y and z are carried forward as incrementally maintained values. The device stands
-    // in for that block, so it must hand its maintained y/z back or the host resumes with the duals
-    // from the START of the node while vstatus, x and dy_se have all moved on.
-    //
-    // Measured with them missing: the objective stops being monotone. germanrr oscillated between
-    // 117936034.95 and 121878287.74 for 503 legs and 51,408 iterations without converging; wachplan
-    // slid BACKWARDS from -8.667 to -7.783, crossed its -8.0 cutoff and fathomed a node whose true
-    // optimum is -8.5. Both converge in ~10 legs once the duals come back.
-    //
-    // For a caller with no resume loop nothing reads them, so the m + n doubles stay unsent.
-    if (H->allow_refactor_exit) {
-      RAFT_CUDA_TRY(cudaMemcpyAsync(sol.y.data(), a.y, a.m * sizeof(f_t),
-                                    cudaMemcpyDeviceToHost, cs));
-      RAFT_CUDA_TRY(cudaMemcpyAsync(sol.z.data(), a.z, n * sizeof(f_t),
-                                    cudaMemcpyDeviceToHost, cs));
+    if (n != m) {
+      std::copy_n(H->h_nonbasic_list.data() + b * (n - m), n - m,
+                  items[b].nonbasic_list->data());
     }
-    sol.objective      = h_obj;
-    sol.user_objective = h_uobj;
-    sol.iterations     = h_iters;
-    out_status[b]      = static_cast<dual::status_t>(h_status[0]);
-    if (items[b].refactor_reason != nullptr) { *items[b].refactor_reason = h_status[1]; }
+    auto& dy_se = *items[b].dy_se;
+    dy_se.resize(n);
+    if (n != 0) {
+      std::copy_n(H->h_dy_se.data() + b * n, n, dy_se.data());
+      std::copy_n(H->h_z.data() + b * n, n, sol.z.data());
+    }
+    if (m != 0) { std::copy_n(H->h_y.data() + b * m, m, sol.y.data()); }
+    sol.objective      = H->h_objective->data()[b];
+    sol.user_objective = H->h_user_objective->data()[b];
+    sol.iterations     = H->h_iterations->data()[b];
+    if (items[b].refactor_reason != nullptr) {
+      *items[b].refactor_reason = H->h_status->data()[2 * b + 1];
+    }
   }
-  // y/z are enqueued after the per-item scalar synchronization above. Every resumable caller may
-  // consume them immediately for a host refactor, so make completion of *all* D2H state part of
-  // harvest's contract rather than relying on pageable-memory staging or a later allocation side
-  // effect (which notably left the final non-persistent seat unordered).
-  if (H->allow_refactor_exit) { H->stream.synchronize(); }
   timing.copyback_s = toc(cb_t0);
 
 
 
   std::fill(H->staged.begin(), H->staged.end(), 0);
+}
+
+template <typename i_t, typename f_t>
+void gpu_simplified_dual_phase2_batch_use_views(
+  gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H)
+{
+  if (H == nullptr || !H->persistent_mode) {
+    throw std::runtime_error("result views require a persistent GPU batch");
+  }
+  H->view_mode = true;
+}
+
+template <typename i_t, typename f_t>
+gpu_batch_result_view<i_t, f_t> gpu_simplified_dual_phase2_batch_result(
+  gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H, std::size_t seat)
+{
+  if (H == nullptr || !H->view_mode || H->launched || seat >= H->items.size()) {
+    throw std::runtime_error("GPU batch result view is unavailable");
+  }
+  const size_t m = static_cast<size_t>(H->rows);
+  const size_t n = static_cast<size_t>(H->cols);
+  const auto slice = [seat](auto& field, size_t width) {
+    using value_t = typename std::remove_reference_t<decltype(field)>::value_type;
+    return width == 0 ? std::span<value_t>{}
+                      : std::span<value_t>{field.data() + seat * width, width};
+  };
+  return {slice(H->h_x, n),
+          slice(H->h_y, m),
+          slice(H->h_z, n),
+          slice(H->h_dy_se, n),
+          slice(H->h_vstatus, n),
+          slice(H->h_basic_list, m),
+          slice(H->h_nonbasic_list, n - m),
+          static_cast<dual::status_t>(H->h_status->data()[2 * seat]),
+          H->h_objective->data()[seat],
+          H->h_user_objective->data()[seat],
+          H->h_iterations->data()[seat],
+          H->h_status->data()[2 * seat + 1]};
 }
 
 template <typename T>
@@ -5760,7 +5939,8 @@ bool gpu_simplified_dual_phase2_batch_stage(
   kernel_args& a = H->h_args[seat];
   const i_t m    = a.m;
   const i_t n    = a.n;
-  assert(item.dy_se->size() == static_cast<size_t>(n));
+  assert(H->view_mode ? H->h_dy_se.size() == H->h_args.size() * static_cast<size_t>(n)
+                      : item.dy_se->size() == static_cast<size_t>(n));
   if (item.lp->num_rows != m || item.lp->num_cols != n || item.lower == nullptr ||
       item.upper == nullptr || item.lower->size() != static_cast<size_t>(n) ||
       item.upper->size() != static_cast<size_t>(n)) {
@@ -5776,7 +5956,7 @@ bool gpu_simplified_dual_phase2_batch_stage(
     H->staged.assign(seats, 0);
     H->factor_index16_scratch.resize(4 * seats);
     H->factor_caps.resize(seats);
-    H->pinned_bound_deltas.assign(seats, nullptr);
+    H->pinned_bound_deltas.resize(seats);
     H->pinned_bound_caps.assign(seats, 0);
     for (size_t b = 0; b < seats; ++b) {
       H->factor_caps[b] = {static_cast<size_t>(H->h_args[b].L0_nz),
@@ -5808,8 +5988,12 @@ bool gpu_simplified_dual_phase2_batch_stage(
   a.start_time           = tic();
   a.terminal_certificate_retry = item.terminal_certificate_retry ? 1 : 0;
   a.refactor_resume = command == gpu_batch_seat_command::REFACTOR_RESUME ? 1 : 0;
-  a.resume_obj      = item.sol->objective;
-  a.resume_iter     = static_cast<i_t>(item.sol->iterations);
+  a.resume_obj      = H->view_mode && command != gpu_batch_seat_command::FRESH_NODE
+                        ? H->h_objective->data()[seat]
+                        : item.sol->objective;
+  a.resume_iter     = H->view_mode && command != gpu_batch_seat_command::FRESH_NODE
+                        ? H->h_iterations->data()[seat]
+                        : static_cast<i_t>(item.sol->iterations);
   const cudaStream_t cs = H->stream.value();
 
   if (command == gpu_batch_seat_command::CHILD_CONTINUE) {
@@ -5821,16 +6005,15 @@ bool gpu_simplified_dual_phase2_batch_stage(
     if (deltas.size() > H->pinned_bound_caps[seat]) {
       // The previous generation has already been harvested, so this seat's old staging buffer is
       // no longer in flight. Grow geometrically to avoid repeated host registrations.
-      if (H->pinned_bound_deltas[seat] != nullptr) {
-        RAFT_CUDA_TRY(cudaFreeHost(H->pinned_bound_deltas[seat]));
-      }
       const size_t cap = std::max(deltas.size(), 2 * H->pinned_bound_caps[seat]);
-      RAFT_CUDA_TRY(cudaMallocHost(
-        reinterpret_cast<void**>(&H->pinned_bound_deltas[seat]),
-        cap * sizeof(gpu_bound_delta<i_t, f_t>)));
+      H->pinned_bound_deltas[seat].emplace(
+        cuda::make_pinned_buffer<gpu_bound_delta<i_t, f_t>>(
+          cuda::stream_ref{cs}, cap, cuda::no_init));
       H->pinned_bound_caps[seat] = cap;
     }
-    auto* pinned = H->pinned_bound_deltas[seat];
+    auto* pinned = H->pinned_bound_deltas[seat]
+                     ? H->pinned_bound_deltas[seat]->data()
+                     : nullptr;
     for (size_t q = 0; q < deltas.size(); ++q) {
       if (deltas[q].column < 0 || deltas[q].column >= n || (deltas[q].mask & ~3u) != 0u) {
         error = "invalid child bound delta";
@@ -5842,26 +6025,43 @@ bool gpu_simplified_dual_phase2_batch_stage(
     a.bound_delta_count = static_cast<i_t>(deltas.size());
     // x/y/z, lists, dy_se, the base factor and the MPF stack deliberately stay resident.
   } else {
-    if (item.vstatus->size() != static_cast<size_t>(n) ||
+    if ((!H->view_mode || command == gpu_batch_seat_command::FRESH_NODE) &&
+        (item.vstatus->size() != static_cast<size_t>(n) ||
         item.basic_list->size() != static_cast<size_t>(m) ||
         item.nonbasic_list->size() != static_cast<size_t>(n - m) ||
         item.sol->x.size() != static_cast<size_t>(n) ||
         item.sol->y.size() != static_cast<size_t>(m) ||
         item.sol->z.size() != static_cast<size_t>(n) ||
-        item.dy_se->size() != static_cast<size_t>(n)) {
+        item.dy_se->size() != static_cast<size_t>(n))) {
       error = "persistent fresh/refactor state has the wrong size";
       return false;
     }
     persistent_copy(a.lower, item.lower->data(), n, H->stream);
     persistent_copy(a.upper, item.upper->data(), n, H->stream);
-    persistent_copy(a.vstatus, item.vstatus->data(), n, H->stream);
-    persistent_copy(a.basic_list, item.basic_list->data(), m, H->stream);
-    persistent_copy(a.nonbasic_list, item.nonbasic_list->data(), n - m, H->stream);
-    persistent_copy(a.x, item.sol->x.data(), n, H->stream);
-    persistent_copy(a.y, item.sol->y.data(), m, H->stream);
-    persistent_copy(a.z, item.sol->z.data(), n, H->stream);
-
-    persistent_copy(a.dy_se, item.dy_se->data(), n, H->stream);
+    if (H->view_mode) {
+      // A resume already modified its harvested spans in place. A fresh replacement owns new
+      // vectors, so only that seat is written into the host slabs before the full-pool upload.
+      if (command == gpu_batch_seat_command::FRESH_NODE) {
+        const auto copy_seat = [seat](auto& slab, size_t width, const auto& source) {
+          if (width != 0) { std::copy_n(source.data(), width, slab.data() + seat * width); }
+        };
+        copy_seat(H->h_vstatus, n, *item.vstatus);
+        copy_seat(H->h_basic_list, m, *item.basic_list);
+        copy_seat(H->h_nonbasic_list, n - m, *item.nonbasic_list);
+        copy_seat(H->h_x, n, item.sol->x);
+        copy_seat(H->h_y, m, item.sol->y);
+        copy_seat(H->h_z, n, item.sol->z);
+        copy_seat(H->h_dy_se, n, *item.dy_se);
+      }
+    } else {
+      persistent_copy(a.vstatus, item.vstatus->data(), n, H->stream);
+      persistent_copy(a.basic_list, item.basic_list->data(), m, H->stream);
+      persistent_copy(a.nonbasic_list, item.nonbasic_list->data(), n - m, H->stream);
+      persistent_copy(a.x, item.sol->x.data(), n, H->stream);
+      persistent_copy(a.y, item.sol->y.data(), m, H->stream);
+      persistent_copy(a.z, item.sol->z.data(), n, H->stream);
+      persistent_copy(a.dy_se, item.dy_se->data(), n, H->stream);
+    }
     persistent_copy(a.row_perm, item.ft->row_permutation().data(), m, H->stream);
     persistent_copy(a.inv_row_perm, item.ft->inverse_row_permutation().data(), m, H->stream);
     a.num_updates = 0;
@@ -5921,6 +6121,24 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
   // boundary so an incumbent published while those ran is not hidden behind the earlier snapshot.
   for (size_t b = 0; b < N; ++b) { H->h_args[b].cut_off = H->items[b].settings->cut_off; }
   const double t0 = tic();
+  if (H->view_mode) {
+    const auto upload = [H](const auto& source, fixed_field_id id) {
+      if (!source.empty()) {
+        RAFT_CUDA_TRY(cudaMemcpyAsync(H->fixed.template data<typename std::remove_reference_t<decltype(source)>::value_type>(id),
+                                      source.data(),
+                                      source.size() * sizeof(typename std::remove_reference_t<decltype(source)>::value_type),
+                                      cudaMemcpyHostToDevice,
+                                      H->stream.value()));
+      }
+    };
+    upload(H->h_x, fixed_field_id::x);
+    upload(H->h_y, fixed_field_id::y);
+    upload(H->h_z, fixed_field_id::z);
+    upload(H->h_dy_se, fixed_field_id::dy_se);
+    upload(H->h_vstatus, fixed_field_id::vstatus);
+    upload(H->h_basic_list, fixed_field_id::basic_list);
+    upload(H->h_nonbasic_list, fixed_field_id::nonbasic_list);
+  }
   RAFT_CUDA_TRY(cudaMemcpyAsync(H->d_args,
                                 H->h_args.data(),
                                 N * sizeof(kernel_args),
@@ -6167,6 +6385,10 @@ template void gpu_simplified_dual_phase2_batch_finish<int, double>(
 template void gpu_simplified_dual_phase2_batch_harvest<int, double>(
   gpu_phase2_detail::gpu_batch_handle_t<int, double>*,
   std::vector<dual::status_t>&, gpu_batch_timing&);
+template void gpu_simplified_dual_phase2_batch_use_views<int, double>(
+  gpu_phase2_detail::gpu_batch_handle_t<int, double>*);
+template gpu_batch_result_view<int, double> gpu_simplified_dual_phase2_batch_result<int, double>(
+  gpu_phase2_detail::gpu_batch_handle_t<int, double>*, std::size_t);
 template bool gpu_simplified_dual_phase2_batch_stage<int, double>(
   gpu_phase2_detail::gpu_batch_handle_t<int, double>*,
   std::size_t,

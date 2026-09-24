@@ -44,7 +44,7 @@ variable_status_t decode(uint8_t val)
   return variable_status_t::NONBASIC_FREE;
 }
 
-std::vector<uint8_t> compress_vstatus(const std::vector<variable_status_t>& vstatus)
+std::vector<uint8_t> compress_vstatus(std::span<const variable_status_t> vstatus)
 {
   size_t compressed_size = vstatus.size() / 4;
   size_t has_tail        = (vstatus.size() % 4 > 0);

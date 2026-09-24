@@ -19,10 +19,11 @@ namespace cuopt::mathematical_optimization::simplex {
 
 // Work = 3 * m
 template <typename i_t>
-i_t reorder_basic_list(const std::vector<i_t>& q, std::vector<i_t>& basic_list)
+i_t reorder_basic_list(const std::vector<i_t>& q,
+                       std::type_identity_t<std::span<i_t>> basic_list)
 {
   const i_t m                     = basic_list.size();
-  std::vector<i_t> basic_list_old = basic_list;
+  std::vector<i_t> basic_list_old(basic_list.begin(), basic_list.end());
   for (i_t k = 0; k < m; k++) {
     basic_list[k] = basic_list_old[q[k]];
   }
@@ -159,7 +160,7 @@ void write_basis_info(const csc_matrix_t<i_t, f_t>& B)
 template <typename i_t, typename f_t>
 i_t factorize_basis(const csc_matrix_t<i_t, f_t>& A,
                     const simplex_solver_settings_t<i_t, f_t>& settings,
-                    const std::vector<i_t>& basic_list,
+                    std::type_identity_t<std::span<const i_t>> basic_list,
                     f_t start_time,
                     csc_matrix_t<i_t, f_t>& L,
                     csc_matrix_t<i_t, f_t>& U,
@@ -682,10 +683,10 @@ i_t basis_repair(const csc_matrix_t<i_t, f_t>& A,
                  const std::vector<f_t>& upper,
                  const std::vector<i_t>& deficient,
                  const std::vector<i_t>& slacks_needed,
-                 std::vector<i_t>& basis_list,
-                 std::vector<i_t>& nonbasic_list,
+                 std::type_identity_t<std::span<i_t>> basis_list,
+                 std::type_identity_t<std::span<i_t>> nonbasic_list,
                  std::vector<i_t>& superbasic_list,
-                 std::vector<variable_status_t>& vstatus,
+                 std::type_identity_t<std::span<variable_status_t>> vstatus,
                  f_t& work_estimate)
 {
   const i_t m = A.m;
@@ -764,7 +765,7 @@ i_t basis_repair(const csc_matrix_t<i_t, f_t>& A,
 
 template <typename i_t, typename f_t>
 i_t form_b(const csc_matrix_t<i_t, f_t>& A,
-           const std::vector<i_t>& basic_list,
+           std::type_identity_t<std::span<const i_t>> basic_list,
            csc_matrix_t<i_t, f_t>& B,
            f_t& work_estimate)
 {
@@ -935,7 +936,7 @@ i_t b_solve(const csc_matrix_t<i_t, f_t>& L,
 
 #ifdef DUAL_SIMPLEX_INSTANTIATE_DOUBLE
 
-template int reorder_basic_list<int>(const std::vector<int>& q, std::vector<int>& basic_list);
+template int reorder_basic_list<int>(const std::vector<int>& q, std::span<int> basic_list);
 
 template void get_basis_from_vstatus<int>(int m,
                                           const std::vector<variable_status_t>& vstatus,
@@ -945,7 +946,7 @@ template void get_basis_from_vstatus<int>(int m,
 
 template int factorize_basis<int>(const csc_matrix_t<int, double>& A,
                                   const simplex_solver_settings_t<int, double>& settings,
-                                  const std::vector<int>& basis_list,
+                                  std::span<const int> basis_list,
                                   double start_time,
                                   csc_matrix_t<int, double>& L,
                                   csc_matrix_t<int, double>& U,
@@ -962,14 +963,14 @@ template int basis_repair<int, double>(const csc_matrix_t<int, double>& A,
                                        const std::vector<double>& upper,
                                        const std::vector<int>& deficient,
                                        const std::vector<int>& slacks_needed,
-                                       std::vector<int>& basis_list,
-                                       std::vector<int>& nonbasic_list,
+                                       std::span<int> basis_list,
+                                       std::span<int> nonbasic_list,
                                        std::vector<int>& superbasic_list,
-                                       std::vector<variable_status_t>& vstatus,
+                                       std::span<variable_status_t> vstatus,
                                        double& work_estimate);
 
 template int form_b<int, double>(const csc_matrix_t<int, double>& A,
-                                 const std::vector<int>& basic_list,
+                                 std::span<const int> basic_list,
                                  csc_matrix_t<int, double>& B,
                                  double& work_estimate);
 

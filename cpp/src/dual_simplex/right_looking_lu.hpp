@@ -11,6 +11,8 @@
 #include <linear_algebra/sparse_matrix.hpp>
 
 #include <optional>
+#include <span>
+#include <type_traits>
 
 namespace cuopt::mathematical_optimization::simplex {
 
@@ -18,7 +20,7 @@ template <typename i_t, typename f_t>
 i_t right_looking_lu(const csc_matrix_t<i_t, f_t>& A,
                      const simplex_solver_settings_t<i_t, f_t>& settings,
                      f_t tol,
-                     const std::vector<i_t>& column_list,
+                     std::type_identity_t<std::span<const i_t>> column_list,
                      f_t start_time,
                      std::vector<i_t>& q,
                      csc_matrix_t<i_t, f_t>& L,

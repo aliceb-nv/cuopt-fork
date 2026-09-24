@@ -97,7 +97,7 @@ class mip_node_t {
     children[1] = nullptr;
   }
 
-  mip_node_t(f_t root_lower_bound, const std::vector<simplex::variable_status_t>& basis)
+  mip_node_t(f_t root_lower_bound, std::span<const simplex::variable_status_t> basis)
     : status(node_status_t::PENDING),
       lower_bound(root_lower_bound),
       depth(0),
@@ -120,7 +120,7 @@ class mip_node_t {
              branch_direction_t branch_direction,
              f_t branch_var_value,
              i_t integer_inf,
-             const std::vector<simplex::variable_status_t>& basis)
+             std::span<const simplex::variable_status_t> basis)
     : status(node_status_t::PENDING),
       lower_bound(parent_node->lower_bound),
       depth(parent_node->depth + 1),
@@ -393,7 +393,7 @@ class search_tree_t {
               const i_t branch_var,
               const f_t fractional_val,
               const i_t integer_infeasible,
-              const std::vector<simplex::variable_status_t>& parent_vstatus,
+              std::span<const simplex::variable_status_t> parent_vstatus,
               const simplex::lp_problem_t<i_t, f_t>& original_lp,
               simplex::logger_t& log)
   {

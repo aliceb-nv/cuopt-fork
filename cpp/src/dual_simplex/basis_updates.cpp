@@ -2382,9 +2382,9 @@ int basis_update_mpf_t<i_t, f_t>::refactor_basis(
   const std::vector<f_t>& lower,
   const std::vector<f_t>& upper,
   f_t start_time,
-  std::vector<i_t>& basic_list,
-  std::vector<i_t>& nonbasic_list,
-  std::vector<variable_status_t>& vstatus,
+  std::span<i_t> basic_list,
+  std::span<i_t> nonbasic_list,
+  std::span<variable_status_t> vstatus,
   bool* repaired)
 {
   raft::common::nvtx::range scope("LU::refactor_basis");

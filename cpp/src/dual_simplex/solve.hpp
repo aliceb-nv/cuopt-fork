@@ -13,6 +13,9 @@
 #include <dual_simplex/simplex_solver_settings.hpp>
 #include <math_optimization/types.hpp>
 
+#include <span>
+#include <type_traits>
+
 namespace cuopt {
 struct work_limit_context_t;
 }
@@ -59,7 +62,8 @@ static std::string lp_status_to_string(lp_status_t status)
 }
 
 template <typename i_t, typename f_t>
-f_t compute_objective(const lp_problem_t<i_t, f_t>& problem, const std::vector<f_t>& x);
+f_t compute_objective(const lp_problem_t<i_t, f_t>& problem,
+                      std::type_identity_t<std::span<const f_t>> x);
 
 template <typename i_t, typename f_t>
 f_t compute_user_objective(const lp_problem_t<i_t, f_t>& lp, const std::vector<f_t>& x);

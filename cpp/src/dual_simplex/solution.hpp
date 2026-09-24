@@ -10,6 +10,7 @@
 #include <math_optimization/types.hpp>
 
 #include <utilities/omp_helpers.hpp>
+#include <span>
 #include <vector>
 
 namespace cuopt::mathematical_optimization::simplex {
@@ -62,9 +63,9 @@ class mip_solution_t {
 
   void resize(i_t n) { x.resize(n); }
 
-  void set_incumbent_solution(f_t primal_objective, const std::vector<f_t>& primal_solution)
+  void set_incumbent_solution(f_t primal_objective, std::span<const f_t> primal_solution)
   {
-    x             = primal_solution;
+    x.assign(primal_solution.begin(), primal_solution.end());
     objective     = primal_objective;
     has_incumbent = true;
   }

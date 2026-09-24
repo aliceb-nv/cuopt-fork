@@ -132,7 +132,8 @@ bool is_mip(const user_problem_t<i_t, f_t>& problem)
 }
 
 template <typename i_t, typename f_t>
-f_t compute_objective(const lp_problem_t<i_t, f_t>& problem, const std::vector<f_t>& x)
+f_t compute_objective(const lp_problem_t<i_t, f_t>& problem,
+                      std::type_identity_t<std::span<const f_t>> x)
 {
   const i_t n = problem.num_cols;
   assert(x.size() == problem.num_cols);
@@ -954,7 +955,7 @@ i_t solve_mip_with_guess(const user_problem_t<i_t, f_t>& problem,
 template bool is_mip<int, double>(const user_problem_t<int, double>& problem);
 
 template double compute_objective<int, double>(const lp_problem_t<int, double>& problem,
-                                               const std::vector<double>& x);
+                                               std::span<const double> x);
 
 template double compute_user_objective<int, double>(const lp_problem_t<int, double>& lp,
                                                     const std::vector<double>& x);

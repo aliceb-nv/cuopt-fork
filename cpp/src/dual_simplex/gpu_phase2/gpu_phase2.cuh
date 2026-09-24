@@ -28,6 +28,7 @@
 #include <math_optimization/types.hpp>
 
 #include <cstddef>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -240,6 +241,26 @@ template <typename i_t, typename f_t>
 void gpu_simplified_dual_phase2_batch_harvest(gpu_batch_handle<i_t, f_t>* handle,
                                               std::vector<dual::status_t>& out_status,
                                               gpu_batch_timing& timing);
+
+// Nondeterministic B&B keeps the harvested arrays as the authoritative host state. A view remains
+// valid until the next harvest or until the handle is destroyed; writes through it update the
+// staging array used by the next bulk upload. The default batch API still scatters into items.
+template <typename i_t, typename f_t>
+struct gpu_batch_result_view {
+  std::span<f_t> x, y, z, dy_se;
+  std::span<variable_status_t> vstatus;
+  std::span<i_t> basic_list, nonbasic_list;
+  dual::status_t status{dual::status_t::UNSET};
+  f_t objective{}, user_objective{};
+  i_t iterations{}, refactor_reason{};
+};
+
+template <typename i_t, typename f_t>
+void gpu_simplified_dual_phase2_batch_use_views(gpu_batch_handle<i_t, f_t>* handle);
+
+template <typename i_t, typename f_t>
+gpu_batch_result_view<i_t, f_t> gpu_simplified_dual_phase2_batch_result(
+  gpu_batch_handle<i_t, f_t>* handle, std::size_t seat);
 
 template <typename i_t, typename f_t>
 bool gpu_simplified_dual_phase2_batch_stage(

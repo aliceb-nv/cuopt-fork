@@ -7,6 +7,9 @@
 
 #pragma once
 
+#include <span>
+#include <type_traits>
+
 #include <dual_simplex/initial_basis.hpp>
 #include <dual_simplex/presolve.hpp>
 #include <linear_algebra/sparse_matrix.hpp>
@@ -15,7 +18,8 @@
 namespace cuopt::mathematical_optimization::simplex {
 
 template <typename i_t>
-i_t reorder_basic_list(const std::vector<i_t>& q, std::vector<i_t>& basic_list);
+i_t reorder_basic_list(const std::vector<i_t>& q,
+                       std::type_identity_t<std::span<i_t>> basic_list);
 
 // Get basis_list and nonbasic_list from vstatus
 template <typename i_t>
@@ -29,7 +33,7 @@ void get_basis_from_vstatus(i_t m,
 template <typename i_t, typename f_t>
 i_t factorize_basis(const csc_matrix_t<i_t, f_t>& A,
                     const simplex_solver_settings_t<i_t, f_t>& settings,
-                    const std::vector<i_t>& basis_list,
+                    std::type_identity_t<std::span<const i_t>> basis_list,
                     f_t start_time,
                     csc_matrix_t<i_t, f_t>& L,
                     csc_matrix_t<i_t, f_t>& U,
@@ -48,16 +52,16 @@ i_t basis_repair(const csc_matrix_t<i_t, f_t>& A,
                  const std::vector<f_t>& upper,
                  const std::vector<i_t>& deficient,
                  const std::vector<i_t>& slacks_needed,
-                 std::vector<i_t>& basis_list,
-                 std::vector<i_t>& nonbasic_list,
+                 std::type_identity_t<std::span<i_t>> basis_list,
+                 std::type_identity_t<std::span<i_t>> nonbasic_list,
                  std::vector<i_t>& superbasic_list,
-                 std::vector<variable_status_t>& vstatus,
+                 std::type_identity_t<std::span<variable_status_t>> vstatus,
                  f_t& work_estimate);
 
 // Form the basis matrix B = A(:, basic_list)
 template <typename i_t, typename f_t>
 i_t form_b(const csc_matrix_t<i_t, f_t>& A,
-           const std::vector<i_t>& basic_list,
+           std::type_identity_t<std::span<const i_t>> basic_list,
            csc_matrix_t<i_t, f_t>& B,
            f_t& work_estimate);
 

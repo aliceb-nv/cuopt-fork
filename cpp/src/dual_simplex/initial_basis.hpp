@@ -12,6 +12,8 @@
 #include <linear_algebra/sparse_matrix.hpp>
 #include <math_optimization/types.hpp>
 
+#include <span>
+
 namespace cuopt::mathematical_optimization::simplex {
 
 enum class variable_status_t : int8_t {
@@ -23,7 +25,7 @@ enum class variable_status_t : int8_t {
   SUPERBASIC     = 4
 };
 
-std::vector<uint8_t> compress_vstatus(const std::vector<variable_status_t>& vstatus);
+std::vector<uint8_t> compress_vstatus(std::span<const variable_status_t> vstatus);
 void decompress_vstatus(const std::vector<uint8_t>& packed_vstatus,
                         size_t vstatus_size,
                         std::vector<variable_status_t>& vstatus);

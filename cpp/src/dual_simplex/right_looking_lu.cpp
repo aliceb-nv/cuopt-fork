@@ -96,7 +96,7 @@ class nonzero_counts_t {
 template <typename i_t, typename f_t>
 class trailing_matrix_t {
  public:
-  trailing_matrix_t(const csc_matrix_t<i_t, f_t>& A, const std::vector<i_t>& column_list)
+  trailing_matrix_t(const csc_matrix_t<i_t, f_t>& A, std::span<const i_t> column_list)
     : m_(A.m),
       n_(column_list.size()),
       Bnz_(0),
@@ -720,7 +720,7 @@ class trailing_matrix_t {
   }
 
   std::vector<i_t> compute_column_degree(const csc_matrix_t<i_t, f_t>& A,
-                                         const std::vector<i_t>& column_list)
+                                         std::span<const i_t> column_list)
   {
     const i_t n = column_list.size();
     std::vector<i_t> Cdegree(n);
@@ -735,7 +735,7 @@ class trailing_matrix_t {
   }
 
   std::vector<i_t> compute_row_degree(const csc_matrix_t<i_t, f_t>& A,
-                                      const std::vector<i_t>& column_list,
+                                      std::span<const i_t> column_list,
                                       i_t& Bnz)
   {
     std::vector<i_t> Rdegree(A.m, 0);
@@ -811,7 +811,7 @@ template <typename i_t, typename f_t>
 i_t right_looking_lu(const csc_matrix_t<i_t, f_t>& A,
                      const simplex_solver_settings_t<i_t, f_t>& settings,
                      f_t tol,
-                     const std::vector<i_t>& column_list,
+                     std::type_identity_t<std::span<const i_t>> column_list,
                      f_t start_time,
                      std::vector<i_t>& q,
                      csc_matrix_t<i_t, f_t>& L,
@@ -1792,7 +1792,7 @@ i_t right_looking_ldlt(const csc_matrix_t<i_t, f_t>& A,
 template int right_looking_lu<int, double>(const csc_matrix_t<int, double>& A,
                                            const simplex_solver_settings_t<int, double>& settings,
                                            double tol,
-                                           const std::vector<int>& column_list,
+                                           std::span<const int> column_list,
                                            double start_time,
                                            std::vector<int>& q,
                                            csc_matrix_t<int, double>& L,

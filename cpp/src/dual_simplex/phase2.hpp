@@ -16,6 +16,8 @@
 #include <utilities/memory_instrumentation.hpp>
 
 #include <vector>
+#include <span>
+#include <type_traits>
 
 namespace cuopt {
 struct work_limit_context_t;
@@ -115,8 +117,8 @@ dual::status_t simplified_dual_phase2(const lp_problem_t<i_t, f_t>& lp,
 
 template <typename i_t, typename f_t>
 void compute_reduced_cost_update(const lp_problem_t<i_t, f_t>& lp,
-                                 const std::vector<i_t>& basic_list,
-                                 const std::vector<i_t>& nonbasic_list,
+                                 std::type_identity_t<std::span<const i_t>> basic_list,
+                                 std::type_identity_t<std::span<const i_t>> nonbasic_list,
                                  const std::vector<f_t>& delta_y,
                                  i_t leaving_index,
                                  i_t direction,
@@ -163,10 +165,10 @@ i_t compute_primal_solution_from_basis(const lp_problem_t<i_t, f_t>& lp,
                                        const std::vector<f_t>& lower,
                                        const std::vector<f_t>& upper,
                                        basis_update_mpf_t<i_t, f_t>& ft,
-                                       const std::vector<i_t>& basic_list,
-                                       const std::vector<i_t>& nonbasic_list,
-                                       const std::vector<variable_status_t>& vstatus,
-                                       std::vector<f_t>& x,
+                                       std::type_identity_t<std::span<const i_t>> basic_list,
+                                       std::type_identity_t<std::span<const i_t>> nonbasic_list,
+                                       std::type_identity_t<std::span<const variable_status_t>> vstatus,
+                                       std::type_identity_t<std::span<f_t>> x,
                                        std::vector<f_t>& xB_workspace,
                                        f_t& work_estimate);
 
@@ -176,8 +178,8 @@ i_t compute_primal_solution_from_basis(const lp_problem_t<i_t, f_t>& lp,
 template <typename i_t, typename f_t>
 void compute_dual_solution_from_basis(const lp_problem_t<i_t, f_t>& lp,
                                       basis_update_mpf_t<i_t, f_t>& ft,
-                                      const std::vector<i_t>& basic_list,
-                                      const std::vector<i_t>& nonbasic_list,
+                                      std::type_identity_t<std::span<const i_t>> basic_list,
+                                      std::type_identity_t<std::span<const i_t>> nonbasic_list,
                                       std::vector<f_t>& y,
                                       std::vector<f_t>& z,
                                       f_t& work_estimate);

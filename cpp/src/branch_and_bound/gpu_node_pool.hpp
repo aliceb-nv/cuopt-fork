@@ -462,10 +462,15 @@ gpu_batch_run<i_t, f_t>* gpu_persistent_batch_begin(
   std::vector<gpu_batch_node_t<i_t, f_t>>& nodes,
   rmm::cuda_stream_view stream,
   gds::gpu_ro_cache<i_t, f_t>* ro_cache,
-  std::vector<batch_seat_state_t<i_t, f_t>>* seat_state);
+  std::vector<batch_seat_state_t<i_t, f_t>>* seat_state,
+  bool result_views = false);
 
 template <typename i_t, typename f_t>
 bool gpu_persistent_batch_harvest(gpu_batch_run<i_t, f_t>* run);
+
+template <typename i_t, typename f_t>
+gds::gpu_batch_result_view<i_t, f_t> gpu_persistent_batch_result(
+  gpu_batch_run<i_t, f_t>* run, i_t seat);
 
 template <typename i_t, typename f_t>
 bool gpu_persistent_batch_stage_fresh(gpu_batch_run<i_t, f_t>* run, i_t seat, std::string& error);
