@@ -329,23 +329,17 @@ __device__ void gpu_sort(T* first, T* last, Cmp cmp)
 
 // ---------------------------------------------------------------------------
 // Non-owning sparse-matrix view (CSC). Backs the LP matrix and the fixed LU factors / their
-// transposes. col_start is read-only because reach()/DFS keeps visited state in a private byte-mark
+// transposes. col_start is read-only because reach()/DFS keeps visited state in a private bitset
 // workspace instead of temporarily modifying the factor.
 // ---------------------------------------------------------------------------
-// RI is the row-index storage type. A and S_ retain full-width indices; only the four immutable LU
-// factors use uint16_t. Factor dimensions and every uploaded row index are checked before narrowing.
-template <typename RI = i_t>
-struct gpu_csc_view_t {
+// All matrix row indices, including the four immutable LU factors, use i_t.
+struct gpu_csc_view {
   i_t m{0}, n{0}, nz_max{0};
   gpu_span<const i_t> col_start;
-  gpu_span<RI> i;
+  gpu_span<i_t> i;
   gpu_span<f_t> x;
   __device__ i_t nnz() const { return col_start[n]; }
 };
-
-using gpu_csc_view = gpu_csc_view_t<i_t>;
-template <typename FactorIndex>
-using gpu_factor_view_t = gpu_csc_view_t<FactorIndex>;
 
 // Owning sparse-matrix (CSC). Used only for S_ (the MPF rank-1 update store),
 // which grows one (u,v) column-pair per iteration.
@@ -405,8 +399,7 @@ struct gpu_csr_matrix {
 };
 
 // Forward decl.
-template <typename FactorIndex>
-struct gpu_basis_update_mpf_t;
+struct gpu_basis_update_t;
 
 // ---------------------------------------------------------------------------
 // gpu_sparse_vector : owning sparse vector (created/grown inside the kernel).
@@ -601,7 +594,6 @@ __host__ __device__ constexpr bool op_ascending(int op) { return op == 0 || op =
 // Trivially constructible (no member initializers) so it can be a __shared__
 // variable. Lane 0 fills every field (warp_build_config + warp_dispatch) before
 // any lane reads it, ordered by the first __syncwarp.
-template <typename FactorIndex>
 struct warp_solve_config_t {
   // ONLY the elimination-level SCHEDULE survives. Every per-dispatch REQUEST field (x/op and the
   // tl_/dz_/dzs_/td_/fd_/rt_/su_/pi_/ud_/nbe_/sp_op/sp_nlev groups, ~95 fields, ~700 of 928 bytes)
@@ -611,7 +603,7 @@ struct warp_solve_config_t {
   // read — the four wavefront bodies encode their own direction, so nothing consumes them.
   // Built once (by the kernel prologue on lane 0), read-only after.
   const i_t* cs[kNumWarpSolveOps];      // gather CSC col_start
-  const FactorIndex* ridx[kNumWarpSolveOps];    // gather CSC row indices
+  const i_t* ridx[kNumWarpSolveOps];    // gather CSC row indices
   const f_t* val[kNumWarpSolveOps];     // gather CSC values
   const i_t* lstart[kNumWarpSolveOps];  // level offsets [nlev+1]
   const i_t* corder[kNumWarpSolveOps];  // columns by level [m]
@@ -650,20 +642,20 @@ __device__ __forceinline__ f_t warp_reduce_min(f_t v);
 // COMPILE-TIME operator variant, for the `Direct` path where the op is a literal at the call
 // site. Nothing about the solve is decided at runtime: no op code, no flag loads, no per-column
 // branches — ptxas emits one specialized wavefront body per call site.
-template <int Op, typename FactorIndex>
+template <int Op>
 __device__ __forceinline__ void warp_solve_body_op(const i_t* a_corder, const i_t* a_cs,
                                                    const i_t* a_lstart, i_t a_nlev,
-                                                   const FactorIndex* a_ridx,
+                                                   const i_t* a_ridx,
                                                    const f_t* a_val, f_t* a_x)
 {
   dts::wavefront_solve_op<Op>(a_cs, a_ridx, a_val, a_x, a_lstart, a_corder, a_nlev);
 }
 
 
-template <int Op, typename FactorIndex>
+template <int Op>
 __device__ __forceinline__ void warp_solve2_body_op(const i_t* a_corder, const i_t* a_cs,
                                                     const i_t* a_lstart, i_t a_nlev,
-                                                    const FactorIndex* a_ridx,
+                                                    const i_t* a_ridx,
                                                     const f_t* a_val, f_t* a_x0, f_t* a_x1)
 {
   dts::wavefront_solve2_op<Op>(
@@ -1435,9 +1427,9 @@ __device__ __forceinline__ i_t warp_sptrsv_maxlevel_body(const i_t* a_level, i_t
 }
 
 // COMPILE-TIME operator variant of the reach-restricted gather (`Direct` path).
-template <int Op, typename FactorIndex>
+template <int Op>
 __device__ __forceinline__ void warp_sptrsv_body_op(const i_t* a_cs,
-                                                    const FactorIndex* a_ridx,
+                                                    const i_t* a_ridx,
                                                     const f_t* a_val, i_t* a_sp_co, i_t* a_sp_ls,
                                                     int a_sp_nlev, f_t* a_x)
 {
@@ -1469,8 +1461,7 @@ __device__ __forceinline__ f_t warp_reduce_min(f_t v)
 // Build the elimination-level schedule of one gather operator (lane 0, once).
 // `mat` is the gather CSC (its columns are the solve's output rows). Fills
 // level_start[nlev+1] and col_order[m]; returns nlev. `level` is m-sized scratch.
-template <typename RI>
-__device__ int warp_build_levels(const gpu_csc_view_t<RI>& mat, bool diag_first, bool asc_process,
+__device__ int warp_build_levels(const gpu_csc_view& mat, bool diag_first, bool asc_process,
                                   gpu_span<i_t>& level, gpu_span<i_t>& level_start,
                                   gpu_span<i_t>& col_order, gpu_span<i_t>& pos)
 {
@@ -1525,14 +1516,21 @@ __device__ int warp_build_levels(const gpu_csc_view_t<RI>& mat, bool diag_first,
 
 
 // ---- sparse triangular solve (reach + iterative DFS) ----------------------
-// Visited state lives in a private byte array so the factor CSC remains read-only. Only lane 0
-// walks the DFS, so byte loads/stores are sufficient; reached entries are cleared on exit instead
-// of sweeping all m rows per solve.
+// Visited state lives in a private byte buffer so the factor CSC remains read-only. The warp
+// reach path views this buffer as 32-bit words; small matrices use one byte per row.
+using reach_mark_word = std::uint32_t;
+static_assert(sizeof(reach_mark_word) == 4);
+
+// Keep m addressable bytes per seat while rounding only this buffer up to word alignment.
+__host__ __device__ constexpr i_t reach_mark_storage_words(i_t rows)
+{
+  const i_t words = rows / 4 + (rows % 4 != 0);
+  return words == 0 ? 1 : words;
+}
 
 // pinv == nullptr means no permutation.
-template <typename RI>
 __device__ i_t depth_first_search(
-  i_t j, const i_t* pinv, const gpu_csc_view_t<RI>& G, unsigned char* marked, i_t top, i_t* xi,
+  i_t j, const i_t* pinv, const gpu_csc_view& G, unsigned char* marked, i_t top, i_t* xi,
   i_t* pstack)
 {
   i_t head = 0;
@@ -1567,8 +1565,6 @@ __device__ i_t depth_first_search(
   return top;
 }
 
-using reach_mark_word = unsigned int;
-
 __device__ __forceinline__ bool reach_bit_marked(const reach_mark_word* marked, i_t row)
 {
   return (marked[row >> 5] & (1u << (row & 31))) != 0;
@@ -1586,9 +1582,8 @@ __device__ __forceinline__ void reach_bit_clear(reach_mark_word* marked, i_t row
 
 // General global-stack fallback for a bit-packed reach whose active depth exceeds the shared hot
 // stack. Lane 0 is the only accessor, so ordinary word read-modify-write operations are sufficient.
-template <typename RI>
 __device__ i_t depth_first_search_bits(
-  i_t root, const gpu_csc_view_t<RI>& G, reach_mark_word* marked, i_t top, i_t* xi, i_t* pstack)
+  i_t root, const gpu_csc_view& G, reach_mark_word* marked, i_t top, i_t* xi, i_t* pstack)
 {
   i_t head = 0;
   xi[0]    = root;
@@ -1617,9 +1612,8 @@ __device__ i_t depth_first_search_bits(
 // 64-entry hot stack (shared memory in the monolith), cache both CSC bounds once per discovered
 // vertex, and resume at p+1 instead of reloading the edge that led to the child. If an unusually
 // deep factor exceeds the hot stack, the general bitset DFS handles that subtree in xi/xi+m.
-template <typename RI>
 __device__ i_t depth_first_search_hot(
-  i_t root, const gpu_csc_view_t<RI>& G, reach_mark_word* marked, i_t top, i_t* xi,
+  i_t root, const gpu_csc_view& G, reach_mark_word* marked, i_t top, i_t* xi,
   i_t* dfs_node, i_t* dfs_next, i_t* dfs_end)
 {
   constexpr i_t hot_depth = 64;
@@ -1653,9 +1647,8 @@ __device__ i_t depth_first_search_hot(
   return top;
 }
 
-template <typename RI>
 __device__ i_t reach_hot(
-  const gpu_sparse_vector& b, const gpu_csc_view_t<RI>& G, reach_mark_word* marked, i_t* xi,
+  const gpu_sparse_vector& b, const gpu_csc_view& G, reach_mark_word* marked, i_t* xi,
   i_t* dfs_node, i_t* dfs_next, i_t* dfs_end)
 {
   const i_t m   = G.m;
@@ -1671,9 +1664,8 @@ __device__ i_t reach_hot(
   return top;
 }
 
-template <typename RI>
 __device__ i_t reach(
-  const gpu_sparse_vector& b, const i_t* pinv, const gpu_csc_view_t<RI>& G, unsigned char* marked,
+  const gpu_sparse_vector& b, const i_t* pinv, const gpu_csc_view& G, unsigned char* marked,
   i_t* xi)
 {
   const i_t m   = G.m;
@@ -1740,8 +1732,7 @@ __device__ __forceinline__ T lane0_bcast(T v)
 // L0_/U0_ (+ transposes) and permutations are fixed views uploaded from the
 // host; S_/mu_values_ grow in-kernel as rank-1 updates are stacked.
 // ---------------------------------------------------------------------------
-template <typename FactorIndex>
-struct gpu_basis_update_mpf_t {
+struct gpu_basis_update_t {
   // Compile-time tag for the BU switch in the templated driver/kernel (mirrors the CPU
   // `is_mpf = std::is_same<BU, basis_update_mpf_t>` dispatch in simplified_dual_phase2).
   static constexpr bool is_mpf_bu = true;
@@ -1759,9 +1750,8 @@ struct gpu_basis_update_mpf_t {
   i_t eta_nnz_cap_{0};
   // Set by grow_storage when the store cannot take another update. Sticky until the next reset.
   bool store_exhausted_{false};
-  using factor_index_type = FactorIndex;
-  using factor_view_type  = gpu_factor_view_t<FactorIndex>;
-  using warp_config_type  = warp_solve_config_t<FactorIndex>;
+  using factor_view_type  = gpu_csc_view;
+  using warp_config_type  = warp_solve_config_t;
 
   factor_view_type L0_, U0_, L0_transpose_, U0_transpose_;
   gpu_span<i_t> row_permutation_, inverse_row_permutation_;
@@ -1769,7 +1759,7 @@ struct gpu_basis_update_mpf_t {
   gpu_span<f_t> mu_values_;
   gpu_span<i_t> xi_workspace_;  // size 2*m (scratch)
   gpu_span<f_t> x_workspace_;   // size m   (scratch)
-  gpu_span<unsigned char> reach_mark_;  // size m, private visited bytes for immutable factor DFS
+  gpu_span<unsigned char> reach_mark_;  // m bytes; the warp reach path uses aligned 32-bit words
   // Reused solve scratch (owning; grows to m once, then reused every call) so the b_solve /
   // b_transpose_solve dense↔sparse conversions and the sparse-Lᵀ gather no longer device-malloc a
   // fresh temporary per solve. Bit-identical to the per-call locals (same values, same order).
@@ -1806,10 +1796,10 @@ struct gpu_basis_update_mpf_t {
   // update_cap_/eta_nnz_cap_ set they are preallocated once by reserve_store() and never grow, so
   // they are now fixed-size preallocated buffers; overflow is reported, never allocated.
 
-  __device__ gpu_basis_update_mpf_t() {}
-  gpu_basis_update_mpf_t(const gpu_basis_update_mpf_t&)            = delete;
-  gpu_basis_update_mpf_t& operator=(const gpu_basis_update_mpf_t&) = delete;
-  __device__ ~gpu_basis_update_mpf_t()                             = default;
+  __device__ gpu_basis_update_t() {}
+  gpu_basis_update_t(const gpu_basis_update_t&)            = delete;
+  gpu_basis_update_t& operator=(const gpu_basis_update_t&) = delete;
+  __device__ ~gpu_basis_update_t()                             = default;
 
   __device__ i_t num_updates() const { return num_updates_; }
 
@@ -2576,9 +2566,6 @@ struct gpu_basis_update_mpf_t {
   }
 
 };
-
-using gpu_basis_update_mpf_u16 = gpu_basis_update_mpf_t<std::uint16_t>;
-using gpu_basis_update_mpf_i32 = gpu_basis_update_mpf_t<i_t>;
 
 // ---------------------------------------------------------------------------
 // LP / settings / solution device structs (non-owning views over uploaded data)
@@ -3929,21 +3916,21 @@ struct kernel_args {
   gpu_bound_delta<i_t, f_t>* bound_deltas;
   i_t bound_delta_count;
   f_t obj_scale, obj_constant;
-  // Fixed-factor row-index width is selected once per launch.
+  // Fixed-factor row indices use i_t throughout.
   i_t* L0_col_start;
-  void* L0_i;
+  i_t* L0_i;
   f_t* L0_x;
   i_t L0_nz;
   i_t* U0_col_start;
-  void* U0_i;
+  i_t* U0_i;
   f_t* U0_x;
   i_t U0_nz;
   i_t* L0t_col_start;
-  void* L0t_i;
+  i_t* L0t_i;
   f_t* L0t_x;
   i_t L0t_nz;
   i_t* U0t_col_start;
-  void* U0t_i;
+  i_t* U0t_i;
   f_t* U0t_x;
   i_t U0t_nz;
   i_t *row_perm, *inv_row_perm;
@@ -3952,7 +3939,7 @@ struct kernel_args {
   unsigned char* reach_mark;
   i_t num_updates;
   i_t refactor_frequency;
-  // Caps on the preallocated MPF rank-1 store (see gpu_basis_update_mpf_t). 0/0 = uncapped, i.e.
+  // Caps on the preallocated MPF rank-1 store (see gpu_basis_update_t). 0/0 = uncapped, i.e.
   // the historical grow-in-kernel behaviour. Sized by mpf_store_caps().
   i_t mpf_update_cap;
   i_t mpf_eta_nnz_cap;
@@ -3960,7 +3947,7 @@ struct kernel_args {
   // placement-news into on first entry and reuses thereafter. This is what lets the per-pivot
   // workspaces + ft's mutable state (S_, routing stats, scratch) outlive a single kernel launch —
   // host-visible "already constructed" flag (0 = fresh node → construct + run setup).
-  void* slot;
+  slot_state<gpu_basis_update_t>* slot;
   // Per-slot flat buffer for every gpu_span payload. Ordinary VRAM,
   // so it is NOT subject to the driver's ~16 GB in-kernel malloc cap -- which is what used to set the
   // batch-size ceiling. Null/0 is legal and simply leaves every buffer on device malloc().
@@ -4010,16 +3997,15 @@ __device__ gpu_csc_view make_view(
   return v;
 }
 
-template <typename FactorIndex>
-__device__ gpu_factor_view_t<FactorIndex> make_factor_view(
-  i_t rows, i_t cols, i_t nz, i_t* col_start, FactorIndex* idx, f_t* val)
+__device__ gpu_csc_view make_factor_view(
+  i_t rows, i_t cols, i_t nz, i_t* col_start, i_t* idx, f_t* val)
 {
-  gpu_factor_view_t<FactorIndex> v;
+  gpu_csc_view v;
   v.m         = rows;
   v.n         = cols;
   v.nz_max    = nz;
   v.col_start = gpu_span<const i_t>(col_start, cols + 1);
-  v.i         = gpu_span<FactorIndex>(idx, nz);
+  v.i         = gpu_span<i_t>(idx, nz);
   v.x         = gpu_span<f_t>(val, nz);
   return v;
 }
@@ -4028,9 +4014,8 @@ __device__ gpu_factor_view_t<FactorIndex> make_factor_view(
 // Fill the warp-solve config for all 4 operators (lane 0, once at start). The
 // level schedules are written into the caller-owned gpu_spans ls[o]/co[o]
 // (kept alive for the whole kernel); `lvlscratch` is reused m-sized workspace.
-template <typename FactorIndex>
-__device__ __noinline__ void warp_build_config(const gpu_basis_update_mpf_t<FactorIndex>& ft,
-                                  warp_solve_config_t<FactorIndex>& cfg,
+__device__ __noinline__ void warp_build_config(const gpu_basis_update_t& ft,
+                                  warp_solve_config_t& cfg,
                                    gpu_span<i_t>* lev, gpu_span<i_t>* ls, gpu_span<i_t>* co,
                                    gpu_span<i_t>& sp_ls_v, gpu_span<i_t>& sp_co_v,
                                    gpu_span<i_t>& sp_pos_v, gpu_span<i_t>& lvl_pos_v)
@@ -4047,7 +4032,7 @@ __device__ __noinline__ void warp_build_config(const gpu_basis_update_mpf_t<Fact
   cfg.sp_ls  = sp_ls_v.data();
   cfg.sp_pos = sp_pos_v.data();
   // op order: L, U, Lᵀ, Uᵀ. Gather matrix + flags per op.
-  const gpu_factor_view_t<FactorIndex>* mats[kNumWarpSolveOps] = {
+  const gpu_csc_view* mats[kNumWarpSolveOps] = {
     &ft.L0_transpose_, &ft.U0_transpose_, &ft.L0_, &ft.U0_};
   for (int o = 0; o < kNumWarpSolveOps; ++o) {
     cfg.cs[o]         = mats[o]->col_start.data();
@@ -4069,11 +4054,11 @@ __device__ __noinline__ void warp_build_config(const gpu_basis_update_mpf_t<Fact
 // reads and writes only that problem's independently marshalled buffers in args[idx].
 // g_gpu_capacity_exceeded is reset by the HOST before launch (not here) so a late block cannot
 // clear a failure flag an earlier block already set.
-template <class FT, bool AllowRefactorExit, bool PersistentSeats = false>
+template <bool AllowRefactorExit, bool PersistentSeats = false>
 __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args, i_t idx)
 {
-  using factor_index_type = typename FT::factor_index_type;
-  using warp_config_type  = typename FT::warp_config_type;
+  using FT = gpu_basis_update_t;
+  using warp_config_type = FT::warp_config_type;
   // NOTE: the CUDA 13 `.pragma "enable_smem_spilling"` (spill regs to shared instead of local) is
   // INCOMPATIBLE here — ptxas fails with "(C7800) Smem spilling should not be enabled when functions
   // use abi": this kernel makes ABI (non-inlined) device calls into the whole driver, and the pragma
@@ -4144,16 +4129,14 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args, i_t id
   settings.steepest_edge_ratio = a.steepest_edge_ratio;
   settings.refactor_frequency  = a.refactor_frequency;
 
-  // Per-slot state (see slot_state). The host hands us a zeroed blob sized for slot_state<FT>;
-  // construct it in place and wire the read-only factorization views into its ft. This is
-  // unconditional -- the blob is freshly zeroed per launch. It used to be guarded by the host's
-  // that flag to 1 once the super-steps were removed.
-  slot_state<FT>& st = *static_cast<slot_state<FT>*>(a.slot);
-  // placement-new, ft wiring and S_.init_empty (which resizes -> mallocs) are all RMW on shared
-  // state, so under Direct they belong to lane 0 alone.
+  // Per-slot state (see slot_state). Fresh and refactor commands reset it and wire the
+  // read-only factorization views into its ft; child continuation retains the live state.
+  // RMM allocates typed but uninitialized device storage. Placement new below only calls the
+  // constructor in that already-allocated memory; it does not allocate device memory.
+  // Construction, ft wiring and S_.init_empty are RMW on shared state and belong to lane 0.
   if (!child_continue) {
     lane0_serial([&] {
-      new (&st) slot_state<FT>();  // placement new: reset logical state for fresh/refactor commands
+      slot_state<FT>& st = *new (a.slot) slot_state<FT>();
     // Wire every buffer into the host-provided slot memory. Nothing allocates: a buffer that
     // outgrows its layout slot is a layout bug and is reported, not silently regrown.
     // Exceeding a span's reserved capacity is a host-side sizing bug; a debug build asserts.
@@ -4161,10 +4144,10 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args, i_t id
     FT& ft                      = st.ft;
     ft.num_updates_             = a.num_updates;
     ft.refactor_frequency_      = a.refactor_frequency;
-    ft.L0_                      = make_factor_view(m, m, a.L0_nz, a.L0_col_start, static_cast<factor_index_type*>(a.L0_i), a.L0_x);
-    ft.U0_                      = make_factor_view(m, m, a.U0_nz, a.U0_col_start, static_cast<factor_index_type*>(a.U0_i), a.U0_x);
-    ft.L0_transpose_            = make_factor_view(m, m, a.L0t_nz, a.L0t_col_start, static_cast<factor_index_type*>(a.L0t_i), a.L0t_x);
-    ft.U0_transpose_            = make_factor_view(m, m, a.U0t_nz, a.U0t_col_start, static_cast<factor_index_type*>(a.U0t_i), a.U0t_x);
+    ft.L0_                      = make_factor_view(m, m, a.L0_nz, a.L0_col_start, a.L0_i, a.L0_x);
+    ft.U0_                      = make_factor_view(m, m, a.U0_nz, a.U0_col_start, a.U0_i, a.U0_x);
+    ft.L0_transpose_            = make_factor_view(m, m, a.L0t_nz, a.L0t_col_start, a.L0t_i, a.L0t_x);
+    ft.U0_transpose_            = make_factor_view(m, m, a.U0t_nz, a.U0t_col_start, a.U0t_i, a.U0t_x);
     ft.row_permutation_         = gpu_span<i_t>(a.row_perm, m);
     ft.inverse_row_permutation_ = gpu_span<i_t>(a.inv_row_perm, m);
     ft.xi_workspace_            = gpu_span<i_t>(a.xi_workspace, 2 * m);
@@ -4176,6 +4159,7 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args, i_t id
       ft.hypersparse_threshold_ = 0.05;
     });   // end lane-0 construction
   }
+  slot_state<FT>& st = *a.slot;
   FT& ft = st.ft;
 
   if (!child_continue) {
@@ -4265,8 +4249,7 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args, i_t id
 // Keep the cleanup's measured 128-register occupancy target for both factor-index specializations.
 // Keep only the resident-block budget in flight. Each block dequeues another independent problem
 // after finishing its current one, reducing tail imbalance without sharing any per-problem state.
-template <class FT = gpu_basis_update_mpf_u16,
-          bool AllowRefactorExit = false,
+template <bool AllowRefactorExit = false,
           bool PersistentSeats   = false>
 __global__ void __launch_bounds__(32, 16)
 // `next_problem` is PER LAUNCH, not a device global. Branch-and-bound runs one batch per GPU
@@ -4285,7 +4268,7 @@ gpu_phase2_kernel_direct(kernel_args* args,
     }
     __syncwarp(0xffffffffu);
     if (problem_idx >= n_problems) { break; }
-    gpu_phase2_kernel_body<FT, AllowRefactorExit, PersistentSeats>(args, problem_idx);
+    gpu_phase2_kernel_body<AllowRefactorExit, PersistentSeats>(args, problem_idx);
   }
 
   // Every block publishes all result writes before announcing that it has drained its share of
@@ -4346,101 +4329,288 @@ struct marshal_storage {
   }
 };
 
-// One device allocation per fixed-capacity field, with seat b at b * stride. The byte vector is
-// intentional: it permits the slot_state header to use its own alignment while retaining a single
-// allocation for that field. Each field is separately allocated, never a mixed-type slab.
-enum class fixed_field_id : size_t {
-  lower, upper,
-  L0_col_start, U0_col_start, L0t_col_start, U0t_col_start,
-  row_perm, inv_row_perm, xi_workspace, x_workspace, reach_mark,
-  vstatus, basic_list, nonbasic_list, x, y, z, dy_se,
-  out_status, out_objective, out_user_objective, out_iterations, slot,
-  xB_workspace, delta_y, delta_z, delta_x, v, squared_infeas, setup_rhs,
-  basic_mark, delta_z_mark, delta_z_indices, nonbasic_pos, infeas_idx,
-  ft_dense_scratch, ft_dense_scratch2, ft_sort_bucket, ft_sort_x, ft_sort_i, ft_sort_perm,
-  lvl_lev0, lvl_ls0, lvl_co0, lvl_lev1, lvl_ls1, lvl_co1,
-  lvl_lev2, lvl_ls2, lvl_co2, lvl_lev3, lvl_ls3, lvl_co3,
-  sp_ls_v, sp_co_v, sp_pos_v, lvl_pos_v,
-  ft_recover_rhs, ft_recover_sol, S_col_start, S_i, S_x, mu_values,
-  delta_y_sparse_i, delta_y_sparse_x, UTsol_sparse_i, UTsol_sparse_x,
-  utilde_sparse_i, utilde_sparse_x, scaled_dxB_sparse_i, scaled_dxB_sparse_x,
-  rhs_sparse_i, rhs_sparse_x, v_sparse_i, v_sparse_x,
-  se_dy_i, se_dy_x, se_UTsol_i, se_UTsol_x, se_ei_i, se_ei_x,
-  ft_sparse_scratch_i, ft_sparse_scratch_x, ft_ei_scratch_i, ft_ei_scratch_x,
-  count
-};
-static_assert(static_cast<size_t>(fixed_field_id::count) == 85);
+// One typed device vector per fixed-capacity field. Only reach_mark rounds its byte-sized seat
+// storage up to 32-bit words, because the warp reach path accesses it through a word pointer.
+struct fixed_storage {
+  rmm::device_uvector<f_t> lower;
+  rmm::device_uvector<f_t> upper;
+  rmm::device_uvector<i_t> L0_col_start;
+  rmm::device_uvector<i_t> U0_col_start;
+  rmm::device_uvector<i_t> L0t_col_start;
+  rmm::device_uvector<i_t> U0t_col_start;
+  rmm::device_uvector<i_t> row_perm;
+  rmm::device_uvector<i_t> inv_row_perm;
+  rmm::device_uvector<i_t> xi_workspace;
+  rmm::device_uvector<f_t> x_workspace;
+  rmm::device_uvector<reach_mark_word> reach_mark;
+  rmm::device_uvector<variable_status_t> vstatus;
+  rmm::device_uvector<i_t> basic_list;
+  rmm::device_uvector<i_t> nonbasic_list;
+  rmm::device_uvector<f_t> x;
+  rmm::device_uvector<f_t> y;
+  rmm::device_uvector<f_t> z;
+  rmm::device_uvector<f_t> dy_se;
+  rmm::device_uvector<i_t> out_status;
+  rmm::device_uvector<f_t> out_objective;
+  rmm::device_uvector<f_t> out_user_objective;
+  rmm::device_uvector<i_t> out_iterations;
+  rmm::device_uvector<slot_state<gpu_basis_update_t>> slot;
+  rmm::device_uvector<f_t> xB_workspace;
+  rmm::device_uvector<f_t> delta_y;
+  rmm::device_uvector<f_t> delta_z;
+  rmm::device_uvector<f_t> delta_x;
+  rmm::device_uvector<f_t> v;
+  rmm::device_uvector<f_t> squared_infeas;
+  rmm::device_uvector<f_t> setup_rhs;
+  rmm::device_uvector<i_t> basic_mark;
+  rmm::device_uvector<i_t> delta_z_mark;
+  rmm::device_uvector<i_t> delta_z_indices;
+  rmm::device_uvector<i_t> nonbasic_pos;
+  rmm::device_uvector<i_t> infeas_idx;
+  rmm::device_uvector<f_t> ft_dense_scratch;
+  rmm::device_uvector<f_t> ft_dense_scratch2;
+  rmm::device_uvector<f_t> ft_sort_bucket;
+  rmm::device_uvector<f_t> ft_sort_x;
+  rmm::device_uvector<i_t> ft_sort_i;
+  rmm::device_uvector<i_t> ft_sort_perm;
+  rmm::device_uvector<i_t> lvl_lev0;
+  rmm::device_uvector<i_t> lvl_ls0;
+  rmm::device_uvector<i_t> lvl_co0;
+  rmm::device_uvector<i_t> lvl_lev1;
+  rmm::device_uvector<i_t> lvl_ls1;
+  rmm::device_uvector<i_t> lvl_co1;
+  rmm::device_uvector<i_t> lvl_lev2;
+  rmm::device_uvector<i_t> lvl_ls2;
+  rmm::device_uvector<i_t> lvl_co2;
+  rmm::device_uvector<i_t> lvl_lev3;
+  rmm::device_uvector<i_t> lvl_ls3;
+  rmm::device_uvector<i_t> lvl_co3;
+  rmm::device_uvector<i_t> sp_ls_v;
+  rmm::device_uvector<i_t> sp_co_v;
+  rmm::device_uvector<i_t> sp_pos_v;
+  rmm::device_uvector<i_t> lvl_pos_v;
+  rmm::device_uvector<f_t> ft_recover_rhs;
+  rmm::device_uvector<f_t> ft_recover_sol;
+  rmm::device_uvector<i_t> S_col_start;
+  rmm::device_uvector<i_t> S_i;
+  rmm::device_uvector<f_t> S_x;
+  rmm::device_uvector<f_t> mu_values;
+  rmm::device_uvector<i_t> delta_y_sparse_i;
+  rmm::device_uvector<f_t> delta_y_sparse_x;
+  rmm::device_uvector<i_t> UTsol_sparse_i;
+  rmm::device_uvector<f_t> UTsol_sparse_x;
+  rmm::device_uvector<i_t> utilde_sparse_i;
+  rmm::device_uvector<f_t> utilde_sparse_x;
+  rmm::device_uvector<i_t> scaled_dxB_sparse_i;
+  rmm::device_uvector<f_t> scaled_dxB_sparse_x;
+  rmm::device_uvector<i_t> rhs_sparse_i;
+  rmm::device_uvector<f_t> rhs_sparse_x;
+  rmm::device_uvector<i_t> v_sparse_i;
+  rmm::device_uvector<f_t> v_sparse_x;
+  rmm::device_uvector<i_t> se_dy_i;
+  rmm::device_uvector<f_t> se_dy_x;
+  rmm::device_uvector<i_t> se_UTsol_i;
+  rmm::device_uvector<f_t> se_UTsol_x;
+  rmm::device_uvector<i_t> se_ei_i;
+  rmm::device_uvector<f_t> se_ei_x;
+  rmm::device_uvector<i_t> ft_sparse_scratch_i;
+  rmm::device_uvector<f_t> ft_sparse_scratch_x;
+  rmm::device_uvector<i_t> ft_ei_scratch_i;
+  rmm::device_uvector<f_t> ft_ei_scratch_x;
 
-struct packed_fixed_storage {
-  struct field {
-    std::optional<rmm::device_uvector<std::uint8_t>> device;
-    std::vector<std::uint8_t> upload;
-    size_t stride_bytes{0};
+  std::vector<f_t> h_lower;
+  std::vector<f_t> h_upper;
+  std::vector<i_t> h_L0_col_start;
+  std::vector<i_t> h_U0_col_start;
+  std::vector<i_t> h_L0t_col_start;
+  std::vector<i_t> h_U0t_col_start;
+  std::vector<i_t> h_row_perm;
+  std::vector<i_t> h_inv_row_perm;
+  std::vector<variable_status_t> h_vstatus;
+  std::vector<i_t> h_basic_list;
+  std::vector<i_t> h_nonbasic_list;
+  std::vector<f_t> h_x;
+  std::vector<f_t> h_y;
+  std::vector<f_t> h_z;
+  std::vector<f_t> h_dy_se;
+  struct upload_descriptor {
+    void* device;
+    const void* host;
+    size_t bytes;
   };
-  std::array<field, static_cast<size_t>(fixed_field_id::count)> fields;
-  size_t seats{0};
-  rmm::cuda_stream_view stream{rmm::cuda_stream_default};
+  std::vector<upload_descriptor> uploads;
+  size_t seats;
+  rmm::cuda_stream_view stream;
 
-  template <typename T>
-  T* seat_ptr(fixed_field_id id,
-              size_t seat,
-              size_t elements,
-              bool zeroed = false,
-              bool staged_upload = false,
-              size_t alignment = alignof(T))
+  fixed_storage(size_t seat_count, size_t m, size_t n, size_t ucap,
+                size_t eta, rmm::cuda_stream_view s)
+    :
+      // The batch is homogeneous, so every seat has the same field widths.
+      lower(seat_count * (n), s),
+      upper(seat_count * (n), s),
+      L0_col_start(seat_count * (m + 1), s),
+      U0_col_start(seat_count * (m + 1), s),
+      L0t_col_start(seat_count * (m + 1), s),
+      U0t_col_start(seat_count * (m + 1), s),
+      row_perm(seat_count * (m), s),
+      inv_row_perm(seat_count * (m), s),
+      xi_workspace(seat_count * (2 * m), s),
+      x_workspace(seat_count * (m), s),
+      reach_mark(seat_count * static_cast<size_t>(reach_mark_storage_words(static_cast<i_t>(m))), s),
+      vstatus(seat_count * (n), s),
+      basic_list(seat_count * (m), s),
+      nonbasic_list(seat_count * (n - m), s),
+      x(seat_count * (n), s),
+      y(seat_count * (m), s),
+      z(seat_count * (n), s),
+      dy_se(seat_count * (n), s),
+      out_status(seat_count * (2), s),
+      out_objective(seat_count * (1), s),
+      out_user_objective(seat_count * (1), s),
+      out_iterations(seat_count * (1), s),
+      slot(seat_count * (1), s),
+      xB_workspace(seat_count * (std::max(m, n)), s),
+      delta_y(seat_count * (std::max(m, n)), s),
+      delta_z(seat_count * (std::max(m, n)), s),
+      delta_x(seat_count * (std::max(m, n)), s),
+      v(seat_count * (std::max(m, n)), s),
+      squared_infeas(seat_count * (std::max(m, n)), s),
+      setup_rhs(seat_count * (std::max(m, n)), s),
+      basic_mark(seat_count * (std::max(m, n)), s),
+      delta_z_mark(seat_count * (std::max(m, n)), s),
+      delta_z_indices(seat_count * (std::max(m, n)), s),
+      nonbasic_pos(seat_count * (std::max(m, n)), s),
+      infeas_idx(seat_count * (std::max(m, n)), s),
+      ft_dense_scratch(seat_count * (std::max(m, n)), s),
+      ft_dense_scratch2(seat_count * (std::max(m, n)), s),
+      ft_sort_bucket(seat_count * (std::max(m, n)), s),
+      ft_sort_x(seat_count * (std::max(m, n)), s),
+      ft_sort_i(seat_count * (std::max(m, n)), s),
+      ft_sort_perm(seat_count * (std::max(m, n)), s),
+      lvl_lev0(seat_count * (m + 1), s),
+      lvl_ls0(seat_count * (m + 1), s),
+      lvl_co0(seat_count * (m + 1), s),
+      lvl_lev1(seat_count * (m + 1), s),
+      lvl_ls1(seat_count * (m + 1), s),
+      lvl_co1(seat_count * (m + 1), s),
+      lvl_lev2(seat_count * (m + 1), s),
+      lvl_ls2(seat_count * (m + 1), s),
+      lvl_co2(seat_count * (m + 1), s),
+      lvl_lev3(seat_count * (m + 1), s),
+      lvl_ls3(seat_count * (m + 1), s),
+      lvl_co3(seat_count * (m + 1), s),
+      sp_ls_v(seat_count * (m + 1), s),
+      sp_co_v(seat_count * (m + 1), s),
+      sp_pos_v(seat_count * (m + 1), s),
+      lvl_pos_v(seat_count * (m + 1), s),
+      ft_recover_rhs(seat_count * (m), s),
+      ft_recover_sol(seat_count * (m), s),
+      S_col_start(seat_count * (2 * ucap + 1), s),
+      S_i(seat_count * (eta), s),
+      S_x(seat_count * (eta), s),
+      mu_values(seat_count * (ucap), s),
+      delta_y_sparse_i(seat_count * (std::max(m, n)), s),
+      delta_y_sparse_x(seat_count * (std::max(m, n)), s),
+      UTsol_sparse_i(seat_count * (std::max(m, n)), s),
+      UTsol_sparse_x(seat_count * (std::max(m, n)), s),
+      utilde_sparse_i(seat_count * (std::max(m, n)), s),
+      utilde_sparse_x(seat_count * (std::max(m, n)), s),
+      scaled_dxB_sparse_i(seat_count * (std::max(m, n)), s),
+      scaled_dxB_sparse_x(seat_count * (std::max(m, n)), s),
+      rhs_sparse_i(seat_count * (std::max(m, n)), s),
+      rhs_sparse_x(seat_count * (std::max(m, n)), s),
+      v_sparse_i(seat_count * (std::max(m, n)), s),
+      v_sparse_x(seat_count * (std::max(m, n)), s),
+      se_dy_i(seat_count * (std::max(m, n)), s),
+      se_dy_x(seat_count * (std::max(m, n)), s),
+      se_UTsol_i(seat_count * (std::max(m, n)), s),
+      se_UTsol_x(seat_count * (std::max(m, n)), s),
+      se_ei_i(seat_count * (std::max(m, n)), s),
+      se_ei_x(seat_count * (std::max(m, n)), s),
+      ft_sparse_scratch_i(seat_count * (std::max(m, n)), s),
+      ft_sparse_scratch_x(seat_count * (std::max(m, n)), s),
+      ft_ei_scratch_i(seat_count * (std::max(m, n)), s),
+      ft_ei_scratch_x(seat_count * (std::max(m, n)), s),
+      h_lower(seat_count * (n)),
+      h_upper(seat_count * (n)),
+      h_L0_col_start(seat_count * (m + 1)),
+      h_U0_col_start(seat_count * (m + 1)),
+      h_L0t_col_start(seat_count * (m + 1)),
+      h_U0t_col_start(seat_count * (m + 1)),
+      h_row_perm(seat_count * (m)),
+      h_inv_row_perm(seat_count * (m)),
+      h_vstatus(seat_count * (n)),
+      h_basic_list(seat_count * (m)),
+      h_nonbasic_list(seat_count * (n - m)),
+      h_x(seat_count * (n)),
+      h_y(seat_count * (m)),
+      h_z(seat_count * (n)),
+      h_dy_se(seat_count * (n)),
+      seats(seat_count),
+      stream(s)
   {
-    if (seat >= seats || alignment == 0) { throw std::runtime_error("invalid packed seat"); }
-    auto& f = fields[static_cast<size_t>(id)];
-    const size_t count = std::max<size_t>(elements, 1);
-    if (count > std::numeric_limits<size_t>::max() / sizeof(T)) {
-      throw std::runtime_error("packed field size overflow");
-    }
-    const size_t raw = count * sizeof(T);
-    if (raw > std::numeric_limits<size_t>::max() - (alignment - 1)) {
-      throw std::runtime_error("packed field alignment overflow");
-    }
-    const size_t stride = ((raw + alignment - 1) / alignment) * alignment;
-    if (!f.device) {
-      if (seats > std::numeric_limits<size_t>::max() / stride) {
-        throw std::runtime_error("packed batch size overflow");
-      }
-      f.stride_bytes = stride;
-      f.device.emplace(seats * stride, stream);
-      if (zeroed) {
-        RAFT_CUDA_TRY(cudaMemsetAsync(f.device->data(), 0, seats * stride, stream.value()));
-      }
-      if (staged_upload) { f.upload.resize(seats * stride); }
-    } else if (f.stride_bytes != stride) {
-      throw std::runtime_error("packed field stride changed within a batch");
-    }
-    return reinterpret_cast<T*>(f.device->data() + seat * stride);
+    const auto zero = [s](auto& field) {
+      RAFT_CUDA_TRY(cudaMemsetAsync(
+        field.data(), 0, field.size() * sizeof(*field.data()), s.value()));
+    };
+    zero(xi_workspace);
+    zero(x_workspace);
+    zero(reach_mark);
+    zero(out_status);
+    zero(out_objective);
+    zero(out_user_objective);
+    zero(out_iterations);
+    uploads = {
+      {lower.data(), h_lower.data(), h_lower.size() * sizeof(f_t)},
+      {upper.data(), h_upper.data(), h_upper.size() * sizeof(f_t)},
+      {L0_col_start.data(), h_L0_col_start.data(), h_L0_col_start.size() * sizeof(i_t)},
+      {U0_col_start.data(), h_U0_col_start.data(), h_U0_col_start.size() * sizeof(i_t)},
+      {L0t_col_start.data(), h_L0t_col_start.data(), h_L0t_col_start.size() * sizeof(i_t)},
+      {U0t_col_start.data(), h_U0t_col_start.data(), h_U0t_col_start.size() * sizeof(i_t)},
+      {row_perm.data(), h_row_perm.data(), h_row_perm.size() * sizeof(i_t)},
+      {inv_row_perm.data(), h_inv_row_perm.data(), h_inv_row_perm.size() * sizeof(i_t)},
+      {vstatus.data(), h_vstatus.data(), h_vstatus.size() * sizeof(variable_status_t)},
+      {basic_list.data(), h_basic_list.data(), h_basic_list.size() * sizeof(i_t)},
+      {nonbasic_list.data(), h_nonbasic_list.data(), h_nonbasic_list.size() * sizeof(i_t)},
+      {x.data(), h_x.data(), h_x.size() * sizeof(f_t)},
+      {y.data(), h_y.data(), h_y.size() * sizeof(f_t)},
+      {z.data(), h_z.data(), h_z.size() * sizeof(f_t)},
+      {dy_se.data(), h_dy_se.data(), h_dy_se.size() * sizeof(f_t)},
+    };
   }
 
   template <typename T>
-  T* stage(fixed_field_id id, size_t seat, const T* src, size_t count)
+  T* seat_ptr(rmm::device_uvector<T> fixed_storage::*member, size_t seat,
+              size_t elements)
   {
-    T* dst = seat_ptr<T>(id, seat, count, false, true);
-    auto& f = fields[static_cast<size_t>(id)];
-    if (count != 0) {
-      std::memcpy(f.upload.data() + seat * f.stride_bytes, src, count * sizeof(T));
+    if (seat >= seats) { throw std::runtime_error("invalid fixed-storage seat"); }
+    auto& field = this->*member;
+    if (field.size() != seats * elements) {
+      throw std::runtime_error("fixed field length changed within a batch");
     }
+    return elements == 0 ? nullptr : field.data() + seat * elements;
+  }
+
+  template <typename T>
+  T* stage(rmm::device_uvector<T> fixed_storage::*member,
+           std::vector<T> fixed_storage::*host_member,
+           size_t seat, const T* src, size_t count)
+  {
+    T* dst = seat_ptr(member, seat, count);
+    auto& host = this->*host_member;
+    if (host.size() != seats * count) {
+      throw std::runtime_error("fixed upload length changed within a batch");
+    }
+    if (count != 0) { std::memcpy(host.data() + seat * count, src, count * sizeof(T)); }
     return dst;
-  }
-
-  template <typename T>
-  T* data(fixed_field_id id)
-  {
-    auto& f = fields[static_cast<size_t>(id)];
-    return f.device ? reinterpret_cast<T*>(f.device->data()) : nullptr;
   }
 
   void flush_uploads()
   {
-    for (auto& f : fields) {
-      if (!f.upload.empty()) {
-        RAFT_CUDA_TRY(cudaMemcpyAsync(f.device->data(), f.upload.data(), f.upload.size(),
-                                      cudaMemcpyHostToDevice, stream.value()));
-      }
+    for (const auto& upload : uploads) {
+      if (upload.bytes == 0) { continue; }
+      RAFT_CUDA_TRY(cudaMemcpyAsync(upload.device, upload.host, upload.bytes,
+                                    cudaMemcpyHostToDevice, stream.value()));
     }
   }
 };
@@ -4461,32 +4631,6 @@ static T* upload_n(const T* p, size_t count, marshal_storage& st)
   if (count == 0) { st.bufs.emplace_back(bytes, st.stream); }
   else { st.bufs.emplace_back(p, bytes, st.stream); }
   return static_cast<T*>(st.bufs.back().data());
-}
-
-static constexpr size_t kUint16FactorRowCapacity =
-  static_cast<size_t>(std::numeric_limits<std::uint16_t>::max()) + 1;
-
-static bool factors_fit_uint16(i_t rows)
-{
-  return rows >= 0 && static_cast<size_t>(rows) <= kUint16FactorRowCapacity;
-}
-
-template <typename FactorIndex>
-static FactorIndex* upload_factor_indices(
-  const i_t* idx, size_t count, i_t rows, marshal_storage& st)
-{
-  std::vector<FactorIndex> converted(count);
-  for (size_t k = 0; k < count; ++k) {
-    if (idx[k] < 0 || idx[k] >= rows) {
-      throw std::runtime_error("gpu_phase2: factor row index is outside [0, m)");
-    }
-    if (static_cast<size_t>(idx[k]) >
-        static_cast<size_t>(std::numeric_limits<FactorIndex>::max())) {
-      throw std::runtime_error("gpu_phase2: selected factor-index type cannot represent row index");
-    }
-    converted[k] = static_cast<FactorIndex>(idx[k]);
-  }
-  return upload_n(converted.data(), converted.size(), st);
 }
 
 // Uninitialised: every per-slot buffer is resize/assign-filled before it is read, and zeroing all
@@ -4528,23 +4672,23 @@ static T* alloc_zeroed(size_t count, marshal_storage& st)
 template <typename T>
 static T* upload_fixed(const std::vector<T>& src,
                        marshal_storage& st,
-                       packed_fixed_storage* fixed,
-                       fixed_field_id id,
+                       fixed_storage* fixed,
+                       rmm::device_uvector<T> fixed_storage::*member,
+                       std::vector<T> fixed_storage::*host_member,
                        size_t seat)
 {
-  return fixed ? fixed->stage<T>(id, seat, src.data(), src.size()) : upload(src, st);
+  return fixed ? fixed->stage(member, host_member, seat, src.data(), src.size()) : upload(src, st);
 }
 
 template <typename T>
 static T* alloc_fixed(size_t count,
                       marshal_storage& st,
-                      packed_fixed_storage* fixed,
-                      fixed_field_id id,
+                      fixed_storage* fixed,
+                      rmm::device_uvector<T> fixed_storage::*member,
                       size_t seat,
-                      bool zeroed = false,
-                      size_t alignment = alignof(T))
+                      bool zeroed = false)
 {
-  if (fixed) { return fixed->seat_ptr<T>(id, seat, count, zeroed, false, alignment); }
+  if (fixed) { return fixed->seat_ptr(member, seat, count); }
   return zeroed ? alloc_zeroed<T>(count, st) : alloc_uninit<T>(count, st);
 }
 
@@ -4556,11 +4700,11 @@ static T* alloc_fixed(size_t count,
 // ---- [CONFIG] self-report -------------------------------------------------------------------
 // Every launch states its own decisive configuration. A measurement that reports its configuration
 // cannot be mislabelled by the operator, the shell history, or another agent reading the output.
-static void report_config(const char* path, size_t nprob, int factor_index_bits)
+static void report_config(const char* path, size_t nprob)
 {
   std::printf("[CONFIG] path=%s geometry=persistent-warp<<<resident,32>>> problems=%zu factor_index_bits=%d "
               "mu=divide tri_diag=divide\n",
-              path, nprob, factor_index_bits);
+              path, nprob, 32);
 }
 
 // Device heap (in-kernel gpu_span malloc arena) + stack are per-CONTEXT limits and the heap
@@ -4814,7 +4958,6 @@ static size_t slot_buffer_bytes(size_t m, size_t n, size_t ucap, size_t eta)
   return t;
 }
 
-template <typename FactorIndex>
 static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
                                    const simplex_solver_settings_t<i_t, f_t>& settings,
                                    std::vector<variable_status_t>& vstatus,
@@ -4829,7 +4972,7 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
                                    bool terminal_certificate_retry = false,
                                    const std::vector<f_t>* lower_ovr = nullptr,
                                    const std::vector<f_t>* upper_ovr = nullptr,
-                                   packed_fixed_storage* fixed = nullptr,
+                                   fixed_storage* fixed = nullptr,
                                    size_t seat = 0)
 {
   const int m = lp.num_rows;
@@ -4841,6 +4984,13 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   const auto& U0  = ft.U0();
   const auto& L0t = ft.L0_transpose();
   const auto& U0t = ft.U0_transpose();
+  for (const auto* factor : {&L0, &U0, &L0t, &U0t}) {
+    for (const auto row : factor->i) {
+      if (row < 0 || row >= m) {
+        throw std::runtime_error("gpu_phase2: factor row index is outside [0, m)");
+      }
+    }
+  }
 
   kernel_args a{};
   a.m = m;
@@ -4877,37 +5027,46 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   }
   // Per-node (basis- or branch-dependent), always uploaded per item: bounds, the LU factor, row perm.
   a.lower       = upload_fixed(lower_ovr != nullptr ? *lower_ovr : lp.lower,
-                               st, fixed, fixed_field_id::lower, seat);
+                               st, fixed, &fixed_storage::lower,
+                               &fixed_storage::h_lower, seat);
   a.upper       = upload_fixed(upper_ovr != nullptr ? *upper_ovr : lp.upper,
-                               st, fixed, fixed_field_id::upper, seat);
+                               st, fixed, &fixed_storage::upper,
+                               &fixed_storage::h_upper, seat);
   // Allocated lazily only when the persistent path first continues a child. Keeping it null for
   // one-shot launches preserves their allocation footprint exactly.
   a.bound_deltas      = nullptr;
   a.bound_delta_count = 0;
-  a.L0_col_start = upload_fixed(L0.col_start, st, fixed, fixed_field_id::L0_col_start, seat);
+  a.L0_col_start = upload_fixed(L0.col_start, st, fixed, &fixed_storage::L0_col_start,
+                                &fixed_storage::h_L0_col_start, seat);
   a.L0_nz = L0.nnz();
-  a.L0_i = upload_factor_indices<FactorIndex>(L0.i.data(), L0.nnz(), m, st);
+  a.L0_i = upload_n(L0.i.data(), L0.nnz(), st);
   a.L0_x = upload_n(L0.x.data(), L0.nnz(), st);
-  a.U0_col_start = upload_fixed(U0.col_start, st, fixed, fixed_field_id::U0_col_start, seat);
+  a.U0_col_start = upload_fixed(U0.col_start, st, fixed, &fixed_storage::U0_col_start,
+                                &fixed_storage::h_U0_col_start, seat);
   a.U0_nz = U0.nnz();
-  a.U0_i = upload_factor_indices<FactorIndex>(U0.i.data(), U0.nnz(), m, st);
+  a.U0_i = upload_n(U0.i.data(), U0.nnz(), st);
   a.U0_x = upload_n(U0.x.data(), U0.nnz(), st);
-  a.L0t_col_start = upload_fixed(L0t.col_start, st, fixed, fixed_field_id::L0t_col_start, seat);
+  a.L0t_col_start = upload_fixed(L0t.col_start, st, fixed, &fixed_storage::L0t_col_start,
+                                 &fixed_storage::h_L0t_col_start, seat);
   a.L0t_nz = L0t.nnz();
-  a.L0t_i = upload_factor_indices<FactorIndex>(L0t.i.data(), L0t.nnz(), m, st);
+  a.L0t_i = upload_n(L0t.i.data(), L0t.nnz(), st);
   a.L0t_x = upload_n(L0t.x.data(), L0t.nnz(), st);
-  a.U0t_col_start = upload_fixed(U0t.col_start, st, fixed, fixed_field_id::U0t_col_start, seat);
+  a.U0t_col_start = upload_fixed(U0t.col_start, st, fixed, &fixed_storage::U0t_col_start,
+                                 &fixed_storage::h_U0t_col_start, seat);
   a.U0t_nz = U0t.nnz();
-  a.U0t_i = upload_factor_indices<FactorIndex>(U0t.i.data(), U0t.nnz(), m, st);
+  a.U0t_i = upload_n(U0t.i.data(), U0t.nnz(), st);
   a.U0t_x = upload_n(U0t.x.data(), U0t.nnz(), st);
-  a.row_perm     = upload_fixed(ft.row_permutation(), st, fixed, fixed_field_id::row_perm, seat);
+  a.row_perm     = upload_fixed(ft.row_permutation(), st, fixed, &fixed_storage::row_perm,
+                                &fixed_storage::h_row_perm, seat);
   a.inv_row_perm = upload_fixed(ft.inverse_row_permutation(), st, fixed,
-                                fixed_field_id::inv_row_perm, seat);
-  a.xi_workspace = alloc_fixed<int>(2 * m, st, fixed, fixed_field_id::xi_workspace, seat, true);
-  a.x_workspace  = alloc_fixed<double>(m, st, fixed, fixed_field_id::x_workspace, seat, true);
-  // The warp reach solver views these bytes as reach_mark_word entries.
-  a.reach_mark   = alloc_fixed<unsigned char>(m, st, fixed, fixed_field_id::reach_mark, seat,
-                                               true, alignof(reach_mark_word));
+                                &fixed_storage::inv_row_perm,
+                                &fixed_storage::h_inv_row_perm, seat);
+  a.xi_workspace = alloc_fixed<int>(2 * m, st, fixed, &fixed_storage::xi_workspace, seat, true);
+  a.x_workspace  = alloc_fixed<double>(m, st, fixed, &fixed_storage::x_workspace, seat, true);
+  const i_t reach_words = reach_mark_storage_words(m);
+  a.reach_mark = reinterpret_cast<unsigned char*>(
+    fixed ? fixed->seat_ptr(&fixed_storage::reach_mark, seat, reach_words)
+          : alloc_zeroed<reach_mark_word>(reach_words, st));
   a.num_updates  = 0;
   a.refactor_frequency = settings.refactor_frequency;
   a.mpf_update_cap     = mpf_update_cap();
@@ -4917,8 +5076,8 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   a.terminal_certificate_retry = terminal_certificate_retry ? 1 : 0;
   a.resume_obj      = sol.objective;
   a.resume_iter     = static_cast<i_t>(sol.iterations);
-  a.vstatus       = upload_fixed(vstatus, st, fixed, fixed_field_id::vstatus, seat);
-  a.basic_list    = upload_fixed(basic_list, st, fixed, fixed_field_id::basic_list, seat);
+  a.vstatus       = upload_fixed(vstatus, st, fixed, &fixed_storage::vstatus, &fixed_storage::h_vstatus, seat);
+  a.basic_list    = upload_fixed(basic_list, st, fixed, &fixed_storage::basic_list, &fixed_storage::h_basic_list, seat);
   // REACHABILITY CHECK for the nonbasic_list length contract. get_basis_from_vstatus routes
   // SUPERBASIC variables to superbasic_list, NOT nonbasic_list (basis_solves.cpp:53), so
   // nonbasic_list holds n - m - |superbasic| entries -- while the device's ratio test iterates
@@ -4930,11 +5089,11 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
                  nonbasic_list.size(), (int)(n - m), (int)m, (int)n,
                  (int)(n - m - static_cast<i_t>(nonbasic_list.size())));
   }
-  a.nonbasic_list = upload_fixed(nonbasic_list, st, fixed, fixed_field_id::nonbasic_list, seat);
-  a.x             = upload_fixed(sol.x, st, fixed, fixed_field_id::x, seat);
-  a.y             = upload_fixed(sol.y, st, fixed, fixed_field_id::y, seat);
-  a.z             = upload_fixed(sol.z, st, fixed, fixed_field_id::z, seat);
-  a.dy_se         = upload_fixed(delta_y_steepest_edge, st, fixed, fixed_field_id::dy_se, seat);
+  a.nonbasic_list = upload_fixed(nonbasic_list, st, fixed, &fixed_storage::nonbasic_list, &fixed_storage::h_nonbasic_list, seat);
+  a.x             = upload_fixed(sol.x, st, fixed, &fixed_storage::x, &fixed_storage::h_x, seat);
+  a.y             = upload_fixed(sol.y, st, fixed, &fixed_storage::y, &fixed_storage::h_y, seat);
+  a.z             = upload_fixed(sol.z, st, fixed, &fixed_storage::z, &fixed_storage::h_z, seat);
+  a.dy_se         = upload_fixed(delta_y_steepest_edge, st, fixed, &fixed_storage::dy_se, &fixed_storage::h_dy_se, seat);
 
   a.primal_tol = settings.primal_tol;
   a.dual_tol   = settings.dual_tol;
@@ -4948,69 +5107,84 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   a.start_time          = tic();
 
   // TWO ints: [0] = status, [1] = the REFACTOR_NEEDED reason (0 periodic / 1 rejected update).
-  a.out_status         = alloc_fixed<int>(2, st, fixed, fixed_field_id::out_status, seat, true);
-  a.out_objective      = alloc_fixed<double>(1, st, fixed, fixed_field_id::out_objective, seat, true);
-  a.out_user_objective = alloc_fixed<double>(1, st, fixed, fixed_field_id::out_user_objective, seat, true);
-  a.out_iterations     = alloc_fixed<int>(1, st, fixed, fixed_field_id::out_iterations, seat, true);
+  a.out_status         = alloc_fixed<int>(2, st, fixed, &fixed_storage::out_status, seat, true);
+  a.out_objective      = alloc_fixed<double>(1, st, fixed, &fixed_storage::out_objective, seat, true);
+  a.out_user_objective = alloc_fixed<double>(1, st, fixed, &fixed_storage::out_user_objective, seat, true);
+  a.out_iterations     = alloc_fixed<int>(1, st, fixed, &fixed_storage::out_iterations, seat, true);
 
-  // Persistent per-slot solve state. Allocated ZEROED (the kernel's placement-new relies on that
-  // here.
-  a.slot = alloc_fixed<char>(sizeof(slot_state<gpu_basis_update_mpf_t<FactorIndex>>),
-                             st, fixed, fixed_field_id::slot, seat, true,
-                             alignof(slot_state<gpu_basis_update_mpf_t<FactorIndex>>));
+  a.slot = alloc_fixed<slot_state<gpu_basis_update_t>>(
+    1, st, fixed, &fixed_storage::slot, seat);
 
-  // The slot's flat buffer: every gpu_span in the kernel is a slice of this, wired at a fixed
-  // offset by attach_all_buffers. Deliberately NOT zeroed -- every consumer resize/assign-fills
-  // before reading, and zeroing would cost a multi-GB memset across a large batch.
-  // One allocation per buffer, from the RMM pool, like every other array uploaded above.
+  // Each workspace has its own fixed-capacity buffer, wired by attach_all_buffers. Workspaces
+  // are not zeroed: consumers initialize elements before reading them.
   {
     const size_t mn   = (static_cast<size_t>(m) > static_cast<size_t>(n)) ? m : n;
     const size_t m1   = static_cast<size_t>(m) + 1;
     const size_t ucap = static_cast<size_t>(mpf_update_cap());
     const size_t eta  = static_cast<size_t>(mpf_eta_nnz_cap());
     slot_buffers& b   = a.buf;
-#define PACK_F(name, count) b.name = alloc_fixed<f_t>(count, st, fixed, fixed_field_id::name, seat)
-#define PACK_I(name, count) b.name = alloc_fixed<i_t>(count, st, fixed, fixed_field_id::name, seat)
-    PACK_F(xB_workspace, mn);
-    PACK_F(delta_y, mn);
-    PACK_F(delta_z, mn);
-    PACK_F(delta_x, mn);
-    PACK_F(v, mn);
-    PACK_F(squared_infeas, mn);
-    PACK_F(setup_rhs, mn);
-    PACK_I(basic_mark, mn);
-    PACK_I(delta_z_mark, mn);
-    PACK_I(delta_z_indices, mn);
-    PACK_I(nonbasic_pos, mn);
-    PACK_I(infeas_idx, mn);
-    PACK_F(ft_dense_scratch, mn);
-    PACK_F(ft_dense_scratch2, mn);
-    PACK_F(ft_sort_bucket, mn);
-    PACK_F(ft_sort_x, mn);
-    PACK_I(ft_sort_i, mn);
-    PACK_I(ft_sort_perm, mn);
-    PACK_I(lvl_lev0, m1); PACK_I(lvl_ls0, m1); PACK_I(lvl_co0, m1);
-    PACK_I(lvl_lev1, m1); PACK_I(lvl_ls1, m1); PACK_I(lvl_co1, m1);
-    PACK_I(lvl_lev2, m1); PACK_I(lvl_ls2, m1); PACK_I(lvl_co2, m1);
-    PACK_I(lvl_lev3, m1); PACK_I(lvl_ls3, m1); PACK_I(lvl_co3, m1);
-    PACK_I(sp_ls_v, m1); PACK_I(sp_co_v, m1);
-    PACK_I(sp_pos_v, m1); PACK_I(lvl_pos_v, m1);
-    PACK_F(ft_recover_rhs, m); PACK_F(ft_recover_sol, m);
-    PACK_I(S_col_start, 2 * ucap + 1);
-    PACK_I(S_i, eta); PACK_F(S_x, eta); PACK_F(mu_values, ucap);
-    PACK_I(delta_y_sparse_i, mn); PACK_F(delta_y_sparse_x, mn);
-    PACK_I(UTsol_sparse_i, mn); PACK_F(UTsol_sparse_x, mn);
-    PACK_I(utilde_sparse_i, mn); PACK_F(utilde_sparse_x, mn);
-    PACK_I(scaled_dxB_sparse_i, mn); PACK_F(scaled_dxB_sparse_x, mn);
-    PACK_I(rhs_sparse_i, mn); PACK_F(rhs_sparse_x, mn);
-    PACK_I(v_sparse_i, mn); PACK_F(v_sparse_x, mn);
-    PACK_I(se_dy_i, mn); PACK_F(se_dy_x, mn);
-    PACK_I(se_UTsol_i, mn); PACK_F(se_UTsol_x, mn);
-    PACK_I(se_ei_i, mn); PACK_F(se_ei_x, mn);
-    PACK_I(ft_sparse_scratch_i, mn); PACK_F(ft_sparse_scratch_x, mn);
-    PACK_I(ft_ei_scratch_i, mn); PACK_F(ft_ei_scratch_x, mn);
-#undef PACK_I
-#undef PACK_F
+    b.xB_workspace = alloc_fixed<f_t>(mn, st, fixed, &fixed_storage::xB_workspace, seat);
+    b.delta_y = alloc_fixed<f_t>(mn, st, fixed, &fixed_storage::delta_y, seat);
+    b.delta_z = alloc_fixed<f_t>(mn, st, fixed, &fixed_storage::delta_z, seat);
+    b.delta_x = alloc_fixed<f_t>(mn, st, fixed, &fixed_storage::delta_x, seat);
+    b.v = alloc_fixed<f_t>(mn, st, fixed, &fixed_storage::v, seat);
+    b.squared_infeas = alloc_fixed<f_t>(mn, st, fixed, &fixed_storage::squared_infeas, seat);
+    b.setup_rhs = alloc_fixed<f_t>(mn, st, fixed, &fixed_storage::setup_rhs, seat);
+    b.basic_mark = alloc_fixed<i_t>(mn, st, fixed, &fixed_storage::basic_mark, seat);
+    b.delta_z_mark = alloc_fixed<i_t>(mn, st, fixed, &fixed_storage::delta_z_mark, seat);
+    b.delta_z_indices = alloc_fixed<i_t>(mn, st, fixed, &fixed_storage::delta_z_indices, seat);
+    b.nonbasic_pos = alloc_fixed<i_t>(mn, st, fixed, &fixed_storage::nonbasic_pos, seat);
+    b.infeas_idx = alloc_fixed<i_t>(mn, st, fixed, &fixed_storage::infeas_idx, seat);
+    b.ft_dense_scratch = alloc_fixed<f_t>(mn, st, fixed, &fixed_storage::ft_dense_scratch, seat);
+    b.ft_dense_scratch2 = alloc_fixed<f_t>(mn, st, fixed, &fixed_storage::ft_dense_scratch2, seat);
+    b.ft_sort_bucket = alloc_fixed<f_t>(mn, st, fixed, &fixed_storage::ft_sort_bucket, seat);
+    b.ft_sort_x = alloc_fixed<f_t>(mn, st, fixed, &fixed_storage::ft_sort_x, seat);
+    b.ft_sort_i = alloc_fixed<i_t>(mn, st, fixed, &fixed_storage::ft_sort_i, seat);
+    b.ft_sort_perm = alloc_fixed<i_t>(mn, st, fixed, &fixed_storage::ft_sort_perm, seat);
+    b.lvl_lev0 = alloc_fixed<i_t>(m1, st, fixed, &fixed_storage::lvl_lev0, seat);
+    b.lvl_ls0 = alloc_fixed<i_t>(m1, st, fixed, &fixed_storage::lvl_ls0, seat);
+    b.lvl_co0 = alloc_fixed<i_t>(m1, st, fixed, &fixed_storage::lvl_co0, seat);
+    b.lvl_lev1 = alloc_fixed<i_t>(m1, st, fixed, &fixed_storage::lvl_lev1, seat);
+    b.lvl_ls1 = alloc_fixed<i_t>(m1, st, fixed, &fixed_storage::lvl_ls1, seat);
+    b.lvl_co1 = alloc_fixed<i_t>(m1, st, fixed, &fixed_storage::lvl_co1, seat);
+    b.lvl_lev2 = alloc_fixed<i_t>(m1, st, fixed, &fixed_storage::lvl_lev2, seat);
+    b.lvl_ls2 = alloc_fixed<i_t>(m1, st, fixed, &fixed_storage::lvl_ls2, seat);
+    b.lvl_co2 = alloc_fixed<i_t>(m1, st, fixed, &fixed_storage::lvl_co2, seat);
+    b.lvl_lev3 = alloc_fixed<i_t>(m1, st, fixed, &fixed_storage::lvl_lev3, seat);
+    b.lvl_ls3 = alloc_fixed<i_t>(m1, st, fixed, &fixed_storage::lvl_ls3, seat);
+    b.lvl_co3 = alloc_fixed<i_t>(m1, st, fixed, &fixed_storage::lvl_co3, seat);
+    b.sp_ls_v = alloc_fixed<i_t>(m1, st, fixed, &fixed_storage::sp_ls_v, seat);
+    b.sp_co_v = alloc_fixed<i_t>(m1, st, fixed, &fixed_storage::sp_co_v, seat);
+    b.sp_pos_v = alloc_fixed<i_t>(m1, st, fixed, &fixed_storage::sp_pos_v, seat);
+    b.lvl_pos_v = alloc_fixed<i_t>(m1, st, fixed, &fixed_storage::lvl_pos_v, seat);
+    b.ft_recover_rhs = alloc_fixed<f_t>(m, st, fixed, &fixed_storage::ft_recover_rhs, seat);
+    b.ft_recover_sol = alloc_fixed<f_t>(m, st, fixed, &fixed_storage::ft_recover_sol, seat);
+    b.S_col_start = alloc_fixed<i_t>(2 * ucap + 1, st, fixed, &fixed_storage::S_col_start, seat);
+    b.S_i = alloc_fixed<i_t>(eta, st, fixed, &fixed_storage::S_i, seat);
+    b.S_x = alloc_fixed<f_t>(eta, st, fixed, &fixed_storage::S_x, seat);
+    b.mu_values = alloc_fixed<f_t>(ucap, st, fixed, &fixed_storage::mu_values, seat);
+    b.delta_y_sparse_i = alloc_fixed<i_t>(mn, st, fixed, &fixed_storage::delta_y_sparse_i, seat);
+    b.delta_y_sparse_x = alloc_fixed<f_t>(mn, st, fixed, &fixed_storage::delta_y_sparse_x, seat);
+    b.UTsol_sparse_i = alloc_fixed<i_t>(mn, st, fixed, &fixed_storage::UTsol_sparse_i, seat);
+    b.UTsol_sparse_x = alloc_fixed<f_t>(mn, st, fixed, &fixed_storage::UTsol_sparse_x, seat);
+    b.utilde_sparse_i = alloc_fixed<i_t>(mn, st, fixed, &fixed_storage::utilde_sparse_i, seat);
+    b.utilde_sparse_x = alloc_fixed<f_t>(mn, st, fixed, &fixed_storage::utilde_sparse_x, seat);
+    b.scaled_dxB_sparse_i = alloc_fixed<i_t>(mn, st, fixed, &fixed_storage::scaled_dxB_sparse_i, seat);
+    b.scaled_dxB_sparse_x = alloc_fixed<f_t>(mn, st, fixed, &fixed_storage::scaled_dxB_sparse_x, seat);
+    b.rhs_sparse_i = alloc_fixed<i_t>(mn, st, fixed, &fixed_storage::rhs_sparse_i, seat);
+    b.rhs_sparse_x = alloc_fixed<f_t>(mn, st, fixed, &fixed_storage::rhs_sparse_x, seat);
+    b.v_sparse_i = alloc_fixed<i_t>(mn, st, fixed, &fixed_storage::v_sparse_i, seat);
+    b.v_sparse_x = alloc_fixed<f_t>(mn, st, fixed, &fixed_storage::v_sparse_x, seat);
+    b.se_dy_i = alloc_fixed<i_t>(mn, st, fixed, &fixed_storage::se_dy_i, seat);
+    b.se_dy_x = alloc_fixed<f_t>(mn, st, fixed, &fixed_storage::se_dy_x, seat);
+    b.se_UTsol_i = alloc_fixed<i_t>(mn, st, fixed, &fixed_storage::se_UTsol_i, seat);
+    b.se_UTsol_x = alloc_fixed<f_t>(mn, st, fixed, &fixed_storage::se_UTsol_x, seat);
+    b.se_ei_i = alloc_fixed<i_t>(mn, st, fixed, &fixed_storage::se_ei_i, seat);
+    b.se_ei_x = alloc_fixed<f_t>(mn, st, fixed, &fixed_storage::se_ei_x, seat);
+    b.ft_sparse_scratch_i = alloc_fixed<i_t>(mn, st, fixed, &fixed_storage::ft_sparse_scratch_i, seat);
+    b.ft_sparse_scratch_x = alloc_fixed<f_t>(mn, st, fixed, &fixed_storage::ft_sparse_scratch_x, seat);
+    b.ft_ei_scratch_i = alloc_fixed<i_t>(mn, st, fixed, &fixed_storage::ft_ei_scratch_i, seat);
+    b.ft_ei_scratch_x = alloc_fixed<f_t>(mn, st, fixed, &fixed_storage::ft_ei_scratch_x, seat);
   }
   return a;
 }
@@ -5032,7 +5206,6 @@ static size_t problem_shared_ro_bytes(const lp_problem_t<i_t, f_t>& lp)
 // factors/matrix + mutable state), EXCLUDING the in-kernel gpu_span heap (S_ growth). Used by
 // the batch pre-flight VRAM estimate; mirrors the upload/alloc sizes 1:1 (empty vectors still
 // take 1 element, matching upload/alloc_zeroed). Slightly conservative on the small state vectors.
-template <typename FactorIndex>
 static size_t problem_static_bytes(const lp_problem_t<i_t, f_t>& lp,
                                    const basis_update_mpf_t<i_t, f_t>& ft)
 {
@@ -5044,24 +5217,24 @@ static size_t problem_static_bytes(const lp_problem_t<i_t, f_t>& lp,
   const auto& U0t = ft.U0_transpose();
   auto bi = [](size_t c) { return (c == 0 ? 1 : c) * sizeof(i_t); };
   auto bd = [](size_t c) { return (c == 0 ? 1 : c) * sizeof(f_t); };
-  auto bf = [](size_t c) { return (c == 0 ? 1 : c) * sizeof(FactorIndex); };
   size_t b = 0;
   // Immutable A/rhs/objective/Arow (deduplicated across seats) plus per-seat lower/upper.
   b += problem_shared_ro_bytes(lp) + 2 * bd(n);
   // Four factors, each col_start + i + x
-  b += bi(L0.col_start.size())  + bf(L0.nnz())  + bd(L0.nnz());
-  b += bi(U0.col_start.size())  + bf(U0.nnz())  + bd(U0.nnz());
-  b += bi(L0t.col_start.size()) + bf(L0t.nnz()) + bd(L0t.nnz());
-  b += bi(U0t.col_start.size()) + bf(U0t.nnz()) + bd(U0t.nnz());
+  b += bi(L0.col_start.size())  + bi(L0.nnz())  + bd(L0.nnz());
+  b += bi(U0.col_start.size())  + bi(U0.nnz())  + bd(U0.nnz());
+  b += bi(L0t.col_start.size()) + bi(L0t.nnz()) + bd(L0t.nnz());
+  b += bi(U0t.col_start.size()) + bi(U0t.nnz()) + bd(U0t.nnz());
   // perms + workspaces
-  b += bi(m) + bi(m) + bi(2 * m) + bd(m) + m * sizeof(unsigned char);
+  b += bi(m) + bi(m) + bi(2 * m) + bd(m) +
+       static_cast<size_t>(reach_mark_storage_words(static_cast<i_t>(m))) * sizeof(reach_mark_word);
   // state: vstatus(n) + basic(m) + nonbasic(<=n) + x(n)+y(m)+z(n) + dy_se(n) + outputs
   b += n * sizeof(variable_status_t) + bi(m) + bi(n) + bd(n) + bd(m) + bd(n) + bd(n);
   // out_status[2] + iterations + three zero-step diagnostics; objective + user_objective.
   b += 6 * bi(1) + 2 * bd(1);
   // persistent per-slot solve state (slot_state<FT> header only -- its gpu_span payloads live in
   // the arena below, or on the in-kernel heap for the few buffers left there)
-  b += sizeof(slot_state<gpu_basis_update_mpf_t<FactorIndex>>);
+  b += sizeof(slot_state<gpu_basis_update_t>);
   // The per-slot buffers. Static VRAM, so it must be in the pre-flight or a large batch passes the
   // check and then fails to allocate.
   b += slot_buffer_bytes(m, n, static_cast<size_t>(mpf_update_cap()),
@@ -5121,7 +5294,7 @@ struct gpu_batch_handle_t {
   std::vector<gpu_batch_item<i_t, f_t>> items;
   std::vector<kernel_args> h_args;
   std::vector<marshal_storage> store;
-  packed_fixed_storage fixed;
+  std::optional<fixed_storage> fixed;
   marshal_storage ro_store;
   std::unordered_map<const void*, ro_upload> ro_cache;
   kernel_args* d_args{nullptr};
@@ -5141,14 +5314,12 @@ struct gpu_batch_handle_t {
   bool allow_refactor_exit{false};
   bool persistent_mode{false};
   bool view_mode{false};  // Nondeterministic pool consumes the host slabs without per-seat scatter.
-  bool use_uint16_factors{true};
   std::vector<unsigned char> staged;
   // Pool-owned pinned host staging for sparse child bound deltas. Capacity grows per seat to the
   // largest diff that seat has seen; it is not an N*n slab (which would pin hundreds of MB for the
   // usual one-column branch updates).
   std::vector<std::optional<cuda::host_buffer<gpu_bound_delta<i_t, f_t>>>> pinned_bound_deltas;
   std::vector<size_t> pinned_bound_caps;
-  std::vector<std::vector<std::uint16_t>> factor_index16_scratch;
   struct factor_caps_t {
     size_t L0{0}, U0{0}, L0t{0}, U0t{0};
   };
@@ -5260,29 +5431,17 @@ static dual::status_t gpu_simplified_dual_phase2_leg(
 
   // Owns every uploaded buffer for this solve; destroyed at scope exit, returning them to the pool.
   marshal_storage store;
-  const bool use_uint16_factors = factors_fit_uint16(m);
-  kernel_args a                 = use_uint16_factors ? marshal_problem<std::uint16_t>(lp,
-                                                                      settings,
-                                                                      vstatus,
-                                                                      ft,
-                                                                      basic_list,
-                                                                      nonbasic_list,
-                                                                      sol,
-                                                                      delta_y_steepest_edge,
-                                                                      nullptr,
-                                                                      store,
-                                                                      resume)
-                                                     : marshal_problem<i_t>(lp,
-                                                            settings,
-                                                            vstatus,
-                                                            ft,
-                                                            basic_list,
-                                                            nonbasic_list,
-                                                            sol,
-                                                            delta_y_steepest_edge,
-                                                            nullptr,
-                                                            store,
-                                                            resume);
+  kernel_args a = marshal_problem(lp,
+                                  settings,
+                                  vstatus,
+                                  ft,
+                                  basic_list,
+                                  nonbasic_list,
+                                  sol,
+                                  delta_y_steepest_edge,
+                                  nullptr,
+                                  store,
+                                  resume);
 
   // Work-stealing counter for the persistent kernel, zeroed before the launch. Per launch, not a
   // device global -- see the batch path for why.
@@ -5296,17 +5455,12 @@ static dual::status_t gpu_simplified_dual_phase2_leg(
   RAFT_CUDA_TRY(cudaMalloc(&d_args, sizeof(kernel_args)));
   RAFT_CUDA_TRY(cudaMemcpy(d_args, &a, sizeof(kernel_args), cudaMemcpyHostToDevice));
 
-  report_config("monolith", 1, use_uint16_factors ? 16 : 32);
+  report_config("monolith", 1);
   const auto _k0 = std::chrono::steady_clock::now();
   // AllowRefactorExit = TRUE on the single-problem entry: this path owns a host resume loop that
   // can answer REFACTOR_NEEDED. The batch entry takes the default (false) because it has none.
-  if (use_uint16_factors) {
-    gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16, true><<<1, 32>>>(
-      d_args, i_t{1}, d_next, nullptr, nullptr);
-  } else {
-    gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32, true><<<1, 32>>>(
-      d_args, i_t{1}, d_next, nullptr, nullptr);
-  }
+  gpu_phase2_kernel_direct<true><<<1, 32>>>(
+    d_args, i_t{1}, d_next, nullptr, nullptr);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
   RAFT_CUDA_TRY(cudaDeviceSynchronize());
   cudaFree(d_args);
@@ -5377,9 +5531,6 @@ gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batc
   timing = gpu_batch_timing{};
   if (N == 0) return nullptr;
 
-  // A launch has one compile-time factor-index type. If any node exceeds uint16 capacity,
-  // use the int32 specialization for the entire batch.
-  bool use_uint16_factors = true;
   i_t batch_m = -1, batch_n = -1;
   size_t active_seats = 0;
   // Every ft must be a fresh factorization (pure MPF stacking port, no on-device refactor).
@@ -5419,8 +5570,6 @@ gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batc
       reject_item("has incorrectly sized state");
       return nullptr;
     }
-    use_uint16_factors =
-      use_uint16_factors && factors_fit_uint16(m);
     // A seat CONTINUING a plunge arrives with the parent's MPF stack on purpose -- that is the CPU's
     // behaviour and the reason a dived child costs no LU. Only a seat that claims to be starting
     // fresh must be fresh.
@@ -5432,19 +5581,13 @@ gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batc
       return nullptr;
     }
   }
-  // Keep large bases on the int32 specialization. The launch and marshalling paths below already
-  // support it; rejecting it here made the resumable batch verifier silently unable to cover the
-  // large V7 nodes (including chromaticindex1024-7), precisely the nodes whose serial tail is most
-  // expensive.
   // ---- Pre-flight VRAM check (fail loud, before any device allocation) ----
   size_t static_bytes = 0;
   std::unordered_map<const void*, std::pair<size_t, size_t>> counted_ro;
   for (size_t b = 0; b < N; ++b) {
     if (items[b].terminal_status != dual::status_t::UNSET) { continue; }
     const auto& item_lp = *items[b].lp;
-    size_t item_bytes = use_uint16_factors
-                          ? problem_static_bytes<std::uint16_t>(item_lp, *items[b].ft)
-                          : problem_static_bytes<int>(item_lp, *items[b].ft);
+    size_t item_bytes = problem_static_bytes(item_lp, *items[b].ft);
     const void* ro_key = static_cast<const void*>(item_lp.A.col_start.data());
     const std::pair<size_t, size_t> ro_shape{item_lp.A.col_start.size(), item_lp.A.i.size()};
     const auto [it, inserted] = counted_ro.emplace(ro_key, ro_shape);
@@ -5504,12 +5647,14 @@ gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batc
   H->stream = stream;
   H->allow_refactor_exit = allow_refactor_exit;
   H->persistent_mode     = persistent_seats;
-  H->use_uint16_factors  = use_uint16_factors;
   H->rows = active_seats == 0 ? 0 : batch_m;
   H->cols = active_seats == 0 ? 0 : batch_n;
   H->active_seats = active_seats;
-  H->fixed.seats = N;
-  H->fixed.stream = stream;
+  if (active_seats != 0) {
+    H->fixed.emplace(N, static_cast<size_t>(batch_m), static_cast<size_t>(batch_n),
+                     static_cast<size_t>(mpf_update_cap()),
+                     static_cast<size_t>(mpf_eta_nnz_cap()), stream);
+  }
   H->ro_store.stream = stream;
   // One cache-line-aligned mapped word is the asynchronous host/device completion handshake for
   // this handle. It is logically a bool, but a 32-bit word has well-defined CUDA and CPU atomic
@@ -5580,18 +5725,13 @@ gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batc
       if (res.second) { res.first->second = upload_ro(*it.lp, H->ro_store); }
       ro = &res.first->second;
     }
-    h_args[b] = use_uint16_factors
-                  ? marshal_problem<std::uint16_t>(
-                      *it.lp, *it.settings, *it.vstatus, *it.ft, *it.basic_list,
-                      *it.nonbasic_list, *it.sol, *it.dy_se, ro, store[b], it.refactor_resume,
-                      it.terminal_certificate_retry, it.lower, it.upper, &H->fixed, b)
-                  : marshal_problem<i_t>(
-                      *it.lp, *it.settings, *it.vstatus, *it.ft, *it.basic_list,
-                      *it.nonbasic_list, *it.sol, *it.dy_se, ro, store[b], it.refactor_resume,
-                      it.terminal_certificate_retry, it.lower, it.upper, &H->fixed, b);
+    h_args[b] = marshal_problem(*it.lp, *it.settings, *it.vstatus, *it.ft, *it.basic_list,
+                                *it.nonbasic_list, *it.sol, *it.dy_se, ro, store[b],
+                                it.refactor_resume, it.terminal_certificate_retry,
+                                it.lower, it.upper, &*H->fixed, b);
   }
 
-  H->fixed.flush_uploads();
+  if (H->fixed) { H->fixed->flush_uploads(); }
 
   // d_args comes from the pool on this batch's stream. It used to be a raw cudaMalloc plus a
   // BLOCKING cudaMemcpy, which is a device-wide synchronisation point in the middle of the launch
@@ -5619,7 +5759,7 @@ gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batc
   timing.upload_s = toc(up_t0);
 
   // ---- Launch a resident work-stealing grid, timed with CUDA events (device compute only) ----
-  report_config("monolith", items.size(), use_uint16_factors ? 16 : 32);
+  report_config("monolith", items.size());
   // (upload_solve_class_config() was dropped with g_elide_noop -- all it did was set that flag.)
   // Resident grid: launch only as many blocks as actually fit, and let them steal the remaining
   // problems. This is what removes the intra-launch tail -- a block finishing a 3-iteration node
@@ -5629,13 +5769,8 @@ gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batc
   int sm_count = 1;
   RAFT_CUDA_TRY(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
   int blocks_per_sm = 1;
-  if (use_uint16_factors) {
-    RAFT_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &blocks_per_sm, gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16>, 32, 0));
-  } else {
-    RAFT_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &blocks_per_sm, gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32>, 32, 0));
-  }
+  RAFT_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+    &blocks_per_sm, gpu_phase2_kernel_direct<>, 32, 0));
   unsigned int nb = static_cast<unsigned int>(blocks_per_sm) * static_cast<unsigned int>(sm_count);
   if (nb == 0 || nb > N) { nb = static_cast<unsigned int>(N); }
   // Events live on the HANDLE, not the stack: _launch returns before the kernel finishes, and
@@ -5648,34 +5783,17 @@ gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batc
   {
     // The register/occupancy target is a BUILD-time knob on the Direct kernel
     // gpu_phase2_kernel_direct.
-    // Two instantiations, selected at launch. `true` compiles IN the refactor exits so each problem
-    // can come back REFACTOR_NEEDED for a caller that owns a host resume loop; `false` compiles them
-    // out and is what the benchmark and any resume-less caller must use.
+    // `true` compiles IN the refactor exits so each problem can come back REFACTOR_NEEDED for a
+    // caller that owns a host resume loop; `false` compiles them out for resume-less callers.
     if (allow_refactor_exit) {
-      if (use_uint16_factors) {
-        gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16, true><<<nb, 32, 0, stream.value()>>>(
-          d_args,
-          static_cast<i_t>(N),
-          d_next,
-          H->d_completed_blocks,
-          H->d_completion_flag);
-      } else {
-        gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32, true><<<nb, 32, 0, stream.value()>>>(
-          d_args,
-          static_cast<i_t>(N),
-          d_next,
-          H->d_completed_blocks,
-          H->d_completion_flag);
-      }
-    } else if (use_uint16_factors) {
-      gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16><<<nb, 32, 0, stream.value()>>>(
+      gpu_phase2_kernel_direct<true><<<nb, 32, 0, stream.value()>>>(
         d_args,
         static_cast<i_t>(N),
         d_next,
         H->d_completed_blocks,
         H->d_completion_flag);
     } else {
-      gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32><<<nb, 32, 0, stream.value()>>>(
+      gpu_phase2_kernel_direct<><<<nb, 32, 0, stream.value()>>>(
         d_args,
         static_cast<i_t>(N),
         d_next,
@@ -5749,20 +5867,20 @@ void gpu_simplified_dual_phase2_batch_harvest(
         RAFT_CUDA_TRY(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, cs));
       }
     };
-    copy(H->h_status->data(), H->fixed.template data<i_t>(fixed_field_id::out_status), N * 2 * sizeof(i_t));
-    copy(H->h_objective->data(), H->fixed.template data<f_t>(fixed_field_id::out_objective), N * sizeof(f_t));
-    copy(H->h_user_objective->data(), H->fixed.template data<f_t>(fixed_field_id::out_user_objective), N * sizeof(f_t));
-    copy(H->h_iterations->data(), H->fixed.template data<i_t>(fixed_field_id::out_iterations), N * sizeof(i_t));
-    copy(H->h_x.data(), H->fixed.template data<f_t>(fixed_field_id::x), N * n * sizeof(f_t));
-    copy(H->h_vstatus.data(), H->fixed.template data<variable_status_t>(fixed_field_id::vstatus),
+    copy(H->h_status->data(), H->fixed->out_status.data(), N * 2 * sizeof(i_t));
+    copy(H->h_objective->data(), H->fixed->out_objective.data(), N * sizeof(f_t));
+    copy(H->h_user_objective->data(), H->fixed->out_user_objective.data(), N * sizeof(f_t));
+    copy(H->h_iterations->data(), H->fixed->out_iterations.data(), N * sizeof(i_t));
+    copy(H->h_x.data(), H->fixed->x.data(), N * n * sizeof(f_t));
+    copy(H->h_vstatus.data(), H->fixed->vstatus.data(),
          N * n * sizeof(variable_status_t));
-    copy(H->h_basic_list.data(), H->fixed.template data<i_t>(fixed_field_id::basic_list),
+    copy(H->h_basic_list.data(), H->fixed->basic_list.data(),
          N * m * sizeof(i_t));
-    copy(H->h_nonbasic_list.data(), H->fixed.template data<i_t>(fixed_field_id::nonbasic_list),
+    copy(H->h_nonbasic_list.data(), H->fixed->nonbasic_list.data(),
          N * (n - m) * sizeof(i_t));
-    copy(H->h_dy_se.data(), H->fixed.template data<f_t>(fixed_field_id::dy_se), N * n * sizeof(f_t));
-    copy(H->h_y.data(), H->fixed.template data<f_t>(fixed_field_id::y), N * m * sizeof(f_t));
-    copy(H->h_z.data(), H->fixed.template data<f_t>(fixed_field_id::z), N * n * sizeof(f_t));
+    copy(H->h_dy_se.data(), H->fixed->dy_se.data(), N * n * sizeof(f_t));
+    copy(H->h_y.data(), H->fixed->y.data(), N * m * sizeof(f_t));
+    copy(H->h_z.data(), H->fixed->z.data(), N * n * sizeof(f_t));
   }
   H->stream.synchronize();
   float kernel_ms = 0.0f;
@@ -5868,10 +5986,9 @@ template <typename matrix_t, typename i_t, typename f_t>
 static void persistent_stage_factor(
   gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H,
   size_t seat,
-  size_t factor_ordinal,
   const matrix_t& F,
   i_t*& d_col,
-  void*& d_i,
+  i_t*& d_i,
   f_t*& d_x,
   i_t& d_nz,
   size_t& capacity)
@@ -5890,27 +6007,11 @@ static void persistent_stage_factor(
   persistent_copy(d_col, F.col_start.data(), F.col_start.size(), H->stream);
   if (nz > capacity) {
     const size_t grown = std::max(nz, capacity == 0 ? size_t{1} : 2 * capacity);
-    if (H->use_uint16_factors) {
-      d_i = alloc_uninit<std::uint16_t>(grown, H->store[seat]);
-    } else {
-      d_i = alloc_uninit<i_t>(grown, H->store[seat]);
-    }
+    d_i      = alloc_uninit<i_t>(grown, H->store[seat]);
     d_x      = alloc_uninit<f_t>(grown, H->store[seat]);
     capacity = grown;
   }
-  if (H->use_uint16_factors) {
-    auto& converted = H->factor_index16_scratch[4 * seat + factor_ordinal];
-    converted.resize(nz);
-    for (size_t p = 0; p < nz; ++p) {
-      if (static_cast<size_t>(F.i[p]) >= kUint16FactorRowCapacity) {
-        throw std::runtime_error("persistent factor index does not fit uint16");
-      }
-      converted[p] = static_cast<std::uint16_t>(F.i[p]);
-    }
-    persistent_copy(static_cast<std::uint16_t*>(d_i), converted.data(), nz, H->stream);
-  } else {
-    persistent_copy(static_cast<i_t*>(d_i), F.i.data(), nz, H->stream);
-  }
+  persistent_copy(d_i, F.i.data(), nz, H->stream);
   persistent_copy(d_x, F.x.data(), nz, H->stream);
   d_nz = static_cast<i_t>(nz);
 }
@@ -5954,7 +6055,6 @@ bool gpu_simplified_dual_phase2_batch_stage(
   if (H->staged.empty()) {
     const size_t seats = H->h_args.size();
     H->staged.assign(seats, 0);
-    H->factor_index16_scratch.resize(4 * seats);
     H->factor_caps.resize(seats);
     H->pinned_bound_deltas.resize(seats);
     H->pinned_bound_caps.assign(seats, 0);
@@ -6068,12 +6168,11 @@ bool gpu_simplified_dual_phase2_batch_stage(
 
     auto& caps = H->factor_caps[seat];
     persistent_stage_factor(
-      H, seat, 0, item.ft->L0(), a.L0_col_start, a.L0_i, a.L0_x, a.L0_nz, caps.L0);
+      H, seat, item.ft->L0(), a.L0_col_start, a.L0_i, a.L0_x, a.L0_nz, caps.L0);
     persistent_stage_factor(
-      H, seat, 1, item.ft->U0(), a.U0_col_start, a.U0_i, a.U0_x, a.U0_nz, caps.U0);
+      H, seat, item.ft->U0(), a.U0_col_start, a.U0_i, a.U0_x, a.U0_nz, caps.U0);
     persistent_stage_factor(H,
                             seat,
-                            2,
                             item.ft->L0_transpose(),
                             a.L0t_col_start,
                             a.L0t_i,
@@ -6082,7 +6181,6 @@ bool gpu_simplified_dual_phase2_batch_stage(
                             caps.L0t);
     persistent_stage_factor(H,
                             seat,
-                            3,
                             item.ft->U0_transpose(),
                             a.U0t_col_start,
                             a.U0t_i,
@@ -6122,22 +6220,22 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
   for (size_t b = 0; b < N; ++b) { H->h_args[b].cut_off = H->items[b].settings->cut_off; }
   const double t0 = tic();
   if (H->view_mode) {
-    const auto upload = [H](const auto& source, fixed_field_id id) {
+    const auto upload = [H](const auto& source, auto member) {
       if (!source.empty()) {
-        RAFT_CUDA_TRY(cudaMemcpyAsync(H->fixed.template data<typename std::remove_reference_t<decltype(source)>::value_type>(id),
+        RAFT_CUDA_TRY(cudaMemcpyAsync((H->fixed.value().*member).data(),
                                       source.data(),
                                       source.size() * sizeof(typename std::remove_reference_t<decltype(source)>::value_type),
                                       cudaMemcpyHostToDevice,
                                       H->stream.value()));
       }
     };
-    upload(H->h_x, fixed_field_id::x);
-    upload(H->h_y, fixed_field_id::y);
-    upload(H->h_z, fixed_field_id::z);
-    upload(H->h_dy_se, fixed_field_id::dy_se);
-    upload(H->h_vstatus, fixed_field_id::vstatus);
-    upload(H->h_basic_list, fixed_field_id::basic_list);
-    upload(H->h_nonbasic_list, fixed_field_id::nonbasic_list);
+    upload(H->h_x, &fixed_storage::x);
+    upload(H->h_y, &fixed_storage::y);
+    upload(H->h_z, &fixed_storage::z);
+    upload(H->h_dy_se, &fixed_storage::dy_se);
+    upload(H->h_vstatus, &fixed_storage::vstatus);
+    upload(H->h_basic_list, &fixed_storage::basic_list);
+    upload(H->h_nonbasic_list, &fixed_storage::nonbasic_list);
   }
   RAFT_CUDA_TRY(cudaMemcpyAsync(H->d_args,
                                 H->h_args.data(),
@@ -6156,41 +6254,23 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
   int sm_count = 1;
   RAFT_CUDA_TRY(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
   int blocks_per_sm = 1;
-  if (H->use_uint16_factors) {
-    RAFT_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &blocks_per_sm,
-      gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16, true, true>,
-      32,
-      0));
-  } else {
-    RAFT_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &blocks_per_sm,
-      gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32, true, true>,
-      32,
-      0));
-  }
+  RAFT_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+    &blocks_per_sm,
+    gpu_phase2_kernel_direct<true, true>,
+    32,
+    0));
   unsigned int nb = static_cast<unsigned int>(blocks_per_sm) * static_cast<unsigned int>(sm_count);
   if (nb == 0 || nb > N) { nb = static_cast<unsigned int>(N); }
   RAFT_CUDA_TRY(cudaEventCreate(&H->ev_start));
   RAFT_CUDA_TRY(cudaEventCreate(&H->ev_stop));
   RAFT_CUDA_TRY(cudaEventRecord(H->ev_start, H->stream.value()));
-  if (H->use_uint16_factors) {
-    gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16, true, true>
-      <<<nb, 32, 0, H->stream.value()>>>(
-      H->d_args,
-      static_cast<i_t>(N),
-      H->d_next,
-      H->d_completed_blocks,
-      H->d_completion_flag);
-  } else {
-    gpu_phase2_kernel_direct<gpu_basis_update_mpf_i32, true, true>
-      <<<nb, 32, 0, H->stream.value()>>>(
-      H->d_args,
-      static_cast<i_t>(N),
-      H->d_next,
-      H->d_completed_blocks,
-      H->d_completion_flag);
-  }
+  gpu_phase2_kernel_direct<true, true>
+    <<<nb, 32, 0, H->stream.value()>>>(
+    H->d_args,
+    static_cast<i_t>(N),
+    H->d_next,
+    H->d_completed_blocks,
+    H->d_completion_flag);
   RAFT_CUDA_TRY(cudaEventRecord(H->ev_stop, H->stream.value()));
   RAFT_CUDA_TRY(cudaPeekAtLastError());
   H->launched = true;
@@ -6407,7 +6487,7 @@ int gpu_max_blocks_per_sm()
   using namespace gpu_phase2_detail;
   int blocks = 0;
   const cudaError_t rc = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-    &blocks, gpu_phase2_kernel_direct<gpu_basis_update_mpf_u16>, 32, 0);
+    &blocks, gpu_phase2_kernel_direct<>, 32, 0);
   return (rc == cudaSuccess) ? blocks : 0;
 }
 
