@@ -4615,22 +4615,58 @@ struct fixed_storage {
   }
 };
 
+// Setup telemetry (gpu_batch_set_setup_telemetry): host wall time inside each class of CUDA call
+// made while marshalling. Thread-local because every branch-and-bound worker marshals its own pool
+// on its own thread; the launch resets it before marshalling and copies it into gpu_batch_timing.
+static std::atomic<bool> g_setup_telemetry{false};
+struct setup_stats_t {
+  bool on{false};
+  double alloc_s{0.0}, h2d_s{0.0}, memset_s{0.0};
+  size_t alloc_n{0}, h2d_n{0}, h2d_bytes{0}, memset_n{0};
+};
+static thread_local setup_stats_t tl_setup;
+
+// Allocate one device_buffer in `st`, timed as an allocation.
+static void* setup_alloc(size_t bytes, marshal_storage& st)
+{
+  const double t0 = tl_setup.on ? tic() : 0.0;
+  st.bufs.emplace_back(bytes, st.stream);
+  if (tl_setup.on) {
+    tl_setup.alloc_s += toc(t0);
+    ++tl_setup.alloc_n;
+  }
+  return st.bufs.back().data();
+}
+
+// Host-to-device copy on `st.stream`, timed as an upload. The same call rmm::device_buffer's
+// copying constructor makes, split out so the allocation and the copy are measured separately.
+static void setup_h2d(void* dst, const void* src, size_t bytes, marshal_storage& st)
+{
+  const double t0 = tl_setup.on ? tic() : 0.0;
+  RAFT_CUDA_TRY(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, st.stream.value()));
+  if (tl_setup.on) {
+    tl_setup.h2d_s += toc(t0);
+    ++tl_setup.h2d_n;
+    tl_setup.h2d_bytes += bytes;
+  }
+}
+
 template <typename T>
 static T* upload(const std::vector<T>& v, marshal_storage& st)
 {
   const size_t bytes = (v.empty() ? 1 : v.size()) * sizeof(T);
-  if (v.empty()) { st.bufs.emplace_back(bytes, st.stream); }
-  else { st.bufs.emplace_back(v.data(), bytes, st.stream); }
-  return static_cast<T*>(st.bufs.back().data());
+  void* d            = setup_alloc(bytes, st);
+  if (!v.empty()) { setup_h2d(d, v.data(), bytes, st); }
+  return static_cast<T*>(d);
 }
 
 template <typename T>
 static T* upload_n(const T* p, size_t count, marshal_storage& st)
 {
   const size_t bytes = (count == 0 ? 1 : count) * sizeof(T);
-  if (count == 0) { st.bufs.emplace_back(bytes, st.stream); }
-  else { st.bufs.emplace_back(p, bytes, st.stream); }
-  return static_cast<T*>(st.bufs.back().data());
+  void* d            = setup_alloc(bytes, st);
+  if (count != 0) { setup_h2d(d, p, bytes, st); }
+  return static_cast<T*>(d);
 }
 
 // Uninitialised: every per-slot buffer is resize/assign-filled before it is read, and zeroing all
@@ -4639,8 +4675,7 @@ template <typename T>
 static T* alloc_uninit(size_t count, marshal_storage& st)
 {
   const size_t bytes = (count == 0 ? 1 : count) * sizeof(T);
-  st.bufs.emplace_back(bytes, st.stream);
-  void* d = st.bufs.back().data();
+  void* d            = setup_alloc(bytes, st);
   // DIAGNOSTIC (CUOPT_GPU_ZERO_WORKSPACE=1). These buffers are left uninitialised on the premise
   // that the kernel writes every element before reading it. If that premise is wrong anywhere, the
   // result depends on whatever the RMM pool last left in that memory -- so the same problem, with
@@ -4659,13 +4694,17 @@ template <typename T>
 static T* alloc_zeroed(size_t count, marshal_storage& st)
 {
   const size_t bytes = (count == 0 ? 1 : count) * sizeof(T);
-  st.bufs.emplace_back(bytes, st.stream);
-  void* d = st.bufs.back().data();
+  void* d            = setup_alloc(bytes, st);
   // The STORAGE's stream, never the legacy default one. The buffer was just allocated on
   // `st.stream`, so zeroing it anywhere else is unordered against that allocation; and
   // branch-and-bound runs one batch per worker concurrently, which the default stream would
   // serialise. It also breaks any CUDA graph capture live on another thread.
+  const double t0 = tl_setup.on ? tic() : 0.0;
   RAFT_CUDA_TRY(cudaMemsetAsync(d, 0, bytes, st.stream.value()));
+  if (tl_setup.on) {
+    tl_setup.memset_s += toc(t0);
+    ++tl_setup.memset_n;
+  }
   return static_cast<T*>(d);
 }
 
@@ -4705,144 +4744,6 @@ static void report_config(const char* path, size_t nprob)
   std::printf("[CONFIG] path=%s geometry=persistent-warp<<<resident,32>>> problems=%zu factor_index_bits=%d "
               "mu=divide tri_diag=divide\n",
               path, nprob, 32);
-}
-
-// Device heap (in-kernel gpu_span malloc arena) + stack are per-CONTEXT limits and the heap
-// can ONLY be set before the first malloc-using kernel launch, so set them exactly once per
-// process. First caller wins: the batch wrapper (the only/first GPU kernel in the throughput
-// benchmark) sizes the heap for N concurrent S_ stacks; the single-problem wrapper uses a
-// generous default. heap_bytes is the requested malloc-arena size (NOT counting the static
-// per-problem buffers, which are separate cudaMallocs).
-// MEASURED LIMITS OF THE IN-KERNEL malloc HEAP (2026-08-14, probe.cu, confirmed on an RTX 3500 Ada
-// with 12 GB and on a B200 with 178 GB):
-//   * cudaDeviceGetLimit saturates at ~16.47 GB however much you ask for. It is the SAME number on
-//     both cards, so it is a fixed driver cap, not a fraction of device memory.
-//   * The arena is reserved LAZILY, at the first malloc-using launch, not by cudaDeviceSetLimit.
-//   * If the granted size does not fit in free VRAM at that moment, the reservation fails and the
-//     usable arena is ZERO. It is a cliff, not a gradual degradation: a 12 GB request on a card with
-//     11.86 GB free gave 0 bytes usable, while an 8 GB request gave 6.56 GB.
-//   * Usable is about 0.82 x granted. The rest is allocator overhead.
-// So the practical ceiling is ~13.5 GB usable on ANY device. Requesting more is not merely wasteful,
-// it is how we crashed: 86.75 GB requested -> capped -> in-kernel malloc returns nullptr ->
-// gpu_span::grow_to returns no buffer -> the next write raises cudaErrorIllegalAddress.
-// Measured by bisection with a standalone probe kernel: granted tracks the request exactly up
-// to 16.40 GB and saturates at 16.47 GB from 16.50 GB upward. Identical on a 12 GB card and a 178 GB
-// B200. We clamp to a round 16 GB, safely inside the saturation point.
-static constexpr size_t kDeviceHeapDriverCap = static_cast<size_t>(16) << 30;
-static constexpr double kDeviceHeapUsableFrac = 0.82;                          // measured overhead
-// The caller's heap estimate is deliberately pessimistic. Measured on the 100 v6 nodes with
-// -DCUOPT_ALLOC_STATS=1: real demand 1.408 MB/problem against an estimate of 3.874 MB, i.e. 0.363.
-// Rounded UP to 0.45 so the guard errs toward letting a run proceed; a run that then exhausts the
-// arena still reports it, whereas a wrongly refused run wastes a whole benchmark slot.
-static constexpr double kHeapEstimateToActual = 0.45;
-
-static bool g_device_limits_set = false;
-static size_t g_device_heap_granted = 0;
-static size_t g_device_heap_requested = 0;
-// Returns the bytes the driver GRANTED, which is what the kernel can actually draw on.
-static size_t ensure_device_limits(size_t heap_bytes)
-{
-  if (g_device_limits_set) return g_device_heap_granted;
-  g_device_limits_set = true;
-
-  if (heap_bytes < (static_cast<size_t>(256) << 20)) { heap_bytes = static_cast<size_t>(256) << 20; }
-
-  // CLAMP. Asking for more than the driver grants, or more than fits, is never useful and is exactly
-  // how the arena ends up unusable. Keep a margin below free VRAM for the per-problem cudaMallocs
-  // that follow this call.
-  const double GBd = 1.0 / (1024.0 * 1024.0 * 1024.0);
-  size_t free_b = 0, total_b = 0;
-  if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
-    const size_t fit = static_cast<size_t>(0.80 * static_cast<double>(free_b));
-    if (heap_bytes > fit) {
-      std::fprintf(stderr, "[gpu_phase2] clamping malloc arena %.2f -> %.2f GB (80%% of %.2f GB free)\n",
-                   heap_bytes * GBd, fit * GBd, free_b * GBd);
-      heap_bytes = fit;
-    }
-  }
-  if (heap_bytes > kDeviceHeapDriverCap) {
-    std::fprintf(stderr, "[gpu_phase2] clamping malloc arena %.2f -> %.2f GB (driver cap)\n",
-                 heap_bytes * GBd, kDeviceHeapDriverCap * GBd);
-    heap_bytes = kDeviceHeapDriverCap;
-  }
-  // Report the arena. A malloc failure inside the kernel is hard to attribute after the fact, so the
-  // size that was actually requested must be in the log of every run.
-  std::fprintf(stderr, "[gpu_phase2] device malloc arena = %.2f GB (must match the pre-flight heap)\n",
-               static_cast<double>(heap_bytes) / (1024.0 * 1024.0 * 1024.0));
-  cudaError_t hp = cudaDeviceSetLimit(cudaLimitMallocHeapSize, heap_bytes);
-  if (hp != cudaSuccess) {
-    cudaGetLastError();
-    std::fprintf(stderr, "[gpu_phase2] warning: could not set device heap size: %s\n",
-                 cudaGetErrorString(hp));
-  }
-  // READ THE LIMIT BACK. cudaDeviceSetLimit reports success even when the driver grants less than
-  // was asked for, and nothing here ever checked. A granted value below the request is invisible
-  // until in-kernel malloc starts returning nullptr, which then looks like a solver bug.
-  {
-    size_t granted = 0;
-    if (cudaDeviceGetLimit(&granted, cudaLimitMallocHeapSize) == cudaSuccess) {
-      g_device_heap_granted   = granted;
-      g_device_heap_requested = heap_bytes;
-      std::fprintf(stderr, "[gpu_phase2] malloc arena: requested %.2f GB, granted %.2f GB, "
-                           "usable ~%.2f GB\n",
-                   heap_bytes * GBd, granted * GBd, granted * kDeviceHeapUsableFrac * GBd);
-    } else {
-      cudaGetLastError();
-      g_device_heap_granted   = heap_bytes;
-      g_device_heap_requested = heap_bytes;
-    }
-  }
-  // The deep (non-recursive) call chain wants more than the ~1 KB default stack.
-  cudaError_t stk = cudaDeviceSetLimit(cudaLimitStackSize, static_cast<size_t>(32) << 10);
-  if (stk != cudaSuccess) {
-    cudaGetLastError();
-    std::fprintf(stderr, "[gpu_phase2] warning: could not raise device stack size: %s\n",
-                 cudaGetErrorString(stk));
-  }
-  return g_device_heap_granted;
-}
-
-
-// Reject a batch whose in-kernel heap demand cannot fit the arena the driver will grant.
-// WITHOUT this the kernel launches, malloc returns nullptr thousands of times, and the run dies on
-// cudaErrorIllegalAddress -- which looks like a solver bug and costs a whole benchmark slot.
-// Returns true when the caller must abort. `demand` is the caller's own heap estimate.
-static bool heap_demand_rejected(size_t demand, size_t granted, size_t requested,
-                                 size_t n_problems, gpu_batch_timing& timing)
-{
-  const double GBd    = 1.0 / (1024.0 * 1024.0 * 1024.0);
-  const size_t usable = static_cast<size_t>(static_cast<double>(granted) * kDeviceHeapUsableFrac);
-  // Compare PREDICTED ACTUAL demand, not the raw estimate. Using the estimate refused batches that
-  // run perfectly well, because the estimate carries kHeapSafety plus terms that are never allocated.
-  const size_t predicted = static_cast<size_t>(static_cast<double>(demand) * kHeapEstimateToActual);
-  if (predicted <= usable) { return false; }
-  // The estimate is deliberately pessimistic (kHeapSafety, plus terms that may not be allocated at
-  // all), so "estimate > usable" alone is NOT a reason to refuse: 100 problems estimate 0.58 GB,
-  // get a 0.47 GB usable arena, and run perfectly well. Refuse only when the DRIVER CAPPED us --
-  // then the arena cannot be enlarged by any means and the run would fail for a knowable reason.
-  if (granted >= requested) {
-    std::fprintf(stderr,
-                 "[gpu_phase2] note: heap estimate %.2f GB is above the usable arena %.2f GB, but "
-                 "the driver granted everything asked for. Proceeding; the estimate carries a "
-                 "safety factor.\n", demand * GBd, usable * GBd);
-    return false;
-  }
-  const size_t per      = n_problems ? (demand / n_problems) : demand;
-  const size_t per_pred = n_problems ? (predicted / n_problems) : predicted;
-  const size_t max_n    = per_pred ? (usable / per_pred) : 0;
-  char buf[512];
-  std::snprintf(buf, sizeof(buf),
-                "predicted in-kernel heap demand %.2f GB exceeds the usable arena %.2f GB (driver "
-                "granted %.2f GB; the heap is capped at ~%.2f GB on EVERY device, so no setting "
-                "raises it). %zu problems, estimate %.2f MB each, predicted actual %.2f MB each. "
-                "At most ~%zu problems fit. Lower the problem count.",
-                predicted * GBd, usable * GBd, granted * GBd, kDeviceHeapDriverCap * GBd,
-                n_problems, static_cast<double>(per) / (1024.0 * 1024.0),
-                static_cast<double>(per_pred) / (1024.0 * 1024.0), max_n);
-  timing.rejected = true;
-  timing.message  = buf;
-  std::fprintf(stderr, "[gpu_phase2] batch REJECTED: %s\n", buf);
-  return true;
 }
 
 // Marshal one prepared problem into a kernel_args with fresh device buffers. Both the
@@ -5203,7 +5104,7 @@ static size_t problem_shared_ro_bytes(const lp_problem_t<i_t, f_t>& lp)
 }
 
 // Exact device bytes marshal_problem cudaMallocs for one problem's STATIC buffers (read-only
-// factors/matrix + mutable state), EXCLUDING the in-kernel gpu_span heap (S_ growth). Used by
+// factors/matrix + mutable state + per-slot buffers; the kernel allocates nothing itself). Used by
 // the batch pre-flight VRAM estimate; mirrors the upload/alloc sizes 1:1 (empty vectors still
 // take 1 element, matching upload/alloc_zeroed). Slightly conservative on the small state vectors.
 static size_t problem_static_bytes(const lp_problem_t<i_t, f_t>& lp,
@@ -5414,21 +5315,6 @@ static dual::status_t gpu_simplified_dual_phase2_leg(
     return dual::status_t::NUMERICAL;
   }
 
-  // Size the per-context device heap/stack once (generous default for a single solve).
-  {
-    size_t free_b = 0, total_b = 0;
-    RAFT_CUDA_TRY(cudaMemGetInfo(&free_b, &total_b));
-    size_t heap = static_cast<size_t>(0.7 * static_cast<double>(free_b));
-    const size_t cap = static_cast<size_t>(8) << 30;  // 8 GiB cap
-    if (heap > cap) { heap = cap; }
-    // The malloc arena is only actually reserved at the first malloc-using LAUNCH, on top of the
-    // per-thread local reservation (cudaLimitStackSize x every resident thread) and the per-problem
-    // cudaMallocs. On a small-VRAM card those three together can exceed the device and the launch
-    // fails with cudaErrorLaunchOutOfResources -- which reads like a kernel-config problem but is not.
-    // batch path alike (4096 works on a 12 GB card where 0.7*free does not).
-    ensure_device_limits(heap);
-  }
-
   // Owns every uploaded buffer for this solve; destroyed at scope exit, returning them to the pool.
   marshal_storage store;
   kernel_args a = marshal_problem(lp,
@@ -5516,7 +5402,6 @@ static dual::status_t gpu_simplified_dual_phase2_leg(
 template <typename i_t, typename f_t>
 gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batch_launch(
   const std::vector<gpu_batch_item<i_t, f_t>>& items,
-  size_t heap_estimate_bytes,
   gpu_batch_timing& timing,
   rmm::cuda_stream_view stream,
   bool allow_refactor_exit,
@@ -5595,7 +5480,7 @@ gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batc
     static_bytes += item_bytes;
   }
   const size_t args_bytes = N * sizeof(kernel_args);
-  const size_t need = static_bytes + heap_estimate_bytes + args_bytes;
+  const size_t need = static_bytes + args_bytes;
   size_t free_b = 0, total_b = 0;
   RAFT_CUDA_TRY(cudaMemGetInfo(&free_b, &total_b));
 
@@ -5620,10 +5505,10 @@ gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batc
   if (need > budget) {
     char buf[512];
     std::snprintf(buf, sizeof(buf),
-                  "batch needs ~%.2f GB VRAM (static %.2f + heap %.2f + args %.2f), only %.2f GB "
+                  "batch needs ~%.2f GB VRAM (static %.2f + args %.2f), only %.2f GB "
                   "available (%.2f free + %.2f current RMM pool; usable budget %.2f GB) for %zu "
                   "problems — reduce --replicas or use a larger GPU",
-                  need * GB, static_bytes * GB, heap_estimate_bytes * GB, args_bytes * GB,
+                  need * GB, static_bytes * GB, args_bytes * GB,
                   available_b * GB, free_b * GB, pool_b * GB, budget * GB, N);
     timing.rejected = true;
     timing.message  = buf;
@@ -5631,16 +5516,12 @@ gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batc
     return nullptr;
   }
 
-  // Size the malloc heap for all N concurrent S_ stacks (first GPU kernel this process).
-  {
-    const size_t granted = ensure_device_limits(heap_estimate_bytes);
-    if (heap_demand_rejected(heap_estimate_bytes, granted, g_device_heap_requested, N, timing)) { return nullptr; }
-  }
-
   // ---- Marshal every problem + upload (host-timed) ----
   // Deduplicate the immutable A CSC, CSR Arow, rhs, and objective across nodes with the same
   // original matrix. Basis-dependent factors, row permutations, and bounds remain per-node.
   const double up_t0 = tic();
+  tl_setup           = setup_stats_t{};
+  tl_setup.on        = g_setup_telemetry.load(std::memory_order_relaxed);
   auto* H = new gpu_batch_handle_t<i_t, f_t>();
   H->items  = items;
   H->up_t0  = up_t0;
@@ -5736,27 +5617,29 @@ gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batc
   // d_args comes from the pool on this batch's stream. It used to be a raw cudaMalloc plus a
   // BLOCKING cudaMemcpy, which is a device-wide synchronisation point in the middle of the launch
   // path -- fatal for running one batch per GPU worker.
-  H->ro_store.bufs.emplace_back(N * sizeof(kernel_args), stream);
   kernel_args*& d_args = H->d_args;
-  d_args = static_cast<kernel_args*>(H->ro_store.bufs.back().data());
-  RAFT_CUDA_TRY(cudaMemcpyAsync(d_args, h_args.data(), N * sizeof(kernel_args),
-                                cudaMemcpyHostToDevice, stream.value()));
+  d_args = static_cast<kernel_args*>(setup_alloc(N * sizeof(kernel_args), H->ro_store));
+  setup_h2d(d_args, h_args.data(), N * sizeof(kernel_args), H->ro_store);
 
   // The persistent kernel's work-stealing counter, allocated PER LAUNCH from the pool and zeroed
   // stream-ordered. Per launch rather than a device global because branch-and-bound runs one batch
   // per GPU worker concurrently; a shared counter would have those launches stealing from each
   // other's index space. Zeroing on the stream also keeps the launch path free of any device sync.
-  H->ro_store.bufs.emplace_back(sizeof(unsigned int), stream);
-  unsigned int* d_next = static_cast<unsigned int*>(H->ro_store.bufs.back().data());
+  unsigned int* d_next = alloc_zeroed<unsigned int>(1, H->ro_store);
   H->d_next            = d_next;
-  RAFT_CUDA_TRY(cudaMemsetAsync(d_next, 0, sizeof(unsigned int), stream.value()));
-  H->ro_store.bufs.emplace_back(sizeof(unsigned int), stream);
-  H->d_completed_blocks =
-    static_cast<unsigned int*>(H->ro_store.bufs.back().data());
-  RAFT_CUDA_TRY(
-    cudaMemsetAsync(H->d_completed_blocks, 0, sizeof(unsigned int), stream.value()));
+  H->d_completed_blocks = alloc_zeroed<unsigned int>(1, H->ro_store);
   // No device-wide sync: the copies are async and the caller may keep working.
   timing.upload_s = toc(up_t0);
+  if (tl_setup.on) {
+    timing.setup_alloc_s   = tl_setup.alloc_s;
+    timing.setup_alloc_n   = tl_setup.alloc_n;
+    timing.setup_h2d_s     = tl_setup.h2d_s;
+    timing.setup_h2d_n     = tl_setup.h2d_n;
+    timing.setup_h2d_bytes = tl_setup.h2d_bytes;
+    timing.setup_memset_s  = tl_setup.memset_s;
+    timing.setup_memset_n  = tl_setup.memset_n;
+    tl_setup.on            = false;
+  }
 
   // ---- Launch a resident work-stealing grid, timed with CUDA events (device compute only) ----
   report_config("monolith", items.size());
@@ -5824,6 +5707,32 @@ template <typename i_t, typename f_t>
 void gpu_ro_cache_destroy(gpu_ro_cache<i_t, f_t>* c)
 {
   delete c;
+}
+
+void gpu_batch_set_setup_telemetry(bool on)
+{
+  gpu_phase2_detail::g_setup_telemetry.store(on, std::memory_order_relaxed);
+}
+
+void gpu_call_stats_begin()
+{
+  gpu_phase2_detail::tl_setup    = gpu_phase2_detail::setup_stats_t{};
+  gpu_phase2_detail::tl_setup.on = true;
+}
+
+gpu_call_stats gpu_call_stats_end()
+{
+  const auto& s = gpu_phase2_detail::tl_setup;
+  gpu_call_stats out;
+  out.alloc_s   = s.alloc_s;
+  out.alloc_n   = s.alloc_n;
+  out.h2d_s     = s.h2d_s;
+  out.h2d_n     = s.h2d_n;
+  out.h2d_bytes = s.h2d_bytes;
+  out.memset_s  = s.memset_s;
+  out.memset_n  = s.memset_n;
+  gpu_phase2_detail::tl_setup.on = false;
+  return out;
 }
 
 template <typename i_t, typename f_t>
@@ -5978,8 +5887,15 @@ static void persistent_copy(T* dst,
                             rmm::cuda_stream_view stream)
 {
   if (count == 0) { return; }
+  auto& stats     = gpu_phase2_detail::tl_setup;
+  const double t0 = stats.on ? tic() : 0.0;
   RAFT_CUDA_TRY(cudaMemcpyAsync(
     dst, src, count * sizeof(T), cudaMemcpyHostToDevice, stream.value()));
+  if (stats.on) {
+    stats.h2d_s += toc(t0);
+    ++stats.h2d_n;
+    stats.h2d_bytes += count * sizeof(T);
+  }
 }
 
 template <typename matrix_t, typename i_t, typename f_t>
@@ -6189,10 +6105,16 @@ bool gpu_simplified_dual_phase2_batch_stage(
                             caps.U0t);
   }
 
+  auto& stats     = tl_setup;
+  const double t0 = stats.on ? tic() : 0.0;
   RAFT_CUDA_TRY(cudaMemsetAsync(a.out_status, 0, 2 * sizeof(i_t), cs));
   RAFT_CUDA_TRY(cudaMemsetAsync(a.out_objective, 0, sizeof(f_t), cs));
   RAFT_CUDA_TRY(cudaMemsetAsync(a.out_user_objective, 0, sizeof(f_t), cs));
   RAFT_CUDA_TRY(cudaMemsetAsync(a.out_iterations, 0, sizeof(i_t), cs));
+  if (stats.on) {
+    stats.memset_s += toc(t0);
+    stats.memset_n += 4;
+  }
   H->staged[seat] = 1;
   return true;
 }
@@ -6305,13 +6227,12 @@ void gpu_simplified_dual_phase2_batch_finish(gpu_phase2_detail::gpu_batch_handle
 // Synchronous entry point: launch, wait, collect. What the benchmark harness uses.
 template <typename i_t, typename f_t>
 void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>>& items,
-                                      size_t heap_estimate_bytes,
                                       std::vector<dual::status_t>& out_status,
                                       gpu_batch_timing& timing,
                                       bool allow_refactor_exit)
 {
   out_status.assign(items.size(), dual::status_t::UNSET);
-  auto* H = gpu_simplified_dual_phase2_batch_launch<i_t, f_t>(items, heap_estimate_bytes, timing,
+  auto* H = gpu_simplified_dual_phase2_batch_launch<i_t, f_t>(items, timing,
                                                              rmm::cuda_stream_default,
                                                              allow_refactor_exit);
   if (H == nullptr) { return; }   // rejected; timing.message says why
@@ -6445,13 +6366,12 @@ template dual::status_t gpu_simplified_dual_phase2<int, double>(
 
 template void gpu_simplified_dual_phase2_batch<int, double>(
   const std::vector<gpu_batch_item<int, double>>&,
-  size_t,
   std::vector<dual::status_t>&,
   gpu_batch_timing&, bool);
 
 template gpu_phase2_detail::gpu_batch_handle_t<int, double>*
 gpu_simplified_dual_phase2_batch_launch<int, double>(
-  const std::vector<gpu_batch_item<int, double>>&, size_t, gpu_batch_timing&, rmm::cuda_stream_view,
+  const std::vector<gpu_batch_item<int, double>>&, gpu_batch_timing&, rmm::cuda_stream_view,
   bool, gpu_phase2_detail::gpu_ro_cache_t<int, double>*, bool);
 template gpu_phase2_detail::gpu_ro_cache_t<int, double>* gpu_ro_cache_create<int, double>();
 template gpu_phase2_detail::gpu_ro_cache_t<int, double>* gpu_ro_cache_create_borrowed<int, double>(

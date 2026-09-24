@@ -194,6 +194,9 @@ solver_settings_t<i_t, f_t>::solver_settings_t() : pdlp_settings(), mip_settings
     {CUOPT_MIP_RINS, &mip_settings.submip_params.rins, -1, 1, -1},
     {CUOPT_MIP_RENS, &mip_settings.submip_params.rens, -1, 1, -1},
     {CUOPT_MIP_OBJECTIVE_STEP, &mip_settings.objective_step, 0, 1, 1},
+    // num_gpus drives both multi-GPU consumers: the concurrent LP (barrier on device 1 when > 1,
+    // at most 2 devices; distributed PDLP when method=PDLP) and, for MIP, the branch-and-bound GPU
+    // dual simplex on devices 1..num_gpus-1. -1 = all visible devices.
     {CUOPT_NUM_GPUS, &pdlp_settings.num_gpus, -1, 72, 1},
     {CUOPT_NUM_GPUS, &mip_settings.num_gpus, -1, 72, 1},
     {CUOPT_MIP_BATCH_PDLP_STRONG_BRANCHING, &mip_settings.mip_batch_pdlp_strong_branching, 0, 2, 0},

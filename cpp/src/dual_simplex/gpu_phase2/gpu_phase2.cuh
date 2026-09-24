@@ -146,14 +146,23 @@ struct gpu_batch_timing {
   double upload_s          = 0.0;  // host: marshal + H2D of all N problems
   double kernel_s          = 0.0;  // device compute (CUDA events, kernel only)
   double copyback_s        = 0.0;  // host: D2H of all N results
+  // Split of a launch's marshal (all N problems + the shared read-only block), filled only while
+  // gpu_batch_set_setup_telemetry(true): host wall time spent inside each class of CUDA call.
+  double setup_alloc_s       = 0.0;  // device_buffer allocations
+  std::size_t setup_alloc_n  = 0;
+  double setup_h2d_s         = 0.0;  // host-to-device copies
+  std::size_t setup_h2d_n    = 0;
+  std::size_t setup_h2d_bytes = 0;
+  double setup_memset_s      = 0.0;  // device memsets
+  std::size_t setup_memset_n = 0;
   std::size_t vram_needed_bytes = 0;
   std::size_t vram_free_bytes   = 0;
   bool rejected            = false;
   std::string message;
 };
 
-// Solve every item in one <<<N,1>>> launch. `heap_estimate_bytes` sizes the device
-// malloc arena for all N concurrent S_ stacks (and is included in the VRAM check).
+// Solve every item in one <<<N,1>>> launch. The kernel does no in-kernel malloc: every buffer it
+// touches is preallocated by the host, so there is no device heap to size.
 // Fails loud: if the batch will not fit it sets timing.rejected + timing.message and
 // returns without launching (never a silent OOM). On success fills out_status[i] and
 // each item->sol. Only instantiated for <int, double>.
@@ -218,7 +227,6 @@ void gpu_ro_cache_destroy(gpu_ro_cache<i_t, f_t>* cache);
 template <typename i_t, typename f_t>
 gpu_batch_handle<i_t, f_t>* gpu_simplified_dual_phase2_batch_launch(
   const std::vector<gpu_batch_item<i_t, f_t>>& items,
-  std::size_t heap_estimate_bytes,
   gpu_batch_timing& timing,
   rmm::cuda_stream_view stream = rmm::cuda_stream_default,
   bool allow_refactor_exit     = false,
@@ -227,6 +235,20 @@ gpu_batch_handle<i_t, f_t>* gpu_simplified_dual_phase2_batch_launch(
 
 template <typename i_t, typename f_t>
 bool gpu_simplified_dual_phase2_batch_ready(gpu_batch_handle<i_t, f_t>* handle);
+
+// Host telemetry switch for the gpu_batch_timing::setup_* split (process-wide, default off). With
+// it off the marshal path takes no timestamps.
+void gpu_batch_set_setup_telemetry(bool on);
+
+// Per-thread CUDA call accounting for host telemetry. gpu_call_stats_begin() resets and enables it
+// on the calling thread; gpu_call_stats_end() disables it and returns the host wall time spent in
+// allocations, host-to-device copies and memsets made by this file (e.g. persistent staging) since.
+struct gpu_call_stats {
+  double alloc_s{0.0}, h2d_s{0.0}, memset_s{0.0};
+  std::size_t alloc_n{0}, h2d_n{0}, h2d_bytes{0}, memset_n{0};
+};
+void gpu_call_stats_begin();
+gpu_call_stats gpu_call_stats_end();
 
 template <typename i_t, typename f_t>
 void gpu_simplified_dual_phase2_batch_finish(gpu_batch_handle<i_t, f_t>* handle,
@@ -281,7 +303,6 @@ void gpu_simplified_dual_phase2_batch_destroy(gpu_batch_handle<i_t, f_t>* handle
 
 template <typename i_t, typename f_t>
 void gpu_simplified_dual_phase2_batch(const std::vector<gpu_batch_item<i_t, f_t>>& items,
-                                      std::size_t heap_estimate_bytes,
                                       std::vector<dual::status_t>& out_status,
                                       gpu_batch_timing& timing,
                                       bool allow_refactor_exit = false);

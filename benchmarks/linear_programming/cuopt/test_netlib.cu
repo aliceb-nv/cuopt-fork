@@ -1303,24 +1303,8 @@ void benchmark_parallel_mode(const raft::handle_t& handle, const std::string& di
 {
   namespace fs = std::filesystem;
   constexpr double GB          = 1.0 / (1024.0 * 1024.0 * 1024.0);
-  constexpr double kSparsity   = 0.30;  // per-update S_ fill (fraction of m) from the sparsity study
-  // Safety factor on the analytic heap estimate. 2.0 was NOT enough: a 15,000-problem B200 run at
-  // 2.0 exhausted the arena and crashed with cudaErrorIllegalAddress. Three reasons the analytic
-  // figure runs low: the device malloc heap fragments (grow_to allocates the new buffer before it
-  // frees the old); `iters` below is the CPU pivot count, and the GPU takes more (5148 vs 3939 on the
-  // 100 v6 nodes); and the per-thread stack reservation is not counted at all.
-  // MEASURED 2026-08-14 with -DCUOPT_ALLOC_STATS=1 on the 100 v6 nodes: real in-kernel demand is
-  // 2.45 MB per problem (warp) and 2.23 MB (single thread), against a raw formula value of ~2.96 MB.
-  // So the formula itself is good to about 20%; the 2.0 factor makes the whole estimate ~2.4x
-  // pessimistic. That matters because the estimate sizes the arena request AND the VRAM pre-flight.
-  // ⚠ The in-kernel heap is capped by the driver at ~16.47 GB on EVERY device (usable ~13.5 GB), so
-  // the real ceiling is ~5,600 problems no matter what this factor is set to.
-  const double kHeapSafety = 2.0;
-
-  // The per-slot arena is always on, so the fixed-size m/n-length workspaces come from ordinary
-  // VRAM and are NOT heap. They must therefore stay OUT of the heap estimate below, or it doubles
-  // its own size and the VRAM pre-flight counts them twice (they are already in
-  // problem_static_bytes).
+  // The kernel does no in-kernel malloc (every buffer is preallocated by the host and budgeted by
+  // problem_static_bytes), so the VRAM pre-flight below is static bytes only.
 
   // One prepared, replicated problem instance.
   struct unique_node_t {
@@ -1340,7 +1324,6 @@ void benchmark_parallel_mode(const raft::handle_t& handle, const std::string& di
     // therefore identical across every configuration being compared. See the sort below.
     int verify_iters              = 0;
     size_t static_bytes           = 0;
-    size_t heap_bytes             = 0;
     explicit unique_node_t(ds::lp_problem_t<int, double>&& lp_in) : lp(std::move(lp_in)) {}
   };
 
@@ -1430,25 +1413,6 @@ void benchmark_parallel_mode(const raft::handle_t& handle, const std::string& di
                                            iters, dinf, upd, /*init*/ false, un->edge_norms);
     un->ref_iters = iters;
     un->ref_obj   = obj;
-    // Two heap contributors per block:
-    //  (a) the iteration-driven S_ MPF stack: ~iters updates x kSparsity*m fill x 12 B (int+double);
-    //  (b) an ITERATION-INDEPENDENT floor that exists even for a 0-iter node — the dense m-length
-    //      solve workspaces and the sparse/dense scratch.
-    //  Arow is NOT counted here any more: it is always uploaded from the host (see marshal_problem),
-    //  so it is static VRAM, not heap. It used to be built in-kernel on the RO-shared path and cost
-    //  1.04 MB of HEAP per problem (2.450 -> 1.408 MB measured), which halved the maximum batch,
-    //  because the device heap is driver-capped at ~16 GB while ordinary VRAM is not.
-    //  With the arena ON, (b) is no longer heap at all: those workspaces are bound to the per-slot
-    //  arena in ordinary VRAM (slot_state::bind_arena_buffers) and are budgeted by
-    //  problem_static_bytes instead. Counting them in both places would reject batches that fit.
-    //  The arena-on value is a FLOOR, not zero: S_.init_empty still allocates, and any buffer that
-    //  outgrows its arena slice falls back to malloc(). A zero here would also make a batch of
-    //  0-iteration nodes request a zero-byte heap.
-    const size_t work_bytes = 4096;
-    const size_t iter_heap  = static_cast<size_t>(static_cast<double>(iters) * kSparsity *
-                                                  static_cast<double>(un->m) * 12.0);
-    un->heap_bytes = static_cast<size_t>((static_cast<double>(iter_heap) +
-                                          static_cast<double>(work_bytes)) * kHeapSafety);
   }
 
   // ---- Heavy-first order (anti-tailing): sort unique by verify.log iters desc; each unique's
@@ -1479,20 +1443,17 @@ void benchmark_parallel_mode(const raft::handle_t& handle, const std::string& di
   const size_t Ntot = list.size();
 
   // ---- Pre-flight memory estimate (fail loud BEFORE building anything big) ----
-  size_t vram_static = 0, vram_heap = 0, host_need = 0;
+  size_t vram_static = 0, host_need = 0;
   for (int u : list) {
     vram_static += nodes[u]->static_bytes;
-    vram_heap   += nodes[u]->heap_bytes;
     host_need   += static_cast<size_t>(nodes[u]->static_bytes * 1.3);  // host copies + overhead
   }
-  const size_t vram_need = vram_static + vram_heap;
+  const size_t vram_need = vram_static;
   size_t free_vram = 0, total_vram = 0;
   cudaMemGetInfo(&free_vram, &total_vram);
   const size_t free_ram = host_mem_available_bytes();
   std::printf("Memory estimate for %zu problems:\n", Ntot);
-  std::printf("  heap safety factor : %.2f\n", kHeapSafety);
-  std::printf("  VRAM  needed ~%.2f GB (static %.2f + heap %.2f) | free %.2f GB\n",
-              vram_need * GB, vram_static * GB, vram_heap * GB, free_vram * GB);
+  std::printf("  VRAM  needed ~%.2f GB (static) | free %.2f GB\n", vram_need * GB, free_vram * GB);
   std::printf("  Host  needed ~%.2f GB | available %.2f GB\n\n", host_need * GB, free_ram * GB);
   bool reject = false;
   std::string why;
@@ -1573,7 +1534,7 @@ void benchmark_parallel_mode(const raft::handle_t& handle, const std::string& di
 
   std::vector<ds::dual::status_t> gpu_status;
   gds::gpu_batch_timing timing;
-  gds::gpu_simplified_dual_phase2_batch<int, double>(items, vram_heap, gpu_status, timing);
+  gds::gpu_simplified_dual_phase2_batch<int, double>(items, gpu_status, timing);
   if (timing.rejected) {
     std::printf("BENCHMARK REJECTED (GPU pre-flight): %s\n", timing.message.c_str());
     return;
@@ -1948,7 +1909,6 @@ void replay_node_mode(const raft::handle_t& handle, const std::string& file, dou
     gds::gpu_batch_timing timing;
     auto* run = gds::gpu_simplified_dual_phase2_batch_launch<int, double>(
       items,
-      0,
       timing,
       rmm::cuda_stream_default,
       /*allow_refactor_exit=*/true,
@@ -2152,7 +2112,7 @@ void replay_node_mode(const raft::handle_t& handle, const std::string& file, dou
         // allow_refactor_exit=TRUE. Without it this leg gets the kernel with the refactor exits
         // compiled OUT, so at the 256-update MPF cap it returns NUMERICAL instead of
         // REFACTOR_NEEDED and the loop stops after one leg -- which is NOT how B&B drives it.
-        gds::gpu_simplified_dual_phase2_batch<int, double>(batch, 0, out, timing,
+        gds::gpu_simplified_dual_phase2_batch<int, double>(batch, out, timing,
                                                           /*allow_refactor_exit*/ true);
         if (out.empty() || timing.rejected) {
           std::printf("  batch rejected: %s\n", timing.message.c_str());
@@ -2634,9 +2594,8 @@ int main(int argc, char* argv[])
   // resource is current, so without a pool here every marshalled buffer is its own cudaMalloc
   // (measured: 41,300 cudaMallocs, 0.234 s, on a 1,200-problem batch).
   //
-  // NOTE make_pool() reserves 40% of FREE VRAM up front. The batch pre-flight then sizes the
-  // in-kernel malloc heap from what is left, so on a card already at its ceiling (12 replicas here)
-  // the two compete -- see the heap note in gpu_phase2's ensure_device_limits.
+  // NOTE make_pool() reserves 40% of FREE VRAM up front; the batch pre-flight adds the current RMM
+  // pool's size back to free VRAM, so a batch is not rejected merely because the pool exists.
   auto memory_resource = make_pool();
   rmm::mr::set_current_device_resource(memory_resource);
 

@@ -44,9 +44,11 @@ namespace gds = cuopt::linear_programming::dual_simplex;
 // device for testing on a single-GPU machine; it is a test hook, not a production path.
 // ---------------------------------------------------------------------------
 
-// Devices available to the dual simplex: every device except 0, which keeps the heuristics.
-// Empty on a single-GPU machine unless the test override names a device.
-std::vector<int> gpu_usable_devices();
+// Devices available to the dual simplex: devices 1..num_gpus-1 of the `num_gpus` solver parameter
+// (-1 = every visible device), clamped to the visible count. Device 0 keeps the heuristics. These
+// are exactly the devices the entry point gave an RMM pool to (cuopt_cli sets one per device in
+// [0, num_gpus)). Empty for num_gpus <= 1 unless the test override names a device.
+std::vector<int> gpu_usable_devices(int num_gpus = -1);
 
 // ---------------------------------------------------------------------------
 // Serial substitution (TEST PATH, CUOPT_BNB_GPU_SERIAL=1).
@@ -196,8 +198,9 @@ int gpu_batch_iter_limit();
 // Host-side B&B GPU-DS telemetry (CUOPT_BNB_GPU_LOG=1). Off by default and never adds device work.
 bool gpu_pool_logging();
 // #4 -- pool index -> CUDA device, computed once before any worker starts. Entry is -1 when no
-// device is usable. See the rationale in gpu_node_pool.cu.
-std::vector<int> gpu_pool_device_map(int num_workers);
+// device is usable. `num_gpus` is the solver parameter (see gpu_usable_devices). See the rationale
+// in gpu_node_pool.cu.
+std::vector<int> gpu_pool_device_map(int num_workers, int num_gpus);
 // #3 -- engage the pool only once the worker's queue holds seats * factor nodes, so a fill does not
 // empty it. CUOPT_BNB_GPU_HEAP_FACTOR, default 5; 0 disables the gate.
 int gpu_pool_heap_factor();
@@ -388,6 +391,25 @@ struct gpu_batch_pool_t {
   uint64_t fill_errors{0}, harvest_errors{0}, relaunch_errors{0}, device_errors{0};
   uint64_t refill_shortfalls{0}, preparation_failures{0};
   uint64_t allocation_halvings{0}, allocation_disables{0};
+  // Setup split (one sample per pool start): `fill` = host seat preparation in the start, `begin` =
+  // gpu_persistent_batch_begin = host LU of every seat + marshal (alloc / H2D / memset) + launch.
+  uint64_t setups{0}, setup_alloc_n{0}, setup_h2d_n{0}, setup_h2d_bytes{0}, setup_memset_n{0};
+  double setup_fill_s{0.0}, setup_begin_s{0.0}, setup_host_lu_s{0.0};
+  double setup_alloc_s{0.0}, setup_h2d_s{0.0}, setup_memset_s{0.0};
+  double last_fill_s{0.0};
+  // Steady-state service-step split, summed over the steps that harvested a launch: `guard` /
+  // `restore` = saving / restoring the worker's CPU LP continuation around the step, `harvest` =
+  // results D2H, `process` = per-seat result install + tree update + child placement, `refill` =
+  // new nodes into free seats, `stage` = per-seat settings + host LU + H2D + memsets (+ growth
+  // allocations), `relaunch` = argument upload + kernel launch.
+  uint64_t steps{0}, step_h2d_n{0}, step_h2d_bytes{0}, step_memset_n{0}, step_alloc_n{0};
+  double step_total_s{0.0}, step_guard_s{0.0}, step_restore_s{0.0}, step_harvest_s{0.0};
+  double step_process_s{0.0}, step_refill_s{0.0}, step_stage_s{0.0}, step_stage_settings_s{0.0};
+  double step_stage_lu_s{0.0}, step_stage_h2d_s{0.0}, step_stage_memset_s{0.0};
+  double step_stage_alloc_s{0.0}, step_relaunch_s{0.0};
+  // Pool retirement (nondeterministic_gpu_pool_finish: destroy the run + return nodes): all of it,
+  // and the part that happened inside a harvesting step (`drain` in the step split).
+  double finish_s{0.0}, step_drain_s{0.0};
 
   // One entry per seat, sized once. Reset for a fresh node, PRESERVED for a plunge child.
   std::vector<batch_seat_state_t<i_t, f_t>> seat_state;
@@ -445,6 +467,10 @@ struct gpu_batch_run_metrics {
   std::size_t terminal_noop_seats{0};
   int periodic_refactors{0}, rejected_refactors{0}, certificate_refactors{0};
   double upload_s{0.0}, kernel_s{0.0}, copyback_s{0.0}, host_factor_s{0.0}, wall_s{0.0};
+  // Initial launch (gpu_persistent_batch_begin) split; zero unless CUOPT_BNB_GPU_LOG=1.
+  double setup_wall_s{0.0}, setup_host_lu_s{0.0};
+  double setup_alloc_s{0.0}, setup_h2d_s{0.0}, setup_memset_s{0.0};
+  std::size_t setup_alloc_n{0}, setup_h2d_n{0}, setup_h2d_bytes{0}, setup_memset_n{0};
 };
 
 template <typename i_t, typename f_t>

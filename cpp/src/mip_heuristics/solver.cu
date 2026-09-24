@@ -349,6 +349,9 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
     branch_and_bound_settings.time_limit           = timer_.get_time_limit();
     branch_and_bound_settings.node_limit           = context.settings.node_limit;
     branch_and_bound_settings.num_threads          = std::max(num_threads - 1, 1);
+    // Same `num_gpus` the concurrent root LP used: B&B puts its GPU dual simplex on devices
+    // 1..num_gpus-1 (-1 = all visible), which are the devices the caller gave RMM pools.
+    branch_and_bound_settings.num_gpus             = context.settings.num_gpus;
     branch_and_bound_settings.print_presolve_stats = false;
     branch_and_bound_settings.absolute_mip_gap_tol = context.settings.tolerances.absolute_mip_gap;
     branch_and_bound_settings.relative_mip_gap_tol = context.settings.tolerances.relative_mip_gap;

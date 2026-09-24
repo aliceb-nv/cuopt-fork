@@ -343,8 +343,10 @@ class pdlp_solver_settings_t {
   bool all_primal_feasible{false};
   presolver_t presolver{presolver_t::Default};
   bool dual_postsolve{true};
-  // Concurrent LP/MIP: 1–2 GPUs. Distributed PDLP (method=PDLP): up to the visible device
-  // count; -1 selects all visible GPUs. See use_distributed_pdlp.
+  // Concurrent LP: uses at most 2 GPUs (barrier on device 1 when > 1); larger values are for MIP,
+  // whose branch-and-bound GPU dual simplex runs on devices 1..num_gpus-1 (see
+  // mip_solver_settings_t::num_gpus). Distributed PDLP (method=PDLP): up to the visible device
+  // count. -1 selects all visible GPUs. See use_distributed_pdlp.
   int num_gpus{1};
   // Dispatch the LP to the multi-GPU distributed PDLP engine (typically set when
   // method=PDLP and num_gpus>1, or num_gpus=-1).
