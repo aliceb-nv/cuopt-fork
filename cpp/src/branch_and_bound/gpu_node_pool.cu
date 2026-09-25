@@ -15,6 +15,7 @@
 #include <math_optimization/tic_toc.hpp>
 
 #include <raft/core/error.hpp>
+#include <raft/core/nvtx.hpp>
 
 #include <atomic>
 #include <cassert>
@@ -1332,6 +1333,7 @@ struct gpu_batch_run_t {
   // confirms that the returned basis/status pair is dual feasible.
   bool refactorize(i_t s, bool initialize_basis)
   {
+    raft::common::nvtx::range scope("GPUPool::host_lu");
     auto& w    = st[s];
     auto& node = nodes[s];
     const auto result = result_views && !initialize_basis
@@ -1588,6 +1590,7 @@ struct gpu_batch_run_t {
 
   bool stage_persistent_fresh(i_t s, std::string& error)
   {
+    raft::common::nvtx::range scope("GPUPool::stage_fresh");
     auto& node = nodes[s];
     auto& w    = st[s];
     // Fresh basis repair retains the incoming vector, matching the CPU driver.
@@ -1623,6 +1626,7 @@ struct gpu_batch_run_t {
 
   bool stage_persistent_refactor(i_t s, std::string& error)
   {
+    raft::common::nvtx::range scope("GPUPool::stage_refactor");
     auto& node = nodes[s];
     auto& w    = st[s];
     assert(result_views || node.dy_se.size() == static_cast<size_t>(n));
@@ -1680,6 +1684,7 @@ struct gpu_batch_run_t {
                       const std::vector<gds::gpu_bound_delta<i_t, f_t>>& deltas,
                       std::string& error)
   {
+    raft::common::nvtx::range scope("GPUPool::stage_child");
     auto& node = nodes[s];
     auto& w    = st[s];
     assert(result_views || node.dy_se.size() == static_cast<size_t>(n));
@@ -1920,6 +1925,7 @@ gpu_batch_run<i_t, f_t>* gpu_persistent_batch_begin(
   std::vector<batch_seat_state_t<i_t, f_t>>* seat_state,
   bool result_views)
 {
+  raft::common::nvtx::range scope("GPUPool::batch_begin");
   static const std::vector<int> devices = gpu_usable_devices();
   if (devices.empty() || nodes.empty() || seat_state == nullptr) { return nullptr; }
   const bool telemetry = gpu_pool_logging();

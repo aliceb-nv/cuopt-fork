@@ -46,6 +46,7 @@
 #include <cstring>
 #include <limits>
 #include <list>
+#include <optional>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -2034,6 +2035,7 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_prepare_fresh(
   gpu_batch_node_t<i_t, f_t>& batch_node,
   gpu_seat_ctx_t<i_t, f_t>& seat_ctx)
 {
+  raft::common::nvtx::range scope("GPUPool::prepare_fresh");
   assert(worker != nullptr);
   assert(node != nullptr);
   worker->recompute_bounds = true;
@@ -2066,6 +2068,7 @@ template <typename i_t, typename f_t>
 void branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_finish(
   bfs_worker_t<i_t, f_t>* worker)
 {
+  raft::common::nvtx::range scope("GPUPool::finish");
   if (worker == nullptr || worker->worker_id < 0 ||
       worker->worker_id >= static_cast<i_t>(gpu_batch_pools_.size())) {
     return;
@@ -2109,6 +2112,7 @@ template <typename i_t, typename f_t>
 bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_start(
   bfs_worker_t<i_t, f_t>* worker)
 {
+  raft::common::nvtx::range scope("GPUPool::start");
   if (worker == nullptr || settings_.inside_submip != 0 || worker->worker_id < 0 ||
       worker->worker_id >= static_cast<i_t>(gpu_batch_pools_.size())) {
     return false;
@@ -2357,6 +2361,11 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
   // every not-ready poll defeats CPU/GPU overlap and can dominate the B&B worker's runtime.
   if (pool.run != nullptr && !may_block && !gpu_batch_run_ready<i_t, f_t>(pool.run)) { return true; }
 
+  // NVTX: one range per serviced step, and one sub-range per phase, matching the [GPUPOOL-*] step
+  // telemetry buckets. emplace() closes the previous phase before opening the next.
+  raft::common::nvtx::range nvtx_step("GPUPool::step");
+  std::optional<raft::common::nvtx::range<>> nvtx_phase;
+
   const bool telemetry = gpu_pool_logging();
   const double service_t0 = telemetry ? tic() : 0.0;
   // Per-phase split of this service step (telemetry only). Phases are added to the pool as they
@@ -2552,6 +2561,7 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     if (!may_block) { return true; }
   }
 
+  nvtx_phase.emplace("GPUPool::harvest");
   const bool ready_before_harvest = gpu_batch_run_ready<i_t, f_t>(pool.run);
   const double harvest_t0 = telemetry ? tic() : 0.0;
   if (!gpu_persistent_batch_harvest<i_t, f_t>(pool.run)) {
@@ -2586,6 +2596,7 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     pool.accounted_kernel_s = metrics.kernel_s;
   }
 
+  nvtx_phase.emplace("GPUPool::process");
   const double process_t0 = telemetry ? tic() : 0.0;
   enum class next_t : unsigned char { FRESH, REFACTOR, CHILD };
   std::vector<next_t> next(batch.size(), next_t::FRESH);
@@ -2731,6 +2742,7 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     nondeterministic_gpu_pool_finish(worker);
     return false;
   }
+  nvtx_phase.emplace("GPUPool::refill");
   const double refill_t0 = telemetry ? tic() : 0.0;
   for (i_t seat = 0; seat < static_cast<i_t>(batch.size()); ++seat) {
     if (next[seat] == next_t::FRESH &&
@@ -2743,6 +2755,7 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
 
   // Stage split: host LU is the run's host_factor_s delta, H2D / memset / growth allocations come
   // from the per-thread CUDA call accounting, settings copies are timed here.
+  nvtx_phase.emplace("GPUPool::stage");
   const double stage_t0        = telemetry ? tic() : 0.0;
   const double stage_factor_t0 =
     telemetry ? gpu_batch_run_get_metrics<i_t, f_t>(pool.run).host_factor_s : 0.0;
@@ -2858,8 +2871,10 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     }
   }
   close_stage();
+  nvtx_phase.reset();
 
   nondeterministic_gpu_pool_update_lower_bound(worker);
+  nvtx_phase.emplace("GPUPool::relaunch");
   const double relaunch_t0 = telemetry ? tic() : 0.0;
   if (!gpu_persistent_batch_relaunch<i_t, f_t>(pool.run, stage_error)) {
     if (telemetry) {

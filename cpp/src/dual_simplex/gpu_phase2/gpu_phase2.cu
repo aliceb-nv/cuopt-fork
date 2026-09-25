@@ -38,6 +38,8 @@
 #include <utilities/macros.cuh>
 #include <utilities/manual_cuda_graph.cuh>   // run_while: the device-controlled super-step loop
 
+#include <raft/core/nvtx.hpp>
+
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
@@ -4607,6 +4609,7 @@ struct fixed_storage {
 
   void flush_uploads()
   {
+    raft::common::nvtx::range nvtx_scope("GpuDS::flush_uploads");
     for (const auto& upload : uploads) {
       if (upload.bytes == 0) { continue; }
       RAFT_CUDA_TRY(cudaMemcpyAsync(upload.device, upload.host, upload.bytes,
@@ -4764,6 +4767,7 @@ struct ro_upload {
 
 static ro_upload upload_ro(const lp_problem_t<i_t, f_t>& lp, marshal_storage& st)
 {
+  raft::common::nvtx::range nvtx_scope("GpuDS::upload_ro");
   const auto& A = lp.A;
   ro_upload r{};
   // Build and upload the immutable CSR transpose once per distinct A.
@@ -4876,6 +4880,7 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
                                    fixed_storage* fixed = nullptr,
                                    size_t seat = 0)
 {
+  raft::common::nvtx::range nvtx_scope("GpuDS::marshal_problem");
   const int m = lp.num_rows;
   const int n = lp.num_cols;
   assert(delta_y_steepest_edge.size() == static_cast<size_t>(n));
@@ -5408,6 +5413,7 @@ gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batc
   gpu_phase2_detail::gpu_ro_cache_t<i_t, f_t>* ro_ext,
   bool persistent_seats)
 {
+  raft::common::nvtx::range nvtx_scope("GpuDS::batch_launch");
   using namespace gpu_phase2_detail;
   static_assert(sizeof(i_t) == sizeof(int) && sizeof(f_t) == sizeof(double),
                 "gpu_simplified_dual_phase2_batch is only instantiated for <int, double>");
@@ -5750,6 +5756,7 @@ void gpu_simplified_dual_phase2_batch_harvest(
   std::vector<dual::status_t>& out_status,
   gpu_batch_timing& timing)
 {
+  raft::common::nvtx::range nvtx_scope("GpuDS::batch_harvest");
   using namespace gpu_phase2_detail;
   if (H == nullptr) { return; }
   const std::vector<gpu_batch_item<i_t, f_t>>& items = H->items;
@@ -5909,6 +5916,7 @@ static void persistent_stage_factor(
   i_t& d_nz,
   size_t& capacity)
 {
+  raft::common::nvtx::range nvtx_scope("GpuDS::persistent_stage_factor");
   using namespace gpu_phase2_detail;
   const i_t rows = H->h_args[seat].m;
   if (F.m != rows || F.n != rows || F.col_start.size() != static_cast<size_t>(rows + 1)) {
@@ -5941,6 +5949,7 @@ bool gpu_simplified_dual_phase2_batch_stage(
   const std::vector<gpu_bound_delta<i_t, f_t>>& deltas,
   std::string& error)
 {
+  raft::common::nvtx::range nvtx_scope("GpuDS::batch_stage");
   using namespace gpu_phase2_detail;
   error.clear();
   if (H == nullptr || !H->persistent_mode || H->launched) {
@@ -6125,6 +6134,7 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
   gpu_batch_timing& timing,
   std::string& error)
 {
+  raft::common::nvtx::range nvtx_scope("GpuDS::batch_relaunch");
   using namespace gpu_phase2_detail;
   error.clear();
   if (H == nullptr || !H->persistent_mode || H->launched) {
