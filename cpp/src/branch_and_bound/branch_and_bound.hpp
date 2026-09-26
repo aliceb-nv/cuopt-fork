@@ -374,6 +374,10 @@ class branch_and_bound_t {
 
   // A worker attempts to steal nodes from another worker
   void work_stealing(bfs_worker_t<i_t, f_t>* worker);
+  // CUOPT_BNB_REBALANCE (default on): a heap below half the mean pulls from the largest heap.
+  bool rebalance_pull(bfs_worker_t<i_t, f_t>* worker, bool force);
+  std::atomic<int64_t> rebalance_pulls_{0}, rebalance_nodes_{0};
+  std::atomic<int64_t> fetch_no_scores_{0}, fetch_unreliable_{0}, accepted_optimal_{0};  // telemetry
 
   // Perform a deep dive in the subtree determined by the `start_node` in order
   // to find integer feasible solutions.
@@ -510,13 +514,20 @@ class branch_and_bound_t {
   bool nondeterministic_gpu_pool_step(bfs_worker_t<i_t, f_t>* worker, bool may_block);
   bool nondeterministic_gpu_pool_ready(const bfs_worker_t<i_t, f_t>* worker) const;
   void nondeterministic_gpu_pool_finish(bfs_worker_t<i_t, f_t>* worker);
+  // Telemetry: one [GPUPOOL-SAMPLE] line per second (pool fill, heap sizes, open nodes).
+  void sample_gpu_pools(f_t now);
+  std::atomic<double> gpu_sample_next_s_{0.0};
   simplex::simplex_solver_settings_t<i_t, f_t> nondeterministic_gpu_pool_settings(
     const bfs_worker_t<i_t, f_t>* worker);
   bool nondeterministic_gpu_pool_prepare_fresh(bfs_worker_t<i_t, f_t>* worker,
                                                mip_node_t<i_t, f_t>* node,
                                                gpu_batch_node_t<i_t, f_t>& batch_node,
-                                               gpu_seat_ctx_t<i_t, f_t>& seat_ctx);
-  bool nondeterministic_gpu_pool_fill_fresh_seat(bfs_worker_t<i_t, f_t>* worker, i_t seat);
+                                               gpu_seat_ctx_t<i_t, f_t>& seat_ctx,
+                                               gpu_pool_lap_t* lap        = nullptr,
+                                               bool refresh_settings_only = false);
+  bool nondeterministic_gpu_pool_fill_fresh_seat(bfs_worker_t<i_t, f_t>* worker,
+                                                 i_t seat,
+                                                 double* sub = nullptr);
   void nondeterministic_gpu_pool_update_lower_bound(const bfs_worker_t<i_t, f_t>* worker);
   simplex::dual_status_t nondeterministic_gpu_pool_install_result(
     bfs_worker_t<i_t, f_t>* worker,
@@ -598,7 +609,7 @@ class branch_and_bound_t {
   std::atomic<int64_t> gpu_batch_noseat_{0};   // stolen, but no seat prepared (fathomed / infeasible
                                                // by strengthening / past the deadline)
   // Why seats never produced a device answer, indexed by gpu_batch_node_t::drop_t.
-  std::array<std::atomic<int64_t>, 9> gpu_batch_drops_{};
+  std::array<std::atomic<int64_t>, 11> gpu_batch_drops_{};
   std::atomic<int64_t> gpu_batch_launched_{0};    // seats sent to the device
   std::atomic<int64_t> gpu_batch_launches_{0};    // launches
   mip_status_t deterministic_global_termination_status_{mip_status_t::UNSET};

@@ -6,6 +6,8 @@
 /* clang-format on */
 
 #include <branch_and_bound/branch_and_bound.hpp>
+
+#include <malloc.h>
 #include <branch_and_bound/bad_node_dump.hpp>
 #include <branch_and_bound/gpu_node_pool.hpp>
 #include <branch_and_bound/diving_heuristics.hpp>
@@ -61,6 +63,13 @@
 #endif
 
 namespace cuopt::mathematical_optimization::mip {
+
+// Telemetry: set by the GPU pool's result processing around update_tree_impl (null otherwise).
+static thread_local gpu_pool_lap_t* tl_tree_laps = nullptr;
+static inline void tree_lap(int k)
+{
+  if (tl_tree_laps != nullptr) { tl_tree_laps->lap(k); }
+}
 
 using simplex::basis_update_mpf_t;
 using simplex::bounds_strengthening_t;
@@ -1234,6 +1243,13 @@ struct nondeterministic_policy_t : tree_update_policy_t<i_t, f_t> {
     return bnb.variable_selection(node, fractional, worker);
   }
 
+  branch_variable_t<i_t> select_branch_variable_device(
+    const gds::gpu_batch_result_view<i_t, f_t>& result)
+  {
+    const i_t var = result.dev_best_var;
+    return {var, martin_criteria(result.x[var], worker->root_solution[var])};
+  }
+
   branch_variable_t<i_t> select_branch_variable_view(
     mip_node_t<i_t, f_t>* node,
     const std::vector<i_t>& fractional,
@@ -1550,16 +1566,22 @@ std::pair<node_status_t, branch_direction_t> branch_and_bound_t<i_t, f_t>::updat
     status = node_status_t::INFEASIBLE;
 
   } else if (lp_status == dual_status_t::CUTOFF) {
-    f_t leaf_obj          = compute_objective(leaf_problem, leaf_x);
+    f_t leaf_obj          = gpu_result != nullptr && gpu_pool_device_objective()
+                              ? gpu_result->objective
+                              : compute_objective(leaf_problem, leaf_x);
     node_ptr->lower_bound = upper_bound;
     policy.graphviz(search_tree, node_ptr, "cut off", leaf_obj);
     search_tree.update(node_ptr, node_status_t::FATHOMED);
     status = node_status_t::FATHOMED;
 
   } else if (lp_status == dual_status_t::OPTIMAL) {
+    const bool dev_scores = gpu_result != nullptr && gpu_result->dev_num_frac >= 0 &&
+                            !gpu_result->dev_unreliable;
     std::vector<i_t> leaf_fractional;
-    i_t num_frac =
-      fractional_variables(settings_, leaf_x, worker->var_types, leaf_fractional);
+    i_t num_frac = dev_scores
+                     ? gpu_result->dev_num_frac
+                     : fractional_variables(settings_, leaf_x, worker->var_types, leaf_fractional);
+    tree_lap(SUB_TREE_FRAC);
 
 #ifdef DEBUG_FRACTIONAL_FIXED
     for (i_t j : leaf_fractional) {
@@ -1577,10 +1599,14 @@ std::pair<node_status_t, branch_direction_t> branch_and_bound_t<i_t, f_t>::updat
     }
 #endif
 
-    f_t leaf_obj = compute_objective(leaf_problem, leaf_x);
+    f_t leaf_obj = gpu_result != nullptr && gpu_pool_device_objective()
+                     ? gpu_result->objective
+                     : compute_objective(leaf_problem, leaf_x);
 
     policy.graphviz(search_tree, node_ptr, "lower bound", leaf_obj);
+    tree_lap(SUB_TREE_FRAC);
     policy.update_pseudo_costs(node_ptr, leaf_obj);
+    tree_lap(SUB_TREE_PSEUDO);
     node_ptr->lower_bound = leaf_obj;
     snap_to_lattice(leaf_problem, node_ptr, leaf_obj);
 
@@ -1598,7 +1624,8 @@ std::pair<node_status_t, branch_direction_t> branch_and_bound_t<i_t, f_t>::updat
     } else if (node_ptr->lower_bound <= upper_bound + abs_fathom_tol) {
       branch_variable_t<i_t> selected;
       if constexpr (std::is_same_v<Policy, nondeterministic_policy_t<i_t, f_t>>) {
-        selected = gpu_result != nullptr
+        selected = dev_scores ? policy.select_branch_variable_device(*gpu_result)
+                   : gpu_result != nullptr
                      ? policy.select_branch_variable_view(node_ptr, leaf_fractional, *gpu_result)
                      : policy.select_branch_variable(node_ptr, leaf_fractional,
                                                      worker->leaf_solution.x);
@@ -1606,6 +1633,9 @@ std::pair<node_status_t, branch_direction_t> branch_and_bound_t<i_t, f_t>::updat
         selected = policy.select_branch_variable(node_ptr, leaf_fractional,
                                                  worker->leaf_solution.x);
       }
+      tree_lap(pseudo_costs_t<i_t, f_t>::last_selection_unreliable ? SUB_TREE_SELECT_SB
+                                                                   : SUB_TREE_SELECT);
+      pseudo_costs_t<i_t, f_t>::last_selection_unreliable = false;
       auto [branch_var, dir] = selected;
       round_dir = dir;
 
@@ -1614,7 +1644,9 @@ std::pair<node_status_t, branch_direction_t> branch_and_bound_t<i_t, f_t>::updat
       assert(dir != branch_direction_t::NONE);
 
       if constexpr (std::is_same_v<Policy, nondeterministic_policy_t<i_t, f_t>>) {
-        if (gpu_result != nullptr) {
+        if (dev_scores) {
+          node_ptr->objective_estimate = node_ptr->lower_bound + gpu_result->dev_estimate;
+        } else if (gpu_result != nullptr) {
           policy.update_objective_estimate_view(node_ptr, leaf_fractional, leaf_x);
         } else {
           policy.update_objective_estimate(node_ptr, leaf_fractional, worker->leaf_solution.x);
@@ -1622,6 +1654,7 @@ std::pair<node_status_t, branch_direction_t> branch_and_bound_t<i_t, f_t>::updat
       } else {
         policy.update_objective_estimate(node_ptr, leaf_fractional, worker->leaf_solution.x);
       }
+      tree_lap(SUB_TREE_ESTIMATE);
       worker->recompute_basis  = worker->host_basis_stale;
       worker->recompute_bounds = false;
 
@@ -1634,6 +1667,7 @@ std::pair<node_status_t, branch_direction_t> branch_and_bound_t<i_t, f_t>::updat
                          leaf_vstatus,
                          leaf_problem,
                          log);
+      tree_lap(SUB_TREE_BRANCH);
       search_tree.update(node_ptr, node_status_t::HAS_CHILDREN);
       status = node_status_t::HAS_CHILDREN;
 
@@ -2025,7 +2059,19 @@ void branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_update_lower_bound(
   for (const auto& context : pool.ctx) {
     if (context.node != nullptr) { bound = std::min(bound, context.node->lower_bound); }
   }
+  for (size_t k = pool.prefetch_next; k < pool.prefetched.size(); ++k) {
+    bound = std::min(bound, pool.prefetched[k]->lower_bound);
+  }
   pool.lower_bound = bound;
+}
+
+// No host strengthening or symmetry reduction touches a seat's bounds.
+template <typename i_t, typename f_t>
+static bool gpu_pool_inplace_bounds(const bfs_worker_t<i_t, f_t>* worker, int symmetry)
+{
+  return gpu_pool_inplace() && gpu_pool_device_strengthen() && !gpu_pool_recheck() &&
+         dump_bad_nodes_dir() == nullptr && worker->orbital_fixing == nullptr &&
+         (symmetry != 2 || worker->lexical_reduction == nullptr);
 }
 
 template <typename i_t, typename f_t>
@@ -2033,20 +2079,54 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_prepare_fresh(
   bfs_worker_t<i_t, f_t>* worker,
   mip_node_t<i_t, f_t>* node,
   gpu_batch_node_t<i_t, f_t>& batch_node,
-  gpu_seat_ctx_t<i_t, f_t>& seat_ctx)
+  gpu_seat_ctx_t<i_t, f_t>& seat_ctx,
+  gpu_pool_lap_t* lap,
+  bool refresh_settings_only)
 {
   raft::common::nvtx::range scope("GPUPool::prepare_fresh");
+  gpu_pool_lap_t no_lap;
+  gpu_pool_lap_t& laps = lap != nullptr ? *lap : no_lap;
   assert(worker != nullptr);
   assert(node != nullptr);
   worker->recompute_bounds = true;
   worker->recompute_basis  = true;
-  decompress_vstatus(node->packed_vstatus, worker->leaf_problem.num_cols, worker->leaf_vstatus);
-  worker->leaf_edge_norms = worker->root_edge_norm;
   worker->ensure_orbital_fixing();
+  const bool path_bounds =
+    gpu_pool_path_bounds() && gpu_pool_inplace_bounds(worker, settings_.symmetry) &&
+    gpu_batch_run_path_bounds<i_t, f_t>(gpu_batch_pools_[worker->worker_id]->run);
+  const bool packed_fresh = path_bounds && gpu_pool_packed_fresh();
+  if (!packed_fresh) {
+    decompress_vstatus(node->packed_vstatus, worker->leaf_problem.num_cols, worker->leaf_vstatus);
+    worker->leaf_edge_norms = worker->root_edge_norm;
+  }
+  batch_node.packed_vstatus = packed_fresh ? &node->packed_vstatus : nullptr;
+  batch_node.root_dy_se     = packed_fresh ? &worker->root_edge_norm : nullptr;
+  laps.lap(SUB_REFILL_VSTATUS);
 
-  bool feasible = worker->set_lp_variable_bounds(node, settings_);
-  if (worker->orbital_fixing != nullptr) { worker->orbital_fixing->reset(symmetry_, node); }
-  if (feasible) { feasible = apply_symmetry_reductions(node, worker, exploration_stats_); }
+  batch_node.root_lower = batch_node.root_upper = nullptr;
+  bool feasible = true;
+  if (path_bounds) {
+    auto& path = batch_node.path_deltas;
+    path.clear();
+    std::fill(worker->bounds_changed.begin(), worker->bounds_changed.end(), false);
+    for (const mip_node_t<i_t, f_t>* p = node; p->parent != nullptr; p = p->parent) {
+      if (worker->bounds_changed[p->branch_var]) { continue; }
+      worker->bounds_changed[p->branch_var] = true;
+      path.push_back({p->branch_var, p->branch_var_lower, p->branch_var_upper, 3});
+    }
+    batch_node.root_lower = &worker->start_lower;
+    batch_node.root_upper = &worker->start_upper;
+    batch_node.lower.resize(worker->leaf_problem.num_cols);
+    batch_node.upper.resize(worker->leaf_problem.num_cols);
+    laps.lap(SUB_REFILL_BOUNDS);
+  } else {
+    // With device strengthening the seat's bounds are strengthened in the kernel.
+    feasible = worker->set_lp_variable_bounds(node, settings_, !gpu_pool_device_strengthen());
+    laps.lap(SUB_REFILL_BOUNDS);
+    if (worker->orbital_fixing != nullptr) { worker->orbital_fixing->reset(symmetry_, node); }
+    if (feasible) { feasible = apply_symmetry_reductions(node, worker, exploration_stats_); }
+    laps.lap(SUB_REFILL_SYMMETRY);
+  }
   if (!feasible) {
     ++exploration_stats_.nodes_since_last_log;
     ++exploration_stats_.nodes_explored;
@@ -2055,12 +2135,25 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_prepare_fresh(
     return false;
   }
 
-  batch_node.settings = nondeterministic_gpu_pool_settings(worker);
-  batch_node.lower    = worker->leaf_problem.lower;
-  batch_node.upper    = worker->leaf_problem.upper;
-  batch_node.vstatus  = worker->leaf_vstatus;
-  batch_node.dy_se    = worker->leaf_edge_norms;
+  const auto& gen = gpu_batch_pools_[worker->worker_id]->gen_settings;
+  if (refresh_settings_only && gen.concurrent_halt == &node_concurrent_halt_ &&
+      batch_node.settings.concurrent_halt == &node_concurrent_halt_) {
+    batch_node.settings.cut_off    = gen.cut_off;
+    batch_node.settings.time_limit = gen.time_limit;
+  } else {
+    batch_node.settings = nondeterministic_gpu_pool_settings(worker);
+  }
+  laps.lap(SUB_BUILD_SETTINGS);
+  if (!path_bounds) {
+    batch_node.lower = worker->leaf_problem.lower;
+    batch_node.upper = worker->leaf_problem.upper;
+  }
+  if (!packed_fresh) {
+    batch_node.vstatus = worker->leaf_vstatus;
+    batch_node.dy_se   = worker->leaf_edge_norms;
+  }
   seat_ctx            = gpu_seat_ctx_t<i_t, f_t>{node, {}, {}, 0, true};
+  laps.lap(SUB_BUILD_COPY);
   return true;
 }
 
@@ -2100,12 +2193,59 @@ void branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_finish(
   pool.batch.clear();
   pool.ctx.clear();
   pool.seat_state.clear();
-  pool.busy = false;
+  pool.busy   = false;
+  pool.seated = 0;
   if (gpu_pool_logging()) {
     ++pool.drains;
+    settings_.log.printf("[GPUPOOL-DRAIN] t=%.3f worker=%d gpu=%d reason=%s heap=%d\n",
+                         toc(exploration_stats_.start_time), (int)worker->worker_id, pool.device,
+                         pool.drain_reason, (int)worker->node_queue.best_first_queue_size());
+    pool.drain_reason = "other";
     pool.available_since_s = toc(exploration_stats_.start_time);
     pool.finish_s += toc(finish_t0);
   }
+}
+
+template <typename i_t, typename f_t>
+void branch_and_bound_t<i_t, f_t>::sample_gpu_pools(f_t now)
+{
+  double next = gpu_sample_next_s_.load();
+  if (now < next || !gpu_sample_next_s_.compare_exchange_strong(next, now + 1.0)) { return; }
+  if (!bfs_worker_pool_.is_initialized()) { return; }
+  // Fill histogram of active pools in 10% bins; idle pools split by the engagement gate.
+  int fill[10] = {}, active = 0, idle_blocked = 0, idle_ready = 0;
+  int64_t seated = 0, heap_total = 0, below_gate = 0;
+  std::vector<int64_t> heaps;
+  for (i_t w = 0; w < bfs_worker_pool_.size(); ++w) {
+    const int64_t h = bfs_worker_pool_[w]->node_queue.best_first_queue_size();
+    heaps.push_back(h);
+    heap_total += h;
+    if (w >= static_cast<i_t>(gpu_batch_pools_.size())) { continue; }
+    const auto& pool = *gpu_batch_pools_[w];
+    if (pool.seats <= 0) { continue; }
+    const int64_t gate = static_cast<int64_t>(pool.seats) * std::max(gpu_pool_heap_factor(), 1);
+    below_gate += h < gate;
+    if (pool.busy) {
+      ++active;
+      seated += pool.seated;
+      fill[std::min(9, 10 * pool.seated.load() / pool.seats)]++;
+    } else {
+      (h < gate ? idle_blocked : idle_ready)++;
+    }
+  }
+  std::sort(heaps.begin(), heaps.end());
+  const auto q = [&](double p) { return heaps.empty() ? 0 : heaps[static_cast<size_t>(p * (heaps.size() - 1))]; };
+  settings_.log.printf(
+    "[GPUPOOL-SAMPLE] t=%.2f open=%lld heap_total=%lld seated=%lld active=%d idle_blocked=%d "
+    "idle_ready=%d below_gate=%lld fill=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d heap_q=%lld,%lld,%lld,%lld,%lld "
+    "rebalance_pulls=%lld rebalance_nodes=%lld optimal=%lld fetch_no_scores=%lld fetch_unreliable=%lld\n",
+    now, (long long)exploration_stats_.nodes_unexplored.load(), (long long)heap_total,
+    (long long)seated, active, idle_blocked, idle_ready, (long long)below_gate, fill[0], fill[1],
+    fill[2], fill[3], fill[4], fill[5], fill[6], fill[7], fill[8], fill[9], (long long)q(0),
+    (long long)q(0.1), (long long)q(0.5), (long long)q(0.9), (long long)q(1.0),
+    (long long)rebalance_pulls_.load(), (long long)rebalance_nodes_.load(),
+    (long long)accepted_optimal_.load(), (long long)fetch_no_scores_.load(),
+    (long long)fetch_unreliable_.load());
 }
 
 template <typename i_t, typename f_t>
@@ -2169,6 +2309,7 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_start(
   }
 
   nondeterministic_gpu_pool_update_lower_bound(worker);
+  pool.seated = static_cast<int>(pool.batch.size());
   ++gpu_batch_cycles_;
   gpu_batch_stolen_ += static_cast<int64_t>(pool.batch.size());
   if (telemetry) {
@@ -2198,32 +2339,64 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_start(
 
 template <typename i_t, typename f_t>
 bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_fill_fresh_seat(
-  bfs_worker_t<i_t, f_t>* worker, i_t seat)
+  bfs_worker_t<i_t, f_t>* worker, i_t seat, double* sub)
 {
   auto& pool = *gpu_batch_pools_[worker->worker_id];
+  gpu_pool_lap_t laps{sub};
+  laps.start();
   while (solver_status_ == mip_status_t::UNSET && is_running_) {
     // Publish the queue's current minimum before transferring ownership out of it. Keeping the
     // lower value temporarily is conservative; missing the popped node even briefly is not.
     pool.lower_bound = std::min(pool.lower_bound.load(), worker->node_queue.get_lower_bound());
-    mip_node_t<i_t, f_t>* node = worker->node_queue.pop_gpu_eligible();
+    mip_node_t<i_t, f_t>* node = pool.prefetch_next < pool.prefetched.size()
+                                   ? pool.prefetched[pool.prefetch_next++]
+                                   : worker->node_queue.pop_gpu_eligible();
     if (node == nullptr) {
       if (gpu_pool_logging()) { ++pool.refill_shortfalls; }
+      laps.lap(SUB_REFILL_FAIL);
       return false;
     }
     if (node->lower_bound > upper_bound_.load()) {
       search_tree_.graphviz_node(settings_.log, node, "cutoff", node->lower_bound);
       search_tree_.update(node, node_status_t::FATHOMED);
       --exploration_stats_.nodes_unexplored;
+      laps.lap(SUB_REFILL_CUTOFF);
       continue;
     }
+    laps.lap(SUB_REFILL_POP);
 
+    gpu_seat_ctx_t<i_t, f_t> seat_ctx;
+    if (gpu_pool_inplace() && seat < static_cast<i_t>(pool.batch.size())) {
+      auto& reuse         = pool.batch[seat];
+      reuse.continue_basis = false;
+      reuse.status         = dual_status_t::UNSET;
+      reuse.iters          = 0;
+      reuse.solved         = false;
+      reuse.drop           = gpu_batch_node_t<i_t, f_t>::drop_t::NONE;
+      reuse.basic_list.clear();
+      reuse.nonbasic_list.clear();
+      laps.lap(SUB_BUILD_ALLOC);
+      if (!nondeterministic_gpu_pool_prepare_fresh(
+            worker, node, reuse, seat_ctx, &laps, gpu_pool_light_settings())) {
+        continue;
+      }
+      pool.ctx[seat] = std::move(seat_ctx);
+      laps.lap(SUB_REFILL_BUILD);
+      if (!gpu_pool_batch_heap()) { nondeterministic_gpu_pool_update_lower_bound(worker); }
+      laps.lap(SUB_REFILL_LB);
+      return true;
+    }
     gpu_batch_node_t<i_t, f_t> batch_node(worker->leaf_problem.num_rows,
                                            worker->leaf_problem.num_cols);
-    gpu_seat_ctx_t<i_t, f_t> seat_ctx;
-    if (!nondeterministic_gpu_pool_prepare_fresh(worker, node, batch_node, seat_ctx)) { continue; }
+    laps.lap(SUB_BUILD_ALLOC);
+    if (!nondeterministic_gpu_pool_prepare_fresh(worker, node, batch_node, seat_ctx, &laps)) {
+      continue;
+    }
     pool.batch[seat] = std::move(batch_node);
     pool.ctx[seat]   = std::move(seat_ctx);
-    nondeterministic_gpu_pool_update_lower_bound(worker);
+    laps.lap(SUB_REFILL_BUILD);
+    if (!gpu_pool_batch_heap()) { nondeterministic_gpu_pool_update_lower_bound(worker); }
+    laps.lap(SUB_REFILL_LB);
     return true;
   }
   return false;
@@ -2239,8 +2412,13 @@ dual_status_t branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_install_re
 {
   dual_status_t accepted_status = result.status;
   gpu_answer_accepted           = true;
-  worker->leaf_problem.lower    = batch_node.lower;
-  worker->leaf_problem.upper    = batch_node.upper;
+  if (!result.lower.empty()) {
+    worker->leaf_problem.lower.assign(result.lower.begin(), result.lower.end());
+    worker->leaf_problem.upper.assign(result.upper.begin(), result.upper.end());
+  } else {
+    worker->leaf_problem.lower = batch_node.lower;
+    worker->leaf_problem.upper = batch_node.upper;
+  }
   i_t accepted_iterations = result.iterations;
 
   if (gpu_pool_recheck()) {
@@ -2367,6 +2545,11 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
   std::optional<raft::common::nvtx::range<>> nvtx_phase;
 
   const bool telemetry = gpu_pool_logging();
+  if (telemetry && !pool.warmup_done &&
+      toc(exploration_stats_.start_time) >= gpu_pool_log_warmup_s()) {
+    pool.warmup_done = true;
+    pool.reset_step_split();
+  }
   const double service_t0 = telemetry ? tic() : 0.0;
   // Per-phase split of this service step (telemetry only). Phases are added to the pool as they
   // finish; the step total and the continuation save/restore only for steps that harvested.
@@ -2441,7 +2624,8 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
   };
   auto fresh_factor_failure = [&](i_t seat) {
     return batch[seat].drop == drop_t::FACTORIZE_FILL ||
-           batch[seat].drop == drop_t::SIZE_CONTRACT;
+           batch[seat].drop == drop_t::SIZE_CONTRACT ||
+           batch[seat].drop == drop_t::FACTOR_CAP_FRESH;
   };
   auto stop_drain = [&](i_t seat) {
     return batch[seat].drop == drop_t::DEADLINE ||
@@ -2451,14 +2635,17 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     return batch[seat].status == dual_status_t::ITERATION_LIMIT ||
            batch[seat].drop == drop_t::FACTORIZE_RESUME ||
            batch[seat].drop == drop_t::DUAL_INFEASIBLE_RESUME ||
-           batch[seat].drop == drop_t::LIVELOCK;
+           batch[seat].drop == drop_t::LIVELOCK ||
+           batch[seat].drop == drop_t::FACTOR_CAP_RESUME;
   };
 
   if (pool.run == nullptr) {
-    for (auto& node : batch) { node.settings = nondeterministic_gpu_pool_settings(worker); }
+    pool.gen_settings = nondeterministic_gpu_pool_settings(worker);
+    for (auto& node : batch) { node.settings = pool.gen_settings; }
     double launch_t0 = telemetry ? tic() : 0.0;
     pool.run = gpu_persistent_batch_begin<i_t, f_t>(
-      worker->leaf_problem, batch, pool.stream.view(), pool.ro_cache, &pool.seat_state, true);
+      worker->leaf_problem, batch, pool.stream.view(), pool.ro_cache, &pool.seat_state, true,
+        gpu_pool_device_strengthen() ? &var_types_ : nullptr);
 
     while (pool.run == nullptr) {
       bool replaced = false;
@@ -2488,7 +2675,8 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
       if (!replaced) { break; }
       launch_t0 = telemetry ? tic() : 0.0;
       pool.run = gpu_persistent_batch_begin<i_t, f_t>(
-        worker->leaf_problem, batch, pool.stream.view(), pool.ro_cache, &pool.seat_state, true);
+        worker->leaf_problem, batch, pool.stream.view(), pool.ro_cache, &pool.seat_state, true,
+        gpu_pool_device_strengthen() ? &var_types_ : nullptr);
     }
 
     if (pool.run == nullptr && batch.size() > 1 && !pool.halved) {
@@ -2504,7 +2692,8 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
       nondeterministic_gpu_pool_update_lower_bound(worker);
       launch_t0 = telemetry ? tic() : 0.0;
       pool.run = gpu_persistent_batch_begin<i_t, f_t>(
-        worker->leaf_problem, batch, pool.stream.view(), pool.ro_cache, &pool.seat_state, true);
+        worker->leaf_problem, batch, pool.stream.view(), pool.ro_cache, &pool.seat_state, true,
+        gpu_pool_device_strengthen() ? &var_types_ : nullptr);
     }
     if (pool.run == nullptr) {
       pool.disabled = true;
@@ -2561,6 +2750,8 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     if (!may_block) { return true; }
   }
 
+  const bool inplace = gpu_pool_inplace_bounds(worker, settings_.symmetry);
+  gpu_batch_run_set_bounds_mirror<i_t, f_t>(pool.run, !(inplace && gpu_pool_bounds_view()));
   nvtx_phase.emplace("GPUPool::harvest");
   const bool ready_before_harvest = gpu_batch_run_ready<i_t, f_t>(pool.run);
   const double harvest_t0 = telemetry ? tic() : 0.0;
@@ -2583,6 +2774,16 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     ++pool.steps;
     pool.step_harvest_s += harvest_wall;
     const auto metrics = gpu_batch_run_get_metrics<i_t, f_t>(pool.run);
+    pool.step_sub_s[SUB_HARVEST_D2H] += metrics.last_harvest_d2h_s;
+    pool.step_sub_s[SUB_D2H_ENQUEUE] += metrics.last_harvest_d2h_enqueue_s;
+    pool.step_sub_s[SUB_D2H_DEVICE] += metrics.last_harvest_d2h_device_s;
+    pool.step_sub_s[SUB_HARVEST_SCATTER] += metrics.last_harvest_scatter_s;
+    pool.step_sub_s[SUB_HARVEST_UNPACK] += metrics.last_harvest_unpack_s;
+    pool.step_sub_s[SUB_NOTICE_PREKERNEL] += metrics.last_prekernel_s;
+    pool.step_sub_s[SUB_NOTICE_LU] += metrics.last_prekernel_lu_s;
+    pool.step_sub_s[SUB_NOTICE_H2D] += metrics.last_prekernel_h2d_s;
+    pool.step_sub_s[SUB_NOTICE_SCATTER] += metrics.last_prekernel_scatter_s;
+    pool.step_sub_s[SUB_NOTICE_DELTAS] += metrics.last_prekernel_deltas_s;
     const double upload = std::max(0.0, metrics.upload_s - pool.accounted_upload_s);
     const double kernel = std::max(0.0, metrics.kernel_s - pool.accounted_kernel_s);
     // From the launch to the moment this worker ENTERED the step (it had just seen the completion
@@ -2592,18 +2793,55 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     const double notice = std::max(0.0, flight_wall - upload - kernel);
     pool.completion_notice_s += notice;
     pool.completion_notice_max_s = std::max(pool.completion_notice_max_s, notice);
+    pool.step_kernel_s += kernel;
+    pool.step_notice_s += notice;
     pool.accounted_upload_s = metrics.upload_s;
     pool.accounted_kernel_s = metrics.kernel_s;
   }
 
   nvtx_phase.emplace("GPUPool::process");
+  search_tree_.begin_deferral();
+  scope_guard flush_tree_updates([&]() { search_tree_.flush_deferred(); });
   const double process_t0 = telemetry ? tic() : 0.0;
   enum class next_t : unsigned char { FRESH, REFACTOR, CHILD };
   std::vector<next_t> next(batch.size(), next_t::FRESH);
   std::vector<std::vector<gds::gpu_bound_delta<i_t, f_t>>> deltas(batch.size());
   i_t fresh_required = 0;
   const int max_plunge = gpu_pool_plunge_depth();
+  gpu_pool_lap_t laps{telemetry ? pool.step_sub_s.data() : nullptr};
+  const bool batch_heap = gpu_pool_batch_heap();
+  pool.pending_push.clear();
+  auto push_node = [&](mip_node_t<i_t, f_t>* n) {
+    if (batch_heap) {  // pushed under one lock after the seat loop
+      pool.pending_push.push_back(n);
+      return;
+    }
+    if (!telemetry) {
+      worker->node_queue.push_atomic(n);
+      return;
+    }
+    const double t0 = tic();
+    worker->node_queue.push_atomic(n);
+    const double dt = toc(t0);
+    pool.step_sub_s[SUB_PROCESS_PUSH] += dt;
+    pool.step_sub_s[SUB_PROCESS_CHILD] -= dt;
+  };
 
+  const bool batch_fetch = gpu_pool_slim_d2h() && gpu_pool_batch_fetch();
+  if (batch_fetch) {
+    laps.start();
+    std::vector<int> need;
+    for (i_t seat = 0; seat < static_cast<i_t>(batch.size()); ++seat) {
+      if (batch[seat].status != dual_status_t::OPTIMAL || ctx[seat].node == nullptr) { continue; }
+      const auto r = gpu_persistent_batch_result<i_t, f_t>(pool.run, seat);
+      if (r.dev_num_frac < 0 || r.dev_unreliable) {
+        need.push_back(seat);
+        if (telemetry) { ++(r.dev_num_frac < 0 ? fetch_no_scores_ : fetch_unreliable_); }
+      }
+    }
+    gpu_persistent_batch_fetch_seats<i_t, f_t>(pool.run, need);
+    laps.lap(SUB_PROCESS_SNAPSHOT);
+  }
   for (i_t seat = 0; seat < static_cast<i_t>(batch.size()); ++seat) {
     if (batch[seat].status == dual_status_t::REFACTOR_NEEDED) {
       next[seat] = next_t::REFACTOR;
@@ -2624,9 +2862,21 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
       ++fresh_required;
       continue;
     }
-    const std::vector<f_t> resident_lower = batch[seat].lower;
-    const std::vector<f_t> resident_upper = batch[seat].upper;
+    laps.start();
+    std::vector<f_t> resident_lower_copy, resident_upper_copy;
+    if (!inplace) {
+      resident_lower_copy = batch[seat].lower;
+      resident_upper_copy = batch[seat].upper;
+    }
+    const std::vector<f_t>& resident_lower = inplace ? batch[seat].lower : resident_lower_copy;
+    const std::vector<f_t>& resident_upper = inplace ? batch[seat].upper : resident_upper_copy;
     const auto result = gpu_persistent_batch_result<i_t, f_t>(pool.run, seat);
+    const bool view_bounds = inplace && !result.lower.empty();
+    const std::span<const f_t> seat_lower =
+      view_bounds ? std::span<const f_t>(result.lower) : std::span<const f_t>(resident_lower);
+    const std::span<const f_t> seat_upper =
+      view_bounds ? std::span<const f_t>(result.upper) : std::span<const f_t>(resident_upper);
+    laps.lap(SUB_PROCESS_SNAPSHOT);
 
     record_terminal(batch[seat].status, batch[seat].iters);
     pool.record_completed_iterations(batch[seat].iters);
@@ -2634,6 +2884,7 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     bool gpu_answer_accepted = false;
     const dual_status_t lp_status = nondeterministic_gpu_pool_install_result(
       worker, node, batch[seat], result, gpu_answer_accepted);
+    laps.lap(SUB_PROCESS_INSTALL);
     if (trace_gpu_results && gpu_answer_accepted) {
       std::fprintf(stderr,
                    "[GPU-SB-NODE] worker=%d node=%d\n",
@@ -2643,10 +2894,20 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     ++exploration_stats_.nodes_since_last_log;
     ++exploration_stats_.nodes_explored;
     --exploration_stats_.nodes_unexplored;
+    // Strong branching reads the full solution.
+    if (!batch_fetch && gpu_answer_accepted && lp_status == dual_status_t::OPTIMAL &&
+        (result.dev_num_frac < 0 || result.dev_unreliable)) {
+      gpu_persistent_batch_fetch_seat<i_t, f_t>(pool.run, seat);
+      if (telemetry) { ++(result.dev_num_frac < 0 ? fetch_no_scores_ : fetch_unreliable_); }
+    }
+    if (telemetry && gpu_answer_accepted && lp_status == dual_status_t::OPTIMAL) { ++accepted_optimal_; }
     nondeterministic_policy_t<i_t, f_t> policy{*this, worker, settings_.log};
+    tl_tree_laps = telemetry ? &laps : nullptr;
     auto [node_status, round_dir] = update_tree_impl(
       node, search_tree_, worker, lp_status, policy, gpu_answer_accepted ? &result : nullptr);
+    tl_tree_laps = nullptr;
     ctx[seat].node = nullptr;
+    laps.lap(SUB_PROCESS_TREE);
 
     bool child_installed = false;
     if (node_status == node_status_t::HAS_CHILDREN) {
@@ -2662,10 +2923,45 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
       // harvested spans still describe the resident GPU basis, so that work does not prevent
       // this seat from continuing with the preferred child.
       const bool parent_state_matches =
-        gpu_answer_accepted &&
-        worker->leaf_problem.lower == resident_lower &&
-        worker->leaf_problem.upper == resident_upper;
-      if (parent_state_matches && ctx[seat].plunge_depth < max_plunge) {
+        gpu_answer_accepted && (view_bounds || (worker->leaf_problem.lower == resident_lower &&
+                                                worker->leaf_problem.upper == resident_upper));
+      if (inplace && parent_state_matches && ctx[seat].plunge_depth < max_plunge) {
+        auto& seat_node = pool.batch[seat];
+        // Packing reads NONBASIC_FIXED back as NONBASIC_LOWER: only non-tight FIXED columns differ.
+        const f_t fixed_tol = seat_node.settings.fixed_tol;
+        bool same_basis     = true;
+        for (size_t j = 0; same_basis && j < result.vstatus.size(); ++j) {
+          same_basis = result.vstatus[j] != variable_status_t::NONBASIC_FIXED ||
+                       std::abs(seat_upper[j] - seat_lower[j]) < fixed_tol;
+        }
+        laps.lap(SUB_CHILD_VSTATUS);
+        if (same_basis) {
+          const i_t bv  = preferred->branch_var;
+          const f_t lo  = preferred->branch_var_lower;
+          const f_t up  = preferred->branch_var_upper;
+          unsigned char mask = 0;
+          if (std::memcmp(&seat_lower[bv], &lo, sizeof(f_t)) != 0) { mask |= 1u; }
+          if (std::memcmp(&seat_upper[bv], &up, sizeof(f_t)) != 0) { mask |= 2u; }
+          seat_node.lower[bv] = lo;
+          seat_node.upper[bv] = up;
+          if (mask != 0) { deltas[seat].push_back({bv, lo, up, mask}); }
+          seat_node.continue_basis = false;
+          seat_node.status         = dual_status_t::UNSET;
+          seat_node.iters          = 0;
+          seat_node.solved         = false;
+          seat_node.drop           = gpu_batch_node_t<i_t, f_t>::drop_t::NONE;
+          seat_node.basic_list.clear();
+          seat_node.nonbasic_list.clear();
+          seat_node.dy_se.clear();
+          pool.ctx[seat] =
+            gpu_seat_ctx_t<i_t, f_t>{preferred, {}, {}, ctx[seat].plunge_depth + 1, true};
+          next[seat]      = next_t::CHILD;
+          child_installed = true;
+          ++gpu_batch_plunged_;
+          push_node(sibling);
+          laps.lap(SUB_CHILD_DELTA);
+        }
+      } else if (parent_state_matches && ctx[seat].plunge_depth < max_plunge) {
         gpu_batch_node_t<i_t, f_t> child(worker->leaf_problem.num_rows,
                                          worker->leaf_problem.num_cols);
         child.settings = nondeterministic_gpu_pool_settings(worker);
@@ -2674,8 +2970,10 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
         std::fill(worker->bounds_changed.begin(), worker->bounds_changed.end(), false);
         preferred->update_branched_variable_bounds(
           child.lower, child.upper, worker->bounds_changed);
-        bool feasible = worker->node_presolver.bounds_strengthening(
-          child.settings, worker->bounds_changed, child.lower, child.upper);
+        laps.lap(SUB_CHILD_SETUP);
+        bool feasible = gpu_pool_device_strengthen() ||
+                        worker->node_presolver.bounds_strengthening(
+                          child.settings, worker->bounds_changed, child.lower, child.upper);
         if (feasible) {
           worker->leaf_problem.lower = child.lower;
           worker->leaf_problem.upper = child.upper;
@@ -2683,6 +2981,7 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
           child.lower = worker->leaf_problem.lower;
           child.upper = worker->leaf_problem.upper;
         }
+        laps.lap(SUB_CHILD_SYMMETRY);
         if (feasible) {
           decompress_vstatus(
             preferred->packed_vstatus, worker->leaf_problem.num_cols, child.vstatus);
@@ -2698,6 +2997,7 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
                          result.vstatus[j] == variable_status_t::NONBASIC_FIXED &&
                          std::abs(resident_upper[j] - resident_lower[j]) < child.settings.fixed_tol;
           }
+          laps.lap(SUB_CHILD_VSTATUS);
           if (same_basis) {
             auto& child_deltas = deltas[seat];
             child_deltas.reserve(static_cast<size_t>(worker->leaf_problem.num_cols));
@@ -2715,42 +3015,84 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
                                                        true};
             next[seat]       = next_t::CHILD;
             child_installed  = true;
+            laps.lap(SUB_CHILD_DELTA);
             ++gpu_batch_plunged_;
-            worker->node_queue.push_atomic(sibling);
+            push_node(sibling);
           }
         }
       }
       if (!child_installed) {
-        worker->node_queue.push_atomic(preferred);
-        worker->node_queue.push_atomic(sibling);
+        push_node(preferred);
+        push_node(sibling);
       }
     }
+    laps.lap(SUB_PROCESS_CHILD);
 
     if (!child_installed) { ++fresh_required; }
   }
+  if (batch_heap) {
+    laps.start();
+    worker->node_queue.push_many(pool.pending_push);
+    pool.pending_push.clear();
+    laps.lap(SUB_PROCESS_PUSH);
+  }
+  auto flush_updates = [&](int sub) {
+    laps.start();
+    search_tree_.flush_deferred();
+    laps.lap(sub);
+    if (telemetry) {
+      pool.step_sub_s[SUB_FLUSH_WAIT] += search_tree_.last_flush_wait_s();
+      pool.step_sub_s[SUB_FLUSH_HOLD] += search_tree_.last_flush_hold_s();
+    }
+  };
+  if (!gpu_pool_defer_refill()) { flush_updates(SUB_PROCESS_FLUSH); }
   if (telemetry) { pool.step_process_s += toc(process_t0); }
 
   // The owner ran out of CPU work and failed to steal. Harvest this generation, but retire the
   // pool even if it produced children: those nodes now continue through the ordinary CPU heap.
   if (may_block) {
+    pool.drain_reason = "no_cpu_work";
     nondeterministic_gpu_pool_finish(worker);
     return false;
   }
 
   if (solver_status_ != mip_status_t::UNSET || !is_running_ ||
       worker->node_queue.best_first_queue_size() < fresh_required) {
+    pool.drain_reason = solver_status_ != mip_status_t::UNSET || !is_running_ ? "stop" : "heap_short";
     nondeterministic_gpu_pool_finish(worker);
     return false;
   }
   nvtx_phase.emplace("GPUPool::refill");
   const double refill_t0 = telemetry ? tic() : 0.0;
+  if (gpu_pool_light_settings()) { pool.gen_settings = nondeterministic_gpu_pool_settings(worker); }
+  auto return_prefetched = [&]() {
+    if (pool.prefetch_next < pool.prefetched.size()) {
+      pool.prefetched.erase(pool.prefetched.begin(), pool.prefetched.begin() + pool.prefetch_next);
+      worker->node_queue.push_many(pool.prefetched);
+    }
+    pool.prefetched.clear();
+    pool.prefetch_next = 0;
+  };
+  if (batch_heap) {
+    laps.start();
+    pool.lower_bound = std::min(pool.lower_bound.load(), worker->node_queue.get_lower_bound());
+    worker->node_queue.pop_gpu_eligible_many(
+      static_cast<int>(std::count(next.begin(), next.end(), next_t::FRESH)), pool.prefetched);
+    laps.lap(SUB_REFILL_POP);
+  }
   for (i_t seat = 0; seat < static_cast<i_t>(batch.size()); ++seat) {
     if (next[seat] == next_t::FRESH &&
-        !nondeterministic_gpu_pool_fill_fresh_seat(worker, seat)) {
+        !nondeterministic_gpu_pool_fill_fresh_seat(
+          worker, seat, telemetry ? pool.step_sub_s.data() : nullptr)) {
+      return_prefetched();
+      if (telemetry) { pool.step_refill_s += toc(refill_t0); }
+      pool.drain_reason = "refill_short";
       nondeterministic_gpu_pool_finish(worker);
       return false;
     }
   }
+  return_prefetched();
+  if (gpu_pool_defer_refill()) { flush_updates(SUB_REFILL_FLUSH); }
   if (telemetry) { pool.step_refill_s += toc(refill_t0); }
 
   // Stage split: host LU is the run's host_factor_s delta, H2D / memset / growth allocations come
@@ -2780,11 +3122,24 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
   };
   scope_guard stage_timer([&]() { close_stage(); });   // early-return paths
   std::string stage_error;
+  tl_stage_laps = telemetry ? &laps : nullptr;
+  double* bstage_split = gds::gpu_batch_stage_split();
+  std::fill(bstage_split, bstage_split + 4, 0.0);
+  scope_guard stage_laps_off([&]() { tl_stage_laps = nullptr; });
+  const bool light_settings = gpu_pool_light_settings();
   for (i_t seat = 0; seat < static_cast<i_t>(batch.size()); ++seat) {
     const double settings_t0 = telemetry ? tic() : 0.0;
-    batch[seat].settings = nondeterministic_gpu_pool_settings(worker);
+    auto& seat_settings      = batch[seat].settings;
+    if (light_settings && seat_settings.concurrent_halt == &node_concurrent_halt_) {
+      seat_settings.cut_off    = pool.gen_settings.cut_off;
+      seat_settings.time_limit = pool.gen_settings.time_limit;
+    } else {
+      seat_settings = nondeterministic_gpu_pool_settings(worker);
+    }
     if (telemetry) { stage_settings_s += toc(settings_t0); }
     if (next[seat] != next_t::FRESH) { continue; }
+    laps.start();
+    scope_guard fresh_lap([&]() { laps.lap(SUB_STAGE_FRESH); });
     while (!gpu_persistent_batch_stage_fresh<i_t, f_t>(pool.run, seat, stage_error)) {
       if (!fresh_factor_failure(seat)) {
         if (stop_drain(seat)) {
@@ -2817,6 +3172,8 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
   }
   for (i_t seat = 0; seat < static_cast<i_t>(batch.size()); ++seat) {
     if (next[seat] != next_t::REFACTOR) { continue; }
+    laps.start();
+    scope_guard refactor_lap([&]() { laps.lap(SUB_STAGE_REFACTOR); });
     if (gpu_persistent_batch_stage_refactor<i_t, f_t>(pool.run, seat, stage_error)) { continue; }
     if (!resume_failure(seat)) {
       if (stop_drain(seat)) {
@@ -2849,11 +3206,20 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
       return false;
     }
     stage_error.clear();
-    if (!gpu_persistent_batch_stage_fresh<i_t, f_t>(pool.run, seat, stage_error)) {
-      nondeterministic_gpu_pool_finish(worker);
-      return false;
+    while (!gpu_persistent_batch_stage_fresh<i_t, f_t>(pool.run, seat, stage_error)) {
+      if (!fresh_factor_failure(seat)) {
+        nondeterministic_gpu_pool_finish(worker);
+        return false;
+      }
+      return_cpu_only(seat, dual_status_t::NUMERICAL, "nondet-pool-fresh-factor");
+      if (!nondeterministic_gpu_pool_fill_fresh_seat(worker, seat)) {
+        nondeterministic_gpu_pool_finish(worker);
+        return false;
+      }
+      stage_error.clear();
     }
   }
+  laps.start();
   for (i_t seat = 0; seat < static_cast<i_t>(batch.size()); ++seat) {
     if (next[seat] == next_t::CHILD &&
         !gpu_persistent_batch_stage_child<i_t, f_t>(
@@ -2870,10 +3236,29 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
       return false;
     }
   }
+  laps.lap(SUB_STAGE_CHILD);
   close_stage();
   nvtx_phase.reset();
 
   nondeterministic_gpu_pool_update_lower_bound(worker);
+  if (telemetry) {
+    pool.seated = static_cast<int>(std::count_if(
+      pool.ctx.begin(), pool.ctx.end(), [](const auto& c) { return c.node != nullptr; }));
+  }
+  if (gpu_pool_device_scores() && worker->search_strategy == search_strategy_t::BEST_FIRST) {
+    pc_.snapshot(pool.pc_sum_down, pool.pc_sum_up, pool.pc_num_down, pool.pc_num_up);
+    const i_t threshold =
+      settings_.reliability_branching != 0 ? pc_.reliable_threshold_now(exploration_stats_) : 0;
+    gpu_batch_run_set_pseudocosts<i_t, f_t>(pool.run,
+                                            pool.pc_sum_down.data(),
+                                            pool.pc_sum_up.data(),
+                                            pool.pc_num_down.data(),
+                                            pool.pc_num_up.data(),
+                                            pc_.compute_pseudocost_average_down(),
+                                            pc_.compute_pseudocost_average_up(),
+                                            threshold,
+                                            settings_.integer_tol);
+  }
   nvtx_phase.emplace("GPUPool::relaunch");
   const double relaunch_t0 = telemetry ? tic() : 0.0;
   if (!gpu_persistent_batch_relaunch<i_t, f_t>(pool.run, stage_error)) {
@@ -2896,6 +3281,9 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     ++pool.launches;
     pool.launch_started_at = relaunch_t0;
     pool.step_relaunch_s += toc(relaunch_t0);
+    for (int k = 0; k < 4; ++k) { pool.step_sub_s[SUB_BSTAGE_ARGS + k] += bstage_split[k]; }
+    const double* split = gds::gpu_batch_last_relaunch_split();
+    for (int k = 0; k < 4; ++k) { pool.step_sub_s[SUB_RELAUNCH_PACK + k] += split[k]; }
   }
   return true;
 }
@@ -2978,6 +3366,7 @@ void branch_and_bound_t<i_t, f_t>::plunge_with(bfs_worker_t<i_t, f_t>* worker,
     }
 
     f_t now = toc(exploration_stats_.start_time);
+    if (gpu_pool_logging()) { sample_gpu_pools(now); }
 
     if (worker->worker_id == 0) {
       f_t time_since_last_log =
@@ -3191,6 +3580,42 @@ void branch_and_bound_t<i_t, f_t>::launch_bfs_worker(bfs_worker_t<i_t, f_t>* wor
 }
 
 template <typename i_t, typename f_t>
+bool branch_and_bound_t<i_t, f_t>::rebalance_pull(bfs_worker_t<i_t, f_t>* worker, bool force)
+{
+  static const bool on = [] {
+    const char* e = std::getenv("CUOPT_BNB_REBALANCE");
+    return e == nullptr || std::string(e) != "0";
+  }();
+  if (!on || !bfs_worker_pool_.is_initialized()) { return false; }
+  const double now = toc(exploration_stats_.start_time);
+  if (!force && now < worker->next_rebalance_s) { return false; }
+  worker->next_rebalance_s = now + 0.005;
+  const i_t workers = bfs_worker_pool_.size();
+  int64_t total = 0, victim_size = 0;
+  bfs_worker_t<i_t, f_t>* victim = nullptr;
+  for (i_t w = 0; w < workers; ++w) {
+    const int64_t s = bfs_worker_pool_[w]->node_queue.best_first_queue_size();
+    total += s;
+    if (bfs_worker_pool_[w] != worker && s > victim_size) {
+      victim_size = s;
+      victim      = bfs_worker_pool_[w];
+    }
+  }
+  const int64_t target = total / std::max<i_t>(workers, 1);
+  const int64_t mine   = worker->node_queue.best_first_queue_size();
+  if (victim == nullptr || 2 * mine >= target || victim_size < std::max<int64_t>(2 * target, 20)) {
+    return false;
+  }
+  const i_t moved = worker->node_queue.pull_interleaved(
+    victim->node_queue, static_cast<i_t>(std::min(target - mine, victim_size / 2)));
+  if (gpu_pool_logging() && moved > 0) {
+    ++rebalance_pulls_;
+    rebalance_nodes_ += moved;
+  }
+  return moved > 0;
+}
+
+template <typename i_t, typename f_t>
 void branch_and_bound_t<i_t, f_t>::work_stealing(bfs_worker_t<i_t, f_t>* worker)
 {
   i_t nodes_to_steal = settings_.bnb_nodes_per_steal >= 0 ? settings_.bnb_nodes_per_steal
@@ -3280,7 +3705,7 @@ void branch_and_bound_t<i_t, f_t>::best_first_search_with(bfs_worker_t<i_t, f_t>
     }
 
     if (node_queue.best_first_queue_size() == 0) {
-      work_stealing(worker);
+      if (!rebalance_pull(worker, true)) { work_stealing(worker); }
       if (node_queue.best_first_queue_size() == 0) {
         const bool has_pool = worker->worker_id >= 0 &&
                               worker->worker_id < static_cast<i_t>(gpu_batch_pools_.size()) &&
@@ -3327,6 +3752,7 @@ void branch_and_bound_t<i_t, f_t>::best_first_search_with(bfs_worker_t<i_t, f_t>
       break;
     }
 
+    rebalance_pull(worker, false);
     // Steal a node with some probability or when it is empty. The victim is determined at random.
     if (node_queue.best_first_queue_size() == 0 || worker->rng.next_double() < steal_chance) {
       work_stealing(worker);
@@ -4900,6 +5326,13 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
                 error_type_t::ValidationError,
                 "GPU B&B dual simplex does not support PDLP reliability branching (modes 1 or 2)");
 
+  // CUOPT_BNB_MALLOC_TOP_PAD (MiB, default 256, 0 = glibc default). Process-global.
+  if (gpu_batch_seats() != 0 && settings_.inside_submip == 0) {
+    const char* e       = std::getenv("CUOPT_BNB_MALLOC_TOP_PAD");
+    const long pad_mib  = e != nullptr ? std::atol(e) : 256;
+    if (pad_mib > 0) { mallopt(M_TOP_PAD, static_cast<int>(std::min(pad_mib, 1024L) << 20)); }
+  }
+
   logger_t log;
   log.log                             = false;
   log.log_prefix                      = settings_.log.log_prefix;
@@ -5441,7 +5874,7 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
     settings_.log.printf(
       "[GPUBATCH] seat drops: factorize_fill=%ld size_contract=%ld factorize_resume=%ld "
       "livelock=%ld launch_failed=%ld dual_infeasible_resume=%ld | deadline=%ld "
-      "concurrent_halt=%ld\n",
+      "concurrent_halt=%ld | factor_cap_fresh=%ld factor_cap_resume=%ld\n",
       (long)gpu_batch_drops_[1].load(),
       (long)gpu_batch_drops_[2].load(),
       (long)gpu_batch_drops_[3].load(),
@@ -5449,7 +5882,9 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
       (long)gpu_batch_drops_[5].load(),
       (long)gpu_batch_drops_[6].load(),
       (long)gpu_batch_drops_[7].load(),
-      (long)gpu_batch_drops_[8].load());
+      (long)gpu_batch_drops_[8].load(),
+      (long)gpu_batch_drops_[9].load(),
+      (long)gpu_batch_drops_[10].load());
     settings_.log.printf(
       "[GPUBATCH] cpu takebacks: dual_unbounded=%ld numerical=%ld cutoff=%ld iter_limit=%ld "
       "other=%ld | total=%ld\n",
@@ -5761,6 +6196,8 @@ void branch_and_bound_t<i_t, f_t>::log_nondeterministic_gpu_pool_telemetry()
     double step_stage_lu_s{0.0}, step_stage_h2d_s{0.0}, step_stage_memset_s{0.0};
     double step_stage_alloc_s{0.0}, step_relaunch_s{0.0};
     double finish_s{0.0}, step_drain_s{0.0};
+    double step_kernel_s{0.0}, step_notice_s{0.0};
+    std::array<double, SUB_COUNT> step_sub_s{};
   };
   // One `step` line: the service-step split summed over `n` harvesting steps. `stage_other` and
   // `other` are the unmeasured remainders of the stage and of the whole step. `drain` is pool
@@ -5777,16 +6214,34 @@ void branch_and_bound_t<i_t, f_t>::log_nondeterministic_gpu_pool_telemetry()
       "[%s] %s=%d step n=%llu total=%.3f guard=%.3f restore=%.3f harvest=%.3f process=%.3f "
       "refill=%.3f stage=%.3f(settings=%.3f host_lu=%.3f h2d=%.3f(n=%llu,MB=%.1f) "
       "memset=%.3f(n=%llu) alloc=%.3f(n=%llu) other=%.3f) relaunch=%.3f drain=%.3f other=%.3f "
-      "finish=%.3f\n",
+      "finish=%.3f kernel=%.3f notice=%.3f\n",
       tag, key, id, (unsigned long long)s.steps, s.step_total_s, s.step_guard_s,
       s.step_restore_s, s.step_harvest_s, s.step_process_s, s.step_refill_s, s.step_stage_s,
       s.step_stage_settings_s, s.step_stage_lu_s, s.step_stage_h2d_s,
       (unsigned long long)s.step_h2d_n, static_cast<double>(s.step_h2d_bytes) / (1024.0 * 1024.0),
       s.step_stage_memset_s, (unsigned long long)s.step_memset_n, s.step_stage_alloc_s,
       (unsigned long long)s.step_alloc_n, stage_other, s.step_relaunch_s, s.step_drain_s, other,
-      s.finish_s);
+      s.finish_s, s.step_kernel_s, s.step_notice_s);
+    // Several lines: the logger truncates at 1024 characters.
+    std::string subs;
+    char buf[64];
+    for (int k = 0; k < SUB_COUNT; ++k) {
+      std::snprintf(buf, sizeof(buf), " %s=%.3f", gpu_pool_sub_names[k], s.step_sub_s[k]);
+      subs += buf;
+      if (k % 24 == 23 || k + 1 == SUB_COUNT) {
+        settings_.log.printf("[%s] %s=%d substep n=%llu%s\n", tag, key, id,
+                             (unsigned long long)s.steps, subs.c_str());
+        subs.clear();
+      }
+    }
   };
   std::unordered_map<int, device_stats_t> devices;
+  // With a warm-up cutoff, a pool that never serviced a step after it reports no split.
+  if (gpu_pool_log_warmup_s() > 0.0) {
+    for (auto& ptr : gpu_batch_pools_) {
+      if (ptr != nullptr && !ptr->warmup_done) { ptr->reset_step_split(); }
+    }
+  }
 
   for (i_t worker_id = 0; worker_id < static_cast<i_t>(gpu_batch_pools_.size()); ++worker_id) {
     const auto& ptr = gpu_batch_pools_[worker_id];
@@ -5914,6 +6369,9 @@ void branch_and_bound_t<i_t, f_t>::log_nondeterministic_gpu_pool_telemetry()
     device.step_stage_memset_s += pool.step_stage_memset_s;
     device.step_stage_alloc_s += pool.step_stage_alloc_s;
     device.step_relaunch_s += pool.step_relaunch_s;
+    device.step_kernel_s += pool.step_kernel_s;
+    device.step_notice_s += pool.step_notice_s;
+    for (int k = 0; k < SUB_COUNT; ++k) { device.step_sub_s[k] += pool.step_sub_s[k]; }
     device.finish_s += pool.finish_s;
     device.step_drain_s += pool.step_drain_s;
   }
@@ -6179,7 +6637,7 @@ void branch_and_bound_t<i_t, f_t>::run_deterministic_coordinator(const csr_matri
     settings_.log.printf(
       "[GPUBATCH] seat drops: factorize_fill=%ld size_contract=%ld factorize_resume=%ld "
       "livelock=%ld launch_failed=%ld dual_infeasible_resume=%ld | deadline=%ld "
-      "concurrent_halt=%ld\n",
+      "concurrent_halt=%ld | factor_cap_fresh=%ld factor_cap_resume=%ld\n",
       (long)gpu_batch_drops_[1].load(),
       (long)gpu_batch_drops_[2].load(),
       (long)gpu_batch_drops_[3].load(),
@@ -6187,7 +6645,9 @@ void branch_and_bound_t<i_t, f_t>::run_deterministic_coordinator(const csr_matri
       (long)gpu_batch_drops_[5].load(),
       (long)gpu_batch_drops_[6].load(),
       (long)gpu_batch_drops_[7].load(),
-      (long)gpu_batch_drops_[8].load());
+      (long)gpu_batch_drops_[8].load(),
+      (long)gpu_batch_drops_[9].load(),
+      (long)gpu_batch_drops_[10].load());
     // How often the CPU had to take a node back because the device produced a certificate we never
     // trust. This is the production safety net of plan §3a, NOT the temporary recheck gate, so it
     // is reported even when the recheck is off. A non-zero NUMERICAL count is the one to chase:
@@ -7319,7 +7779,7 @@ node_status_t branch_and_bound_t<i_t, f_t>::solve_node_deterministic(
         // The device pivoted its OWN copy of the factorization when the seat ran, so
         // worker.basis_factors does not match worker.leaf_vstatus.
         worker.host_basis_stale = true;
-        // ---- TEMPORARY CORRECTNESS GATE (CUOPT_BNB_GPU_POOL_RECHECK, default 1) ----------------
+        // ---- CORRECTNESS GATE (CUOPT_BNB_GPU_POOL_RECHECK, default 0) --------------------------
         //
         // Re-solve this node on the CPU with the FULL driver branch-and-bound would otherwise have
         // used, from the basis the node ARRIVED with, and compare the two. This is what makes the

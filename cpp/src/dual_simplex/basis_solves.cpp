@@ -157,6 +157,12 @@ void write_basis_info(const csc_matrix_t<i_t, f_t>& B)
 
 }  // namespace
 
+factorize_basis_stats_t& factorize_basis_last_stats()
+{
+  static thread_local factorize_basis_stats_t stats;
+  return stats;
+}
+
 template <typename i_t, typename f_t>
 i_t factorize_basis(const csc_matrix_t<i_t, f_t>& A,
                     const simplex_solver_settings_t<i_t, f_t>& settings,
@@ -173,6 +179,10 @@ i_t factorize_basis(const csc_matrix_t<i_t, f_t>& A,
 {
   raft::common::nvtx::range scope("LU::factorize_basis");
   const i_t m              = basic_list.size();
+  auto& stats              = factorize_basis_last_stats();
+  stats                    = factorize_basis_stats_t{};
+  stats.m                  = static_cast<int>(m);
+  stats.nucleus            = static_cast<int>(m);
   constexpr f_t medium_tol = 1e-12;
 
   const bool eliminate_singletons = settings.eliminate_singletons;
@@ -189,6 +199,10 @@ i_t factorize_basis(const csc_matrix_t<i_t, f_t>& A,
     i_t row_singletons;
     i_t col_singletons;
     find_singletons(B, row_singletons, row_perm, col_singletons, col_perm, work_estimate);
+    stats.row_singletons = static_cast<int>(row_singletons);
+    stats.col_singletons = static_cast<int>(col_singletons);
+    stats.nucleus        = static_cast<int>(m - row_singletons - col_singletons);
+    stats.B_nz           = B.col_start[m];
     std::vector<i_t> row_perm_inv(m);
     work_estimate += m;
     inverse_permutation(row_perm, row_perm_inv);
@@ -362,6 +376,7 @@ i_t factorize_basis(const csc_matrix_t<i_t, f_t>& A,
           work_estimate += 3 * (col_end - col_start);
         }
         S.col_start[Sdim] = Snz;  // Finalize S
+        stats.nucleus_nz  = Snz;
         work_estimate += 4 * (m - num_singletons);
 
         csc_matrix_t<i_t, f_t> SL(Sdim, Sdim, Snz);
@@ -396,6 +411,7 @@ i_t factorize_basis(const csc_matrix_t<i_t, f_t>& A,
         }
         if (Srank < 0) { return Srank; }
         if (Srank != Sdim) {
+          stats.rank_deficiency = static_cast<int>(Sdim - Srank);
           // Get the rank deficient columns
           deficient.clear();
           deficient.resize(Sdim - Srank);

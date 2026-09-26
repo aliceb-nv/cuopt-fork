@@ -134,6 +134,33 @@ class node_queue_t {
     return node;
   }
 
+  int pop_gpu_eligible_many(int k, std::vector<mip_node_t<i_t, f_t>*>& out)
+  {
+    std::lock_guard lock(mutex_);
+    std::vector<std::shared_ptr<heap_entry_t>> cpu_only_entries;
+    int got = 0;
+    while (got < k && !best_first_heap_.empty()) {
+      auto entry = best_first_heap_.pop();
+      if (entry->node->cpu_only) {
+        cpu_only_entries.push_back(std::move(entry));
+        continue;
+      }
+      out.push_back(std::exchange(entry->node, nullptr));
+      ++got;
+    }
+    for (auto& entry : cpu_only_entries) { best_first_heap_.push(std::move(entry)); }
+    lower_bound_ = best_first_heap_.empty() ? std::numeric_limits<f_t>::infinity()
+                                            : best_first_heap_.top()->lower_bound;
+    return got;
+  }
+
+  void push_many(const std::vector<mip_node_t<i_t, f_t>*>& nodes)
+  {
+    if (nodes.empty()) { return; }
+    std::lock_guard lock(mutex_);
+    for (auto* node : nodes) { push_lockfree(node); }
+  }
+
   bool diving_init(const simplex::lp_problem_t<i_t, f_t>& lp,
                    mip_node_t<i_t, f_t>& start_node,
                    std::vector<f_t>& start_lower,
@@ -173,6 +200,26 @@ class node_queue_t {
       steal               = true;
     }
     return steal;
+  }
+
+  // Moves up to `count` of the victim's best nodes here, alternating so both keep half of that range.
+  i_t pull_interleaved(node_queue_t& victim, i_t count)
+  {
+    assert(this != &victim);
+    std::scoped_lock lock(mutex_, victim.mutex_);
+    std::vector<std::shared_ptr<heap_entry_t>> keep;
+    i_t moved = 0;
+    while (moved < count && victim.best_first_heap_.size() > 1) {
+      keep.push_back(victim.best_first_heap_.pop());
+      auto entry = victim.best_first_heap_.pop();
+      if (entry->node == nullptr) { continue; }
+      push_lockfree(std::exchange(entry->node, nullptr));
+      ++moved;
+    }
+    for (auto& entry : keep) { victim.best_first_heap_.push(std::move(entry)); }
+    victim.lower_bound_ = victim.best_first_heap_.empty() ? std::numeric_limits<f_t>::infinity()
+                                                         : victim.best_first_heap_.top()->lower_bound;
+    return moved;
   }
 
   i_t diving_queue_size() { return diving_heap_.size(); }

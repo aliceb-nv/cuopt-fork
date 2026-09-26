@@ -219,6 +219,26 @@ class pseudo_costs_t {
     return num > 0 ? sum / num : avg;
   }
 
+  void snapshot(std::vector<f_t>& sum_down,
+                std::vector<f_t>& sum_up,
+                std::vector<i_t>& num_down,
+                std::vector<i_t>& num_up) const
+  {
+    const size_t n = pseudo_cost_sum_down.size();
+    sum_down.resize(n);
+    sum_up.resize(n);
+    num_down.resize(n);
+    num_up.resize(n);
+    for (size_t j = 0; j < n; ++j) {
+      sum_down[j] = pseudo_cost_sum_down[j];
+      sum_up[j]   = pseudo_cost_sum_up[j];
+      num_down[j] = pseudo_cost_num_down[j];
+      num_up[j]   = pseudo_cost_num_up[j];
+    }
+  }
+
+  i_t reliable_threshold_now(const branch_and_bound_stats_t<i_t, f_t>& bnb_stats) const;
+
   f_t compute_pseudocost_average_down();
   f_t compute_pseudocost_average_up();
 
@@ -235,6 +255,8 @@ class pseudo_costs_t {
                    f_t lower_bound);
 
   i_t variable_selection(const std::vector<i_t>& fractional, std::span<const f_t> solution);
+
+  static inline thread_local bool last_selection_unreliable = false;
 
   i_t reliable_variable_selection(const mip_node_t<i_t, f_t>* node_ptr,
                                   const std::vector<i_t>& fractional,

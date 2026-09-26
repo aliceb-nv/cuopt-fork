@@ -88,6 +88,11 @@ struct gpu_batch_item {
   // the matrix once per node instead of once per batch.
   const std::vector<f_t>* lower;
   const std::vector<f_t>* upper;
+  // Lean FRESH_NODE: bounds = root bounds + deltas; basis from packed status; dy_se from root.
+  const std::vector<f_t>* root_lower{nullptr};
+  const std::vector<f_t>* root_upper{nullptr};
+  const std::vector<std::uint8_t>* packed_vstatus{nullptr};
+  const std::vector<f_t>* root_dy_se{nullptr};
   const simplex_solver_settings_t<i_t, f_t>* settings;
   std::vector<variable_status_t>* vstatus;  // in: warm-start basis; out: FINAL basis
   basis_update_mpf_t<i_t, f_t>* ft;
@@ -96,6 +101,11 @@ struct gpu_batch_item {
   lp_solution_t<i_t, f_t>* sol;  // in: y/z (duals); out: x, objective, user_objective, iterations
                                  // y/z are copied back for callers with a host resume loop
   std::vector<f_t>* dy_se;       // carried steepest-edge norms; size must equal lp->num_cols
+  // Non-null (factor-slot pools only): the device strengthens FRESH and CHILD_CONTINUE bounds, and
+  // the harvest returns them in the result view.
+  const std::vector<variable_type_t>* var_types{nullptr};
+  // FRESH_NODE staging only: the device factorizes (and prices) this seat; ft is not used.
+  bool device_lu{false};
   // Set on a REFACTOR_NEEDED resume. The host has already rebuilt the primal point from the fresh
   // factorization exactly as the CPU driver's in-place refactor does
   // (gpu_recompute_primal_after_refactor), so the device must NOT recompute it: its own cold-start
@@ -146,6 +156,14 @@ struct gpu_batch_timing {
   double upload_s          = 0.0;  // host: marshal + H2D of all N problems
   double kernel_s          = 0.0;  // device compute (CUDA events, kernel only)
   double copyback_s        = 0.0;  // host: D2H of all N results
+  double copyback_sync_s   = 0.0;  // host: part of copyback_s up to the stream sync (D2H + wait)
+  double copyback_enqueue_s = 0.0;  // host: part of copyback_sync_s enqueueing the copies
+  double copyback_device_s  = 0.0;  // device: the result copies (first enqueued to last done)
+  double prekernel_s       = 0.0;  // device: relaunch uploads + dense LU before the solve kernel
+  double prekernel_lu_s    = 0.0;  // device: the dense LU part of prekernel_s
+  double prekernel_h2d_s     = 0.0;  // device: packed upload host-to-device copy
+  double prekernel_scatter_s = 0.0;  // device: batched scatter of the packed pieces
+  double prekernel_deltas_s  = 0.0;  // device: child bound-delta copy
   // Split of a launch's marshal (all N problems + the shared read-only block), filled only while
   // gpu_batch_set_setup_telemetry(true): host wall time spent inside each class of CUDA call.
   double setup_alloc_s       = 0.0;  // device_buffer allocations
@@ -231,7 +249,21 @@ gpu_batch_handle<i_t, f_t>* gpu_simplified_dual_phase2_batch_launch(
   rmm::cuda_stream_view stream = rmm::cuda_stream_default,
   bool allow_refactor_exit     = false,
   gpu_ro_cache<i_t, f_t>* ro_cache = nullptr,
-  bool persistent_seats = false);
+  bool persistent_seats = false,
+  bool factor_slots     = false);
+
+// With factor slots (nondeterministic pool): false when this LU does not fit the seat's slot. The
+// caller sends the node to the CPU; `resume` only selects the overflow counter.
+// True when this handle factorizes FRESH_NODE seats on the device (CUOPT_BNB_GPU_DEVICE_LU).
+template <typename i_t, typename f_t>
+bool gpu_simplified_dual_phase2_batch_device_lu(gpu_batch_handle<i_t, f_t>* handle);
+template <typename i_t, typename f_t>
+bool gpu_simplified_dual_phase2_batch_lean_fresh(gpu_batch_handle<i_t, f_t>* handle);
+
+template <typename i_t, typename f_t>
+bool gpu_simplified_dual_phase2_batch_factor_fits(gpu_batch_handle<i_t, f_t>* handle,
+                                                  const basis_update_mpf_t<i_t, f_t>& ft,
+                                                  bool resume);
 
 template <typename i_t, typename f_t>
 bool gpu_simplified_dual_phase2_batch_ready(gpu_batch_handle<i_t, f_t>* handle);
@@ -248,6 +280,13 @@ struct gpu_call_stats {
   std::size_t alloc_n{0}, h2d_n{0}, h2d_bytes{0}, memset_n{0};
 };
 void gpu_call_stats_begin();
+// Host split of this thread's last batch relaunch: [0] packed upload flush, [1] dense LU enqueue,
+// [2] delta / argument uploads and memsets, [3] occupancy query + kernel launch.
+const double* gpu_batch_last_relaunch_split();
+// Host split of this thread's batch_stage calls since the last reset: [0] argument setup and
+// validation, [1] bounds into the packed upload, [2] fresh-seat slab copies, [3] slab slices and
+// factor staging into the packed upload.
+double* gpu_batch_stage_split();
 gpu_call_stats gpu_call_stats_end();
 
 template <typename i_t, typename f_t>
@@ -260,9 +299,20 @@ void gpu_simplified_dual_phase2_batch_finish(gpu_batch_handle<i_t, f_t>* handle,
 // relaunches the complete array once. Staging only enqueues stream-ordered H2D copies, allowing
 // fresh replacement seats to be copied before CPU refactor/branch work is performed.
 template <typename i_t, typename f_t>
+// slim: y, z, dy_se and the basis lists come back only for REFACTOR_NEEDED seats (others:
+// gpu_simplified_dual_phase2_batch_fetch_seat).
 void gpu_simplified_dual_phase2_batch_harvest(gpu_batch_handle<i_t, f_t>* handle,
                                               std::vector<dual::status_t>& out_status,
-                                              gpu_batch_timing& timing);
+                                              gpu_batch_timing& timing,
+                                              bool slim = false);
+
+template <typename i_t, typename f_t>
+void gpu_simplified_dual_phase2_batch_fetch_seats(gpu_batch_handle<i_t, f_t>* handle,
+                                                  const std::vector<int>& seats);
+
+template <typename i_t, typename f_t>
+void gpu_simplified_dual_phase2_batch_fetch_seat(gpu_batch_handle<i_t, f_t>* handle,
+                                                 std::size_t seat);
 
 // Nondeterministic B&B keeps the harvested arrays as the authoritative host state. A view remains
 // valid until the next harvest or until the handle is destroyed; writes through it update the
@@ -275,7 +325,24 @@ struct gpu_batch_result_view {
   dual::status_t status{dual::status_t::UNSET};
   f_t objective{}, user_objective{};
   i_t iterations{}, refactor_reason{};
+  std::span<const f_t> lower, upper;  // device-strengthened bounds; empty without device strengthening
+  // Device pseudocost scores; dev_num_frac < 0 when absent.
+  i_t dev_num_frac{-1}, dev_best_var{-1};
+  bool dev_unreliable{true};
+  f_t dev_estimate{};
 };
+
+// Pseudocost snapshot scored after the next solve kernel (gpu_branch_scores.cuh).
+template <typename i_t, typename f_t>
+void gpu_simplified_dual_phase2_batch_set_pseudocosts(gpu_batch_handle<i_t, f_t>* handle,
+                                                      const f_t* sum_down,
+                                                      const f_t* sum_up,
+                                                      const i_t* num_down,
+                                                      const i_t* num_up,
+                                                      f_t avg_down,
+                                                      f_t avg_up,
+                                                      i_t reliable_threshold,
+                                                      f_t integer_tol);
 
 template <typename i_t, typename f_t>
 void gpu_simplified_dual_phase2_batch_use_views(gpu_batch_handle<i_t, f_t>* handle);

@@ -150,7 +150,8 @@ class branch_and_bound_worker_t {
 
   // Set the variables bounds for the LP relaxation in the current node.
   bool set_lp_variable_bounds(mip_node_t<i_t, f_t>* node_ptr,
-                              const simplex::simplex_solver_settings_t<i_t, f_t>& settings)
+                              const simplex::simplex_solver_settings_t<i_t, f_t>& settings,
+                              bool strengthen = true)
   {
     // Reset the bound_changed markers
     std::fill(bounds_changed.begin(), bounds_changed.end(), false);
@@ -166,8 +167,8 @@ class branch_and_bound_worker_t {
         leaf_problem.lower, leaf_problem.upper, bounds_changed);
     }
 
-    return node_presolver.bounds_strengthening(
-      settings, bounds_changed, leaf_problem.lower, leaf_problem.upper);
+    return !strengthen || node_presolver.bounds_strengthening(
+                            settings, bounds_changed, leaf_problem.lower, leaf_problem.upper);
   }
 
   void set_active() { is_active = true; }
@@ -252,6 +253,7 @@ class bfs_worker_t : public branch_and_bound_worker_t<i_t, f_t> {
   // The maximum number of diving worker that are associated with this
   // (best-first) worker
   i_t max_diving_workers;
+  double next_rebalance_s{0.0};
 
  private:
   std::vector<search_strategy_t> diving_heuristics;

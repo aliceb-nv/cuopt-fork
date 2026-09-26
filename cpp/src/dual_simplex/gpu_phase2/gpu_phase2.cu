@@ -26,6 +26,8 @@
 // ===========================================================================
 
 #include "gpu_phase2.cuh"
+#include "gpu_branch_scores.cuh"
+#include "gpu_lu.cuh"
 
 #include "dense_triangle_solve.cuh"
 
@@ -52,6 +54,8 @@
 #include <cuda/stream>
 #include <cuda/std/limits>
 #include <cuda/std/span>
+
+#include <cub/device/device_memcpy.cuh>
 
 #include <new>  // placement new: construct the per-slot persistent state in host-allocated memory
 
@@ -3209,6 +3213,8 @@ template <class FT>
 struct slot_state {
   // Stored as i_t so the host can read it back as a plain int array.
   i_t status{static_cast<i_t>(dual::status_t::UNSET)};
+  // A FRESH seat factorized on the device has no host-priced duals: setup prices them.
+  bool price_fresh{false};
 
   FT ft;  // basis update: S_/mu_values_, num_updates_, routing stats, reused scratch
 
@@ -3410,7 +3416,7 @@ struct slot_state {
     // -- these two set the nonbasic values from the sign of z and skip columns with
     // |x_j| < 10*tight_tol -- and that difference moves the trajectory from the first refactor on.
     if constexpr (PersistentSeats) {
-      if (child_continue) { price_child_duals(lp, basic_list, nonbasic_list, sol); }
+      if (child_continue || price_fresh) { price_child_duals(lp, basic_list, nonbasic_list, sol); }
     }
 
     if (!refactor_resume) {
@@ -3917,6 +3923,8 @@ struct kernel_args {
   f_t *rhs, *lower, *upper, *objective;
   gpu_bound_delta<i_t, f_t>* bound_deltas;
   i_t bound_delta_count;
+  const f_t *root_lower, *root_upper;
+  i_t bounds_from_root;
   f_t obj_scale, obj_constant;
   // Fixed-factor row indices use i_t throughout.
   i_t* L0_col_start;
@@ -3984,6 +3992,15 @@ struct kernel_args {
   f_t* out_objective;
   f_t* out_user_objective;
   i_t* out_iterations;
+  // Device bound strengthening (nondeterministic pool): integer flags per column, per-seat scratch
+  // (2m doubles + 2m + n bytes), and the switch.
+  const unsigned char* var_int;
+  unsigned char* bs_scratch;
+  f_t integer_tol;
+  i_t strengthen;
+  // Device LU of a FRESH seat: lu_info = {status, L nz, U nz} written by the dense batch.
+  const int* lu_info;
+  i_t device_lu;
 };
 
 __device__ gpu_csc_view make_view(
@@ -4056,6 +4073,109 @@ __device__ __noinline__ void warp_build_config(const gpu_basis_update_t& ft,
 // reads and writes only that problem's independently marshalled buffers in args[idx].
 // g_gpu_capacity_exceeded is reset by the HOST before launch (not here) so a late block cannot
 // clear a failure flag an earlier block already set.
+// The host bounds_strengthening_t pass on one warp, from every row or the delta columns' rows.
+__device__ __noinline__ void warp_strengthen_bounds(kernel_args& a, bool from_deltas)
+{
+  constexpr unsigned full = 0xffffffffu;
+  const i_t m    = a.m;
+  const i_t n    = a.n;
+  const i_t lane = static_cast<i_t>(threadIdx.x);
+  const f_t inf  = cuda::std::numeric_limits<f_t>::infinity();
+  const f_t ptol = a.primal_tol;
+  f_t* dmin           = reinterpret_cast<f_t*>(a.bs_scratch);
+  f_t* dmax           = dmin + m;
+  unsigned char* rc   = reinterpret_cast<unsigned char*>(dmax + m);
+  unsigned char* rcn  = rc + m;
+  unsigned char* vc   = rcn + m;
+  f_t* lower          = a.lower;
+  f_t* upper          = a.upper;
+  for (i_t i = lane; i < m; i += 32) {
+    rc[i]  = from_deltas ? 0 : 1;
+    rcn[i] = 0;
+  }
+  for (i_t j = lane; j < n; j += 32) { vc[j] = 0; }
+  __syncwarp(full);
+  if (from_deltas) {
+    for (i_t q = 0; q < a.bound_delta_count; ++q) {
+      const i_t j = a.bound_deltas[q].column;
+      for (i_t p = a.A_col_start[j] + lane; p < a.A_col_start[j + 1]; p += 32) { rc[a.A_i[p]] = 1; }
+    }
+    __syncwarp(full);
+  }
+  for (int iter = 0; iter < 10; ++iter) {
+    bool infeasible = false;
+    for (i_t i = lane; i < m; i += 32) {
+      if (!rc[i]) { continue; }
+      f_t min_a = 0.0, max_a = 0.0;
+      for (i_t p = a.Arow_row_start[i]; p < a.Arow_row_start[i + 1]; ++p) {
+        const i_t j    = a.Arow_j[p];
+        const f_t a_ij = a.Arow_x[p];
+        vc[j]          = 1;
+        if (a_ij > 0) {
+          min_a += a_ij * lower[j];
+          max_a += a_ij * upper[j];
+        } else if (a_ij < 0) {
+          min_a += a_ij * upper[j];
+          max_a += a_ij * lower[j];
+        }
+        if (upper[j] == inf && a_ij > 0) { max_a = inf; }
+        if (lower[j] == -inf && a_ij < 0) { max_a = inf; }
+        if (lower[j] == -inf && a_ij > 0) { min_a = -inf; }
+        if (upper[j] == inf && a_ij < 0) { min_a = -inf; }
+      }
+      const f_t b = a.rhs[i];
+      if (min_a > b + ptol || max_a < b - ptol) { infeasible = true; }
+      dmin[i] = b - min_a;
+      dmax[i] = b - max_a;
+    }
+    if (__any_sync(full, infeasible)) { return; }
+    bool changed = false;
+    for (i_t k = lane; k < n; k += 32) {
+      if (!vc[k]) { continue; }
+      const f_t old_lb = lower[k];
+      const f_t old_ub = upper[k];
+      f_t new_lb       = old_lb;
+      f_t new_ub       = old_ub;
+      for (i_t p = a.A_col_start[k]; p < a.A_col_start[k + 1]; ++p) {
+        const i_t i = a.A_i[p];
+        if (!rc[i]) { continue; }
+        const f_t a_ik = a.A_x[p];
+        const f_t dmn  = dmin[i] + ((a_ik < 0) ? a_ik * old_ub : a_ik * old_lb);
+        const f_t dmx  = dmax[i] + ((a_ik > 0) ? a_ik * old_ub : a_ik * old_lb);
+        const f_t lb_c = (a_ik < 0.) ? dmn / a_ik : dmx / a_ik;
+        const f_t ub_c = (a_ik < 0.) ? dmx / a_ik : dmn / a_ik;
+        new_lb         = (new_lb < lb_c) ? lb_c : new_lb;
+        new_ub         = (ub_c < new_ub) ? ub_c : new_ub;
+      }
+      if (a.var_int[k]) {
+        new_lb = ceil(new_lb - a.integer_tol);
+        new_ub = floor(new_ub + a.integer_tol);
+      }
+      const bool updated = fabs(new_lb - old_lb) > 1e3 * ptol || fabs(new_ub - old_ub) > 1e3 * ptol;
+      new_lb = (new_lb < old_lb) ? old_lb : new_lb;
+      new_ub = (old_ub < new_ub) ? old_ub : new_ub;
+      if (new_lb > new_ub + ptol) {
+        infeasible = true;
+        continue;
+      }
+      if (new_lb != old_lb || new_ub != old_ub) {
+        for (i_t p = a.A_col_start[k]; p < a.A_col_start[k + 1]; ++p) { rcn[a.A_i[p]] = 1; }
+      }
+      lower[k] = (new_lb < new_ub) ? new_lb : new_ub;
+      upper[k] = (new_lb < new_ub) ? new_ub : new_lb;
+      changed |= updated;
+    }
+    if (__any_sync(full, infeasible)) { return; }
+    if (!__any_sync(full, changed)) { return; }
+    for (i_t i = lane; i < m; i += 32) {
+      rc[i]  = rcn[i];
+      rcn[i] = 0;
+    }
+    for (i_t j = lane; j < n; j += 32) { vc[j] = 0; }
+    __syncwarp(full);
+  }
+}
+
 template <bool AllowRefactorExit, bool PersistentSeats = false>
 __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args, i_t idx)
 {
@@ -4083,9 +4203,42 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args, i_t id
   // are marshalled as this marker alone, with all problem pointers left null.
   if (a.done != 0) { return; }
 
+  if constexpr (PersistentSeats) {
+    if (a.device_lu != 0) {
+      if (a.lu_info[0] != 0) {
+        // The device LU failed (singular, tiny pivot, or no room): the node goes to the CPU.
+        lane0_serial([&] {
+          a.out_status[0]       = static_cast<i_t>(dual::status_t::NUMERICAL);
+          a.out_status[1]       = 0;
+          *a.out_objective      = 0.0;
+          *a.out_user_objective = 0.0;
+          *a.out_iterations     = 0;
+        });
+        return;
+      }
+      lane0_serial([&] {
+        a.L0_nz = a.L0t_nz = a.lu_info[1];
+        a.U0_nz = a.U0t_nz = a.lu_info[2];
+      });
+    }
+  }
+
   bool child_continue = false;
   if constexpr (PersistentSeats) {
     child_continue = a.command == static_cast<i_t>(gpu_batch_seat_command::CHILD_CONTINUE);
+    if (a.bounds_from_root != 0) {
+      for (i_t j = static_cast<i_t>(threadIdx.x); j < a.n; j += 32) {
+        a.lower[j] = a.root_lower[j];
+        a.upper[j] = a.root_upper[j];
+      }
+      __syncwarp(0xffffffffu);
+      for (i_t q = static_cast<i_t>(threadIdx.x); q < a.bound_delta_count; q += 32) {
+        const auto& d = a.bound_deltas[q];
+        a.lower[d.column] = d.lower;
+        a.upper[d.column] = d.upper;
+      }
+      __syncwarp(0xffffffffu);
+    }
   }
   if constexpr (PersistentSeats) {
     if (child_continue) {
@@ -4100,6 +4253,13 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args, i_t id
       }
     });
     }
+  }
+
+  // FRESH (all rows) and CHILD_CONTINUE (rows of the delta columns); a resume keeps its bounds.
+  if (a.strengthen != 0 && (child_continue || a.refactor_resume == 0)) {
+    __syncwarp(0xffffffffu);
+    warp_strengthen_bounds(a, child_continue);
+    __syncwarp(0xffffffffu);
   }
 
   const i_t m = a.m;
@@ -4159,6 +4319,7 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args, i_t id
     ft.eta_nnz_cap_ = a.mpf_eta_nnz_cap;
     ft.reserve_store(m);
       ft.hypersparse_threshold_ = 0.05;
+      if constexpr (PersistentSeats) { st.price_fresh = a.device_lu != 0; }
     });   // end lane-0 construction
   }
   slot_state<FT>& st = *a.slot;
@@ -4287,6 +4448,8 @@ gpu_phase2_kernel_direct(kernel_args* args,
   if (threadIdx.x == 0 && completed_blocks != nullptr && completion_flag != nullptr) {
     const unsigned int previously_completed = atomicAdd(completed_blocks, 1u);
     if (previously_completed + 1u == static_cast<unsigned int>(gridDim.x)) {
+      *next_problem     = 0u;  // ready for the next launch without memsets
+      *completed_blocks = 0u;
       cuda::atomic_ref<std::uint32_t, cuda::thread_scope_system> ready(*completion_flag);
       ready.store(1u, cuda::memory_order_release);
     }
@@ -4317,6 +4480,108 @@ gpu_phase2_kernel_direct(kernel_args* args,
 // possible at all, since RMM's deallocate needs the original size a bare pointer does not carry.
 // Owns every device_buffer handed out for one problem. Destroying it returns the memory to the pool,
 // so free_kernel_args no longer frees these pointers.
+// Pieces packed into one pinned array, uploaded in one copy, scattered by cub::DeviceMemcpy::Batched.
+struct packed_upload_t {
+  std::optional<cuda::host_buffer<unsigned char>> h;
+  std::optional<rmm::device_buffer> d, temp;
+  size_t cap{0}, dev_cap{0}, temp_cap{0}, used{0};
+  std::vector<size_t> src;
+  std::vector<void*> dst;
+  std::vector<size_t> bytes;
+  std::uint64_t flushes{0}, flushed_bytes{0}, flushed_pieces{0}, grows{0};
+
+  static size_t align(size_t v) { return (v + 15) & ~size_t{15}; }
+  void reserve(size_t need, rmm::cuda_stream_view s)
+  {
+    if (need <= cap) { return; }
+    const size_t c = std::max(need, 2 * cap);
+    auto grown = cuda::make_pinned_buffer<unsigned char>(cuda::stream_ref{s.value()}, c, cuda::no_init);
+    if (used != 0) { std::memcpy(grown.data(), h->data(), used); }
+    h.emplace(std::move(grown));
+    cap = c;
+    ++grows;
+  }
+  void add(void* to, const void* from, size_t n, rmm::cuda_stream_view s)
+  {
+    if (n == 0) { return; }
+    reserve(align(used) + n, s);
+    used = align(used);
+    std::memcpy(h->data() + used, from, n);
+    src.push_back(used);
+    dst.push_back(to);
+    bytes.push_back(n);
+    used += n;
+  }
+  // `mid` (optional) is recorded between the host-to-device copy and the batched scatter.
+  void flush(rmm::cuda_stream_view s, cudaEvent_t mid = nullptr)
+  {
+    const size_t P = src.size();
+    if (P == 0) {
+      if (mid != nullptr) { RAFT_CUDA_TRY(cudaEventRecord(mid, s.value())); }
+      return;
+    }
+    const size_t desc  = align(used);
+    const size_t total = desc + P * (2 * sizeof(void*) + sizeof(size_t));
+    reserve(total, s);
+    if (total > dev_cap) {
+      d.emplace(cap, s);
+      dev_cap = cap;
+    }
+    auto* base = static_cast<unsigned char*>(d->data());
+    auto** hs  = reinterpret_cast<void**>(h->data() + desc);
+    auto** hd  = hs + P;
+    auto* hn   = reinterpret_cast<size_t*>(hd + P);
+    for (size_t k = 0; k < P; ++k) {
+      hs[k] = base + src[k];
+      hd[k] = dst[k];
+      hn[k] = bytes[k];
+    }
+    RAFT_CUDA_TRY(cudaMemcpyAsync(base, h->data(), total, cudaMemcpyHostToDevice, s.value()));
+    if (mid != nullptr) { RAFT_CUDA_TRY(cudaEventRecord(mid, s.value())); }
+    auto** ds = reinterpret_cast<void**>(base + desc);
+    auto* dn  = reinterpret_cast<size_t*>(ds + 2 * P);
+    size_t temp_bytes = 0;
+    RAFT_CUDA_TRY(cub::DeviceMemcpy::Batched(
+      nullptr, temp_bytes, ds, ds + P, dn, static_cast<::cuda::std::int64_t>(P), s.value()));
+    if (temp_bytes > temp_cap) {
+      temp.emplace(std::max(temp_bytes, 2 * temp_cap), s);
+      temp_cap = temp->size();
+    }
+    RAFT_CUDA_TRY(cub::DeviceMemcpy::Batched(
+      temp->data(), temp_bytes, ds, ds + P, dn, static_cast<::cuda::std::int64_t>(P), s.value()));
+    ++flushes;
+    flushed_bytes += used;
+    flushed_pieces += P;
+    src.clear();
+    dst.clear();
+    bytes.clear();
+    used = 0;
+  }
+};
+
+// Fixed per-seat factor slots, sized from the first launch; a larger LU goes to the CPU.
+struct factor_slots_t {
+  size_t capL{0}, capU{0}, acceptL{0}, acceptU{0}, bound{0};
+  i_t *Li{}, *Ui{}, *Lti{}, *Uti{};
+  f_t *Lx{}, *Ux{}, *Ltx{}, *Utx{};
+  // Fill of every LU checked against the slots, as nz / cap: 10 bins of 0.1, then > cap.
+  std::array<std::uint64_t, 11> histL{}, histU{};
+  std::uint64_t lus{0}, overflow_fresh{0}, overflow_resume{0};
+  size_t maxL{0}, maxU{0};
+
+  void record(size_t nzL, size_t nzU)
+  {
+    const auto bin = [](size_t nz, size_t c) {
+      return nz > c ? size_t{10} : std::min<size_t>(9, (10 * nz) / std::max<size_t>(c, 1));
+    };
+    ++histL[bin(nzL, capL)];
+    ++histU[bin(nzU, capU)];
+    ++lus;
+    maxL = std::max(maxL, nzL);
+    maxU = std::max(maxU, nzU);
+  }
+};
+
 struct marshal_storage {
   std::vector<rmm::device_buffer> bufs;
   // The CSR transpose is built here and its host storage must outlive marshal_problem.
@@ -4878,7 +5143,9 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
                                    const std::vector<f_t>* lower_ovr = nullptr,
                                    const std::vector<f_t>* upper_ovr = nullptr,
                                    fixed_storage* fixed = nullptr,
-                                   size_t seat = 0)
+                                   size_t seat = 0,
+                                   const factor_slots_t* slots = nullptr,
+                                   packed_upload_t* pack = nullptr)
 {
   raft::common::nvtx::range nvtx_scope("GpuDS::marshal_problem");
   const int m = lp.num_rows;
@@ -4942,26 +5209,42 @@ static kernel_args marshal_problem(const lp_problem_t<i_t, f_t>& lp,
   // one-shot launches preserves their allocation footprint exactly.
   a.bound_deltas      = nullptr;
   a.bound_delta_count = 0;
+  a.root_lower        = nullptr;
+  a.root_upper        = nullptr;
+  a.bounds_from_root  = 0;
   a.L0_col_start = upload_fixed(L0.col_start, st, fixed, &fixed_storage::L0_col_start,
                                 &fixed_storage::h_L0_col_start, seat);
+  // With slots, the factor goes into the seat's slot through the packed upload.
+  const auto factor_arrays = [&](const auto& F, i_t* slot_i, f_t* slot_x, i_t*& d_i, f_t*& d_x) {
+    if (slots == nullptr) {
+      d_i = upload_n(F.i.data(), F.nnz(), st);
+      d_x = upload_n(F.x.data(), F.nnz(), st);
+      return;
+    }
+    d_i = slot_i;
+    d_x = slot_x;
+    pack->add(d_i, F.i.data(), F.nnz() * sizeof(i_t), st.stream);
+    pack->add(d_x, F.x.data(), F.nnz() * sizeof(f_t), st.stream);
+  };
+  const auto at = [&](auto* base, size_t cap) { return slots ? base + seat * cap : nullptr; };
   a.L0_nz = L0.nnz();
-  a.L0_i = upload_n(L0.i.data(), L0.nnz(), st);
-  a.L0_x = upload_n(L0.x.data(), L0.nnz(), st);
+  factor_arrays(L0, at(slots ? slots->Li : nullptr, slots ? slots->capL : 0),
+                at(slots ? slots->Lx : nullptr, slots ? slots->capL : 0), a.L0_i, a.L0_x);
   a.U0_col_start = upload_fixed(U0.col_start, st, fixed, &fixed_storage::U0_col_start,
                                 &fixed_storage::h_U0_col_start, seat);
   a.U0_nz = U0.nnz();
-  a.U0_i = upload_n(U0.i.data(), U0.nnz(), st);
-  a.U0_x = upload_n(U0.x.data(), U0.nnz(), st);
+  factor_arrays(U0, at(slots ? slots->Ui : nullptr, slots ? slots->capU : 0),
+                at(slots ? slots->Ux : nullptr, slots ? slots->capU : 0), a.U0_i, a.U0_x);
   a.L0t_col_start = upload_fixed(L0t.col_start, st, fixed, &fixed_storage::L0t_col_start,
                                  &fixed_storage::h_L0t_col_start, seat);
   a.L0t_nz = L0t.nnz();
-  a.L0t_i = upload_n(L0t.i.data(), L0t.nnz(), st);
-  a.L0t_x = upload_n(L0t.x.data(), L0t.nnz(), st);
+  factor_arrays(L0t, at(slots ? slots->Lti : nullptr, slots ? slots->capL : 0),
+                at(slots ? slots->Ltx : nullptr, slots ? slots->capL : 0), a.L0t_i, a.L0t_x);
   a.U0t_col_start = upload_fixed(U0t.col_start, st, fixed, &fixed_storage::U0t_col_start,
                                  &fixed_storage::h_U0t_col_start, seat);
   a.U0t_nz = U0t.nnz();
-  a.U0t_i = upload_n(U0t.i.data(), U0t.nnz(), st);
-  a.U0t_x = upload_n(U0t.x.data(), U0t.nnz(), st);
+  factor_arrays(U0t, at(slots ? slots->Uti : nullptr, slots ? slots->capU : 0),
+                at(slots ? slots->Utx : nullptr, slots ? slots->capU : 0), a.U0t_i, a.U0t_x);
   a.row_perm     = upload_fixed(ft.row_permutation(), st, fixed, &fixed_storage::row_perm,
                                 &fixed_storage::h_row_perm, seat);
   a.inv_row_perm = upload_fixed(ft.inverse_row_permutation(), st, fixed,
@@ -5195,10 +5478,114 @@ struct gpu_ro_cache_t {
   explicit gpu_ro_cache_t(rmm::cuda_stream_view borrowed) : owned_stream(), store(borrowed) {}
 };
 
+
+// Result slabs are page-locked unless CUOPT_BNB_GPU_PINNED_RESULTS=0.
+inline bool gpu_pinned_results()
+{
+  static const bool on = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_PINNED_RESULTS");
+    return e == nullptr || std::string(e) != "0";
+  }();
+  return on;
+}
+
+// CUOPT_BNB_GPU_LEAN_FRESH: device-LU fresh seats skip the x / y / z slabs.
+inline bool gpu_lean_fresh()
+{
+  static const bool on = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_LEAN_FRESH");
+    return e == nullptr || std::string(e) != "0";
+  }();
+  return on;
+}
+
+// CUOPT_BNB_GPU_FEW_CALLS (0 disables): batched result copies, no counter memsets, timing events
+// only with CUOPT_BNB_GPU_LOG.
+inline bool gpu_few_calls()
+{
+  static const bool on = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_FEW_CALLS");
+    return e == nullptr || std::string(e) != "0";
+  }();
+  return on;
+}
+inline bool gpu_timing_events()
+{
+  static const bool on = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_LOG");
+    return !gpu_few_calls() || (e != nullptr && std::string(e) != "0");
+  }();
+  return on;
+}
+struct d2h_list_t {
+  std::vector<void*> dst;
+  std::vector<const void*> src;
+  std::vector<size_t> bytes;
+  void add(void* d, const void* s, size_t n)
+  {
+    if (n == 0) { return; }
+    dst.push_back(d);
+    src.push_back(s);
+    bytes.push_back(n);
+  }
+  void submit(cudaStream_t cs)
+  {
+    if (dst.empty()) { return; }
+    if (gpu_few_calls()) {
+      cudaMemcpyAttributes attr{};
+      attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+      size_t first        = 0;
+      RAFT_CUDA_TRY(cudaMemcpyBatchAsync(
+        dst.data(), src.data(), bytes.data(), dst.size(), &attr, &first, 1, cs));
+    } else {
+      for (size_t k = 0; k < dst.size(); ++k) {
+        RAFT_CUDA_TRY(cudaMemcpyAsync(dst[k], src[k], bytes[k], cudaMemcpyDeviceToHost, cs));
+      }
+    }
+    dst.clear();
+    src.clear();
+    bytes.clear();
+  }
+};
+
+template <typename T>
+struct result_allocator_t {
+  using value_type = T;
+  result_allocator_t() = default;
+  template <typename U>
+  result_allocator_t(const result_allocator_t<U>&)
+  {
+  }
+  T* allocate(size_t n)
+  {
+    if (!gpu_pinned_results()) { return std::allocator<T>{}.allocate(n); }
+    void* p = nullptr;
+    RAFT_CUDA_TRY(cudaHostAlloc(&p, n * sizeof(T), cudaHostAllocPortable));
+    return static_cast<T*>(p);
+  }
+  void deallocate(T* p, size_t n)
+  {
+    if (!gpu_pinned_results()) { return std::allocator<T>{}.deallocate(p, n); }
+    cudaFreeHost(p);
+  }
+  template <typename U>
+  bool operator==(const result_allocator_t<U>&) const
+  {
+    return true;
+  }
+  template <typename U>
+  bool operator!=(const result_allocator_t<U>&) const
+  {
+    return false;
+  }
+};
+template <typename T>
+using result_vector_t = std::vector<T, result_allocator_t<T>>;
+
 template <typename i_t, typename f_t>
 struct gpu_batch_handle_t {
   std::vector<gpu_batch_item<i_t, f_t>> items;
-  std::vector<kernel_args> h_args;
+  result_vector_t<kernel_args> h_args;   // page-locked with the result slabs (argument upload)
   std::vector<marshal_storage> store;
   std::optional<fixed_storage> fixed;
   marshal_storage ro_store;
@@ -5209,6 +5596,14 @@ struct gpu_batch_handle_t {
   std::uint32_t* h_completion_flag{nullptr};
   std::uint32_t* d_completion_flag{nullptr};
   cudaEvent_t ev_start{nullptr}, ev_stop{nullptr};
+  cudaEvent_t ev_pre{nullptr};   // start of a relaunch's device work (uploads, dense LU)
+  cudaEvent_t ev_lu0{nullptr}, ev_lu1{nullptr};   // around the dense LU
+  cudaEvent_t ev_h2d{nullptr}, ev_deltas{nullptr};   // after the packed copy / the delta copy
+  cudaEvent_t ev_d2h0{nullptr}, ev_d2h{nullptr};   // around the harvest's result copies
+  bool pre_recorded{false};
+  bool timed{false};  // ev_start recorded for the in-flight launch
+  unsigned int relaunch_blocks{0};
+  d2h_list_t d2h;
   rmm::cuda_stream_view stream{rmm::cuda_stream_default};
   // Non-owning. When set, the immutable problem block lives here instead of in `ro_store`, and
   // survives this launch. `ro_store` still owns the PER-LAUNCH scratch (d_args, the steal counter).
@@ -5221,11 +5616,39 @@ struct gpu_batch_handle_t {
   bool persistent_mode{false};
   bool view_mode{false};  // Nondeterministic pool consumes the host slabs without per-seat scatter.
   std::vector<unsigned char> staged;
-  // Pool-owned pinned host staging for sparse child bound deltas. Capacity grows per seat to the
-  // largest diff that seat has seen; it is not an N*n slab (which would pin hundreds of MB for the
-  // usual one-column branch updates).
-  std::vector<std::optional<cuda::host_buffer<gpu_bound_delta<i_t, f_t>>>> pinned_bound_deltas;
-  std::vector<size_t> pinned_bound_caps;
+  // Bound deltas of one generation, uploaded by the relaunch in one copy.
+  std::optional<cuda::host_buffer<gpu_bound_delta<i_t, f_t>>> h_deltas;
+  std::optional<rmm::device_buffer> d_deltas;
+  size_t delta_cap{0}, delta_dev_cap{0}, delta_used{0};
+  std::vector<size_t> delta_offset;  // per seat; read only for this generation's CHILD_CONTINUE seats
+  std::optional<rmm::device_buffer> d_root;  // root lower | upper | edge norms (path bounds)
+  bool root_dy_se_set{false};
+  // seat list | packed statuses
+  std::optional<rmm::device_buffer> d_expand;
+  std::vector<int> expand_seats;
+  // sum_down | sum_up | num_down | num_up | seat scores
+  const unsigned char* d_var_int{nullptr};
+  std::optional<rmm::device_buffer> d_scores;
+  std::optional<cuda::host_buffer<gpu_scores::seat_score_t>> h_scores;
+  gpu_scores::pseudocosts_t score_pc{};
+  bool scores_armed{false}, scores_valid{false};
+  bool slim_harvest{false};  // last harvest skipped y / z / dy_se / basis lists
+  bool use_slots{false};
+  factor_slots_t slots;
+  packed_upload_t pack;
+  bool strengthen{false};              // device bound strengthening; harvest returns the bounds
+  // Device LU of FRESH seats (dense cuBLAS batch): per-seat targets, this generation's seats.
+  bool device_lu{false};
+  void* blas{nullptr};
+  std::vector<gpu_lu::dense_seat_t> lu_targets;
+  std::vector<gpu_lu::dense_seat_t> lu_batch;
+  bool lu_custom{false};  // run_batch_lu (CUOPT_BNB_GPU_LU_KERNEL=custom) instead of cuBLAS
+  void* lu_ws{nullptr};   // its workspace
+  double *lu_dense{nullptr}, **lu_ptrs{nullptr};
+  int *lu_piv{nullptr}, *lu_cinfo{nullptr}, *lu_info{nullptr};
+  gpu_lu::dense_seat_t* d_lu_batch{nullptr};
+  // Pinned host slabs of the device bounds (with `strengthen`), allocated at the first harvest.
+  std::optional<cuda::host_buffer<f_t>> h_lower, h_upper;
   struct factor_caps_t {
     size_t L0{0}, U0{0}, L0t{0}, U0t{0};
   };
@@ -5237,13 +5660,23 @@ struct gpu_batch_handle_t {
   std::optional<cuda::host_buffer<i_t>> h_iterations;
   std::optional<cuda::host_buffer<f_t>> h_objective;
   std::optional<cuda::host_buffer<f_t>> h_user_objective;
-  std::vector<f_t> h_x, h_y, h_z, h_dy_se;
-  std::vector<variable_status_t> h_vstatus;
-  std::vector<i_t> h_basic_list, h_nonbasic_list;
+  result_vector_t<f_t> h_x, h_y, h_z, h_dy_se;
+  result_vector_t<variable_status_t> h_vstatus;
+  result_vector_t<i_t> h_basic_list, h_nonbasic_list;
 
   ~gpu_batch_handle_t()
   {
     if (h_completion_flag != nullptr) { cudaFreeHost(h_completion_flag); }
+    if (ev_start != nullptr) { cudaEventDestroy(ev_start); }
+    gpu_lu::destroy_blas_handle(blas);
+    if (ev_stop != nullptr) { cudaEventDestroy(ev_stop); }
+    if (ev_pre != nullptr) { cudaEventDestroy(ev_pre); }
+    if (ev_lu0 != nullptr) { cudaEventDestroy(ev_lu0); }
+    if (ev_lu1 != nullptr) { cudaEventDestroy(ev_lu1); }
+    if (ev_h2d != nullptr) { cudaEventDestroy(ev_h2d); }
+    if (ev_deltas != nullptr) { cudaEventDestroy(ev_deltas); }
+    if (ev_d2h != nullptr) { cudaEventDestroy(ev_d2h); }
+    if (ev_d2h0 != nullptr) { cudaEventDestroy(ev_d2h0); }
   }
 };
 
@@ -5404,6 +5837,44 @@ static dual::status_t gpu_simplified_dual_phase2_leg(
 // check rejects the whole batch if it will not fit. On success, fills out_status[i]
 // and each item->sol (x, objective, user_objective, iterations).
 // ---------------------------------------------------------------------------
+namespace gpu_phase2_detail {
+// Slot = max(first-launch max, min(bound, k x p90)), k = CUOPT_BNB_GPU_FACTOR_CAP_K (2);
+// CUOPT_BNB_GPU_FACTOR_CAP_LIMIT lowers the accepted size.
+static void size_factor_slots(const std::vector<gpu_batch_item<i_t, f_t>>& items,
+                              size_t m,
+                              factor_slots_t& fs)
+{
+  static const double k = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_FACTOR_CAP_K");
+    const double v = e != nullptr ? std::atof(e) : 2.0;
+    return v > 0.0 ? v : 2.0;
+  }();
+  static const long limit = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_FACTOR_CAP_LIMIT");
+    return e != nullptr ? std::atol(e) : 0L;
+  }();
+  std::vector<size_t> L, U;
+  for (const auto& it : items) {
+    if (it.terminal_status != dual::status_t::UNSET) { continue; }
+    L.push_back(std::max<size_t>(it.ft->L0().nnz(), it.ft->L0_transpose().nnz()));
+    U.push_back(std::max<size_t>(it.ft->U0().nnz(), it.ft->U0_transpose().nnz()));
+  }
+  fs.bound = std::max<size_t>(1, m * (m + 1) / 2);
+  const auto cap_of = [&](std::vector<size_t> v) {
+    const size_t mx  = *std::max_element(v.begin(), v.end());
+    const size_t r   = std::min(v.size() - 1, (9 * v.size() + 9) / 10 - 1);
+    std::nth_element(v.begin(), v.begin() + r, v.end());
+    const auto want = static_cast<size_t>(std::ceil(k * static_cast<double>(v[r])));
+    return std::max<size_t>({std::min(fs.bound, want), mx, 1});
+  };
+  fs.capL    = cap_of(L);
+  fs.capU    = cap_of(U);
+  fs.acceptL = limit > 0 ? std::min<size_t>(fs.capL, limit) : fs.capL;
+  fs.acceptU = limit > 0 ? std::min<size_t>(fs.capU, limit) : fs.capU;
+  for (size_t b = 0; b < L.size(); ++b) { fs.record(L[b], U[b]); }
+}
+}  // namespace gpu_phase2_detail
+
 template <typename i_t, typename f_t>
 gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batch_launch(
   const std::vector<gpu_batch_item<i_t, f_t>>& items,
@@ -5411,7 +5882,8 @@ gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batc
   rmm::cuda_stream_view stream,
   bool allow_refactor_exit,
   gpu_phase2_detail::gpu_ro_cache_t<i_t, f_t>* ro_ext,
-  bool persistent_seats)
+  bool persistent_seats,
+  bool factor_slots)
 {
   raft::common::nvtx::range nvtx_scope("GpuDS::batch_launch");
   using namespace gpu_phase2_detail;
@@ -5486,7 +5958,47 @@ gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batc
     static_bytes += item_bytes;
   }
   const size_t args_bytes = N * sizeof(kernel_args);
-  const size_t need = static_bytes + args_bytes;
+  factor_slots_t slots{};
+  const bool use_slots = persistent_seats && factor_slots && active_seats != 0;
+  if (use_slots) { size_factor_slots(items, static_cast<size_t>(batch_m), slots); }
+  // Device LU of FRESH seats (m <= 256) unless CUOPT_BNB_GPU_DEVICE_LU=0.
+  static const bool device_lu_env = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_DEVICE_LU");
+    return e == nullptr || std::string(e) != "0";
+  }();
+  const bool device_lu = use_slots && device_lu_env && batch_m > 0 && batch_m <= 256;
+  if (device_lu) {
+    slots.capL = slots.capU = slots.acceptL = slots.acceptU = slots.bound;
+  }
+  // Batch LU kernel: gpu_lu::run_batch_lu (peeling + dense / sparse nucleus), or cuBLAS (dense
+  // form + DgetrfBatched + extract) with CUOPT_BNB_GPU_LU_KERNEL=cublas.
+  static const bool lu_custom = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_LU_KERNEL");
+    return e == nullptr || std::string(e) != "cublas";
+  }();
+  const size_t dense_bytes =
+    !device_lu ? 0
+    : lu_custom
+      ? gpu_lu::batch_lu_workspace_bytes(int(batch_m), int(N)) +
+          N * (4 * sizeof(int) + sizeof(gpu_lu::dense_seat_t))
+      : N * (size_t(batch_m) * batch_m * sizeof(f_t) + sizeof(f_t*) + size_t(batch_m) * sizeof(int) +
+             4 * sizeof(int) + sizeof(gpu_lu::dense_seat_t));
+  const size_t slot_bytes =
+    use_slots ? N * 2 * (slots.capL + slots.capU) * (sizeof(i_t) + sizeof(f_t)) : 0;
+  const gpu_batch_item<i_t, f_t>* first_active = nullptr;
+  for (const auto& it : items) {
+    if (it.terminal_status == dual::status_t::UNSET) {
+      first_active = &it;
+      break;
+    }
+  }
+  const bool device_strengthen =
+    use_slots && first_active != nullptr && first_active->var_types != nullptr;
+  const size_t bs_stride = device_strengthen
+                             ? packed_upload_t::align(static_cast<size_t>(batch_m) * (2 * sizeof(f_t) + 2) +
+                                                      static_cast<size_t>(batch_n))
+                             : 0;
+  const size_t need = static_bytes + args_bytes + slot_bytes + N * bs_stride + dense_bytes;
   size_t free_b = 0, total_b = 0;
   RAFT_CUDA_TRY(cudaMemGetInfo(&free_b, &total_b));
 
@@ -5543,6 +6055,60 @@ gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batc
                      static_cast<size_t>(mpf_eta_nnz_cap()), stream);
   }
   H->ro_store.stream = stream;
+  if (use_slots) {
+    H->use_slots = true;
+    H->slots     = slots;
+    auto& fs     = H->slots;
+    fs.Li  = alloc_uninit<i_t>(N * fs.capL, H->ro_store);
+    fs.Lx  = alloc_uninit<f_t>(N * fs.capL, H->ro_store);
+    fs.Lti = alloc_uninit<i_t>(N * fs.capL, H->ro_store);
+    fs.Ltx = alloc_uninit<f_t>(N * fs.capL, H->ro_store);
+    fs.Ui  = alloc_uninit<i_t>(N * fs.capU, H->ro_store);
+    fs.Ux  = alloc_uninit<f_t>(N * fs.capU, H->ro_store);
+    fs.Uti = alloc_uninit<i_t>(N * fs.capU, H->ro_store);
+    fs.Utx = alloc_uninit<f_t>(N * fs.capU, H->ro_store);
+    size_t first = 0;
+    for (const auto& it : items) {
+      if (it.terminal_status != dual::status_t::UNSET) { continue; }
+      for (const auto* F : {&it.ft->L0(), &it.ft->U0(), &it.ft->L0_transpose(), &it.ft->U0_transpose()}) {
+        first += 2 * packed_upload_t::align(static_cast<size_t>(F->nnz()) * sizeof(f_t)) +
+                 2 * (2 * sizeof(void*) + sizeof(size_t));
+      }
+      // Bounds, permutations, column starts and slab slices of a later FRESH_NODE staging.
+      first += 45 * static_cast<size_t>(batch_n) + 40 * static_cast<size_t>(batch_m) + 16 * 64;
+    }
+    H->pack.reserve(first, stream);
+  }
+  if (device_lu) {
+    H->device_lu  = true;
+    H->lu_custom  = lu_custom;
+    H->lu_info    = alloc_uninit<int>(3 * N, H->ro_store);
+    H->d_lu_batch = alloc_uninit<gpu_lu::dense_seat_t>(N, H->ro_store);
+    if (lu_custom) {
+      const size_t ws = gpu_lu::batch_lu_workspace_bytes(int(batch_m), int(N));
+      if (ws != 0) { H->lu_ws = alloc_uninit<unsigned char>(ws, H->ro_store); }
+    } else {
+      H->blas     = gpu_lu::create_blas_handle();
+      H->lu_dense = alloc_uninit<f_t>(N * size_t(batch_m) * batch_m, H->ro_store);
+      H->lu_ptrs  = alloc_uninit<f_t*>(N, H->ro_store);
+      H->lu_piv   = alloc_uninit<int>(N * size_t(batch_m), H->ro_store);
+      H->lu_cinfo = alloc_uninit<int>(N, H->ro_store);
+      if (H->blas == nullptr) { H->device_lu = false; }
+    }
+  }
+  const unsigned char* d_var_int = nullptr;
+  unsigned char* bs_base         = nullptr;
+  if (device_strengthen) {
+    const auto& vt = *first_active->var_types;
+    std::vector<unsigned char> flags(static_cast<size_t>(batch_n), 0);
+    for (i_t j = 0; j < batch_n && j < static_cast<i_t>(vt.size()); ++j) {
+      flags[j] = vt[j] == variable_type_t::INTEGER || vt[j] == variable_type_t::BINARY;
+    }
+    d_var_int     = upload(flags, H->ro_store);
+    H->d_var_int  = d_var_int;
+    bs_base       = alloc_uninit<unsigned char>(N * bs_stride, H->ro_store);
+    H->strengthen = true;
+  }
   // One cache-line-aligned mapped word is the asynchronous host/device completion handshake for
   // this handle. It is logically a bool, but a 32-bit word has well-defined CUDA and CPU atomic
   // support. The CPU never polls CUDA runtime state in the worker-loop hot path.
@@ -5615,10 +6181,29 @@ gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batc
     h_args[b] = marshal_problem(*it.lp, *it.settings, *it.vstatus, *it.ft, *it.basic_list,
                                 *it.nonbasic_list, *it.sol, *it.dy_se, ro, store[b],
                                 it.refactor_resume, it.terminal_certificate_retry,
-                                it.lower, it.upper, &*H->fixed, b);
+                                it.lower, it.upper, &*H->fixed, b,
+                                H->use_slots ? &H->slots : nullptr, &H->pack);
+    if (H->device_lu) {
+      if (H->lu_targets.empty()) { H->lu_targets.resize(N); }
+      const kernel_args& a = h_args[b];
+      const int cap_l      = static_cast<int>(H->slots.capL);
+      const int cap_u      = static_cast<int>(H->slots.capU);
+      H->lu_targets[b]     = gpu_lu::dense_seat_t{a.basic_list, a.L0_col_start, a.L0_i, a.L0_x,
+                                                  a.U0_col_start, a.U0_i, a.U0_x, a.L0t_col_start,
+                                                  a.L0t_i, a.L0t_x, a.U0t_col_start, a.U0t_i,
+                                                  a.U0t_x, cap_l, cap_u, a.row_perm,
+                                                  a.inv_row_perm, H->lu_info + 3 * b};
+    }
+    if (H->strengthen) {
+      h_args[b].var_int     = d_var_int;
+      h_args[b].bs_scratch  = bs_base + b * bs_stride;
+      h_args[b].integer_tol = it.settings->integer_tol;
+      h_args[b].strengthen  = 1;
+    }
   }
 
   if (H->fixed) { H->fixed->flush_uploads(); }
+  if (H->use_slots) { H->pack.flush(stream); }
 
   // d_args comes from the pool on this batch's stream. It used to be a raw cudaMalloc plus a
   // BLOCKING cudaMemcpy, which is a device-wide synchronisation point in the middle of the launch
@@ -5667,8 +6252,16 @@ gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* gpu_simplified_dual_phase2_batc
   cudaEvent_t& ev_start = H->ev_start;
   cudaEvent_t& ev_stop  = H->ev_stop;
   RAFT_CUDA_TRY(cudaEventCreate(&ev_start));
+  RAFT_CUDA_TRY(cudaEventCreate(&H->ev_pre));
+  RAFT_CUDA_TRY(cudaEventCreate(&H->ev_lu0));
+  RAFT_CUDA_TRY(cudaEventCreate(&H->ev_lu1));
+  RAFT_CUDA_TRY(cudaEventCreate(&H->ev_h2d));
+  RAFT_CUDA_TRY(cudaEventCreate(&H->ev_deltas));
+  RAFT_CUDA_TRY(cudaEventCreate(&H->ev_d2h));
+  RAFT_CUDA_TRY(cudaEventCreate(&H->ev_d2h0));
   RAFT_CUDA_TRY(cudaEventCreate(&ev_stop));
   RAFT_CUDA_TRY(cudaEventRecord(ev_start, stream.value()));
+  H->timed = true;
   {
     // The register/occupancy target is a BUILD-time knob on the Direct kernel
     // gpu_phase2_kernel_direct.
@@ -5720,6 +6313,11 @@ void gpu_batch_set_setup_telemetry(bool on)
   gpu_phase2_detail::g_setup_telemetry.store(on, std::memory_order_relaxed);
 }
 
+static thread_local double tl_relaunch_split[4] = {0.0, 0.0, 0.0, 0.0};
+const double* gpu_batch_last_relaunch_split() { return tl_relaunch_split; }
+static thread_local double tl_stage_split[4] = {0.0, 0.0, 0.0, 0.0};
+double* gpu_batch_stage_split() { return tl_stage_split; }
+
 void gpu_call_stats_begin()
 {
   gpu_phase2_detail::tl_setup    = gpu_phase2_detail::setup_stats_t{};
@@ -5751,10 +6349,57 @@ bool gpu_simplified_dual_phase2_batch_ready(gpu_phase2_detail::gpu_batch_handle_
 
 // Wait for the kernel, copy every result back, release the batch. Destroys the handle.
 template <typename i_t, typename f_t>
+static void enqueue_seat_rest(gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H, size_t b)
+{
+  const size_t m = H->rows, n = H->cols;
+  const auto get = [&](auto& host, const auto& dev, size_t w) {
+    H->d2h.add(host.data() + b * w, dev.data() + b * w, w * sizeof(host[0]));
+  };
+  get(H->h_basic_list, H->fixed->basic_list, m);
+  get(H->h_nonbasic_list, H->fixed->nonbasic_list, n - m);
+  get(H->h_dy_se, H->fixed->dy_se, n);
+  get(H->h_y, H->fixed->y, m);
+  get(H->h_z, H->fixed->z, n);
+}
+
+template <typename i_t, typename f_t>
+void gpu_simplified_dual_phase2_batch_fetch_seat(gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H,
+                                                 std::size_t seat)
+{
+  if (H == nullptr || !H->slim_harvest || H->launched) { return; }
+  enqueue_seat_rest(H, seat);
+  H->d2h.submit(H->stream.value());
+  H->stream.synchronize();
+}
+
+template <typename i_t, typename f_t>
+void gpu_simplified_dual_phase2_batch_fetch_seats(gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H,
+                                                  const std::vector<int>& seats)
+{
+  if (H == nullptr || !H->slim_harvest || H->launched || seats.empty()) { return; }
+  const size_t N = H->h_args.size(), m = H->rows, n = H->cols;
+  if (seats.size() * 8 > N) {  // whole slabs: 5 copies instead of 5 per seat
+    const auto get = [&](auto& host, const auto& dev, size_t w) {
+      H->d2h.add(host.data(), dev.data(), N * w * sizeof(host[0]));
+    };
+    get(H->h_basic_list, H->fixed->basic_list, m);
+    get(H->h_nonbasic_list, H->fixed->nonbasic_list, n - m);
+    get(H->h_dy_se, H->fixed->dy_se, n);
+    get(H->h_y, H->fixed->y, m);
+    get(H->h_z, H->fixed->z, n);
+  } else {
+    for (int s : seats) { enqueue_seat_rest(H, static_cast<size_t>(s)); }
+  }
+  H->d2h.submit(H->stream.value());
+  H->stream.synchronize();
+}
+
+template <typename i_t, typename f_t>
 void gpu_simplified_dual_phase2_batch_harvest(
   gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H,
   std::vector<dual::status_t>& out_status,
-  gpu_batch_timing& timing)
+  gpu_batch_timing& timing,
+  bool slim)
 {
   raft::common::nvtx::range nvtx_scope("GpuDS::batch_harvest");
   using namespace gpu_phase2_detail;
@@ -5778,11 +6423,10 @@ void gpu_simplified_dual_phase2_batch_harvest(
     H->h_basic_list.resize(N * m);
     H->h_nonbasic_list.resize(N * (n - m));
     const cudaStream_t cs = H->stream.value();
-    auto copy = [cs](void* dst, const void* src, size_t bytes) {
-      if (bytes != 0) {
-        RAFT_CUDA_TRY(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, cs));
-      }
-    };
+    auto copy = [H](void* dst, const void* src, size_t bytes) { H->d2h.add(dst, src, bytes); };
+    if (H->ev_d2h0 != nullptr && gpu_timing_events()) {
+      RAFT_CUDA_TRY(cudaEventRecord(H->ev_d2h0, cs));
+    }
     copy(H->h_status->data(), H->fixed->out_status.data(), N * 2 * sizeof(i_t));
     copy(H->h_objective->data(), H->fixed->out_objective.data(), N * sizeof(f_t));
     copy(H->h_user_objective->data(), H->fixed->out_user_objective.data(), N * sizeof(f_t));
@@ -5790,22 +6434,71 @@ void gpu_simplified_dual_phase2_batch_harvest(
     copy(H->h_x.data(), H->fixed->x.data(), N * n * sizeof(f_t));
     copy(H->h_vstatus.data(), H->fixed->vstatus.data(),
          N * n * sizeof(variable_status_t));
-    copy(H->h_basic_list.data(), H->fixed->basic_list.data(),
-         N * m * sizeof(i_t));
-    copy(H->h_nonbasic_list.data(), H->fixed->nonbasic_list.data(),
-         N * (n - m) * sizeof(i_t));
-    copy(H->h_dy_se.data(), H->fixed->dy_se.data(), N * n * sizeof(f_t));
-    copy(H->h_y.data(), H->fixed->y.data(), N * m * sizeof(f_t));
-    copy(H->h_z.data(), H->fixed->z.data(), N * n * sizeof(f_t));
+    if (!slim) {
+      copy(H->h_basic_list.data(), H->fixed->basic_list.data(), N * m * sizeof(i_t));
+      copy(H->h_nonbasic_list.data(), H->fixed->nonbasic_list.data(), N * (n - m) * sizeof(i_t));
+      copy(H->h_dy_se.data(), H->fixed->dy_se.data(), N * n * sizeof(f_t));
+      copy(H->h_y.data(), H->fixed->y.data(), N * m * sizeof(f_t));
+      copy(H->h_z.data(), H->fixed->z.data(), N * n * sizeof(f_t));
+    }
+    if (H->scores_valid) {
+      copy(H->h_scores->data(),
+           static_cast<char*>(H->d_scores->data()) + n * (2 * sizeof(f_t) + 2 * sizeof(i_t)),
+           N * sizeof(gpu_scores::seat_score_t));
+    }
+    if (H->strengthen) {
+      if (!H->h_lower) {
+        const cuda::stream_ref hs{cs};
+        H->h_lower.emplace(cuda::make_pinned_buffer<f_t>(hs, N * n, cuda::no_init));
+        H->h_upper.emplace(cuda::make_pinned_buffer<f_t>(hs, N * n, cuda::no_init));
+      }
+      copy(H->h_lower->data(), H->fixed->lower.data(), N * n * sizeof(f_t));
+      copy(H->h_upper->data(), H->fixed->upper.data(), N * n * sizeof(f_t));
+    }
+    H->d2h.submit(cs);
   }
+  const bool d2h_event = H->active_seats != 0 && H->ev_d2h != nullptr && gpu_timing_events();
+  if (d2h_event) { RAFT_CUDA_TRY(cudaEventRecord(H->ev_d2h, H->stream.value())); }
+  timing.copyback_enqueue_s = toc(cb_t0);
   H->stream.synchronize();
+  H->slim_harvest = slim && H->active_seats != 0;
+  if (H->slim_harvest) {
+    bool any = false;
+    for (size_t b = 0; b < N; ++b) {
+      if (H->h_status->data()[2 * b] == static_cast<i_t>(dual::status_t::REFACTOR_NEEDED)) {
+        enqueue_seat_rest(H, b);
+        any = true;
+      }
+    }
+    if (any) {
+      H->d2h.submit(H->stream.value());
+      H->stream.synchronize();
+    }
+  }
+  timing.copyback_sync_s = toc(cb_t0);
+  if (d2h_event) {
+    float d2h_ms = 0.0f;
+    RAFT_CUDA_TRY(cudaEventElapsedTime(&d2h_ms, H->ev_d2h0, H->ev_d2h));
+    timing.copyback_device_s = d2h_ms / 1000.0;
+  }
   float kernel_ms = 0.0f;
-  RAFT_CUDA_TRY(cudaEventElapsedTime(&kernel_ms, H->ev_start, H->ev_stop));
+  if (H->timed) { RAFT_CUDA_TRY(cudaEventElapsedTime(&kernel_ms, H->ev_start, H->ev_stop)); }
   timing.kernel_s = kernel_ms / 1000.0;
-  cudaEventDestroy(H->ev_start);
-  cudaEventDestroy(H->ev_stop);
-  H->ev_start = nullptr;
-  H->ev_stop  = nullptr;
+  timing.prekernel_s = 0.0;
+  if (H->pre_recorded) {
+    float pre_ms = 0.0f;
+    RAFT_CUDA_TRY(cudaEventElapsedTime(&pre_ms, H->ev_pre, H->ev_start));
+    timing.prekernel_s = pre_ms / 1000.0;
+    RAFT_CUDA_TRY(cudaEventElapsedTime(&pre_ms, H->ev_lu0, H->ev_lu1));
+    timing.prekernel_lu_s = pre_ms / 1000.0;
+    RAFT_CUDA_TRY(cudaEventElapsedTime(&pre_ms, H->ev_pre, H->ev_h2d));
+    timing.prekernel_h2d_s = pre_ms / 1000.0;
+    RAFT_CUDA_TRY(cudaEventElapsedTime(&pre_ms, H->ev_h2d, H->ev_lu0));
+    timing.prekernel_scatter_s = pre_ms / 1000.0;
+    RAFT_CUDA_TRY(cudaEventElapsedTime(&pre_ms, H->ev_lu1, H->ev_deltas));
+    timing.prekernel_deltas_s = pre_ms / 1000.0;
+    H->pre_recorded    = false;
+  }
   H->launched = false;
   for (size_t b = 0; b < N; ++b) {
     if (items[b].terminal_status != dual::status_t::UNSET) {
@@ -5873,7 +6566,7 @@ gpu_batch_result_view<i_t, f_t> gpu_simplified_dual_phase2_batch_result(
     return width == 0 ? std::span<value_t>{}
                       : std::span<value_t>{field.data() + seat * width, width};
   };
-  return {slice(H->h_x, n),
+  gpu_batch_result_view<i_t, f_t> v{slice(H->h_x, n),
           slice(H->h_y, m),
           slice(H->h_z, n),
           slice(H->h_dy_se, n),
@@ -5885,6 +6578,18 @@ gpu_batch_result_view<i_t, f_t> gpu_simplified_dual_phase2_batch_result(
           H->h_user_objective->data()[seat],
           H->h_iterations->data()[seat],
           H->h_status->data()[2 * seat + 1]};
+  if (H->strengthen) {
+    v.lower = std::span<const f_t>(H->h_lower->data() + seat * n, n);
+    v.upper = std::span<const f_t>(H->h_upper->data() + seat * n, n);
+  }
+  if (H->scores_valid) {
+    const auto& sc   = H->h_scores->data()[seat];
+    v.dev_num_frac   = sc.num_frac;
+    v.dev_best_var   = sc.best_var;
+    v.dev_unreliable = sc.unreliable != 0;
+    v.dev_estimate   = sc.estimate;
+  }
+  return v;
 }
 
 template <typename T>
@@ -5902,6 +6607,16 @@ static void persistent_copy(T* dst,
     stats.h2d_s += toc(t0);
     ++stats.h2d_n;
     stats.h2d_bytes += count * sizeof(T);
+  }
+}
+
+template <typename T, typename handle_t>
+static void stage_h2d(handle_t* H, T* dst, const T* src, size_t count)
+{
+  if (H->use_slots) {
+    H->pack.add(dst, src, count * sizeof(T), H->stream);
+  } else {
+    persistent_copy(dst, src, count, H->stream);
   }
 }
 
@@ -5923,12 +6638,20 @@ static void persistent_stage_factor(
     throw std::runtime_error("persistent factor has the wrong dimensions");
   }
   const size_t nz = static_cast<size_t>(F.nnz());
-  for (size_t p = 0; p < nz; ++p) {
+  // The slot path trusts the host LU's row indices; the check stays on the per-seat buffer path.
+  for (size_t p = 0; p < (H->use_slots ? 0 : nz); ++p) {
     if (F.i[p] < 0 || F.i[p] >= rows) {
       throw std::runtime_error("persistent factor row index is outside [0, m)");
     }
   }
-  persistent_copy(d_col, F.col_start.data(), F.col_start.size(), H->stream);
+  stage_h2d(H, d_col, F.col_start.data(), F.col_start.size());
+  if (H->use_slots) {
+    if (nz > capacity) { throw std::runtime_error("persistent factor exceeds its seat slot"); }
+    H->pack.add(d_i, F.i.data(), nz * sizeof(i_t), H->stream);
+    H->pack.add(d_x, F.x.data(), nz * sizeof(f_t), H->stream);
+    d_nz = static_cast<i_t>(nz);
+    return;
+  }
   if (nz > capacity) {
     const size_t grown = std::max(nz, capacity == 0 ? size_t{1} : 2 * capacity);
     d_i      = alloc_uninit<i_t>(grown, H->store[seat]);
@@ -5951,6 +6674,12 @@ bool gpu_simplified_dual_phase2_batch_stage(
 {
   raft::common::nvtx::range nvtx_scope("GpuDS::batch_stage");
   using namespace gpu_phase2_detail;
+  double split_t = tic();
+  const auto split = [&](int k) {
+    const double now = tic();
+    tl_stage_split[k] += now - split_t;
+    split_t = now;
+  };
   error.clear();
   if (H == nullptr || !H->persistent_mode || H->launched) {
     error = "persistent batch must be harvested before staging";
@@ -5981,9 +6710,12 @@ bool gpu_simplified_dual_phase2_batch_stage(
     const size_t seats = H->h_args.size();
     H->staged.assign(seats, 0);
     H->factor_caps.resize(seats);
-    H->pinned_bound_deltas.resize(seats);
-    H->pinned_bound_caps.assign(seats, 0);
+    H->delta_offset.assign(seats, 0);
     for (size_t b = 0; b < seats; ++b) {
+      if (H->use_slots) {
+        H->factor_caps[b] = {H->slots.capL, H->slots.capU, H->slots.capL, H->slots.capU};
+        continue;
+      }
       H->factor_caps[b] = {static_cast<size_t>(H->h_args[b].L0_nz),
                            static_cast<size_t>(H->h_args[b].U0_nz),
                            static_cast<size_t>(H->h_args[b].L0t_nz),
@@ -5998,8 +6730,10 @@ bool gpu_simplified_dual_phase2_batch_stage(
   H->items[seat]         = item;
   H->items[seat].command = command;
   a.done                 = 0;
+  a.device_lu            = 0;
   a.command              = static_cast<i_t>(command);
   a.bound_delta_count    = 0;
+  a.bounds_from_root     = 0;
   a.primal_tol           = item.settings->primal_tol;
   a.dual_tol             = item.settings->dual_tol;
   a.pivot_tol            = item.settings->pivot_tol;
@@ -6021,35 +6755,62 @@ bool gpu_simplified_dual_phase2_batch_stage(
                         : static_cast<i_t>(item.sol->iterations);
   const cudaStream_t cs = H->stream.value();
 
-  if (command == gpu_batch_seat_command::CHILD_CONTINUE) {
-    if (a.bound_deltas == nullptr) {
-      // Capacity n covers the exact full host diff after branching + strengthening. The pointer is
-      // retained in kernel_args for the rest of the pool lifetime.
-      a.bound_deltas = alloc_uninit<gpu_bound_delta<i_t, f_t>>(n, H->store[seat]);
+  const bool from_root = command == gpu_batch_seat_command::FRESH_NODE && item.root_lower != nullptr;
+  if (from_root) {
+    if (!gpu_simplified_dual_phase2_batch_lean_fresh(H) || !item.device_lu ||
+        item.root_lower->size() != static_cast<size_t>(n) ||
+        item.root_upper->size() != static_cast<size_t>(n)) {
+      error = "path bounds need lean fresh staging and root bounds";
+      return false;
     }
-    if (deltas.size() > H->pinned_bound_caps[seat]) {
-      // The previous generation has already been harvested, so this seat's old staging buffer is
-      // no longer in flight. Grow geometrically to avoid repeated host registrations.
-      const size_t cap = std::max(deltas.size(), 2 * H->pinned_bound_caps[seat]);
-      H->pinned_bound_deltas[seat].emplace(
-        cuda::make_pinned_buffer<gpu_bound_delta<i_t, f_t>>(
-          cuda::stream_ref{cs}, cap, cuda::no_init));
-      H->pinned_bound_caps[seat] = cap;
+    if (!H->d_root) {
+      H->d_root.emplace(3 * n * sizeof(f_t), H->stream);
+      auto* d = static_cast<f_t*>(H->d_root->data());
+      RAFT_CUDA_TRY(cudaMemcpyAsync(
+        d, item.root_lower->data(), n * sizeof(f_t), cudaMemcpyHostToDevice, cs));
+      RAFT_CUDA_TRY(cudaMemcpyAsync(
+        d + n, item.root_upper->data(), n * sizeof(f_t), cudaMemcpyHostToDevice, cs));
     }
-    auto* pinned = H->pinned_bound_deltas[seat]
-                     ? H->pinned_bound_deltas[seat]->data()
-                     : nullptr;
+    if (item.root_dy_se != nullptr && !H->root_dy_se_set) {
+      if (item.root_dy_se->size() != static_cast<size_t>(n)) {
+        error = "root edge norms have the wrong size";
+        return false;
+      }
+      RAFT_CUDA_TRY(cudaMemcpyAsync(static_cast<f_t*>(H->d_root->data()) + 2 * n,
+                                    item.root_dy_se->data(), n * sizeof(f_t),
+                                    cudaMemcpyHostToDevice, cs));
+      H->root_dy_se_set = true;
+    }
+    a.root_lower       = static_cast<const f_t*>(H->d_root->data());
+    a.root_upper       = a.root_lower + n;
+    a.bounds_from_root = 1;
+  }
+  if (command == gpu_batch_seat_command::CHILD_CONTINUE || from_root) {
+    const size_t need = H->delta_used + deltas.size();
+    if (need > H->delta_cap) {
+      const size_t cap = std::max({need, 2 * H->delta_cap, 4 * H->h_args.size()});
+      auto grown       = cuda::make_pinned_buffer<gpu_bound_delta<i_t, f_t>>(
+        cuda::stream_ref{cs}, cap, cuda::no_init);
+      if (H->delta_used != 0) { std::copy_n(H->h_deltas->data(), H->delta_used, grown.data()); }
+      H->h_deltas.emplace(std::move(grown));
+      H->delta_cap = cap;
+    }
+    auto* packed = H->h_deltas ? H->h_deltas->data() + H->delta_used : nullptr;
     for (size_t q = 0; q < deltas.size(); ++q) {
       if (deltas[q].column < 0 || deltas[q].column >= n || (deltas[q].mask & ~3u) != 0u) {
         error = "invalid child bound delta";
         return false;
       }
-      pinned[q] = deltas[q];
+      packed[q] = deltas[q];
     }
-    persistent_copy(a.bound_deltas, pinned, deltas.size(), H->stream);
-    a.bound_delta_count = static_cast<i_t>(deltas.size());
+    // The device address is resolved by the relaunch, after the last seat is packed.
+    H->delta_offset[seat] = H->delta_used;
+    H->delta_used         = need;
+    a.bound_deltas        = nullptr;
+    a.bound_delta_count   = static_cast<i_t>(deltas.size());
     // x/y/z, lists, dy_se, the base factor and the MPF stack deliberately stay resident.
-  } else {
+  }
+  if (command != gpu_batch_seat_command::CHILD_CONTINUE) {
     if ((!H->view_mode || command == gpu_batch_seat_command::FRESH_NODE) &&
         (item.vstatus->size() != static_cast<size_t>(n) ||
         item.basic_list->size() != static_cast<size_t>(m) ||
@@ -6061,9 +6822,45 @@ bool gpu_simplified_dual_phase2_batch_stage(
       error = "persistent fresh/refactor state has the wrong size";
       return false;
     }
-    persistent_copy(a.lower, item.lower->data(), n, H->stream);
-    persistent_copy(a.upper, item.upper->data(), n, H->stream);
-    if (H->view_mode) {
+    split(0);
+    // A resumed seat's bounds are the ones the device already holds.
+    if (!from_root && (!H->use_slots || command == gpu_batch_seat_command::FRESH_NODE)) {
+      stage_h2d(H, a.lower, item.lower->data(), n);
+      stage_h2d(H, a.upper, item.upper->data(), n);
+    }
+    split(1);
+    const bool lean = H->view_mode && H->use_slots && H->device_lu && item.device_lu &&
+                      command == gpu_batch_seat_command::FRESH_NODE && gpu_lean_fresh();
+    if (lean) {
+      auto& F        = *H->fixed;
+      const auto put = [&](auto& dev, const auto& source, size_t width) {
+        if (width != 0) {
+          H->pack.add(dev.data() + seat * width, source.data(), width * sizeof(source[0]), H->stream);
+        }
+      };
+      if (item.packed_vstatus != nullptr) {
+        if (!from_root || !H->root_dy_se_set) {
+          error = "packed fresh staging needs path bounds and root edge norms";
+          return false;
+        }
+        const size_t N  = H->h_args.size();
+        const size_t pk = static_cast<size_t>((n + 3) / 4);
+        if (item.packed_vstatus->size() != pk) {
+          error = "packed basis status has the wrong size";
+          return false;
+        }
+        if (!H->d_expand) { H->d_expand.emplace(N * (sizeof(int) + pk), H->stream); }
+        auto* packed = static_cast<std::uint8_t*>(H->d_expand->data()) + N * sizeof(int);
+        H->pack.add(packed + seat * pk, item.packed_vstatus->data(), pk, H->stream);
+        H->expand_seats.push_back(static_cast<int>(seat));
+      } else {
+        put(F.vstatus, *item.vstatus, n);
+        put(F.basic_list, *item.basic_list, m);
+        put(F.nonbasic_list, *item.nonbasic_list, n - m);
+        put(F.dy_se, *item.dy_se, n);
+      }
+      split(3);
+    } else if (H->view_mode) {
       // A resume already modified its harvested spans in place. A fresh replacement owns new
       // vectors, so only that seat is written into the host slabs before the full-pool upload.
       if (command == gpu_batch_seat_command::FRESH_NODE) {
@@ -6078,6 +6875,26 @@ bool gpu_simplified_dual_phase2_batch_stage(
         copy_seat(H->h_z, n, item.sol->z);
         copy_seat(H->h_dy_se, n, *item.dy_se);
       }
+      split(2);
+      if (H->use_slots) {
+        // A resume changed x and the basis in place; y, z and dy_se stay the device's.
+        auto& F = *H->fixed;
+        const auto slice = [&](auto& dev, auto& slab, size_t width) {
+          if (width != 0) {
+            H->pack.add(dev.data() + seat * width, slab.data() + seat * width,
+                        width * sizeof(slab[0]), H->stream);
+          }
+        };
+        slice(F.x, H->h_x, n);
+        slice(F.vstatus, H->h_vstatus, n);
+        slice(F.basic_list, H->h_basic_list, m);
+        slice(F.nonbasic_list, H->h_nonbasic_list, n - m);
+        if (command == gpu_batch_seat_command::FRESH_NODE) {
+          slice(F.y, H->h_y, m);
+          slice(F.z, H->h_z, n);
+          slice(F.dy_se, H->h_dy_se, n);
+        }
+      }
     } else {
       persistent_copy(a.vstatus, item.vstatus->data(), n, H->stream);
       persistent_copy(a.basic_list, item.basic_list->data(), m, H->stream);
@@ -6087,9 +6904,19 @@ bool gpu_simplified_dual_phase2_batch_stage(
       persistent_copy(a.z, item.sol->z.data(), n, H->stream);
       persistent_copy(a.dy_se, item.dy_se->data(), n, H->stream);
     }
-    persistent_copy(a.row_perm, item.ft->row_permutation().data(), m, H->stream);
-    persistent_copy(a.inv_row_perm, item.ft->inverse_row_permutation().data(), m, H->stream);
     a.num_updates = 0;
+    a.device_lu   = 0;
+    if (H->device_lu && item.device_lu && command == gpu_batch_seat_command::FRESH_NODE) {
+      // Factors, permutations and duals come from the device (the relaunch's dense batch).
+      a.device_lu = 1;
+      a.lu_info   = H->lu_info + 3 * seat;
+      H->lu_batch.push_back(H->lu_targets[seat]);
+      H->staged[seat] = 1;
+      split(3);
+      return true;
+    }
+    stage_h2d(H, a.row_perm, item.ft->row_permutation().data(), m);
+    stage_h2d(H, a.inv_row_perm, item.ft->inverse_row_permutation().data(), m);
 
     auto& caps = H->factor_caps[seat];
     persistent_stage_factor(
@@ -6114,16 +6941,6 @@ bool gpu_simplified_dual_phase2_batch_stage(
                             caps.U0t);
   }
 
-  auto& stats     = tl_setup;
-  const double t0 = stats.on ? tic() : 0.0;
-  RAFT_CUDA_TRY(cudaMemsetAsync(a.out_status, 0, 2 * sizeof(i_t), cs));
-  RAFT_CUDA_TRY(cudaMemsetAsync(a.out_objective, 0, sizeof(f_t), cs));
-  RAFT_CUDA_TRY(cudaMemsetAsync(a.out_user_objective, 0, sizeof(f_t), cs));
-  RAFT_CUDA_TRY(cudaMemsetAsync(a.out_iterations, 0, sizeof(i_t), cs));
-  if (stats.on) {
-    stats.memset_s += toc(t0);
-    stats.memset_n += 4;
-  }
   H->staged[seat] = 1;
   return true;
 }
@@ -6151,7 +6968,11 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
   // boundary so an incumbent published while those ran is not hidden behind the earlier snapshot.
   for (size_t b = 0; b < N; ++b) { H->h_args[b].cut_off = H->items[b].settings->cut_off; }
   const double t0 = tic();
-  if (H->view_mode) {
+  const bool timed = gpu_timing_events();
+  if (timed) { RAFT_CUDA_TRY(cudaEventRecord(H->ev_pre, H->stream.value())); }
+  H->pre_recorded = timed;
+  H->timed        = timed;
+  if (H->view_mode && !H->use_slots) {
     const auto upload = [H](const auto& source, auto member) {
       if (!source.empty()) {
         RAFT_CUDA_TRY(cudaMemcpyAsync((H->fixed.value().*member).data(),
@@ -6169,33 +6990,100 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
     upload(H->h_basic_list, &fixed_storage::basic_list);
     upload(H->h_nonbasic_list, &fixed_storage::nonbasic_list);
   }
+  const int lu_count = static_cast<int>(H->lu_batch.size());
+  if (lu_count > 0) {
+    H->pack.add(H->d_lu_batch, H->lu_batch.data(), lu_count * sizeof(gpu_lu::dense_seat_t),
+                H->stream);
+  }
+  const int expand_count = static_cast<int>(H->expand_seats.size());
+  if (expand_count > 0) {
+    H->pack.add(H->d_expand->data(), H->expand_seats.data(), expand_count * sizeof(int), H->stream);
+  }
+  if (H->use_slots) {
+    H->pack.flush(H->stream, timed ? H->ev_h2d : nullptr);
+  } else if (timed) {
+    RAFT_CUDA_TRY(cudaEventRecord(H->ev_h2d, H->stream.value()));
+  }
+  double split_t = tic();
+  tl_relaunch_split[0] = split_t - t0;
+  if (expand_count > 0) {
+    auto& F          = *H->fixed;
+    const size_t N   = H->h_args.size();
+    const int n      = H->cols;
+    auto* seat_list  = static_cast<const int*>(H->d_expand->data());
+    gpu_lu::expand_fresh_seats(
+      {seat_list, expand_count, reinterpret_cast<const std::uint8_t*>(seat_list + N), (n + 3) / 4,
+       H->rows, n, reinterpret_cast<std::int8_t*>(F.vstatus.data()), F.basic_list.data(),
+       F.nonbasic_list.data(), F.dy_se.data(), static_cast<const f_t*>(H->d_root->data()) + 2 * n},
+      H->stream.value());
+    H->expand_seats.clear();
+  }
+  if (timed) { RAFT_CUDA_TRY(cudaEventRecord(H->ev_lu0, H->stream.value())); }
+  if (lu_count > 0) {
+    const kernel_args& a0 = H->h_args[0];
+    gpu_lu::matrix_t A{H->rows, a0.A_col_start, a0.A_i, a0.A_x};
+    if (H->lu_custom) {
+      gpu_lu::run_batch_lu(A, H->d_lu_batch, lu_count, H->lu_ws, 1e-11, H->stream.value());
+    } else {
+      gpu_lu::run_dense_batch(H->blas, A, H->d_lu_batch, lu_count, H->lu_dense, H->lu_ptrs,
+                              H->lu_piv, H->lu_cinfo, 1e-11, H->stream.value());
+    }
+    H->lu_batch.clear();
+  }
+  if (timed) { RAFT_CUDA_TRY(cudaEventRecord(H->ev_lu1, H->stream.value())); }
+  tl_relaunch_split[1] = tic() - split_t;
+  split_t              = tic();
+  if (H->delta_used != 0) {
+    using delta_t = gpu_bound_delta<i_t, f_t>;
+    if (H->delta_used > H->delta_dev_cap) {
+      H->d_deltas.emplace(H->delta_cap * sizeof(delta_t), H->stream);
+      H->delta_dev_cap = H->delta_cap;
+    }
+    auto* d_deltas = static_cast<delta_t*>(H->d_deltas->data());
+    RAFT_CUDA_TRY(cudaMemcpyAsync(d_deltas,
+                                  H->h_deltas->data(),
+                                  H->delta_used * sizeof(delta_t),
+                                  cudaMemcpyHostToDevice,
+                                  H->stream.value()));
+    for (size_t b = 0; b < N; ++b) {
+      if (H->items[b].command == gpu_batch_seat_command::CHILD_CONTINUE ||
+          H->h_args[b].bounds_from_root != 0) {
+        H->h_args[b].bound_deltas = d_deltas + H->delta_offset[b];
+      }
+    }
+    H->delta_used = 0;
+  }
+  if (timed) { RAFT_CUDA_TRY(cudaEventRecord(H->ev_deltas, H->stream.value())); }
   RAFT_CUDA_TRY(cudaMemcpyAsync(H->d_args,
                                 H->h_args.data(),
                                 N * sizeof(kernel_args),
                                 cudaMemcpyHostToDevice,
                                 H->stream.value()));
-  RAFT_CUDA_TRY(cudaMemsetAsync(H->d_next, 0, sizeof(unsigned int), H->stream.value()));
-  RAFT_CUDA_TRY(cudaMemsetAsync(
-    H->d_completed_blocks, 0, sizeof(unsigned int), H->stream.value()));
+  if (!gpu_few_calls()) {
+    RAFT_CUDA_TRY(cudaMemsetAsync(H->d_next, 0, sizeof(unsigned int), H->stream.value()));
+    RAFT_CUDA_TRY(
+      cudaMemsetAsync(H->d_completed_blocks, 0, sizeof(unsigned int), H->stream.value()));
+  }
   std::atomic_ref<std::uint32_t>(*H->h_completion_flag)
     .store(0u, std::memory_order_release);
   timing.upload_s = toc(t0);
+  tl_relaunch_split[2] = tic() - split_t;
+  split_t              = tic();
 
-  int device = 0;
-  RAFT_CUDA_TRY(cudaGetDevice(&device));
-  int sm_count = 1;
-  RAFT_CUDA_TRY(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
-  int blocks_per_sm = 1;
-  RAFT_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-    &blocks_per_sm,
-    gpu_phase2_kernel_direct<true, true>,
-    32,
-    0));
-  unsigned int nb = static_cast<unsigned int>(blocks_per_sm) * static_cast<unsigned int>(sm_count);
-  if (nb == 0 || nb > N) { nb = static_cast<unsigned int>(N); }
-  RAFT_CUDA_TRY(cudaEventCreate(&H->ev_start));
-  RAFT_CUDA_TRY(cudaEventCreate(&H->ev_stop));
-  RAFT_CUDA_TRY(cudaEventRecord(H->ev_start, H->stream.value()));
+  unsigned int nb = H->relaunch_blocks;
+  if (nb == 0 || !gpu_few_calls()) {
+    int device = 0;
+    RAFT_CUDA_TRY(cudaGetDevice(&device));
+    int sm_count = 1;
+    RAFT_CUDA_TRY(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
+    int blocks_per_sm = 1;
+    RAFT_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &blocks_per_sm, gpu_phase2_kernel_direct<true, true>, 32, 0));
+    nb = static_cast<unsigned int>(blocks_per_sm) * static_cast<unsigned int>(sm_count);
+    if (nb == 0 || nb > N) { nb = static_cast<unsigned int>(N); }
+    H->relaunch_blocks = nb;
+  }
+  if (timed) { RAFT_CUDA_TRY(cudaEventRecord(H->ev_start, H->stream.value())); }
   gpu_phase2_kernel_direct<true, true>
     <<<nb, 32, 0, H->stream.value()>>>(
     H->d_args,
@@ -6204,9 +7092,85 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
     H->d_completed_blocks,
     H->d_completion_flag);
   RAFT_CUDA_TRY(cudaEventRecord(H->ev_stop, H->stream.value()));
+  H->scores_valid = H->scores_armed;
+  if (H->scores_armed) {
+    const size_t n = static_cast<size_t>(H->cols);
+    gpu_scores::score_seats(H->fixed->x.data(), H->d_var_int, static_cast<int>(N), H->cols,
+                            H->score_pc,
+                            reinterpret_cast<gpu_scores::seat_score_t*>(
+                              static_cast<char*>(H->d_scores->data()) +
+                              n * (2 * sizeof(f_t) + 2 * sizeof(i_t))),
+                            H->stream.value());
+    H->scores_armed = false;
+  }
   RAFT_CUDA_TRY(cudaPeekAtLastError());
+  tl_relaunch_split[3] = tic() - split_t;
   H->launched = true;
   return true;
+}
+
+template <typename i_t, typename f_t>
+bool gpu_simplified_dual_phase2_batch_device_lu(gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H)
+{
+  return H != nullptr && H->device_lu;
+}
+
+template <typename i_t, typename f_t>
+void gpu_simplified_dual_phase2_batch_set_pseudocosts(
+  gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H,
+  const f_t* sum_down,
+  const f_t* sum_up,
+  const i_t* num_down,
+  const i_t* num_up,
+  f_t avg_down,
+  f_t avg_up,
+  i_t reliable_threshold,
+  f_t integer_tol)
+{
+  if (H == nullptr || !H->use_slots || H->d_var_int == nullptr || H->launched) { return; }
+  const size_t n = static_cast<size_t>(H->cols);
+  const size_t N = H->h_args.size();
+  if (!H->d_scores) {
+    H->d_scores.emplace(n * (2 * sizeof(f_t) + 2 * sizeof(i_t)) +
+                          N * sizeof(gpu_scores::seat_score_t),
+                        H->stream);
+    H->h_scores.emplace(cuda::make_pinned_buffer<gpu_scores::seat_score_t>(
+      cuda::stream_ref{H->stream.value()}, N, cuda::no_init));
+  }
+  auto* base = static_cast<char*>(H->d_scores->data());
+  H->pack.add(base, sum_down, n * sizeof(f_t), H->stream);
+  H->pack.add(base + n * sizeof(f_t), sum_up, n * sizeof(f_t), H->stream);
+  H->pack.add(base + 2 * n * sizeof(f_t), num_down, n * sizeof(i_t), H->stream);
+  H->pack.add(base + 2 * n * sizeof(f_t) + n * sizeof(i_t), num_up, n * sizeof(i_t), H->stream);
+  H->score_pc = {reinterpret_cast<const double*>(base),
+                 reinterpret_cast<const double*>(base + n * sizeof(f_t)),
+                 reinterpret_cast<const int*>(base + 2 * n * sizeof(f_t)),
+                 reinterpret_cast<const int*>(base + 2 * n * sizeof(f_t) + n * sizeof(i_t)),
+                 avg_down, avg_up, reliable_threshold, integer_tol};
+  H->scores_armed = true;
+}
+
+template <typename i_t, typename f_t>
+bool gpu_simplified_dual_phase2_batch_lean_fresh(gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H)
+{
+  return H != nullptr && H->view_mode && H->use_slots && H->device_lu &&
+         gpu_phase2_detail::gpu_lean_fresh();
+}
+
+template <typename i_t, typename f_t>
+bool gpu_simplified_dual_phase2_batch_factor_fits(
+  gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H,
+  const basis_update_mpf_t<i_t, f_t>& ft,
+  bool resume)
+{
+  if (H == nullptr || !H->use_slots) { return true; }
+  auto& fs         = H->slots;
+  const size_t nzL = std::max<size_t>(ft.L0().nnz(), ft.L0_transpose().nnz());
+  const size_t nzU = std::max<size_t>(ft.U0().nnz(), ft.U0_transpose().nnz());
+  fs.record(nzL, nzU);
+  if (nzL <= fs.acceptL && nzU <= fs.acceptU) { return true; }
+  ++(resume ? fs.overflow_resume : fs.overflow_fresh);
+  return false;
 }
 
 template <typename i_t, typename f_t>
@@ -6214,13 +7178,29 @@ void gpu_simplified_dual_phase2_batch_destroy(
   gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H)
 {
   if (H == nullptr) { return; }
+  if (H->use_slots && gpu_phase2_detail::g_setup_telemetry.load(std::memory_order_relaxed)) {
+    const auto& fs = H->slots;
+    const auto& pk = H->pack;
+    const auto hist = [](const std::array<std::uint64_t, 11>& h) {
+      std::string s;
+      for (size_t b = 0; b < h.size(); ++b) { s += (b ? "," : "") + std::to_string(h[b]); }
+      return s;
+    };
+    std::fprintf(stderr,
+                 "[GPUBATCH-FACTOR] m=%d seats=%zu capL=%zu capU=%zu acceptL=%zu acceptU=%zu "
+                 "bound=%zu lus=%llu overflow_fresh=%llu overflow_resume=%llu maxL=%zu maxU=%zu "
+                 "fillL=%s fillU=%s pack_flushes=%llu pack_bytes=%llu pack_pieces=%llu "
+                 "pack_grows=%llu\n",
+                 (int)H->rows, H->h_args.size(), fs.capL, fs.capU, fs.acceptL, fs.acceptU, fs.bound,
+                 (unsigned long long)fs.lus, (unsigned long long)fs.overflow_fresh,
+                 (unsigned long long)fs.overflow_resume, fs.maxL, fs.maxU, hist(fs.histL).c_str(),
+                 hist(fs.histU).c_str(), (unsigned long long)pk.flushes,
+                 (unsigned long long)pk.flushed_bytes, (unsigned long long)pk.flushed_pieces,
+                 (unsigned long long)pk.grows);
+  }
   // A caller may drain a pool while a launch is still running. Device buffers cannot be released
   // until that stream has finished consuming them.
-  if (H->launched && H->ev_stop != nullptr) {
-    RAFT_CUDA_TRY(cudaEventSynchronize(H->ev_stop));
-    cudaEventDestroy(H->ev_start);
-    cudaEventDestroy(H->ev_stop);
-  }
+  if (H->launched && H->ev_stop != nullptr) { RAFT_CUDA_TRY(cudaEventSynchronize(H->ev_stop)); }
   if (!H->staged.empty()) { H->stream.synchronize(); }
   delete H;
 }
@@ -6382,7 +7362,16 @@ template void gpu_simplified_dual_phase2_batch<int, double>(
 template gpu_phase2_detail::gpu_batch_handle_t<int, double>*
 gpu_simplified_dual_phase2_batch_launch<int, double>(
   const std::vector<gpu_batch_item<int, double>>&, gpu_batch_timing&, rmm::cuda_stream_view,
-  bool, gpu_phase2_detail::gpu_ro_cache_t<int, double>*, bool);
+  bool, gpu_phase2_detail::gpu_ro_cache_t<int, double>*, bool, bool);
+template bool gpu_simplified_dual_phase2_batch_device_lu<int, double>(
+  gpu_phase2_detail::gpu_batch_handle_t<int, double>*);
+template bool gpu_simplified_dual_phase2_batch_lean_fresh<int, double>(
+  gpu_phase2_detail::gpu_batch_handle_t<int, double>*);
+template void gpu_simplified_dual_phase2_batch_set_pseudocosts<int, double>(
+  gpu_phase2_detail::gpu_batch_handle_t<int, double>*, const double*, const double*, const int*,
+  const int*, double, double, int, double);
+template bool gpu_simplified_dual_phase2_batch_factor_fits<int, double>(
+  gpu_phase2_detail::gpu_batch_handle_t<int, double>*, const basis_update_mpf_t<int, double>&, bool);
 template gpu_phase2_detail::gpu_ro_cache_t<int, double>* gpu_ro_cache_create<int, double>();
 template gpu_phase2_detail::gpu_ro_cache_t<int, double>* gpu_ro_cache_create_borrowed<int, double>(
   rmm::cuda_stream_view);
@@ -6394,7 +7383,11 @@ template void gpu_simplified_dual_phase2_batch_finish<int, double>(
   std::vector<dual::status_t>&, gpu_batch_timing&);
 template void gpu_simplified_dual_phase2_batch_harvest<int, double>(
   gpu_phase2_detail::gpu_batch_handle_t<int, double>*,
-  std::vector<dual::status_t>&, gpu_batch_timing&);
+  std::vector<dual::status_t>&, gpu_batch_timing&, bool);
+template void gpu_simplified_dual_phase2_batch_fetch_seat<int, double>(
+  gpu_phase2_detail::gpu_batch_handle_t<int, double>*, std::size_t);
+template void gpu_simplified_dual_phase2_batch_fetch_seats<int, double>(
+  gpu_phase2_detail::gpu_batch_handle_t<int, double>*, const std::vector<int>&);
 template void gpu_simplified_dual_phase2_batch_use_views<int, double>(
   gpu_phase2_detail::gpu_batch_handle_t<int, double>*);
 template gpu_batch_result_view<int, double> gpu_simplified_dual_phase2_batch_result<int, double>(

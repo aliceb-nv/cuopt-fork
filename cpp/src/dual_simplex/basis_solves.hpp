@@ -29,6 +29,14 @@ void get_basis_from_vstatus(i_t m,
                             std::vector<i_t>& nonbasic_list,
                             std::vector<i_t>& superbasic_list);
 
+// Shape of the calling thread's last factorize_basis call (read by GPU node pool telemetry).
+struct factorize_basis_stats_t {
+  int m{0}, row_singletons{0}, col_singletons{0}, nucleus{0};
+  long long B_nz{0}, nucleus_nz{0};
+  int rank_deficiency{0};
+};
+factorize_basis_stats_t& factorize_basis_last_stats();
+
 // Factorize the basis matrix B = A(:, basis_list). P*B*Q = L*U
 template <typename i_t, typename f_t>
 i_t factorize_basis(const csc_matrix_t<i_t, f_t>& A,

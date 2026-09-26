@@ -1613,6 +1613,31 @@ i_t pseudo_costs_t<i_t, f_t>::variable_selection(const std::vector<i_t>& fractio
 }
 
 template <typename i_t, typename f_t>
+i_t pseudo_costs_t<i_t, f_t>::reliable_threshold_now(
+  const branch_and_bound_stats_t<i_t, f_t>& bnb_stats) const
+{
+  const int64_t branch_and_bound_lp_iters = bnb_stats.total_simplex_iters;
+  i_t reliable_threshold                  = settings.reliability_branching;
+  if (reliable_threshold < 0) {
+    const i_t max_threshold            = reliability_branching_settings.max_reliable_threshold;
+    const i_t min_threshold            = reliability_branching_settings.min_reliable_threshold;
+    const f_t iter_factor              = reliability_branching_settings.bnb_lp_factor;
+    const i_t iter_offset              = reliability_branching_settings.bnb_lp_offset;
+    const int64_t alpha                = iter_factor * branch_and_bound_lp_iters;
+    const int64_t max_reliability_iter = alpha + reliability_branching_settings.bnb_lp_offset;
+
+    f_t iter_fraction =
+      (max_reliability_iter - strong_branching_lp_iter) / (strong_branching_lp_iter + 1.0);
+    iter_fraction = std::min(1.0, iter_fraction);
+    iter_fraction = std::max((alpha - strong_branching_lp_iter) / (strong_branching_lp_iter + 1.0),
+                             iter_fraction);
+    reliable_threshold = (1 - iter_fraction) * min_threshold + iter_fraction * max_threshold;
+    reliable_threshold = strong_branching_lp_iter < max_reliability_iter ? reliable_threshold : 0;
+  }
+  return reliable_threshold;
+}
+
+template <typename i_t, typename f_t>
 i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
   const mip_node_t<i_t, f_t>* node_ptr,
   const std::vector<i_t>& fractional,
@@ -1665,23 +1690,7 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
                                               reliability_branching_settings.lower_max_lp_iter,
                                               reliability_branching_settings.upper_max_lp_iter);
 
-  i_t reliable_threshold = settings.reliability_branching;
-  if (reliable_threshold < 0) {
-    const i_t max_threshold            = reliability_branching_settings.max_reliable_threshold;
-    const i_t min_threshold            = reliability_branching_settings.min_reliable_threshold;
-    const f_t iter_factor              = reliability_branching_settings.bnb_lp_factor;
-    const i_t iter_offset              = reliability_branching_settings.bnb_lp_offset;
-    const int64_t alpha                = iter_factor * branch_and_bound_lp_iters;
-    const int64_t max_reliability_iter = alpha + reliability_branching_settings.bnb_lp_offset;
-
-    f_t iter_fraction =
-      (max_reliability_iter - strong_branching_lp_iter) / (strong_branching_lp_iter + 1.0);
-    iter_fraction = std::min(1.0, iter_fraction);
-    iter_fraction = std::max((alpha - strong_branching_lp_iter) / (strong_branching_lp_iter + 1.0),
-                             iter_fraction);
-    reliable_threshold = (1 - iter_fraction) * min_threshold + iter_fraction * max_threshold;
-    reliable_threshold = strong_branching_lp_iter < max_reliability_iter ? reliable_threshold : 0;
-  }
+  const i_t reliable_threshold = reliable_threshold_now(bnb_stats);
 
   // If `reliable_threshold == 0`, then we set the uninitialized pseudocosts to the average.
   // Otherwise, the best ones are initialized via strong branching, while the other are ignored.  //
@@ -1721,6 +1730,7 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
                  static_cast<int>(reliable_threshold));
   }
 
+  last_selection_unreliable = !unreliable_list.empty();
   if (unreliable_list.empty()) {
     settings.log.debug("pc branching on %d. Value %e. Score %e\n",
                        branch_var,

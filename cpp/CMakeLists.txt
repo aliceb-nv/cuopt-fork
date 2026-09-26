@@ -578,6 +578,8 @@ add_subdirectory(src)
 # THIS file, and source-file properties are directory-scoped -- setting them here and adding the
 # source in a subdirectory would silently drop them.
 list(APPEND CUOPT_SRC_FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/dual_simplex/gpu_phase2/gpu_phase2.cu)
+list(APPEND CUOPT_SRC_FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/dual_simplex/gpu_phase2/gpu_lu.cu)
+list(APPEND CUOPT_SRC_FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/dual_simplex/gpu_phase2/gpu_branch_scores.cu)
 
 if (HOST_LINEINFO)
     set_source_files_properties(${CUOPT_SRC_FILES} ${CUOPT_CLIENT_SRC_FILES} DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTIES COMPILE_OPTIONS "-g1")

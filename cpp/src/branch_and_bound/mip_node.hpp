@@ -15,8 +15,12 @@
 #include <utilities/hashing.hpp>
 #include <utilities/omp_helpers.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <list>
 #include <memory>
 #include <vector>
@@ -121,6 +125,26 @@ class mip_node_t {
              f_t branch_var_value,
              i_t integer_inf,
              std::span<const simplex::variable_status_t> basis)
+    : mip_node_t(problem,
+                 parent_node,
+                 node_num,
+                 branch_variable,
+                 branch_direction,
+                 branch_var_value,
+                 integer_inf,
+                 compress_vstatus(basis))
+  {
+  }
+
+  // As above, with the basis already packed (both children of a branch share one packing).
+  mip_node_t(const simplex::lp_problem_t<i_t, f_t>& problem,
+             mip_node_t* parent_node,
+             i_t node_num,
+             i_t branch_variable,
+             branch_direction_t branch_direction,
+             f_t branch_var_value,
+             i_t integer_inf,
+             std::vector<uint8_t> packed_basis)
     : status(node_status_t::PENDING),
       lower_bound(parent_node->lower_bound),
       depth(parent_node->depth + 1),
@@ -131,7 +155,7 @@ class mip_node_t {
       fractional_val(branch_var_value),
       integer_infeasible(integer_inf),
       objective_estimate(parent_node->objective_estimate),
-      packed_vstatus(compress_vstatus(basis))
+      packed_vstatus(std::move(packed_basis))
   {
     branch_var_lower = branch_direction == branch_direction_t::DOWN ? problem.lower[branch_var]
                                                                     : std::ceil(branch_var_value);
@@ -186,8 +210,9 @@ class mip_node_t {
   void add_children(std::unique_ptr<mip_node_t>&& down_child,
                     std::unique_ptr<mip_node_t>&& up_child)
   {
-    children[0] = std::move(down_child);
-    children[1] = std::move(up_child);
+    children[0]     = std::move(down_child);
+    children[1]     = std::move(up_child);
+    active_children = (children[0] != nullptr) + (children[1] != nullptr);
     // When we add children we no longer need to store our basis
     packed_vstatus = {};
   }
@@ -238,6 +263,25 @@ class mip_node_t {
         }
         parent_ptr = parent_ptr->parent;
       }
+    }
+  }
+
+  // Whoever retires a parent's last active child fathoms it. A node may be freed by another
+  // thread once its parent's counter drops, so it is not touched after that.
+  void set_terminal_status(node_status_t node_status,
+                           std::vector<std::unique_ptr<mip_node_t>>& graveyard)
+  {
+    status = node_status;
+    update_bound();
+    mip_node_t* p = parent;
+    while (p != nullptr &&
+           std::atomic_ref<int>(p->active_children).fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      p->status = node_status_t::FATHOMED;
+      p->update_bound();
+      for (auto& child : p->children) {
+        if (child != nullptr) { graveyard.push_back(std::move(child)); }
+      }
+      p = p->parent;
     }
   }
 
@@ -318,6 +362,7 @@ class mip_node_t {
 
   mip_node_t<i_t, f_t>* parent;
   std::unique_ptr<mip_node_t> children[2];
+  int active_children{0};
 
   std::vector<uint8_t> packed_vstatus;
 
@@ -374,6 +419,41 @@ void remove_fathomed_nodes(std::vector<mip_node_t<i_t, f_t>*>& stack)
   }
 }
 
+// As above, but the removed subtrees are moved into `graveyard` so the caller can destroy them after
+// releasing the tree lock: nothing reaches them through the tree once they are detached.
+template <typename i_t, typename f_t>
+void detach_fathomed_nodes(std::vector<mip_node_t<i_t, f_t>*>& stack,
+                           std::vector<std::unique_ptr<mip_node_t<i_t, f_t>>>& graveyard)
+{
+  for (size_t i = 0; i < stack.size(); ++i) {
+    for (int child = 0; child < 2; ++child) {
+      if (stack[i]->children[child] != nullptr) {
+        graveyard.push_back(std::move(stack[i]->children[child]));
+      }
+    }
+  }
+}
+
+// CUOPT_BNB_TREE_FREE_OUTSIDE (default on; 0 disables): destroy fathomed subtrees outside the
+// tree lock.
+inline bool tree_free_outside_lock()
+{
+  static const bool on = [] {
+    const char* e = std::getenv("CUOPT_BNB_TREE_FREE_OUTSIDE");
+    return e == nullptr || std::strcmp(e, "0") != 0;
+  }();
+  return on;
+}
+
+inline bool tree_lockfree()
+{
+  static const bool on = [] {
+    const char* e = std::getenv("CUOPT_BNB_TREE_LOCKFREE");
+    return tree_free_outside_lock() && (e == nullptr || std::strcmp(e, "0") != 0);
+  }();
+  return on;
+}
+
 template <typename i_t, typename f_t>
 class search_tree_t {
  public:
@@ -383,10 +463,69 @@ class search_tree_t {
 
   void update(mip_node_t<i_t, f_t>* node_ptr, node_status_t status)
   {
-    std::lock_guard<omp_mutex_t> lock(mutex);
+    auto& d = deferred();
+    if (d.active && inactive_status(status)) {
+      d.updates.emplace_back(node_ptr, status);
+      return;
+    }
+    // An active status neither propagates nor removes anything: a plain write.
+    if (d.active || (tree_lockfree() && !inactive_status(status))) {
+      node_ptr->status = status;
+      return;
+    }
     std::vector<mip_node_t<i_t, f_t>*> stack;
+    std::vector<std::unique_ptr<mip_node_t<i_t, f_t>>> graveyard;
+    if (tree_lockfree()) {
+      node_ptr->set_terminal_status(status, graveyard);
+      return;
+    }
+    std::lock_guard<omp_mutex_t> lock(mutex);
     node_ptr->set_status(status, stack);
-    remove_fathomed_nodes(stack);
+    if (tree_free_outside_lock()) {
+      detach_fathomed_nodes(stack, graveyard);
+    } else {
+      remove_fathomed_nodes(stack);
+    }
+  }
+
+  void begin_deferral()
+  {
+    deferred().active      = true;
+    deferred().last_wait_s = deferred().last_hold_s = 0.0;
+  }
+  // Lock wait / hold time of this thread's last flush_deferred() (0 if it had nothing to apply).
+  double last_flush_wait_s() const { return deferred().last_wait_s; }
+  double last_flush_hold_s() const { return deferred().last_hold_s; }
+  void flush_deferred()
+  {
+    auto& d  = deferred();
+    d.active = false;
+    if (d.updates.empty()) { return; }
+    std::vector<mip_node_t<i_t, f_t>*> stack;
+    std::vector<std::unique_ptr<mip_node_t<i_t, f_t>>> graveyard;
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+    if (tree_lockfree()) {
+      for (auto [node_ptr, status] : d.updates) {
+        node_ptr->set_terminal_status(status, graveyard);
+      }
+      d.last_hold_s = std::chrono::duration<double>(clock::now() - t0).count();
+    } else {
+      std::lock_guard<omp_mutex_t> lock(mutex);
+      const auto t1 = clock::now();
+      d.last_wait_s = std::chrono::duration<double>(t1 - t0).count();
+      for (auto [node_ptr, status] : d.updates) {
+        stack.clear();
+        node_ptr->set_status(status, stack);
+        if (tree_free_outside_lock()) {
+          detach_fathomed_nodes(stack, graveyard);
+        } else {
+          remove_fathomed_nodes(stack);
+        }
+      }
+      d.last_hold_s = std::chrono::duration<double>(clock::now() - t1).count();
+    }
+    d.updates.clear();
   }
 
   void branch(mip_node_t<i_t, f_t>* parent_node,
@@ -398,6 +537,7 @@ class search_tree_t {
               simplex::logger_t& log)
   {
     i_t id = num_nodes.fetch_add(2);
+    std::vector<uint8_t> packed = compress_vstatus(parent_vstatus);
 
     auto down_child = std::make_unique<mip_node_t<i_t, f_t>>(original_lp,
                                                              parent_node,
@@ -406,7 +546,7 @@ class search_tree_t {
                                                              branch_direction_t::DOWN,
                                                              fractional_val,
                                                              integer_infeasible,
-                                                             parent_vstatus);
+                                                             packed);
     graphviz_edge(log,
                   parent_node,
                   down_child.get(),
@@ -421,7 +561,7 @@ class search_tree_t {
                                                            branch_direction_t::UP,
                                                            fractional_val,
                                                            integer_infeasible,
-                                                           parent_vstatus);
+                                                           std::move(packed));
 
     graphviz_edge(log,
                   parent_node,
@@ -464,6 +604,20 @@ class search_tree_t {
 
   mip_node_t<i_t, f_t> root;
   omp_mutex_t mutex;
+
+ private:
+  struct deferred_updates_t {
+    bool active{false};
+    double last_wait_s{0.0}, last_hold_s{0.0};
+    std::vector<std::pair<mip_node_t<i_t, f_t>*, node_status_t>> updates;
+  };
+  static deferred_updates_t& deferred()
+  {
+    static thread_local deferred_updates_t d;
+    return d;
+  }
+
+ public:
   omp_atomic_t<i_t> num_nodes;
 
   static constexpr bool write_graphviz = false;

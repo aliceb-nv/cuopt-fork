@@ -122,6 +122,13 @@ struct gpu_batch_node_t {
   // (branch_and_bound.cpp:3438), so a later seat's true LP is no longer the one the device was
   // given. Keeping the fill-time bounds makes that check exact.
   std::vector<f_t> lower, upper;
+  // Non-null: bounds built on the device from these and path_deltas.
+  const std::vector<f_t>* root_lower{nullptr};
+  const std::vector<f_t>* root_upper{nullptr};
+  std::vector<gds::gpu_bound_delta<i_t, f_t>> path_deltas;
+  // Non-null: vstatus, basis lists and dy_se built on the device.
+  const std::vector<std::uint8_t>* packed_vstatus{nullptr};
+  const std::vector<f_t>* root_dy_se{nullptr};
   // Per node, because the cutoff is derived from the incumbent as it stood when the seat was filled.
   simplex::simplex_solver_settings_t<i_t, f_t> settings;
 
@@ -173,7 +180,9 @@ struct gpu_batch_node_t {
     // collapsing it into FACTORIZE_* once cost an afternoon -- every seat still in flight when the
     // run hits its deadline reports it at once, which reads exactly like a numerical cliff.
     DEADLINE,
-    CONCURRENT_HALT    // CONCURRENT_HALT_RETURN: another solver signalled a halt
+    CONCURRENT_HALT,   // CONCURRENT_HALT_RETURN: another solver signalled a halt
+    FACTOR_CAP_FRESH,  // the fresh LU does not fit the seat's factor slot (node goes to the CPU)
+    FACTOR_CAP_RESUME  // the refactor-resume LU does not fit the seat's factor slot
   };
   drop_t drop{drop_t::NONE};
 
@@ -223,8 +232,27 @@ int gpu_pool_plunge_depth();
 // disabled (CUOPT_BNB_DUMP_BAD_NODES=<dir>). Off by default: the images are multi-megabyte.
 const char* dump_bad_nodes_dir();
 
-// TEMPORARY correctness gate (CUOPT_BNB_GPU_POOL_RECHECK), default ON -- see the definition.
+// Correctness gate (CUOPT_BNB_GPU_POOL_RECHECK), default OFF -- see the definition.
 bool gpu_pool_recheck();
+
+// CUOPT_BNB_GPU_LOG_WARMUP (seconds): telemetry counts only steps after it.
+double gpu_pool_log_warmup_s();
+
+// Env switches, default on ("0" disables).
+bool gpu_pool_device_strengthen();
+
+bool gpu_pool_inplace();
+bool gpu_pool_defer_refill();
+bool gpu_pool_light_settings();
+bool gpu_pool_batch_heap();
+bool gpu_pool_device_objective();
+bool gpu_pool_path_bounds();
+bool gpu_pool_bounds_view();
+bool gpu_pool_packed_fresh();
+bool gpu_pool_device_scores();
+// CUOPT_BNB_GPU_SLIM_D2H: y / z / dy_se / basis lists fetched per seat only when needed.
+bool gpu_pool_slim_d2h();
+bool gpu_pool_batch_fetch();  // CUOPT_BNB_GPU_BATCH_FETCH: one fetch per generation, before the seat loop
 
 // Do a GPU answer and a CPU answer for the SAME node reach a different branch-and-bound DECISION?
 //
@@ -298,6 +326,86 @@ struct batch_seat_state_t {
   batch_seat_state_t(i_t m, i_t rf) : ft(m, rf), basic_list(m), xB_workspace(m, 0.0) {}
 };
 
+// Sub-phases of the step split's harvest / process / refill (CUOPT_BNB_GPU_LOG=1).
+enum gpu_pool_sub_t : int {
+  SUB_HARVEST_D2H,       // D2H enqueue + stream sync
+  SUB_HARVEST_SCATTER,   // statuses (and full results without views) into the batch items
+  SUB_HARVEST_UNPACK,    // per-seat loop of harvest_persistent (device bounds into the nodes)
+  SUB_PROCESS_SNAPSHOT,  // resident bound copies + result view
+  SUB_PROCESS_INSTALL,   // terminal/iteration records + nondeterministic_gpu_pool_install_result
+  SUB_PROCESS_TREE,      // node counters + update_tree_impl
+  SUB_PROCESS_CHILD,     // plunge-child preparation (bounds, symmetry, vstatus, deltas)
+  SUB_PROCESS_PUSH,      // heap pushes
+  SUB_PROCESS_FLUSH,     // flush_deferred (tree lock)
+  SUB_REFILL_POP,        // pop_gpu_eligible + cut-off fathoming
+  SUB_REFILL_VSTATUS,    // decompress_vstatus + edge norms + ensure_orbital_fixing
+  SUB_REFILL_BOUNDS,     // set_lp_variable_bounds
+  SUB_REFILL_SYMMETRY,   // orbital-fixing reset + symmetry reductions
+  SUB_REFILL_BUILD,      // batch node construction, copies, seat install
+  SUB_REFILL_LB,         // nondeterministic_gpu_pool_update_lower_bound
+  SUB_REFILL_CUTOFF,     // fathoming popped nodes above the incumbent
+  SUB_REFILL_FAIL,       // a pop that found no GPU-eligible node (the refill fails)
+  SUB_REFILL_FLUSH,      // deferred tree updates applied after the refill (DEFER_REFILL)
+  // Parts of process_tree (update_tree_impl), process_child and refill_build.
+  SUB_TREE_FRAC,         // fractional variables + objective
+  SUB_TREE_PSEUDO,       // pseudocost update
+  SUB_TREE_SELECT,       // branching variable selection
+  SUB_TREE_ESTIMATE,     // objective estimate
+  SUB_TREE_BRANCH,       // child node creation (packed vstatus)
+  SUB_CHILD_SETUP,       // child batch node, settings, bound copies, branched bound
+  SUB_CHILD_SYMMETRY,    // leaf bounds + symmetry reductions
+  SUB_CHILD_VSTATUS,     // decompress + same-basis check
+  SUB_CHILD_DELTA,       // bound deltas, seat install
+  SUB_BUILD_ALLOC,       // batch node construction
+  SUB_BUILD_SETTINGS,    // per-seat solver settings
+  SUB_BUILD_COPY,        // bounds / vstatus / edge norms into the batch node
+  SUB_STAGE_FRESH,       // stage: fresh seats (basis lists, slabs, device-LU target)
+  SUB_FRESH_PREP,        // stage fresh: seat reset + solution resize
+  SUB_FRESH_BASIS,       // stage fresh: basis lists from vstatus
+  SUB_FRESH_ITEM,        // stage fresh: batch item
+  SUB_BSTAGE_ARGS,       // stage fresh, batch_stage: argument setup
+  SUB_BSTAGE_BOUNDS,     // stage fresh, batch_stage: bounds packed
+  SUB_BSTAGE_SLABS,      // stage fresh, batch_stage: slab copies
+  SUB_BSTAGE_SLICES,     // stage fresh, batch_stage: slices packed
+  SUB_STAGE_REFACTOR,    // stage: refactor-resume seats (host LU + factor staging)
+  SUB_STAGE_CHILD,       // stage: child seats (bound deltas)
+  SUB_RELAUNCH_PACK,     // relaunch: packed upload flush
+  SUB_RELAUNCH_LU,       // relaunch: dense LU enqueue
+  SUB_RELAUNCH_ARGS,     // relaunch: delta / argument uploads, memsets
+  SUB_RELAUNCH_LAUNCH,   // relaunch: occupancy query + kernel launch
+  SUB_NOTICE_PREKERNEL,  // part of notice: device work queued before the solve kernel
+  SUB_NOTICE_LU,         // part of SUB_NOTICE_PREKERNEL: the dense LU
+  SUB_NOTICE_H2D,        // part of SUB_NOTICE_PREKERNEL: packed upload copy
+  SUB_NOTICE_SCATTER,    // part of SUB_NOTICE_PREKERNEL: batched scatter of the packed pieces
+  SUB_NOTICE_DELTAS,     // part of SUB_NOTICE_PREKERNEL: child bound-delta copy
+  SUB_FLUSH_WAIT,        // part of SUB_PROCESS_FLUSH: waiting for the tree lock
+  SUB_FLUSH_HOLD,        // part of SUB_PROCESS_FLUSH: applying the updates under the lock
+  SUB_D2H_ENQUEUE,       // part of SUB_HARVEST_D2H: enqueueing the result copies
+  SUB_D2H_DEVICE,        // part of SUB_HARVEST_D2H: device span of the result copies
+  SUB_TREE_SELECT_SB,    // branching selection of nodes with unreliable candidates (strong branching)
+  SUB_COUNT
+};
+inline constexpr const char* gpu_pool_sub_names[SUB_COUNT] = {
+  "harvest_d2h", "harvest_scatter", "harvest_unpack", "process_snapshot", "process_install",
+  "process_tree", "process_child", "process_push", "process_flush", "refill_pop",
+  "refill_vstatus", "refill_bounds", "refill_symmetry", "refill_build", "refill_lb",
+  "refill_cutoff", "refill_fail", "refill_flush", "tree_frac", "tree_pseudo", "tree_select", "tree_estimate",
+  "tree_branch", "child_setup", "child_symmetry", "child_vstatus", "child_delta", "build_alloc",
+  "build_settings", "build_copy", "stage_fresh", "fresh_prep", "fresh_basis", "fresh_item", "bstage_args", "bstage_bounds", "bstage_slabs", "bstage_slices",
+  "stage_refactor", "stage_child", "relaunch_pack",
+  "relaunch_lu", "relaunch_args", "relaunch_launch", "notice_prekernel", "notice_lu", "notice_h2d", "notice_scatter", "notice_deltas", "flush_wait",
+  "flush_hold", "d2h_enqueue", "d2h_device", "tree_select_sb"};
+
+// Telemetry lap timer: lap(k) adds the time since the previous lap to sub[k]; no-op if sub is null.
+struct gpu_pool_lap_t {
+  double* sub{nullptr};
+  double t{0.0};
+  void start();
+  void lap(int k);
+};
+// Set by the pool step around staging (null otherwise); the stage functions lap into it.
+extern thread_local gpu_pool_lap_t* tl_stage_laps;
+
 template <typename i_t, typename f_t>
 struct gpu_batch_pool_t {
   // #4 -- the device this pool lives on, from gpu_pool_device_map(). MUST be set on the calling
@@ -334,6 +442,8 @@ struct gpu_batch_pool_t {
   // has_work_impl() therefore reports the pool, which is what keeps the worker out of the barrier
   // until the pool drains -- see the invariant in deterministic_sync_callback().
   std::atomic<bool> busy{false};
+  std::atomic<int> seated{0};              // telemetry: seats holding a node (per generation)
+  const char* drain_reason{"other"};       // telemetry: why the next finish drains
 
   // Nodes owned by a busy pool are absent from every CPU heap. Publish their inherited B&B bound
   // here so the opportunistic global-bound scan cannot run past hidden GPU work.
@@ -407,12 +517,33 @@ struct gpu_batch_pool_t {
   double step_process_s{0.0}, step_refill_s{0.0}, step_stage_s{0.0}, step_stage_settings_s{0.0};
   double step_stage_lu_s{0.0}, step_stage_h2d_s{0.0}, step_stage_memset_s{0.0};
   double step_stage_alloc_s{0.0}, step_relaunch_s{0.0};
+  // Kernel time and completion-notice latency of the same steps (the `time` line covers whole runs).
+  double step_kernel_s{0.0}, step_notice_s{0.0};
+  std::array<double, SUB_COUNT> step_sub_s{};
+  bool warmup_done{false};
+  void reset_step_split()
+  {
+    steps = step_h2d_n = step_h2d_bytes = step_memset_n = step_alloc_n = 0;
+    step_total_s = step_guard_s = step_restore_s = step_harvest_s = 0.0;
+    step_process_s = step_refill_s = step_stage_s = step_stage_settings_s = 0.0;
+    step_stage_lu_s = step_stage_h2d_s = step_stage_memset_s = 0.0;
+    step_stage_alloc_s = step_relaunch_s = step_drain_s = 0.0;
+    step_kernel_s = step_notice_s = 0.0;
+    step_sub_s.fill(0.0);
+  }
   // Pool retirement (nondeterministic_gpu_pool_finish: destroy the run + return nodes): all of it,
   // and the part that happened inside a harvesting step (`drain` in the step split).
   double finish_s{0.0}, step_drain_s{0.0};
 
   // One entry per seat, sized once. Reset for a fresh node, PRESERVED for a plunge child.
   std::vector<batch_seat_state_t<i_t, f_t>> seat_state;
+
+  std::vector<mip_node_t<i_t, f_t>*> prefetched;
+  size_t prefetch_next{0};
+  std::vector<mip_node_t<i_t, f_t>*> pending_push;
+  std::vector<f_t> pc_sum_down, pc_sum_up;
+  std::vector<i_t> pc_num_down, pc_num_up;
+  simplex::simplex_solver_settings_t<i_t, f_t> gen_settings;
 
   // The LIVE run, parked here between worker-loop iterations. This is what lets the loop ask "is the
   // GPU done?" and, when it is not, go do something else -- rather than waiting inside the step.
@@ -467,6 +598,12 @@ struct gpu_batch_run_metrics {
   std::size_t terminal_noop_seats{0};
   int periodic_refactors{0}, rejected_refactors{0}, certificate_refactors{0};
   double upload_s{0.0}, kernel_s{0.0}, copyback_s{0.0}, host_factor_s{0.0}, wall_s{0.0};
+  // Split of the latest harvest (D2H + sync, scatter, per-seat unpack).
+  double last_harvest_d2h_s{0.0}, last_harvest_scatter_s{0.0}, last_harvest_unpack_s{0.0};
+  double last_harvest_d2h_enqueue_s{0.0}, last_harvest_d2h_device_s{0.0};
+  double last_prekernel_s{0.0};   // device time of the relaunch's uploads + dense LU
+  double last_prekernel_lu_s{0.0};
+  double last_prekernel_h2d_s{0.0}, last_prekernel_scatter_s{0.0}, last_prekernel_deltas_s{0.0};
   // Initial launch (gpu_persistent_batch_begin) split; zero unless CUOPT_BNB_GPU_LOG=1.
   double setup_wall_s{0.0}, setup_host_lu_s{0.0};
   double setup_alloc_s{0.0}, setup_h2d_s{0.0}, setup_memset_s{0.0};
@@ -489,7 +626,8 @@ gpu_batch_run<i_t, f_t>* gpu_persistent_batch_begin(
   rmm::cuda_stream_view stream,
   gds::gpu_ro_cache<i_t, f_t>* ro_cache,
   std::vector<batch_seat_state_t<i_t, f_t>>* seat_state,
-  bool result_views = false);
+  bool result_views = false,
+  const std::vector<simplex::variable_type_t>* var_types = nullptr);
 
 template <typename i_t, typename f_t>
 bool gpu_persistent_batch_harvest(gpu_batch_run<i_t, f_t>* run);
@@ -497,6 +635,13 @@ bool gpu_persistent_batch_harvest(gpu_batch_run<i_t, f_t>* run);
 template <typename i_t, typename f_t>
 gds::gpu_batch_result_view<i_t, f_t> gpu_persistent_batch_result(
   gpu_batch_run<i_t, f_t>* run, i_t seat);
+
+// Completes a slim-harvested seat's view (y, z, dy_se, basis lists).
+template <typename i_t, typename f_t>
+void gpu_persistent_batch_fetch_seat(gpu_batch_run<i_t, f_t>* run, i_t seat);
+// One fetch (one stream sync) for all listed seats.
+template <typename i_t, typename f_t>
+void gpu_persistent_batch_fetch_seats(gpu_batch_run<i_t, f_t>* run, const std::vector<int>& seats);
 
 template <typename i_t, typename f_t>
 bool gpu_persistent_batch_stage_fresh(gpu_batch_run<i_t, f_t>* run, i_t seat, std::string& error);
@@ -516,6 +661,22 @@ bool gpu_persistent_batch_relaunch(gpu_batch_run<i_t, f_t>* run, std::string& er
 
 template <typename i_t, typename f_t>
 bool gpu_batch_run_ready(gpu_batch_run<i_t, f_t>* run);
+
+template <typename i_t, typename f_t>
+bool gpu_batch_run_path_bounds(gpu_batch_run<i_t, f_t>* run);
+template <typename i_t, typename f_t>
+void gpu_batch_run_set_bounds_mirror(gpu_batch_run<i_t, f_t>* run, bool mirror);
+
+template <typename i_t, typename f_t>
+void gpu_batch_run_set_pseudocosts(gpu_batch_run<i_t, f_t>* run,
+                                   const f_t* sum_down,
+                                   const f_t* sum_up,
+                                   const i_t* num_down,
+                                   const i_t* num_up,
+                                   f_t avg_down,
+                                   f_t avg_up,
+                                   i_t reliable_threshold,
+                                   f_t integer_tol);
 
 template <typename i_t, typename f_t>
 gpu_batch_run_metrics gpu_batch_run_get_metrics(const gpu_batch_run<i_t, f_t>* run);
