@@ -164,6 +164,7 @@ struct gpu_batch_timing {
   double prekernel_h2d_s     = 0.0;  // device: packed upload host-to-device copy
   double prekernel_scatter_s = 0.0;  // device: batched scatter of the packed pieces
   double prekernel_deltas_s  = 0.0;  // device: child bound-delta copy
+  double done_after_pre_s    = 0.0;  // device: relaunch's first event to the last queued GPU op
   // Split of a launch's marshal (all N problems + the shared read-only block), filled only while
   // gpu_batch_set_setup_telemetry(true): host wall time spent inside each class of CUDA call.
   double setup_alloc_s       = 0.0;  // device_buffer allocations
@@ -231,6 +232,11 @@ gpu_ro_cache<i_t, f_t>* gpu_ro_cache_create_borrowed(rmm::cuda_stream_view borro
 
 template <typename i_t, typename f_t>
 void gpu_ro_cache_destroy(gpu_ro_cache<i_t, f_t>* cache);
+// Upload `lp`'s immutable block into the cache now (synchronously). Launches whose LP matches it
+// use it directly, without the cache's map or lock.
+template <typename i_t, typename f_t>
+void gpu_ro_cache_prebuild(gpu_ro_cache<i_t, f_t>* cache, const lp_problem_t<i_t, f_t>& lp);
+std::string gpu_ro_prebuild_report();
 
 // `allow_refactor_exit` selects a SECOND kernel instantiation in which the periodic-refactorization
 // and unsafe-update exits are compiled IN, so the batch can return REFACTOR_NEEDED per problem.
@@ -283,6 +289,20 @@ void gpu_call_stats_begin();
 // Host split of this thread's last batch relaunch: [0] packed upload flush, [1] dense LU enqueue,
 // [2] delta / argument uploads and memsets, [3] occupancy query + kernel launch.
 const double* gpu_batch_last_relaunch_split();
+void gpu_batch_enqueue_histogram(std::uint64_t* out);  // 16 entries, see gpu_phase2.cu
+std::string gpu_batch_seat_clock_report();  // CUOPT_BNB_GPU_SEAT_CLOCK summary lines
+std::string gpu_batch_harvest_report();  // harvest split, pool telemetry
+std::string gpu_batch_overlap_report();  // per-GPU launch / seat overlap, pool telemetry
+std::string gpu_batch_pinned_report();   // CUOPT_BNB_GPU_HUGE_ARENA arena / fallback mapping totals
+std::string gpu_batch_pinned_process_report();   // CUOPT_BNB_GPU_PINNED_ARENA process arena summary
+// CUOPT_BNB_GPU_PINNED_ARENA: one registered huge-page region for all pools, sized before pools start.
+template <typename i_t, typename f_t>
+bool gpu_pinned_arena_reserve(const std::vector<int>& pool_devices,  // device of each GPU pool
+                              std::size_t max_seats,
+                              i_t n,
+                              i_t m,
+                              int dive_rounds,
+                              bool per_node);   // one region per NUMA node of the pools' devices
 // Host split of this thread's batch_stage calls since the last reset: [0] argument setup and
 // validation, [1] bounds into the packed upload, [2] fresh-seat slab copies, [3] slab slices and
 // factor staging into the packed upload.
@@ -330,6 +350,9 @@ struct gpu_batch_result_view {
   i_t dev_num_frac{-1}, dev_best_var{-1};
   bool dev_unreliable{true};
   f_t dev_estimate{};
+  std::span<const std::uint8_t> packed_vstatus;  // device dive record / compact seat: packed basis
+  // Compact harvest: only the branch column of x / lower / upper and the packed basis came back.
+  bool compact{false};
 };
 
 // Pseudocost snapshot scored after the next solve kernel (gpu_branch_scores.cuh).
@@ -344,8 +367,45 @@ void gpu_simplified_dual_phase2_batch_set_pseudocosts(gpu_batch_handle<i_t, f_t>
                                                       i_t reliable_threshold,
                                                       f_t integer_tol);
 
+// A node a device dive solved and branched past (the seat continued into one child).
+template <typename i_t, typename f_t>
+struct gpu_dive_record {
+  f_t objective, estimate, x, lower, upper;  // x and bounds of the branch column
+  i_t iterations, num_frac, var, up;         // up: the dive took the up child
+};
+
+template <typename i_t, typename f_t>
+struct gpu_dive_view {
+  int count{0};
+  const gpu_dive_record<i_t, f_t>* records{nullptr};
+  const std::uint8_t* packed{nullptr};  // count packed bases (compress_vstatus layout)
+  std::size_t packed_stride{0};
+};
+
+// Up to `rounds` solves per seat in the next launch: after each round a device kernel branches a
+// seat with reliable scores and continues it into the Martin child. Needs the pseudocost snapshot.
+template <typename i_t, typename f_t>
+void gpu_simplified_dual_phase2_batch_set_dive(gpu_batch_handle<i_t, f_t>* handle,
+                                               int rounds,
+                                               const f_t* root_x);
+
+template <typename i_t, typename f_t>
+gpu_dive_view<i_t, f_t> gpu_simplified_dual_phase2_batch_dive(gpu_batch_handle<i_t, f_t>* handle,
+                                                             std::size_t seat);
+
 template <typename i_t, typename f_t>
 void gpu_simplified_dual_phase2_batch_use_views(gpu_batch_handle<i_t, f_t>* handle);
+
+// Park: the seat's block exits at once and it reports NUMERICAL until staged again. Unstage: reopen
+// [lo, hi) for staging in this generation.
+template <typename i_t, typename f_t>
+bool gpu_simplified_dual_phase2_batch_park(gpu_batch_handle<i_t, f_t>* handle, std::size_t seat);
+template <typename i_t, typename f_t>
+void gpu_simplified_dual_phase2_batch_unstage(gpu_batch_handle<i_t, f_t>* handle,
+                                              std::size_t lo,
+                                              std::size_t hi);
+template <typename i_t, typename f_t>
+bool gpu_simplified_dual_phase2_batch_launched(gpu_batch_handle<i_t, f_t>* handle);
 
 template <typename i_t, typename f_t>
 gpu_batch_result_view<i_t, f_t> gpu_simplified_dual_phase2_batch_result(

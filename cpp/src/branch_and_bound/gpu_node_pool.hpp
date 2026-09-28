@@ -110,6 +110,8 @@ struct gpu_batch_node_t {
   // leaving the dive. Carrying the stack without carrying its count would be worse than not
   // carrying it, because the refactor schedule fires on the CUMULATIVE count.
   bool continue_basis{false};
+  // Lean begin: no node at the first launch; marshalled from a template seat and parked.
+  bool parked{false};
 
   // ---- in ----
   // This node's bounds, already reconstructed and strengthened. Every seat shares the caller's ONE
@@ -211,7 +213,7 @@ bool gpu_pool_logging();
 // in gpu_node_pool.cu.
 std::vector<int> gpu_pool_device_map(int num_workers, int num_gpus);
 // #3 -- engage the pool only once the worker's queue holds seats * factor nodes, so a fill does not
-// empty it. CUOPT_BNB_GPU_HEAP_FACTOR, default 5; 0 disables the gate.
+// empty it. CUOPT_BNB_GPU_HEAP_FACTOR, default 1 (was 5; sweep 2026-09-27); 0 disables the gate.
 int gpu_pool_heap_factor();
 // CUOPT_BNB_REFAC_FREQ: diagnostic override of refactor_frequency (0 = off).
 int gpu_pool_refac_freq();
@@ -252,7 +254,16 @@ bool gpu_pool_packed_fresh();
 bool gpu_pool_device_scores();
 // CUOPT_BNB_GPU_SLIM_D2H: y / z / dy_se / basis lists fetched per seat only when needed.
 bool gpu_pool_slim_d2h();
-bool gpu_pool_batch_fetch();  // CUOPT_BNB_GPU_BATCH_FETCH: one fetch per generation, before the seat loop
+bool gpu_pool_batch_fetch();
+int gpu_pool_lean_begin();   // CUOPT_BNB_GPU_LEAN_BEGIN=k: first launch with k real seats (default 16, 0 = off)
+int gpu_pool_pipeline();         // CUOPT_BNB_GPU_PIPELINE=K: K pools per worker (default 1)
+bool gpu_pool_pipeline_split();  // CUOPT_BNB_GPU_PIPELINE_SPLIT: the K pools share the worker's seats
+bool gpu_pool_lazy_install();
+bool gpu_pool_batch_stats();  // CUOPT_BNB_GPU_BATCH_STATS (0 disables): pool step flushes shared counters once per generation
+int gpu_pool_dive();  // CUOPT_BNB_GPU_DIVE: solve rounds per launch (device dives, default 3), 1 = off  // CUOPT_BNB_GPU_LAZY_INSTALL: device-scored seats skip the bound copy
+bool gpu_pool_retain();      // CUOPT_BNB_GPU_RETAIN (0 disables): a drained pool keeps its handle (seats parked)
+bool gpu_pool_park_short();  // CUOPT_BNB_GPU_PARK_SHORT: park seats the heap cannot refill
+double gpu_pool_park_min();  // CUOPT_BNB_GPU_PARK_MIN: retire a short pool below this seated fraction (0.5)  // CUOPT_BNB_GPU_BATCH_FETCH: one fetch per generation, before the seat loop
 
 // Do a GPU answer and a CPU answer for the SAME node reach a different branch-and-bound DECISION?
 //
@@ -492,6 +503,11 @@ struct gpu_batch_pool_t {
   double cpu_overlap_s{0.0}, host_service_s{0.0}, host_blocked_s{0.0};
   double upload_s{0.0}, kernel_s{0.0}, copyback_s{0.0}, host_factor_s{0.0};
   double completion_notice_s{0.0}, completion_notice_max_s{0.0};
+  // Finished GPU work waiting for the owning worker (steady window): per launch, from the last queued
+  // GPU op to step entry, split by the worker's activity (worker_activity_t) meanwhile.
+  double wait_s{0.0}, wait_max_s{0.0};
+  std::array<double, 4> wait_act_s{};
+  uint64_t waits{0}, waits_early{0};
   double accounted_upload_s{0.0}, accounted_kernel_s{0.0};
   uint64_t starts{0}, launches{0}, drains{0}, activation_samples{0};
   uint64_t cpu_overlap_nodes{0}, cpu_only_nodes{0};
@@ -507,6 +523,7 @@ struct gpu_batch_pool_t {
   double setup_fill_s{0.0}, setup_begin_s{0.0}, setup_host_lu_s{0.0};
   double setup_alloc_s{0.0}, setup_h2d_s{0.0}, setup_memset_s{0.0};
   double last_fill_s{0.0};
+  double fill_split_s[4]{};  // telemetry: guard, pop, node construction, prepare_fresh
   // Steady-state service-step split, summed over the steps that harvested a launch: `guard` /
   // `restore` = saving / restoring the worker's CPU LP continuation around the step, `harvest` =
   // results D2H, `process` = per-seat result install + tree update + child placement, `refill` =
@@ -530,6 +547,9 @@ struct gpu_batch_pool_t {
     step_stage_alloc_s = step_relaunch_s = step_drain_s = 0.0;
     step_kernel_s = step_notice_s = 0.0;
     step_sub_s.fill(0.0);
+    wait_s = wait_max_s = 0.0;
+    wait_act_s.fill(0.0);
+    waits = waits_early = 0;
   }
   // Pool retirement (nondeterministic_gpu_pool_finish: destroy the run + return nodes): all of it,
   // and the part that happened inside a harvesting step (`drain` in the step split).
@@ -550,6 +570,8 @@ struct gpu_batch_pool_t {
   // Non-null means a batch is on the device right now. `busy` is broader: it also covers the gap
   // between a run finishing and its results being processed.
   gpu_batch_run_t<i_t, f_t>* run{nullptr};
+  bool restart{false};           // CUOPT_BNB_GPU_RETAIN: next step refills a retained handle
+  uint64_t restarts{0};          // telemetry: starts that reused a retained handle
   std::vector<gpu_batch_node_t<i_t, f_t>> batch;
   std::vector<gpu_seat_ctx_t<i_t, f_t>> ctx;
 
@@ -604,6 +626,7 @@ struct gpu_batch_run_metrics {
   double last_prekernel_s{0.0};   // device time of the relaunch's uploads + dense LU
   double last_prekernel_lu_s{0.0};
   double last_prekernel_h2d_s{0.0}, last_prekernel_scatter_s{0.0}, last_prekernel_deltas_s{0.0};
+  double last_done_after_pre_s{0.0};  // device: relaunch start to the last queued GPU op
   // Initial launch (gpu_persistent_batch_begin) split; zero unless CUOPT_BNB_GPU_LOG=1.
   double setup_wall_s{0.0}, setup_host_lu_s{0.0};
   double setup_alloc_s{0.0}, setup_h2d_s{0.0}, setup_memset_s{0.0};
@@ -642,6 +665,12 @@ void gpu_persistent_batch_fetch_seat(gpu_batch_run<i_t, f_t>* run, i_t seat);
 // One fetch (one stream sync) for all listed seats.
 template <typename i_t, typename f_t>
 void gpu_persistent_batch_fetch_seats(gpu_batch_run<i_t, f_t>* run, const std::vector<int>& seats);
+template <typename i_t, typename f_t>
+bool gpu_persistent_batch_park(gpu_batch_run<i_t, f_t>* run, i_t seat);
+template <typename i_t, typename f_t>
+void gpu_persistent_batch_unstage(gpu_batch_run<i_t, f_t>* run, i_t lo, i_t hi);
+template <typename i_t, typename f_t>
+bool gpu_persistent_batch_launched(gpu_batch_run<i_t, f_t>* run);
 
 template <typename i_t, typename f_t>
 bool gpu_persistent_batch_stage_fresh(gpu_batch_run<i_t, f_t>* run, i_t seat, std::string& error);
@@ -666,6 +695,11 @@ template <typename i_t, typename f_t>
 bool gpu_batch_run_path_bounds(gpu_batch_run<i_t, f_t>* run);
 template <typename i_t, typename f_t>
 void gpu_batch_run_set_bounds_mirror(gpu_batch_run<i_t, f_t>* run, bool mirror);
+
+template <typename i_t, typename f_t>
+void gpu_batch_run_set_dive(gpu_batch_run<i_t, f_t>* run, int rounds, const f_t* root_x);
+template <typename i_t, typename f_t>
+gds::gpu_dive_view<i_t, f_t> gpu_persistent_batch_dive(gpu_batch_run<i_t, f_t>* run, i_t seat);
 
 template <typename i_t, typename f_t>
 void gpu_batch_run_set_pseudocosts(gpu_batch_run<i_t, f_t>* run,

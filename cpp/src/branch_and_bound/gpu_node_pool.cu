@@ -1108,6 +1108,77 @@ bool gpu_pool_slim_d2h()
                          dump_bad_nodes_dir() == nullptr;
   return on;
 }
+int gpu_pool_lean_begin()
+{
+  static const int k = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_LEAN_BEGIN");
+    return e != nullptr ? std::max(0, std::atoi(e)) : 16;
+  }();
+  return k;
+}
+int gpu_pool_pipeline()
+{
+  static const int k = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_PIPELINE");
+    return e != nullptr ? std::max(1, std::atoi(e)) : 1;
+  }();
+  return k;
+}
+bool gpu_pool_pipeline_split()
+{
+  static const bool on = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_PIPELINE_SPLIT");
+    return e != nullptr && std::string(e) != "0";
+  }();
+  return on;
+}
+bool gpu_pool_batch_stats()
+{
+  static const bool on = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_BATCH_STATS");
+    return e == nullptr || std::string(e) != "0";
+  }();
+  return on;
+}
+
+int gpu_pool_dive()
+{
+  static const int r = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_DIVE");
+    return e != nullptr ? std::max(1, std::atoi(e)) : 3;
+  }();
+  return r;
+}
+
+bool gpu_pool_lazy_install()
+{
+  static const bool on = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_LAZY_INSTALL");
+    return e != nullptr && std::string(e) != "0";
+  }();
+  return on;
+}
+bool gpu_pool_retain()
+{
+  static const bool on = gpu_pool_env_on("CUOPT_BNB_GPU_RETAIN");
+  return on;
+}
+double gpu_pool_park_min()
+{
+  static const double f = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_PARK_MIN");
+    return e != nullptr ? std::clamp(std::atof(e), 0.0, 1.0) : 0.5;
+  }();
+  return f;
+}
+bool gpu_pool_park_short()
+{
+  static const bool on = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_PARK_SHORT");
+    return e != nullptr && std::string(e) != "0";
+  }();
+  return on;
+}
 bool gpu_pool_batch_fetch()
 {
   static const bool on = gpu_pool_env_on("CUOPT_BNB_GPU_BATCH_FETCH");
@@ -1259,7 +1330,7 @@ int gpu_pool_heap_factor()
 {
   static const int f = [] {
     const char* e = std::getenv("CUOPT_BNB_GPU_HEAP_FACTOR");
-    if (e == nullptr) { return 5; }
+    if (e == nullptr) { return 1; }
     const int v = std::atoi(e);
     return (v > 0) ? v : 0;
   }();
@@ -1385,6 +1456,7 @@ struct gpu_batch_run_t {
   double last_harvest_d2h_enqueue_s{0.0}, last_harvest_d2h_device_s{0.0};
   double last_prekernel_s{0.0}, last_prekernel_lu_s{0.0};
   double last_prekernel_h2d_s{0.0}, last_prekernel_scatter_s{0.0}, last_prekernel_deltas_s{0.0};
+  double last_done_after_pre_s{0.0};
   bool persistent_seats{false};
   // Split of the initial launch (telemetry only; see gpu_persistent_batch_begin).
   bool result_views{false};
@@ -1625,6 +1697,12 @@ struct gpu_batch_run_t {
     auto& node = nodes[s];
     // Every B&B node carries a size-n root or parent steepest-edge vector, including after repair.
     assert(node.dy_se.size() == static_cast<size_t>(n));
+    if (node.parked) {
+      node.solved  = true;
+      node.status  = simplex::dual_status_t::NUMERICAL;
+      st[s].active = false;
+      continue;
+    }
     node.sol.resize(m, n);
     node.status = simplex::dual_status_t::UNSET;
     node.solved = false;
@@ -1780,6 +1858,7 @@ struct gpu_batch_run_t {
     last_prekernel_h2d_s     = timing.prekernel_h2d_s;
     last_prekernel_scatter_s = timing.prekernel_scatter_s;
     last_prekernel_deltas_s  = timing.prekernel_deltas_s;
+    last_done_after_pre_s    = timing.done_after_pre_s;
     last_harvest_scatter_s = std::max(0.0, timing.copyback_s - timing.copyback_sync_s);
     if (timing.rejected || out.size() != static_cast<size_t>(N)) { return false; }
     const double unpack_t0 = cuopt::mathematical_optimization::tic();
@@ -1812,7 +1891,6 @@ struct gpu_batch_run_t {
 
   bool stage_persistent_fresh(i_t s, std::string& error)
   {
-    raft::common::nvtx::range scope("GPUPool::stage_fresh");
     auto& node = nodes[s];
     auto& w    = st[s];
     // Fresh basis repair retains the incoming vector, matching the CPU driver.
@@ -1875,7 +1953,6 @@ struct gpu_batch_run_t {
 
   bool stage_persistent_refactor(i_t s, std::string& error)
   {
-    raft::common::nvtx::range scope("GPUPool::stage_refactor");
     auto& node = nodes[s];
     auto& w    = st[s];
     assert(result_views || node.dy_se.size() == static_cast<size_t>(n));
@@ -1938,7 +2015,6 @@ struct gpu_batch_run_t {
                       const std::vector<gds::gpu_bound_delta<i_t, f_t>>& deltas,
                       std::string& error)
   {
-    raft::common::nvtx::range scope("GPUPool::stage_child");
     auto& node = nodes[s];
     auto& w    = st[s];
     assert(result_views || node.dy_se.size() == static_cast<size_t>(n));
@@ -2216,7 +2292,7 @@ gpu_batch_run<i_t, f_t>* gpu_persistent_batch_begin(
   // The persistent pool never launches terminal/no-op seats. The caller replaces per-node preparation failures and
   // retries; nullptr here also represents pool-wide launch failures that require a drain.
   for (i_t s = 0; s < run->N; ++s) {
-    if (!run->st[s].active) {
+    if (!run->st[s].active && !nodes[s].parked) {
       run->publish();
       delete run;
       return nullptr;
@@ -2275,6 +2351,27 @@ void gpu_persistent_batch_fetch_seats(gpu_batch_run<i_t, f_t>* run, const std::v
 }
 
 template <typename i_t, typename f_t>
+bool gpu_persistent_batch_park(gpu_batch_run<i_t, f_t>* run, i_t seat)
+{
+  run->nodes[seat].status = simplex::dual_status_t::NUMERICAL;
+  return gds::gpu_simplified_dual_phase2_batch_park<i_t, f_t>(run->handle,
+                                                                static_cast<size_t>(seat));
+}
+
+template <typename i_t, typename f_t>
+void gpu_persistent_batch_unstage(gpu_batch_run<i_t, f_t>* run, i_t lo, i_t hi)
+{
+  gds::gpu_simplified_dual_phase2_batch_unstage<i_t, f_t>(
+    run->handle, static_cast<size_t>(lo), static_cast<size_t>(hi));
+}
+
+template <typename i_t, typename f_t>
+bool gpu_persistent_batch_launched(gpu_batch_run<i_t, f_t>* run)
+{
+  return run != nullptr && gds::gpu_simplified_dual_phase2_batch_launched<i_t, f_t>(run->handle);
+}
+
+template <typename i_t, typename f_t>
 bool gpu_persistent_batch_stage_fresh(gpu_batch_run<i_t, f_t>* run, i_t seat, std::string& error)
 {
   return run != nullptr && run->stage_persistent_fresh(seat, error);
@@ -2322,6 +2419,19 @@ void gpu_batch_run_set_bounds_mirror(gpu_batch_run<i_t, f_t>* run, bool mirror)
 }
 
 template <typename i_t, typename f_t>
+void gpu_batch_run_set_dive(gpu_batch_run<i_t, f_t>* run, int rounds, const f_t* root_x)
+{
+  if (run == nullptr || !run->result_views) { return; }
+  gds::gpu_simplified_dual_phase2_batch_set_dive<i_t, f_t>(run->handle, rounds, root_x);
+}
+
+template <typename i_t, typename f_t>
+gds::gpu_dive_view<i_t, f_t> gpu_persistent_batch_dive(gpu_batch_run<i_t, f_t>* run, i_t seat)
+{
+  return gds::gpu_simplified_dual_phase2_batch_dive<i_t, f_t>(run->handle, static_cast<size_t>(seat));
+}
+
+template <typename i_t, typename f_t>
 void gpu_batch_run_set_pseudocosts(gpu_batch_run<i_t, f_t>* run,
                                    const f_t* sum_down,
                                    const f_t* sum_up,
@@ -2363,6 +2473,7 @@ gpu_batch_run_metrics gpu_batch_run_get_metrics(const gpu_batch_run<i_t, f_t>* r
   result.last_prekernel_h2d_s     = run->last_prekernel_h2d_s;
   result.last_prekernel_scatter_s = run->last_prekernel_scatter_s;
   result.last_prekernel_deltas_s  = run->last_prekernel_deltas_s;
+  result.last_done_after_pre_s    = run->last_done_after_pre_s;
   result.wall_s = cuopt::mathematical_optimization::toc(run->t0);
   result.setup_wall_s            = run->setup_wall_s;
   result.setup_host_lu_s         = run->setup_host_lu_s;
@@ -2444,6 +2555,12 @@ template bool gpu_persistent_batch_harvest<int, double>(gpu_batch_run<int, doubl
 template gds::gpu_batch_result_view<int, double> gpu_persistent_batch_result<int, double>(
   gpu_batch_run<int, double>*, int);
 template void gpu_persistent_batch_fetch_seat<int, double>(gpu_batch_run<int, double>*, int);
+template void gpu_batch_run_set_dive<int, double>(gpu_batch_run<int, double>*, int, const double*);
+template gds::gpu_dive_view<int, double> gpu_persistent_batch_dive<int, double>(
+  gpu_batch_run<int, double>*, int);
+template bool gpu_persistent_batch_park<int, double>(gpu_batch_run<int, double>*, int);
+template void gpu_persistent_batch_unstage<int, double>(gpu_batch_run<int, double>*, int, int);
+template bool gpu_persistent_batch_launched<int, double>(gpu_batch_run<int, double>*);
 template void gpu_persistent_batch_fetch_seats<int, double>(gpu_batch_run<int, double>*,
                                                             const std::vector<int>&);
 template bool gpu_persistent_batch_stage_fresh<int, double>(

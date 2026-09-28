@@ -254,6 +254,7 @@ class bfs_worker_t : public branch_and_bound_worker_t<i_t, f_t> {
   // (best-first) worker
   i_t max_diving_workers;
   double next_rebalance_s{0.0};
+  int gpu_pool_slot{0};  // CUOPT_BNB_GPU_PIPELINE: pool of this worker being serviced
 
  private:
   std::vector<search_strategy_t> diving_heuristics;

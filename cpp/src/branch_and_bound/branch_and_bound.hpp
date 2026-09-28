@@ -602,6 +602,8 @@ class branch_and_bound_t {
   // #5 -- plunge refills refused because the worker queue had fallen below the engagement
   // threshold. Distinguishes "stopped diving because the heap ran dry" from the other stop reasons.
   std::atomic<int64_t> gpu_batch_plunge_stop_heap_{0};
+  std::atomic<int64_t> gpu_batch_dive_nodes_{0};  // nodes solved inside device dives
+  std::atomic<int64_t> gpu_batch_dive_lost_{0};   // dive records dropped after a host fathom
   std::atomic<int64_t> gpu_batch_stolen_{0};   // nodes taken out of a worker queue by the pool
   std::atomic<int64_t> gpu_batch_noseat_fathom_{0};    // no seat: already fathomed by its own bound
   std::atomic<int64_t> gpu_batch_noseat_infeas_{0};    // no seat: bound strengthening proved infeasible
@@ -612,6 +614,7 @@ class branch_and_bound_t {
   std::array<std::atomic<int64_t>, 11> gpu_batch_drops_{};
   std::atomic<int64_t> gpu_batch_launched_{0};    // seats sent to the device
   std::atomic<int64_t> gpu_batch_launches_{0};    // launches
+  std::atomic<int64_t> gpu_pin_tasks_{0};         // CUOPT_BNB_GPU_PIN_WORKERS: BFS tasks pinned to their GPU node
   mip_status_t deterministic_global_termination_status_{mip_status_t::UNSET};
   double deterministic_horizon_step_{5.0};     // Work unit step per horizon (tunable)
   double deterministic_current_horizon_{0.0};  // Current horizon target

@@ -579,6 +579,7 @@ add_subdirectory(src)
 # source in a subdirectory would silently drop them.
 list(APPEND CUOPT_SRC_FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/dual_simplex/gpu_phase2/gpu_phase2.cu)
 list(APPEND CUOPT_SRC_FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/dual_simplex/gpu_phase2/gpu_lu.cu)
+list(APPEND CUOPT_SRC_FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/dual_simplex/gpu_phase2/pinned_host_arena.cpp)
 list(APPEND CUOPT_SRC_FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/dual_simplex/gpu_phase2/gpu_branch_scores.cu)
 
 if (HOST_LINEINFO)

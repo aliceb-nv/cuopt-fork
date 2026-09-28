@@ -9,6 +9,7 @@
 #include <branch_and_bound/shared_strong_branching_context.hpp>
 #include <branch_and_bound/symmetry.hpp>
 #include <branch_and_bound/worker.hpp>
+#include <branch_and_bound/worker_activity.hpp>
 
 #include <dual_simplex/basis_solves.hpp>
 #include <dual_simplex/gpu_phase2/gpu_phase2.cuh>
@@ -27,6 +28,8 @@
 
 #include <omp.h>
 
+#include <atomic>
+
 namespace cuopt::mathematical_optimization::mip {
 
 using simplex::basis_update_mpf_t;
@@ -39,6 +42,47 @@ using simplex::lp_solution_t;
 using simplex::simplex_solver_settings_t;
 using simplex::variable_status_t;
 using simplex::variable_type_t;
+
+// CUOPT_RB_STATS: where reliable_variable_selection spends (or skips) its strong branching.
+enum rb_stat_t : int {
+  RB_CALLS, RB_FROM_GPU, RB_EXIT_NO_UNRELIABLE, RB_EXIT_RANK_BASIS, RB_EXIT_TRIAL_BASIS,
+  RB_EXIT_TIME, RB_NO_CPU_TRIALS, RB_REACHED_TRIALS, RB_UNRELIABLE_SUM, RB_CANDIDATES_SUM,
+  RB_TRIALS, RB_TRIAL_ZERO_ITER, RB_TRIAL_ITERS, RB_TRIAL_NAN, RB_SKIP_RELIABLE, RB_ST_OPTIMAL,
+  RB_ST_INFEASIBLE, RB_ST_CUTOFF, RB_ST_ITERLIMIT, RB_ST_OTHER,
+  // GPU-seat calls with an unreliable candidate (the select_sb lap), microseconds
+  RB_G_CALLS, RB_G_US_TOTAL, RB_G_US_LIST, RB_G_REFRESHES, RB_G_US_REFRESH, RB_G_RANKED,
+  RB_G_US_RANK, RB_G_US_TRIALS, RB_G_TRIALS, RB_G_US_LOCKWAIT, RB_G_US_COPY, RB_G_US_SOLVE,
+  RB_COUNT
+};
+static std::atomic<int64_t> g_rb_stats[RB_COUNT];
+static const bool g_rb_stats_on = [] {
+  const char* e = std::getenv("CUOPT_RB_STATS");
+  return e != nullptr && std::string(e) != "0";
+}();
+// CUOPT_RB_UNLOCKED_TRIALS (0 disables): strong-branching trials run outside the per-variable mutex.
+static bool rb_unlocked_trials()
+{
+  static const bool on = [] {
+    const char* e = std::getenv("CUOPT_RB_UNLOCKED_TRIALS");
+    return e == nullptr || std::string(e) != "0";
+  }();
+  return on;
+}
+// Per-variable trial counts (CUOPT_RB_STATS), indexed by column; columns past the cap are not counted.
+constexpr int rb_trial_var_cap = 1 << 16;
+static std::atomic<int32_t> g_rb_trial_var[rb_trial_var_cap];
+static void rb_add(rb_stat_t k, int64_t v = 1)
+{
+  if (g_rb_stats_on) { g_rb_stats[k].fetch_add(v, std::memory_order_relaxed); }
+}
+static void rb_trial_status(dual_status_t status)
+{
+  rb_add(status == dual_status_t::OPTIMAL          ? RB_ST_OPTIMAL
+         : status == dual_status_t::DUAL_UNBOUNDED ? RB_ST_INFEASIBLE
+         : status == dual_status_t::CUTOFF         ? RB_ST_CUTOFF
+         : status == dual_status_t::ITERATION_LIMIT ? RB_ST_ITERLIMIT
+                                                    : RB_ST_OTHER);
+}
 
 namespace {
 
@@ -549,8 +593,10 @@ std::pair<f_t, dual_status_t> trial_branching(const lp_problem_t<i_t, f_t>& orig
                                               f_t upper_bound,
                                               f_t start_time,
                                               i_t iter_limit,
-                                              i_t& iter)
+                                              i_t& iter,
+                                              bool timed = false)
 {
+  const double t_copy             = timed ? tic() : 0.0;
   lp_problem_t child_problem      = original_lp;
   child_problem.lower[branch_var] = branch_var_lower;
   child_problem.upper[branch_var] = branch_var_upper;
@@ -574,6 +620,8 @@ std::pair<f_t, dual_status_t> trial_branching(const lp_problem_t<i_t, f_t>& orig
 
   // Only refactor the basis if we encounter numerical issues.
   child_basis_factors.set_refactor_frequency(iter_limit);
+  const double t_solve = timed ? tic() : 0.0;
+  if (timed) { rb_add(RB_G_US_COPY, static_cast<int64_t>(1e6 * (t_solve - t_copy))); }
 
   dual_status_t status = simplex::dual_phase2_with_advanced_basis(2,
                                                                   0,
@@ -588,6 +636,7 @@ std::pair<f_t, dual_status_t> trial_branching(const lp_problem_t<i_t, f_t>& orig
                                                                   solution,
                                                                   iter,
                                                                   child_edge_norms);
+  if (timed) { rb_add(RB_G_US_SOLVE, static_cast<int64_t>(1e6 * toc(t_solve))); }
 
   if (sb_trace_enabled()) {
     // One fprintf per line: these run inside OpenMP tasks, so a split write would interleave.
@@ -1613,6 +1662,44 @@ i_t pseudo_costs_t<i_t, f_t>::variable_selection(const std::vector<i_t>& fractio
 }
 
 template <typename i_t, typename f_t>
+std::string pseudo_costs_t<i_t, f_t>::reliability_distribution(
+  const std::vector<variable_type_t>& types, i_t threshold) const
+{
+  if (!g_rb_stats_on) { return {}; }
+  std::vector<i_t> obs;
+  std::vector<int32_t> trials;
+  i_t below = 0;
+  const size_t n = std::min(types.size(), pseudo_cost_num_down.size());
+  for (size_t j = 0; j < n; ++j) {
+    if (types[j] == variable_type_t::CONTINUOUS) { continue; }
+    const i_t m = std::min<i_t>(pseudo_cost_num_down[j], pseudo_cost_num_up[j]);
+    obs.push_back(m);
+    if (m < threshold) { ++below; }
+    trials.push_back(j < static_cast<size_t>(rb_trial_var_cap) ? g_rb_trial_var[j].load() : 0);
+  }
+  if (obs.empty()) { return {}; }
+  std::sort(obs.begin(), obs.end());
+  std::sort(trials.begin(), trials.end(), std::greater<int32_t>());
+  const auto q = [&](double p) { return obs[static_cast<size_t>(p * (obs.size() - 1))]; };
+  int64_t total = 0, top5 = 0;
+  int trialled  = 0;
+  for (size_t k = 0; k < trials.size(); ++k) {
+    total += trials[k];
+    if (k < 5) { top5 += trials[k]; }
+    if (trials[k] > 0) { ++trialled; }
+  }
+  char buf[256];
+  std::snprintf(buf, sizeof(buf),
+                " int_vars=%zu below_threshold=%d obs_min_side p0,10,50,90,100=%d,%d,%d,%d,%d "
+                "trialled_vars=%d trials=%lld top1=%d top5=%lld",
+                obs.size(), static_cast<int>(below), static_cast<int>(q(0)), static_cast<int>(q(0.1)),
+                static_cast<int>(q(0.5)), static_cast<int>(q(0.9)), static_cast<int>(q(1.0)), trialled,
+                static_cast<long long>(total), static_cast<int>(trials.empty() ? 0 : trials[0]),
+                static_cast<long long>(top5));
+  return buf;
+}
+
+template <typename i_t, typename f_t>
 i_t pseudo_costs_t<i_t, f_t>::reliable_threshold_now(
   const branch_and_bound_stats_t<i_t, f_t>& bnb_stats) const
 {
@@ -1651,6 +1738,22 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
   const cuopt::linear_programming::dual_simplex::gpu_batch_result_view<i_t, f_t>* gpu_result)
 {
   raft::common::nvtx::range scope("BB::reliability_branching");
+  worker_activity_scope activity(worker_activity_t::STRONG_BRANCH);
+  rb_add(RB_CALLS);
+  if (gpu_result != nullptr) { rb_add(RB_FROM_GPU); }
+  // Split of the select_sb lap: only GPU-seat calls that find an unreliable candidate.
+  const bool rb_timed = g_rb_stats_on && gpu_result != nullptr;
+  const double rb_t0  = rb_timed ? tic() : 0.0;
+  bool rb_sb_call     = false;
+  const auto rb_us    = [](double t) { return static_cast<int64_t>(1e6 * toc(t)); };
+  struct rb_total_guard_t {
+    const bool& on;
+    const double t0;
+    ~rb_total_guard_t()
+    {
+      if (on) { g_rb_stats[RB_G_US_TOTAL].fetch_add(static_cast<int64_t>(1e6 * toc(t0))); }
+    }
+  } rb_total_guard{rb_sb_call, rb_t0};
 
   constexpr f_t eps = 1e-6;
   f_t start_time    = bnb_stats.start_time;
@@ -1731,7 +1834,14 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
   }
 
   last_selection_unreliable = !unreliable_list.empty();
+  rb_add(RB_UNRELIABLE_SUM, static_cast<int64_t>(unreliable_list.size()));
+  if (rb_timed && !unreliable_list.empty()) {
+    rb_sb_call = true;
+    rb_add(RB_G_CALLS);
+    rb_add(RB_G_US_LIST, rb_us(rb_t0));
+  }
   if (unreliable_list.empty()) {
+    rb_add(RB_EXIT_NO_UNRELIABLE);
     settings.log.debug("pc branching on %d. Value %e. Score %e\n",
                        branch_var,
                        leaf_x[branch_var],
@@ -1745,10 +1855,15 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
   // refactor when they need basis solves; this is rare once pseudocosts become reliable
   auto prepare_host_basis = [&]() {
     if (!worker->host_basis_stale) { return true; }
-    if (toc(start_time) > settings.time_limit ||
-        !refresh_stale_basis<i_t, f_t>(worker, settings, leaf_vstatus, leaf_basic, leaf_nonbasic)) {
-      return false;
+    const double rb_tr = rb_timed ? tic() : 0.0;
+    const bool refreshed =
+      toc(start_time) <= settings.time_limit &&
+      refresh_stale_basis<i_t, f_t>(worker, settings, leaf_vstatus, leaf_basic, leaf_nonbasic);
+    if (rb_timed) {
+      rb_add(RB_G_REFRESHES);
+      rb_add(RB_G_US_REFRESH, rb_us(rb_tr));
     }
+    if (!refreshed) { return false; }
     leaf_vstatus = worker->leaf_vstatus;
     leaf_basic = worker->basic_list;
     leaf_nonbasic = worker->nonbasic_list;
@@ -1854,10 +1969,13 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
       return pseudo_cost_num_down[j] == 0 || pseudo_cost_num_up[j] == 0;
     });
   if (rank_with_basis && !prepare_host_basis()) {
+    rb_add(RB_EXIT_RANK_BASIS);
     return variable_selection(fractional, leaf_x);
   }
 
+  const double rb_trank = rb_timed ? tic() : 0.0;
   if (unreliable_list.size() > max_num_candidates) {
+    if (rb_timed) { rb_add(RB_G_RANKED); }
     if (reliability_branching_settings.rank_candidates_with_dual_pivot) {
       i_t m             = worker->leaf_problem.num_rows;
       i_t n             = worker->leaf_problem.num_cols;
@@ -1921,6 +2039,7 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
                       [](auto el1, auto el2) { return el1.first > el2.first; });
   }
 
+  if (rb_timed) { rb_add(RB_G_US_RANK, rb_us(rb_trank)); }
   // Both DS and PDLP work on the same candidate set
   std::vector<i_t> candidate_vars(num_candidates);
   for (i_t i = 0; i < num_candidates; i++) {
@@ -1933,8 +2052,11 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
              pseudo_cost_num_up[j] < reliable_threshold;
     });
   if (need_cpu_trials && !prepare_host_basis()) {
+    rb_add(RB_EXIT_TRIAL_BASIS);
     return variable_selection(fractional, leaf_x);
   }
+  if (!need_cpu_trials) { rb_add(RB_NO_CPU_TRIALS); }
+  rb_add(RB_CANDIDATES_SUM, num_candidates);
 
   // Shared context for cooperative work-stealing (mode 1)
   // [0..num_candidates) = down, [num_candidates..2*num_candidates) = up
@@ -1966,6 +2088,7 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
   }
 
   if (toc(start_time) > settings.time_limit) {
+    rb_add(RB_EXIT_TIME);
     settings.log.debug("Time limit reached\n");
     if (use_pdlp) {
       concurrent_halt.store(1);
@@ -1980,7 +2103,9 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
   std::vector<dual_status_t> dual_simplex_status_up(num_candidates, dual_status_t::UNSET);
 
   f_t dual_simplex_start_time = tic();
+  rb_add(RB_REACHED_TRIALS);
 
+  const bool unlocked_trials = rb_unlocked_trials();
   if (rb_mode != 2) {
 #pragma omp taskloop if (num_tasks > 1) priority(CUOPT_HIGH_TASK_PRIORITY) \
   num_tasks(num_tasks) default(shared)
@@ -1993,7 +2118,11 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
         settings.log.debug(
           "DS skipping variable %d branch down (shared_idx %d): already solved by PDLP\n", j, i);
       } else {
-        pseudo_cost_mutex_down[j].lock();
+        // Unlocked mode: the trial runs outside the mutex, which only guards the update.
+        const bool hold = !unlocked_trials;
+        const double t_lock = rb_timed ? tic() : 0.0;
+        if (hold) { pseudo_cost_mutex_down[j].lock(); }
+        if (rb_timed && hold) { rb_add(RB_G_US_LOCKWAIT, rb_us(t_lock)); }
         if (pseudo_cost_num_down[j] < reliable_threshold) {
           // Do trial branching on the down branch
           i_t iter                 = 0;
@@ -2011,11 +2140,24 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
                                                      upper_bound,
                                                      start_time,
                                                      iter_limit_per_trial,
-                                                     iter);
+                                                     iter,
+                                                     rb_timed);
           strong_branching_lp_iter += iter;
+          rb_add(RB_TRIALS);
+          if (rb_timed) { rb_add(RB_G_TRIALS); }
+          if (g_rb_stats_on && j < rb_trial_var_cap) { g_rb_trial_var[j].fetch_add(1); }
+          rb_add(RB_TRIAL_ITERS, iter);
+          if (iter == 0) { rb_add(RB_TRIAL_ZERO_ITER); }
+          if (std::isnan(obj)) { rb_add(RB_TRIAL_NAN); }
+          if (g_rb_stats_on) { rb_trial_status(status); }
 
           dual_simplex_obj_down[i]    = obj;
           dual_simplex_status_down[i] = status;
+          if (!hold) {
+            const double t_upd = rb_timed ? tic() : 0.0;
+            pseudo_cost_mutex_down[j].lock();
+            if (rb_timed) { rb_add(RB_G_US_LOCKWAIT, rb_us(t_upd)); }
+          }
           if (!std::isnan(obj)) {
             f_t change_in_obj = std::max(obj - node_ptr->lower_bound, eps);
             f_t change_in_x   = leaf_x[j] - std::floor(leaf_x[j]);
@@ -2023,11 +2165,13 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
             pseudo_cost_num_down[j]++;
             if (rb_mode == 1 && is_dual_simplex_done(status)) { sb_view.mark_solved(i); }
           }
+          if (!hold) { pseudo_cost_mutex_down[j].unlock(); }
         } else {
+          rb_add(RB_SKIP_RELIABLE);
           // Variable became reliable, make it as solved so that batch PDLP does not solve it again
           if (rb_mode == 1) sb_view.mark_solved(i);
         }
-        pseudo_cost_mutex_down[j].unlock();
+        if (hold) { pseudo_cost_mutex_down[j].unlock(); }
       }
 
       if (toc(start_time) > settings.time_limit) { continue; }
@@ -2039,7 +2183,11 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
           j,
           shared_idx);
       } else {
-        pseudo_cost_mutex_up[j].lock();
+        // Unlocked mode: the trial runs outside the mutex, which only guards the update.
+        const bool hold = !unlocked_trials;
+        const double t_lock = rb_timed ? tic() : 0.0;
+        if (hold) { pseudo_cost_mutex_up[j].lock(); }
+        if (rb_timed && hold) { rb_add(RB_G_US_LOCKWAIT, rb_us(t_lock)); }
         if (pseudo_cost_num_up[j] < reliable_threshold) {
           i_t iter                 = 0;
           const auto [obj, status] = trial_branching(worker->leaf_problem,
@@ -2056,11 +2204,24 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
                                                      upper_bound,
                                                      start_time,
                                                      iter_limit_per_trial,
-                                                     iter);
+                                                     iter,
+                                                     rb_timed);
           strong_branching_lp_iter += iter;
+          rb_add(RB_TRIALS);
+          if (rb_timed) { rb_add(RB_G_TRIALS); }
+          if (g_rb_stats_on && j < rb_trial_var_cap) { g_rb_trial_var[j].fetch_add(1); }
+          rb_add(RB_TRIAL_ITERS, iter);
+          if (iter == 0) { rb_add(RB_TRIAL_ZERO_ITER); }
+          if (std::isnan(obj)) { rb_add(RB_TRIAL_NAN); }
+          if (g_rb_stats_on) { rb_trial_status(status); }
 
           dual_simplex_obj_up[i]    = obj;
           dual_simplex_status_up[i] = status;
+          if (!hold) {
+            const double t_upd = rb_timed ? tic() : 0.0;
+            pseudo_cost_mutex_up[j].lock();
+            if (rb_timed) { rb_add(RB_G_US_LOCKWAIT, rb_us(t_upd)); }
+          }
           if (!std::isnan(obj)) {
             f_t change_in_obj = std::max(obj - node_ptr->lower_bound, eps);
             f_t change_in_x   = std::ceil(leaf_x[j]) - leaf_x[j];
@@ -2068,11 +2229,13 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
             pseudo_cost_num_up[j]++;
             if (rb_mode == 1 && is_dual_simplex_done(status)) { sb_view.mark_solved(shared_idx); }
           }
+          if (!hold) { pseudo_cost_mutex_up[j].unlock(); }
         } else {
+          rb_add(RB_SKIP_RELIABLE);
           // Variable became reliable, make it as solved so that batch PDLP does not solve it again
           if (rb_mode == 1) sb_view.mark_solved(shared_idx);
         }
-        pseudo_cost_mutex_up[j].unlock();
+        if (hold) { pseudo_cost_mutex_up[j].unlock(); }
       }
 
       if (toc(start_time) > settings.time_limit) { continue; }
@@ -2090,6 +2253,7 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
   }
 
   f_t dual_simplex_elapsed = toc(dual_simplex_start_time);
+  if (rb_timed) { rb_add(RB_G_US_TRIALS, static_cast<int64_t>(1e6 * dual_simplex_elapsed)); }
 
   if (use_pdlp) {
 #pragma omp taskwait  // Wait for the batch PDLP task to finish
@@ -2231,4 +2395,24 @@ template void strong_branching<int, double>(const lp_problem_t<int, double>& ori
 
 #endif
 
+}  // namespace cuopt::mathematical_optimization::mip
+
+namespace cuopt::mathematical_optimization::mip {
+std::string reliability_stats_report()
+{
+  if (!g_rb_stats_on) { return {}; }
+  static const char* names[RB_COUNT] = {
+    "calls", "from_gpu", "exit_no_unreliable", "exit_rank_basis_fail", "exit_trial_basis_fail",
+    "exit_time", "no_cpu_trials", "reached_trials", "unreliable_sum", "candidates_sum", "trials",
+    "trial_zero_iter", "trial_iters", "trial_nan_obj", "skip_became_reliable", "st_optimal",
+    "st_infeasible", "st_cutoff", "st_iterlimit", "st_other", "gpu_sb_calls", "gpu_sb_us_total",
+    "gpu_sb_us_list", "gpu_sb_refreshes", "gpu_sb_us_refresh", "gpu_sb_ranked", "gpu_sb_us_rank",
+    "gpu_sb_us_trials", "gpu_sb_trials", "gpu_sb_us_lockwait", "gpu_sb_us_trial_copy",
+    "gpu_sb_us_trial_solve"};
+  std::string out = "[RB-STATS]";
+  for (int k = 0; k < RB_COUNT; ++k) {
+    out += " " + std::string(names[k]) + "=" + std::to_string(g_rb_stats[k].load());
+  }
+  return out + "\n";
+}
 }  // namespace cuopt::mathematical_optimization::mip

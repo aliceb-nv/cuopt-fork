@@ -536,8 +536,19 @@ class search_tree_t {
               const simplex::lp_problem_t<i_t, f_t>& original_lp,
               simplex::logger_t& log)
   {
+    branch(parent_node, branch_var, fractional_val, integer_infeasible,
+           compress_vstatus(parent_vstatus), original_lp, log);
+  }
+
+  void branch(mip_node_t<i_t, f_t>* parent_node,
+              const i_t branch_var,
+              const f_t fractional_val,
+              const i_t integer_infeasible,
+              std::vector<uint8_t> packed,
+              const simplex::lp_problem_t<i_t, f_t>& original_lp,
+              simplex::logger_t& log)
+  {
     i_t id = num_nodes.fetch_add(2);
-    std::vector<uint8_t> packed = compress_vstatus(parent_vstatus);
 
     auto down_child = std::make_unique<mip_node_t<i_t, f_t>>(original_lp,
                                                              parent_node,

@@ -7,6 +7,9 @@
 
 #pragma once
 
+#include <cstdlib>
+#include <string>
+
 #include <branch_and_bound/constants.hpp>
 #include <branch_and_bound/mip_node.hpp>
 
@@ -33,6 +36,9 @@ struct gpu_batch_result_view;
 
 namespace cuopt::mathematical_optimization::mip {
 
+// CUOPT_RB_STATS=1: one summary line of strong-branching selection exits and trials.
+std::string reliability_stats_report();
+
 template <typename i_t, typename f_t>
 struct mip_symmetry_t;
 
@@ -42,24 +48,31 @@ struct branch_and_bound_worker_t;
 template <typename i_t, typename f_t>
 struct branch_and_bound_stats_t;
 
+// Env override of a reliability-branching setting (sweeps: CUOPT_RB_*).
+inline double reliability_env(const char* name, double fallback)
+{
+  const char* e = std::getenv(name);
+  return e != nullptr ? std::atof(e) : fallback;
+}
+
 template <typename i_t, typename f_t>
 struct reliability_branching_settings_t {
   // Lower bound for the maximum number of LP iterations for a single trial branching
-  i_t lower_max_lp_iter = 10;
+  i_t lower_max_lp_iter = static_cast<i_t>(reliability_env("CUOPT_RB_TRIAL_ITER_MIN", 10));
 
   // Upper bound for the maximum number of LP iterations for a single trial branching
-  i_t upper_max_lp_iter = 500;
+  i_t upper_max_lp_iter = static_cast<i_t>(reliability_env("CUOPT_RB_TRIAL_ITER_MAX", 500));
 
   // The maximum number of candidates initialized by strong branching in a single
   // node
-  i_t max_num_candidates = 100;
+  i_t max_num_candidates = static_cast<i_t>(reliability_env("CUOPT_RB_MAX_CANDIDATES", 100));
 
   // Define the maximum number of iteration spent in strong branching.
   // Let `bnb_lp_iter` = total number of iterations in B&B, then
   // `max iter in strong branching = bnb_lp_factor * bnb_lp_iter + bnb_lp_offset`.
   // This is used for determining the `reliable_threshold`.
-  f_t bnb_lp_factor = 0.5;
-  i_t bnb_lp_offset = 100000;
+  f_t bnb_lp_factor = reliability_env("CUOPT_RB_LP_FACTOR", 0.5);
+  i_t bnb_lp_offset = static_cast<i_t>(reliability_env("CUOPT_RB_LP_OFFSET", 100000));
 
   // Maximum and minimum points in curve to determine the value
   // of the `reliable_threshold` based on the current number of LP
@@ -238,6 +251,11 @@ class pseudo_costs_t {
   }
 
   i_t reliable_threshold_now(const branch_and_bound_stats_t<i_t, f_t>& bnb_stats) const;
+  int64_t strong_branching_iterations() const { return strong_branching_lp_iter.load(); }
+  // CUOPT_RB_STATS: integer variables below `threshold` and the spread of observation counts
+  // (smaller side) and strong-branching trials across variables.
+  std::string reliability_distribution(const std::vector<simplex::variable_type_t>& types,
+                                       i_t threshold) const;
 
   f_t compute_pseudocost_average_down();
   f_t compute_pseudocost_average_up();
