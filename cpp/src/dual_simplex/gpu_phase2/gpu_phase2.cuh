@@ -302,7 +302,8 @@ bool gpu_pinned_arena_reserve(const std::vector<int>& pool_devices,  // device o
                               i_t n,
                               i_t m,
                               int dive_rounds,
-                              bool per_node);   // one region per NUMA node of the pools' devices
+                              int mode,   // 1 one region, 2 per NUMA node, 3 per device (own context)
+                              std::size_t a_nnz);   // sizes the per-seat factor room
 // Host split of this thread's batch_stage calls since the last reset: [0] argument setup and
 // validation, [1] bounds into the packed upload, [2] fresh-seat slab copies, [3] slab slices and
 // factor staging into the packed upload.

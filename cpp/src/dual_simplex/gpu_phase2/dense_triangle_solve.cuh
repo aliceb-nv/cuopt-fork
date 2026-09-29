@@ -79,7 +79,9 @@ __device__ inline void upper_transpose_solve(const i_t* cs, const ri_t* ri, cons
 // specializing/unrolling either one. As template parameters each operator compiles to straight-line
 // code with its own inner loop and no branch. The fission `Direct` path knows its operator as a
 // literal at every call site, so the whole chain down to here is compile-time.
-template <bool DiagFirst, bool Descending, bool Incremental, typename i_t, typename ri_t, typename f_t>
+// Long: the schedule puts each level's long columns last, tagged with the sign bit; 8-lane groups
+// solve them after the level's short columns (reordered sums, not bit-identical).
+template <bool DiagFirst, bool Descending, bool Incremental, bool Long = false, typename i_t, typename ri_t, typename f_t>
 __device__ __forceinline__ void wavefront_gather_solve_t(const i_t* __restrict__ cs,
                                                 const ri_t* __restrict__ ri,
                                                 const f_t* __restrict__ val,
@@ -96,7 +98,7 @@ __device__ __forceinline__ void wavefront_gather_solve_t(const i_t* __restrict__
     // column. For a sufficiently long singleton level, cooperate on its dot product instead.
     if constexpr (!DiagFirst && !Descending && !Incremental) {
       if (level_end - level_begin == 1) {
-        const i_t j  = corder[level_begin];
+        const i_t j  = corder[level_begin] & 0x7fffffff;
         const i_t c0 = cs[j], c1 = cs[j + 1];
         const i_t dp = c1 - 1;
         const i_t lo = c0, hi = c1 - 1;
@@ -114,8 +116,15 @@ __device__ __forceinline__ void wavefront_gather_solve_t(const i_t* __restrict__
         }
       }
     }
+    i_t first_long = level_end;
     for (i_t t = level_begin + lane; t < level_end; t += 32) {
       const i_t j  = corder[t];
+      if constexpr (Long) {
+        if (j < 0) {
+          first_long = t;
+          break;
+        }
+      }
       const i_t c0 = cs[j], c1 = cs[j + 1];
       const i_t dp = DiagFirst ? c0 : (c1 - 1);
       const i_t lo = DiagFirst ? c0 + 1 : c0;
@@ -130,6 +139,25 @@ __device__ __forceinline__ void wavefront_gather_solve_t(const i_t* __restrict__
         if constexpr (!Descending) { for (i_t p = lo; p < hi; ++p) { sum += val[p] * x[ri[p]]; } }
         else                       { for (i_t p = hi - 1; p >= lo; --p) { sum += val[p] * x[ri[p]]; } }
         x[j] = (x[j] - sum) / val[dp];
+      }
+    }
+    if constexpr (Long) {
+      for (int off = 16; off > 0; off >>= 1) {
+        const i_t o = __shfl_xor_sync(0xffffffffu, first_long, off);
+        first_long  = o < first_long ? o : first_long;
+      }
+      const int g           = lane >> 3, gl = lane & 7;
+      const unsigned gmask  = 0xffu << (8 * g);
+      for (i_t t = first_long + g; t < level_end; t += 4) {
+        const i_t j  = corder[t] & 0x7fffffff;
+        const i_t c0 = cs[j], c1 = cs[j + 1];
+        const i_t dp = DiagFirst ? c0 : (c1 - 1);
+        const i_t lo = DiagFirst ? c0 + 1 : c0;
+        const i_t hi = DiagFirst ? c1 : (c1 - 1);
+        f_t sum      = 0.0;
+        for (i_t p = lo + gl; p < hi; p += 8) { sum += val[p] * x[ri[p]]; }
+        for (int off = 4; off > 0; off >>= 1) { sum += __shfl_xor_sync(gmask, sum, off, 8); }
+        if (gl == 0) { x[j] = (x[j] - sum) / val[dp]; }
       }
     }
     __syncwarp(0xffffffffu);
@@ -150,7 +178,7 @@ __device__ __forceinline__ void wavefront_gather_solve2_t(const i_t* __restrict_
   const int lane = threadIdx.x;
   for (int L = 0; L < nlev; ++L) {
     for (i_t t = lstart[L] + lane; t < lstart[L + 1]; t += 32) {
-      const i_t j  = corder[t];
+      const i_t j  = corder[t] & 0x7fffffff;
       const i_t c0 = cs[j], c1 = cs[j + 1];
       const i_t dp = DiagFirst ? c0 : (c1 - 1);
       const i_t lo = DiagFirst ? c0 + 1 : c0;
@@ -194,12 +222,12 @@ __device__ __forceinline__ void wavefront_gather_solve2_t(const i_t* __restrict_
 // The four operators as named entry points. Flag triples MUST match the df/dsc/inc tables in
 // gpu_phase2.cu's kOpDiagFirst/kOpDescending/kOpIncremental (which warp_build_config also uses).
 #define DTS_WF_OP(name, DF, DESC, INC)                                              \
-  template <typename i_t, typename ri_t, typename f_t>                              \
+  template <bool Long, typename i_t, typename ri_t, typename f_t>                   \
   __device__ inline void name(const i_t* cs, const ri_t* ri, const f_t* val, f_t* x, \
                               const i_t* __restrict__ lstart,                        \
                               const i_t* __restrict__ corder, int nlev)              \
   {                                                                                 \
-    wavefront_gather_solve_t<DF, DESC, INC>(cs, ri, val, x, lstart, corder, nlev);   \
+    wavefront_gather_solve_t<DF, DESC, INC, Long>(cs, ri, val, x, lstart, corder, nlev); \
   }
 DTS_WF_OP(wavefront_L_solve,  false, false, true)   // L-solve  over Lᵀ
 DTS_WF_OP(wavefront_U_solve,  true,  true,  true)   // U-solve  over Uᵀ
@@ -209,16 +237,16 @@ DTS_WF_OP(wavefront_UT_solve, false, false, false)  // Uᵀ-solve over U
 
 // Compile-time operator dispatch. `Op` mirrors warp_solve_op {L,U,Lᵀ,Uᵀ} = {0,1,2,3} and is a
 // literal at every fission call site, so this collapses to one direct call — no branch at all.
-template <int Op, typename i_t, typename ri_t, typename f_t>
+template <int Op, bool Long = false, typename i_t, typename ri_t, typename f_t>
 __device__ __forceinline__ void wavefront_solve_op(const i_t* cs, const ri_t* ri, const f_t* val, f_t* x,
                                           const i_t* __restrict__ lstart,
                                           const i_t* __restrict__ corder, int nlev)
 {
   static_assert(Op >= 0 && Op < 4, "Op must be one of {L,U,Lt,Ut} = {0,1,2,3}");
-  if constexpr      (Op == 0) { wavefront_L_solve (cs, ri, val, x, lstart, corder, nlev); }
-  else if constexpr (Op == 1) { wavefront_U_solve (cs, ri, val, x, lstart, corder, nlev); }
-  else if constexpr (Op == 2) { wavefront_LT_solve(cs, ri, val, x, lstart, corder, nlev); }
-  else                        { wavefront_UT_solve(cs, ri, val, x, lstart, corder, nlev); }
+  if constexpr      (Op == 0) { wavefront_L_solve <Long>(cs, ri, val, x, lstart, corder, nlev); }
+  else if constexpr (Op == 1) { wavefront_U_solve <Long>(cs, ri, val, x, lstart, corder, nlev); }
+  else if constexpr (Op == 2) { wavefront_LT_solve<Long>(cs, ri, val, x, lstart, corder, nlev); }
+  else                        { wavefront_UT_solve<Long>(cs, ri, val, x, lstart, corder, nlev); }
 }
 
 template <int Op, typename i_t, typename ri_t, typename f_t>

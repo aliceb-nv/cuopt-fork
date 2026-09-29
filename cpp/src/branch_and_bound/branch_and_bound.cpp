@@ -42,6 +42,7 @@
 #include <utilities/hashing.hpp>
 
 #include <omp.h>
+#include <thread>
 #include <pthread.h>
 #include <sched.h>
 
@@ -2071,7 +2072,7 @@ branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_settings(
   result.time_limit      = settings_.time_limit - toc(exploration_stats_.start_time);
   result.scale_columns   = false;
   result.iteration_limit = gpu_batch_iter_limit();
-  if (gpu_pool_refac_freq() > 0) { result.refactor_frequency = gpu_pool_refac_freq(); }
+  result.refactor_frequency = gpu_pool_refac_freq();
   return result;
 }
 
@@ -2264,6 +2265,8 @@ void branch_and_bound_t<i_t, f_t>::sample_gpu_pools(f_t now)
   if (!bfs_worker_pool_.is_initialized()) { return; }
   // Fill histogram of active pools in 10% bins; idle pools split by the engagement gate.
   int fill[10] = {}, active = 0, idle_blocked = 0, idle_ready = 0;
+  // Idle pools whose owner's heap passes the gate, by the first engage condition that fails.
+  int why_disabled = 0, why_setup = 0, why_slice = 0, why_gate = 0, why_inactive = 0, why_none = 0;
   int64_t seated = 0, heap_total = 0, below_gate = 0;
   std::vector<int64_t> heaps;
   for (i_t w = 0; w < bfs_worker_pool_.size(); ++w) {
@@ -2283,6 +2286,24 @@ void branch_and_bound_t<i_t, f_t>::sample_gpu_pools(f_t now)
         fill[std::min(9, 10 * pool.seated.load() / pool.seats)]++;
       } else {
         (h < gate ? idle_blocked : idle_ready)++;
+        if (h >= gate) {
+          i_t p90         = 0;
+          const auto& his = *gpu_batch_pools_[w * gpu_pool_pipeline()];
+          if (pool.disabled) {
+            ++why_disabled;
+          } else if (!pool.setup_done.load(std::memory_order_acquire)) {
+            ++why_setup;
+          } else if (pool.arena_node != -2 && pool.run == nullptr &&
+                     !gds::pinned_host::slice_available(pool.arena_node)) {
+            ++why_slice;
+          } else if (!his.iteration_gate_allows(gpu_batch_iter_limit(), p90, root_relax_soln_.iterations)) {
+            ++why_gate;
+          } else if (!bfs_worker_pool_[w]->is_active.load()) {
+            ++why_inactive;
+          } else {
+            ++why_none;
+          }
+        }
       }
     }
   }
@@ -2291,18 +2312,23 @@ void branch_and_bound_t<i_t, f_t>::sample_gpu_pools(f_t now)
   settings_.log.printf(
     "[GPUPOOL-SAMPLE] t=%.2f open=%lld heap_total=%lld seated=%lld active=%d idle_blocked=%d "
     "idle_ready=%d below_gate=%lld fill=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d heap_q=%lld,%lld,%lld,%lld,%lld "
-    "rebalance_pulls=%lld rebalance_nodes=%lld optimal=%lld fetch_no_scores=%lld fetch_unreliable=%lld "
+    "rebalance_pulls=%lld rebalance_nodes=%lld feed_nodes=%lld optimal=%lld fetch_no_scores=%lld "
+    "fetch_unreliable=%lld "
     "rb_threshold=%d sb_iters=%lld bnb_iters=%lld%s\n",
     now, (long long)exploration_stats_.nodes_unexplored.load(), (long long)heap_total,
     (long long)seated, active, idle_blocked, idle_ready, (long long)below_gate, fill[0], fill[1],
     fill[2], fill[3], fill[4], fill[5], fill[6], fill[7], fill[8], fill[9], (long long)q(0),
     (long long)q(0.1), (long long)q(0.5), (long long)q(0.9), (long long)q(1.0),
-    (long long)rebalance_pulls_.load(), (long long)rebalance_nodes_.load(),
+    (long long)rebalance_pulls_.load(), (long long)rebalance_nodes_.load(), (long long)gpu_feed_nodes_.load(),
     (long long)accepted_optimal_.load(), (long long)fetch_no_scores_.load(),
     (long long)fetch_unreliable_.load(), (int)pc_.reliable_threshold_now(exploration_stats_),
     (long long)pc_.strong_branching_iterations(),
     (long long)exploration_stats_.total_simplex_iters.load(),
     pc_.reliability_distribution(var_types_, pc_.reliable_threshold_now(exploration_stats_)).c_str());
+  settings_.log.printf(
+    "[GPUPOOL-IDLE] t=%.2f idle_ready by first failing engage condition: disabled=%d setup=%d "
+    "no_slice=%d iter_gate=%d owner_inactive=%d none=%d\n",
+    now, why_disabled, why_setup, why_slice, why_gate, why_inactive, why_none);
 }
 
 template <typename i_t, typename f_t>
@@ -2316,10 +2342,14 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_start(
   }
   auto& pool = *gpu_batch_pools_[gpu_pool_index(worker)];
   if (pool.busy || pool.disabled || pool.device < 0 || pool.seats <= 0) { return false; }
-  if (worker->node_queue.best_first_queue_size() < pool.seats) { return false; }
+  if (!gpu_pool_should_engage(worker->node_queue.best_first_queue_size(), pool.seats)) { return false; }
+  static const bool use_prior = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_GATE_PRIOR");
+    return e == nullptr || std::string(e) != "0";
+  }();
   i_t iteration_p90 = 0;
   if (!gpu_batch_pools_[worker->worker_id * gpu_pool_pipeline()]->iteration_gate_allows(
-        gpu_batch_iter_limit(), iteration_p90)) {
+        gpu_batch_iter_limit(), iteration_p90, use_prior ? root_relax_soln_.iterations : -1)) {
     return false;
   }
   if (cudaSetDevice(pool.device) != cudaSuccess) {
@@ -3271,6 +3301,9 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     return false;
   }
 
+  if (static_cast<int64_t>(worker->node_queue.best_first_queue_size()) < fresh_required) {
+    gpu_pool_feed(worker, 2 * static_cast<int64_t>(fresh_required));
+  }
   if (solver_status_ != mip_status_t::UNSET || !is_running_ ||
       (!gpu_pool_park_short() && worker->node_queue.best_first_queue_size() < fresh_required)) {
     pool.drain_reason = solver_status_ != mip_status_t::UNSET || !is_running_ ? "stop" : "heap_short";
@@ -3564,6 +3597,10 @@ void branch_and_bound_t<i_t, f_t>::plunge_with(bfs_worker_t<i_t, f_t>* worker,
 
     if (worker->worker_id >= 0 &&
         worker->worker_id * gpu_pool_pipeline() < static_cast<i_t>(gpu_batch_pools_.size())) {
+      {
+        const auto& own = *gpu_batch_pools_[worker->worker_id * gpu_pool_pipeline()];
+        if (own.device >= 0 && own.seats > 0) { gpu_pool_feed(worker, 2 * static_cast<int64_t>(own.seats)); }
+      }
       bool serviced = false;
       // Ready pools first, then at most one start: a start is expensive and the other pool may be
       // ready by the next pass.
@@ -3575,16 +3612,29 @@ void branch_and_bound_t<i_t, f_t>::plunge_with(bfs_worker_t<i_t, f_t>* worker,
           serviced = true;
         }
       }
+      // Until a worker has its own iteration samples, the gate uses the root LP's iteration count
+      // (CUOPT_BNB_GPU_GATE_PRIOR=0: wait for the samples).
+      static const bool use_prior = [] {
+        const char* e = std::getenv("CUOPT_BNB_GPU_GATE_PRIOR");
+        return e == nullptr || std::string(e) != "0";
+      }();
+      const i_t gate_prior = use_prior ? root_relax_soln_.iterations : -1;
       for (int k = 0; k < gpu_pool_pipeline() && !serviced; ++k) {
         worker->gpu_pool_slot = k;
         auto& pool            = *gpu_batch_pools_[gpu_pool_index(worker)];
         i_t iteration_p90     = 0;
         // The iteration history is the worker's: CPU node solves record it in slot 0's pool.
         const auto& history = *gpu_batch_pools_[worker->worker_id * gpu_pool_pipeline()];
+        // A retained handle (drained pool, seats parked) still holds its slice; otherwise the slice
+        // is claimed here, last, so pools of one node cannot pass on the same free slice.
         if (!pool.busy && !pool.disabled && pool.seats > 0 &&
-            history.iteration_gate_allows(gpu_batch_iter_limit(), iteration_p90) &&
-            gpu_pool_should_engage(worker->node_queue.best_first_queue_size(), pool.seats)) {
+            pool.setup_done.load(std::memory_order_acquire) &&
+            history.iteration_gate_allows(gpu_batch_iter_limit(), iteration_p90, gate_prior) &&
+            gpu_pool_should_engage(worker->node_queue.best_first_queue_size(), pool.seats) &&
+            (pool.arena_node == -2 || pool.run != nullptr ||
+             gds::pinned_host::claim_for_thread(pool.arena_node))) {
           serviced = nondeterministic_gpu_pool_start(worker);
+          gds::pinned_host::drop_thread_claim();
           break;
         }
       }
@@ -3861,6 +3911,42 @@ bool branch_and_bound_t<i_t, f_t>::rebalance_pull(bfs_worker_t<i_t, f_t>* worker
   if (gpu_pool_logging() && moved > 0) {
     ++rebalance_pulls_;
     rebalance_nodes_ += moved;
+  }
+  return moved > 0;
+}
+
+template <typename i_t, typename f_t>
+bool branch_and_bound_t<i_t, f_t>::gpu_pool_feed(bfs_worker_t<i_t, f_t>* worker, int64_t want)
+{
+  // CUOPT_BNB_GPU_FEED=0 disables: a pool then refills only from its owner's own queue.
+  static const bool on = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_FEED");
+    return e == nullptr || std::string(e) != "0";
+  }();
+  if (!on || !bfs_worker_pool_.is_initialized()) { return false; }
+  const int64_t mine = worker->node_queue.best_first_queue_size();
+  if (mine >= want) { return false; }
+  const double now = toc(exploration_stats_.start_time);
+  if (now < worker->next_feed_s) { return false; }
+  worker->next_feed_s = now + 0.002;
+  int64_t victim_size = 0;
+  bfs_worker_t<i_t, f_t>* victim = nullptr;
+  for (i_t w = 0; w < bfs_worker_pool_.size(); ++w) {
+    // Only workers without a GPU pool are fed from: pool owners pulling from each other ping-pong.
+    const i_t p = w * gpu_pool_pipeline();
+    if (p < static_cast<i_t>(gpu_batch_pools_.size()) && gpu_batch_pools_[p]->device >= 0) { continue; }
+    const int64_t s = bfs_worker_pool_[w]->node_queue.best_first_queue_size();
+    if (bfs_worker_pool_[w] != worker && s > victim_size) {
+      victim_size = s;
+      victim      = bfs_worker_pool_[w];
+    }
+  }
+  if (victim == nullptr || victim_size < 32) { return false; }
+  const i_t moved = worker->node_queue.pull_interleaved(
+    victim->node_queue, static_cast<i_t>(std::min(want - mine, victim_size / 2)));
+  if (moved > 0) {
+    ++gpu_feed_pulls_;
+    gpu_feed_nodes_ += moved;
   }
   return moved > 0;
 }
@@ -6426,59 +6512,121 @@ void branch_and_bound_t<i_t, f_t>::initialize_nondeterministic_gpu_pools(i_t num
     pool.ro_cache = it->second;
   }
   cudaSetDevice(previous_device);
-  // Build every pool's per-seat host state here, on one thread, so the pools' concurrent first launches
-  // do not all grow their malloc heaps at once (mmap_lock contention). CUOPT_BNB_GPU_PREBUILD_SEATS=0
-  // disables.
-  static const bool prebuild_seats = [] {
-    const char* e = std::getenv("CUOPT_BNB_GPU_PREBUILD_SEATS");
-    return e == nullptr || std::string(e) != "0";
-  }();
-  if (prebuild_seats) {
-    const f_t t0  = tic();
-    const i_t rf  = gpu_pool_refac_freq() > 0 ? gpu_pool_refac_freq() : settings_.refactor_frequency;
-    size_t states = 0;
-    for (auto& p : gpu_batch_pools_) {
-      if (p->device < 0 || p->seats <= 0) { continue; }
-      p->seat_state.reserve(p->seats);
-      while (static_cast<i_t>(p->seat_state.size()) < p->seats) {
-        p->seat_state.emplace_back(original_lp_.num_rows, rf);
+  // Seat pre-build and pinned arena reservation. They run on a background thread by default
+  // (CUOPT_BNB_GPU_ASYNC_SETUP=0 runs them here), so the tree search starts at once; pools engage
+  // only after gpu_setup_ready_.
+  auto gpu_setup = [this, seats_by_device, previous_device]() {
+    // Build every pool's per-seat host state on this one thread, so the pools' concurrent first
+    // launches do not all grow their malloc heaps at once (mmap_lock contention).
+    // CUOPT_BNB_GPU_PREBUILD_SEATS=0 disables.
+    static const bool prebuild_seats = [] {
+      const char* e = std::getenv("CUOPT_BNB_GPU_PREBUILD_SEATS");
+      return e == nullptr || std::string(e) != "0";
+    }();
+    // CUOPT_BNB_GPU_PINNED_ARENA: register the pools' pinned host memory up front, as regions per
+    // NUMA node of the pools' GPUs (numa, the default), per GPU in that GPU's context only (device),
+    // one region (1), or not at all (0). It is reserved concurrently with the pre-build and published
+    // in chunks; a pool engages once its seats are built and its node (GPU) has a free slice.
+    // CUOPT_BNB_GPU_ASYNC_SETUP=arena: the pre-build stays here; the arena registers while the
+    // tree search runs.
+    static const bool async_arena = [] {
+      const char* e = std::getenv("CUOPT_BNB_GPU_ASYNC_SETUP");
+      return e != nullptr && std::string(e) == "arena";
+    }();
+    static const int pinned_arena = [] {
+      const char* e = std::getenv("CUOPT_BNB_GPU_PINNED_ARENA");
+      if (e == nullptr) { return 2; }
+      const std::string v(e);
+      return v == "1" ? 1 : v == "numa" ? 2 : v == "device" ? 3 : 0;
+    }();
+    std::thread arena_thread;
+    if (pinned_arena != 0) {
+      std::vector<int> pool_devices;
+      i_t max_seats = 0;
+      for (auto& p : gpu_batch_pools_) {
+        if (p->device < 0) { continue; }
+        pool_devices.push_back(p->device);
+        max_seats     = std::max(max_seats, static_cast<i_t>(p->seats));
+        p->arena_node = pinned_arena == 3   ? p->device
+                        : pinned_arena == 2 ? gds::pinned_host::device_node(p->device)
+                                            : -1;
       }
-      states += p->seat_state.size();
-    }
-    settings_.log.printf("[GPUPOOL-PREBUILD] seat states=%zu in %.3fs\n", states, toc(t0));
-  }
-  // CUOPT_BNB_GPU_PINNED_ARENA: register the pools' pinned host memory up front, as one region per
-  // NUMA node of the pools' GPUs (numa, the default), one region (1), or not at all (0).
-  static const int pinned_arena = [] {
-    const char* e = std::getenv("CUOPT_BNB_GPU_PINNED_ARENA");
-    if (e == nullptr) { return 2; }
-    return std::string(e) == "1" ? 1 : std::string(e) == "numa" ? 2 : 0;
-  }();
-  if (pinned_arena != 0) {
-    std::vector<int> pool_devices;
-    i_t max_seats = 0;
-    for (const auto& p : gpu_batch_pools_) {
-      if (p->device < 0) { continue; }
-      pool_devices.push_back(p->device);
-      max_seats = std::max(max_seats, static_cast<i_t>(p->seats));
-    }
-    if (!pool_devices.empty() && max_seats > 0) {
-      const f_t t0 = tic();
-      gds::gpu_pinned_arena_reserve<i_t, f_t>(pool_devices,
-                                              static_cast<size_t>(max_seats),
-                                              original_lp_.num_cols,
-                                              original_lp_.num_rows,
-                                              gpu_pool_dive(),
-                                              pinned_arena == 2);
-      std::string nodes;
-      for (const auto& [device, seats] : seats_by_device) {
-        nodes += " gpu" + std::to_string(device) + "->node" +
-                 std::to_string(gds::pinned_host::device_node(device));
+      if (!pool_devices.empty() && max_seats > 0) {
+        arena_thread = std::thread([this, pool_devices, max_seats, seats_by_device, previous_device]() {
+          cudaSetDevice(previous_device);
+          const f_t t0 = tic();
+          gds::gpu_pinned_arena_reserve<i_t, f_t>(pool_devices,
+                                                  static_cast<size_t>(max_seats),
+                                                  original_lp_.num_cols,
+                                                  original_lp_.num_rows,
+                                                  gpu_pool_dive(),
+                                                  pinned_arena,
+                                                  static_cast<size_t>(original_lp_.A.nnz()));
+          std::string nodes;
+          for (const auto& [device, seats] : seats_by_device) {
+            nodes += " gpu" + std::to_string(device) + "->node" +
+                     std::to_string(gds::pinned_host::device_node(device));
+          }
+          settings_.log.printf(
+            "[PINNED-ARENA] reserve pools=%zu max_seats=%d n=%d m=%d per_node=%d in %.3fs |%s\n",
+            pool_devices.size(), (int)max_seats, (int)original_lp_.num_cols, (int)original_lp_.num_rows,
+            (int)(pinned_arena >= 2), toc(t0), nodes.c_str());
+        });
       }
-      settings_.log.printf("[PINNED-ARENA] reserve pools=%zu max_seats=%d n=%d m=%d per_node=%d in %.3fs |%s\n",
-                           pool_devices.size(), (int)max_seats, (int)original_lp_.num_cols,
-                           (int)original_lp_.num_rows, (int)(pinned_arena == 2), toc(t0), nodes.c_str());
     }
+    const f_t t0 = tic();
+    const i_t rf = gpu_pool_refac_freq();
+    // CUOPT_BNB_GPU_PREBUILD_THREADS: pools are built in parallel (CHOSEN default 32 threads).
+    static const int prebuild_threads = [] {
+      const char* e = std::getenv("CUOPT_BNB_GPU_PREBUILD_THREADS");
+      return e != nullptr ? std::max(1, std::atoi(e)) : 32;
+    }();
+    std::atomic<size_t> next_pool{0}, states{0};
+    auto build = [&]() {
+      for (size_t k = next_pool.fetch_add(1); k < gpu_batch_pools_.size(); k = next_pool.fetch_add(1)) {
+        auto& p = gpu_batch_pools_[k];
+        if (prebuild_seats && p->device >= 0 && p->seats > 0) {
+          p->seat_state.reserve(p->seats);
+          while (static_cast<i_t>(p->seat_state.size()) < p->seats) {
+            p->seat_state.emplace_back(original_lp_.num_rows, rf);
+          }
+          states += p->seat_state.size();
+        }
+        p->setup_done.store(true, std::memory_order_release);
+      }
+    };
+    {
+      std::vector<std::thread> builders;
+      for (int t = 1; t < prebuild_threads; ++t) { builders.emplace_back(build); }
+      build();
+      for (auto& t : builders) { t.join(); }
+    }
+    if (prebuild_seats) {
+      settings_.log.printf("[GPUPOOL-PREBUILD] seat states=%zu in %.3fs\n", states.load(), toc(t0));
+    }
+    if (arena_thread.joinable()) {
+      if (async_arena) {
+        gpu_arena_thread_ = std::move(arena_thread);
+      } else {
+        arena_thread.join();
+      }
+    }
+  };
+  // Default: run it here, before the workers start, so its threads have the machine to themselves
+  // (under a loaded tree search the same registrations ran ~10x slower).
+  static const bool async_setup = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_ASYNC_SETUP");
+    return e != nullptr && std::string(e) == "1";
+  }();
+  if (async_setup) {
+    gpu_setup_ready_.store(false, std::memory_order_release);
+    gpu_setup_thread_ = std::thread([this, gpu_setup, previous_device]() {
+      cudaSetDevice(previous_device);
+      gpu_setup();
+      gpu_setup_ready_.store(true, std::memory_order_release);
+    });
+  } else {
+    gpu_setup();
   }
 
   std::string split;
@@ -6521,6 +6669,9 @@ void branch_and_bound_t<i_t, f_t>::initialize_nondeterministic_gpu_pools(i_t num
 template <typename i_t, typename f_t>
 void branch_and_bound_t<i_t, f_t>::destroy_nondeterministic_gpu_pools()
 {
+  if (gpu_setup_thread_.joinable()) { gpu_setup_thread_.join(); }
+  if (gpu_arena_thread_.joinable()) { gpu_arena_thread_.join(); }
+  gds::pinned_host::wait_reserved();
   for (auto& pool : gpu_batch_pools_) {
     if (pool != nullptr && pool->run != nullptr) {
       if (pool->device >= 0) { cudaSetDevice(pool->device); }
@@ -6607,7 +6758,11 @@ void branch_and_bound_t<i_t, f_t>::log_nondeterministic_gpu_pool_telemetry()
     settings_.log.printf("%s", hv.c_str());
   }
   if (const std::string clk = gds::gpu_batch_seat_clock_report(); !clk.empty()) {
-    settings_.log.printf("%s", clk.c_str());
+    for (size_t a = 0; a < clk.size();) {
+      const size_t e = clk.find('\n', a);
+      settings_.log.printf("%s\n", clk.substr(a, e == std::string::npos ? std::string::npos : e - a).c_str());
+      a = e == std::string::npos ? clk.size() : e + 1;
+    }
   }
 
   struct device_stats_t {
@@ -7514,7 +7669,7 @@ bool branch_and_bound_t<i_t, f_t>::gpu_pool_cycle(deterministic_bfs_worker_t<i_t
     // consume path now uses to hand a hard node back to the CPU, would be unreachable.
     // Bounds the work a seat can spend; it is NOT a correctness device.
     s.iteration_limit = gpu_batch_iter_limit();
-    if (gpu_pool_refac_freq() > 0) { s.refactor_frequency = gpu_pool_refac_freq(); }
+    s.refactor_frequency = gpu_pool_refac_freq();
     return s;
   };
 
@@ -7667,7 +7822,7 @@ simplex_solver_settings_t<i_t, f_t> branch_and_bound_t<i_t, f_t>::gpu_pool_setti
   result.time_limit      = settings_.time_limit - toc(exploration_stats_.start_time);
   result.scale_columns   = false;
   result.iteration_limit = gpu_batch_iter_limit();
-  if (gpu_pool_refac_freq() > 0) { result.refactor_frequency = gpu_pool_refac_freq(); }
+  result.refactor_frequency = gpu_pool_refac_freq();
   return result;
 }
 
@@ -8137,7 +8292,6 @@ node_status_t branch_and_bound_t<i_t, f_t>::solve_node_deterministic(
   lp_settings.set_log(false);
 
   lp_settings.cut_off       = worker.local_upper_bound + settings_.dual_tol;
-  if (gpu_pool_refac_freq() > 0) { lp_settings.refactor_frequency = gpu_pool_refac_freq(); }
   lp_settings.inside_mip    = 2;
   lp_settings.time_limit    = remaining_time;
   lp_settings.scale_columns = false;
@@ -9001,7 +9155,6 @@ void branch_and_bound_t<i_t, f_t>::deterministic_dive(
     simplex_solver_settings_t<i_t, f_t> lp_settings = settings_;
     lp_settings.set_log(false);
     lp_settings.cut_off       = worker.local_upper_bound + settings_.dual_tol;
-  if (gpu_pool_refac_freq() > 0) { lp_settings.refactor_frequency = gpu_pool_refac_freq(); }
     lp_settings.inside_mip    = 2;
     lp_settings.time_limit    = remaining_time;
     lp_settings.scale_columns = false;

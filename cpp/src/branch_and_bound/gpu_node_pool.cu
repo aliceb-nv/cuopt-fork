@@ -135,7 +135,13 @@ std::vector<int> gpu_pool_device_map(int num_workers, int num_gpus)
   std::vector<int> map(static_cast<size_t>(std::max(num_workers, 0)), -1);
   if (devices.empty() || num_workers <= 0) { return map; }
   const int nd = static_cast<int>(devices.size());
-  for (int w = 0; w < num_workers; ++w) {
+  // CUOPT_BNB_GPU_POOLS_PER_GPU=K: only the first K * devices workers own a pool; the rest are CPU-only.
+  static const int per_gpu = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_POOLS_PER_GPU");
+    return e != nullptr ? std::max(0, std::atoi(e)) : 0;
+  }();
+  const int with_pool = per_gpu > 0 ? std::min(num_workers, per_gpu * nd) : num_workers;
+  for (int w = 0; w < with_pool; ++w) {
     map[static_cast<size_t>(w)] = devices[static_cast<size_t>(w % nd)];
   }
   return map;
@@ -1175,7 +1181,7 @@ bool gpu_pool_park_short()
 {
   static const bool on = [] {
     const char* e = std::getenv("CUOPT_BNB_GPU_PARK_SHORT");
-    return e != nullptr && std::string(e) != "0";
+    return e == nullptr || std::string(e) != "0";
   }();
   return on;
 }
@@ -1301,6 +1307,11 @@ bool gpu_pool_logging()
   return on;
 }
 
+// Refactor frequency of the GPU dual simplex seats (CPU node solves keep their own setting). 200:
+// lrsa120 (2026-09-29, 180 s) 8-16 % more iterations/s than 100 (43 % fewer host LUs); gen-ip054,
+// gen-ip002, mas74, mik-250-20-75-4 within run-to-run spread.
+int gpu_pool_refac_freq() { return 200; }
+
 // #3 -- how full this worker's queue must be before the pool engages, as a MULTIPLE of the seat
 // count. The pool takes `seats` nodes OUT of the queue; firing when the queue barely holds that
 // many empties it, and the worker then has nothing to overlap with and nothing to steal next cycle.
@@ -1312,20 +1323,6 @@ bool gpu_pool_logging()
 //
 // There is deliberately no root/depth escape: CPU search grows the queue until this threshold is
 // reached. A worker that never accumulates enough GPU-eligible nodes simply remains CPU-only.
-// DIAGNOSTIC (CUOPT_BNB_REFAC_FREQ=<n>, 0 = off): force refactorizations to be frequent, so the
-// REFACTOR_NEEDED resume path -- where a node's state round-trips through the host, and therefore
-// where a carried-state bug would live -- is exercised far above its natural rate. Applied to BOTH
-// the device settings and the CPU recheck's, so the two legs stay comparable.
-// NOT a fix and not for production: it changes the refactor schedule, which is the search itself.
-int gpu_pool_refac_freq()
-{
-  static const int v = [] {
-    const char* e = std::getenv("CUOPT_BNB_REFAC_FREQ");
-    return e != nullptr ? std::atoi(e) : 0;
-  }();
-  return v;
-}
-
 int gpu_pool_heap_factor()
 {
   static const int f = [] {
@@ -1342,7 +1339,14 @@ bool gpu_pool_should_engage(size_t queue_size, int seats)
   if (seats <= 0) { return false; }
   const int factor = gpu_pool_heap_factor();
   if (factor <= 0) { return queue_size > 0; }   // gate disabled
-  return queue_size >= static_cast<size_t>(seats) * static_cast<size_t>(factor);
+  // A lean begin seats only gpu_pool_lean_begin() nodes; the refills fill the rest, so that many is
+  // enough to start. CUOPT_BNB_GPU_ENGAGE_FULL=1: require a full batch.
+  static const bool full = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_ENGAGE_FULL");
+    return e != nullptr && std::string(e) == "1";
+  }();
+  const int need = !full && gpu_pool_lean_begin() > 0 ? std::min(seats, gpu_pool_lean_begin()) : seats;
+  return queue_size >= static_cast<size_t>(need) * static_cast<size_t>(factor);
 }
 
 // #2 -- drive the pool from the WORKER LOOP. The loop asks "is the GPU done?" by atomically loading

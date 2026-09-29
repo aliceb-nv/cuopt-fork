@@ -41,6 +41,7 @@
 
 #include <array>
 #include <atomic>
+#include <thread>
 #include <functional>
 #include <future>
 #include <list>
@@ -376,7 +377,10 @@ class branch_and_bound_t {
   void work_stealing(bfs_worker_t<i_t, f_t>* worker);
   // CUOPT_BNB_REBALANCE (default on): a heap below half the mean pulls from the largest heap.
   bool rebalance_pull(bfs_worker_t<i_t, f_t>* worker, bool force);
+  // Pool owner short of nodes: pull up to `want` minus its queue from the largest other queue.
+  bool gpu_pool_feed(bfs_worker_t<i_t, f_t>* worker, int64_t want);
   std::atomic<int64_t> rebalance_pulls_{0}, rebalance_nodes_{0};
+  std::atomic<int64_t> gpu_feed_pulls_{0}, gpu_feed_nodes_{0};
   std::atomic<int64_t> fetch_no_scores_{0}, fetch_unreliable_{0}, accepted_optimal_{0};  // telemetry
 
   // Perform a deep dive in the subtree determined by the `start_node` in order
@@ -577,6 +581,9 @@ class branch_and_bound_t {
   // ONE read-only cache per GPU (not per pool): every pool on a device solves nodes of the same MIP,
   // so A / Arow / rhs / objective are identical across them. Owner; pools hold a borrowed pointer.
   std::vector<gds::gpu_ro_cache<i_t, f_t>*> gpu_ro_caches_;
+  std::thread gpu_setup_thread_;                  // seat pre-build + pinned arena (CUOPT_BNB_GPU_ASYNC_SETUP)
+  std::thread gpu_arena_thread_;                  // pinned arena only (CUOPT_BNB_GPU_ASYNC_SETUP=arena)
+  std::atomic<bool> gpu_setup_ready_{true};
   // Where each node's LP answer came from, so a run can say what the pool actually did rather than
   // leaving it to be inferred from node counts.
   std::atomic<int64_t> gpu_batch_hits_{0};        // consumed from the pool

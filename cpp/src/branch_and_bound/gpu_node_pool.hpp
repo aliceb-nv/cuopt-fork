@@ -215,8 +215,7 @@ std::vector<int> gpu_pool_device_map(int num_workers, int num_gpus);
 // #3 -- engage the pool only once the worker's queue holds seats * factor nodes, so a fill does not
 // empty it. CUOPT_BNB_GPU_HEAP_FACTOR, default 1 (was 5; sweep 2026-09-27); 0 disables the gate.
 int gpu_pool_heap_factor();
-// CUOPT_BNB_REFAC_FREQ: diagnostic override of refactor_frequency (0 = off).
-int gpu_pool_refac_freq();
+int gpu_pool_refac_freq();   // refactor frequency of the GPU dual simplex seats
 // #2 -- CUOPT_BNB_GPU_ASYNC: worker loop drives the pool between rounds. Default off.
 bool gpu_pool_async();
 bool gpu_pool_should_engage(size_t queue_size, int seats);
@@ -262,7 +261,7 @@ bool gpu_pool_lazy_install();
 bool gpu_pool_batch_stats();  // CUOPT_BNB_GPU_BATCH_STATS (0 disables): pool step flushes shared counters once per generation
 int gpu_pool_dive();  // CUOPT_BNB_GPU_DIVE: solve rounds per launch (device dives, default 3), 1 = off  // CUOPT_BNB_GPU_LAZY_INSTALL: device-scored seats skip the bound copy
 bool gpu_pool_retain();      // CUOPT_BNB_GPU_RETAIN (0 disables): a drained pool keeps its handle (seats parked)
-bool gpu_pool_park_short();  // CUOPT_BNB_GPU_PARK_SHORT: park seats the heap cannot refill
+bool gpu_pool_park_short();  // CUOPT_BNB_GPU_PARK_SHORT (0 disables): park seats the heap cannot refill
 double gpu_pool_park_min();  // CUOPT_BNB_GPU_PARK_MIN: retire a short pool below this seated fraction (0.5)  // CUOPT_BNB_GPU_BATCH_FETCH: one fetch per generation, before the seat loop
 
 // Do a GPU answer and a CPU answer for the SAME node reach a different branch-and-bound DECISION?
@@ -484,9 +483,14 @@ struct gpu_batch_pool_t {
     recent_iteration_count  = std::min(recent_iteration_count + 1, iteration_window);
   }
 
-  bool iteration_gate_allows(i_t iteration_limit, i_t& p90) const
+  // `prior` (>= 0): iteration estimate used until the worker has a full window of its own samples.
+  bool iteration_gate_allows(i_t iteration_limit, i_t& p90, i_t prior = -1) const
   {
-    if (recent_iteration_count < iteration_window) { return false; }
+    if (recent_iteration_count < iteration_window) {
+      if (prior < 0) { return false; }
+      p90 = prior;
+      return static_cast<int64_t>(prior) < (9LL * static_cast<int64_t>(iteration_limit)) / 10LL;
+    }
     auto sample = recent_iterations;
     constexpr std::size_t rank = (9 * iteration_window + 9) / 10 - 1;
     std::nth_element(sample.begin(), sample.begin() + rank, sample.end());
@@ -557,6 +561,10 @@ struct gpu_batch_pool_t {
 
   // One entry per seat, sized once. Reset for a fresh node, PRESERVED for a plunge child.
   std::vector<batch_seat_state_t<i_t, f_t>> seat_state;
+  // Background setup: seats built (and gpu_setup done) / host NUMA node of this pool's arena slices
+  // (-2: no arena gating, -1: single process region).
+  std::atomic<bool> setup_done{false};
+  int arena_node{-2};
 
   std::vector<mip_node_t<i_t, f_t>*> prefetched;
   size_t prefetch_next{0};
