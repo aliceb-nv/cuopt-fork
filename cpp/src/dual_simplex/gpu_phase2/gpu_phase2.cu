@@ -75,6 +75,8 @@
 #include <sys/mman.h>
 #include <limits>
 #include <mutex>
+#include <thread>
+#include <chrono>
 #include <optional>
 #include <unordered_map>
 #include <cstdio>
@@ -5520,7 +5522,9 @@ struct packed_upload_t {
   std::vector<size_t> src;
   std::vector<void*> dst;
   std::vector<size_t> bytes;
+  std::vector<const void*> from;  // host copies are deferred to flush(); sources must stay unchanged
   std::uint64_t flushes{0}, flushed_bytes{0}, flushed_pieces{0}, grows{0};
+  static constexpr int kCopyThreads = 16;  // CHOSEN
 
   static size_t align(size_t v) { return (v + 15) & ~size_t{15}; }
   void reserve(size_t need, rmm::cuda_stream_view s)
@@ -5534,17 +5538,15 @@ struct packed_upload_t {
       return;
     }
     auto grown = pinned_make<unsigned char>(nullptr, cuda::stream_ref{s.value()}, c);
-    if (used != 0) { std::memcpy(grown.data(), h->data(), used); }
-    h.emplace(std::move(grown));
+    h.emplace(std::move(grown));  // nothing to keep: the pieces are copied in flush()
     cap = c;
     ++grows;
   }
   void add(void* to, const void* from, size_t n, rmm::cuda_stream_view s)
   {
     if (n == 0) { return; }
-    reserve(align(used) + n, s);
     used = align(used);
-    std::memcpy(hdata() + used, from, n);
+    this->from.push_back(from);
     src.push_back(used);
     dst.push_back(to);
     bytes.push_back(n);
@@ -5561,6 +5563,30 @@ struct packed_upload_t {
     const size_t desc  = align(used);
     const size_t total = desc + P * (2 * sizeof(void*) + sizeof(size_t));
     reserve(total, s);
+    {
+      // Contiguous runs of pieces of about equal bytes per thread.
+      unsigned char* hb = hdata();
+      const auto run = [&](size_t k0, size_t k1) {
+        for (size_t k = k0; k < k1; ++k) { std::memcpy(hb + src[k], from[k], bytes[k]); }
+      };
+      static const int env_t = [] { const char* e = std::getenv("CUOPT_EXP_PACK_THREADS"); return e ? std::atoi(e) : 0; }();
+      const int T = used < (size_t{8} << 20) ? 1 : (env_t > 0 ? env_t : kCopyThreads);
+      const auto tc0 = std::chrono::steady_clock::now();
+      std::vector<std::thread> ths;
+      size_t k0 = 0;
+      for (int t = 0; t < T && k0 < P; ++t) {
+        const size_t goal = used * static_cast<size_t>(t + 1) / static_cast<size_t>(T);
+        size_t k1         = k0;
+        while (k1 < P && (t == T - 1 || src[k1] < goal)) { ++k1; }
+        if (t + 1 < T) { ths.emplace_back(run, k0, k1); } else { run(k0, k1); }
+        k0 = k1;
+      }
+      for (auto& th : ths) { th.join(); }
+      if (std::getenv("CUOPT_EXP_PACK_TIME") != nullptr && used > (size_t{8} << 20)) {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc0).count();
+        std::fprintf(stderr, "[EXP-PACK] threads=%d pieces=%zu MB=%.1f copy_ms=%.2f GB/s=%.1f\n", T, P, used / 1e6, ms, used / 1e6 / ms);
+      }
+    }
     if (total > dev_cap) {
       d.emplace(cap, s);
       dev_cap = cap;
@@ -5593,6 +5619,7 @@ struct packed_upload_t {
     src.clear();
     dst.clear();
     bytes.clear();
+    from.clear();
     used = 0;
   }
 };
