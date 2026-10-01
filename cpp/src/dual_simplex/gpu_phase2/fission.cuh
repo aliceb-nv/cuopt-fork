@@ -677,10 +677,11 @@ __device__ __forceinline__ size_t fission_tloop_chunked(const gpu_basis_update_t
   const size_t half = (cap_bytes / 2) & ~size_t(15);
   f_t* buf[2]       = {stage, reinterpret_cast<f_t*>(reinterpret_cast<char*>(stage) + half)};
   __shared__ int rng[2][2];  // replay positions [s0, s1) held by each buffer
+  __shared__ int big[2];     // 1: buffer holds one update replayed from global memory
   // Next chunk starting at replay position s0, planned by threads [t0, t0 + nt) in parallel: each
   // tests one candidate end (sizes grow with the end), the largest that fits wins. bar() syncs them.
   auto plan = [&](int b, i_t s0, int t0, int nt, auto bar) {
-    if (t0 == 0) { rng[b][0] = s0, rng[b][1] = s0; }
+    if (t0 == 0) { rng[b][0] = s0, rng[b][1] = s0, big[b] = 0; }
     bar();
     for (i_t s1 = s0 + 1 + t0; s1 <= num && s1 <= s0 + nt; s1 += nt) {
       const i_t ka = asc ? s0 : num - s1;
@@ -688,13 +689,14 @@ __device__ __forceinline__ size_t fission_tloop_chunked(const gpu_basis_update_t
       if (fission_chunk_bytes(cs, ka, kb) <= half) { atomicMax(&rng[b][1], s1); }
     }
     bar();
-    if (t0 == 0 && rng[b][1] == s0 && s0 < num) { __trap(); }  // one update larger than half the stage
+    if (t0 == 0 && rng[b][1] == s0 && s0 < num) { rng[b][1] = s0 + 1, big[b] = 1; }
+    bar();
   };
   auto bar_all     = [] { __syncthreads(); };
   auto bar_loaders = [] { asm volatile("bar.sync 1, %0;" ::"r"(kFissionThreads - 32)); };
   auto load = [&](int b, int t0, int nt) {
     const i_t s0 = rng[b][0], s1 = rng[b][1];
-    if (s0 >= s1) { return; }
+    if (s0 >= s1 || big[b]) { return; }
     const i_t ka = asc ? s0 : num - s1, kb = asc ? s1 : num - s0;
     const i_t E0 = cs[2 * ka], E = cs[2 * kb] - E0, n = kb - ka;
     f_t* svx = buf[b];
@@ -708,6 +710,19 @@ __device__ __forceinline__ size_t fission_tloop_chunked(const gpu_basis_update_t
   auto replay = [&](int b) {
     const int lane = threadIdx.x;
     const i_t s0 = rng[b][0], s1 = rng[b][1];
+    if (big[b]) {
+      const i_t k    = asc ? s0 : num - 1 - s0;
+      const i_t dcol = asc ? 2 * k + 1 : 2 * k;
+      const i_t acol = asc ? 2 * k : 2 * k + 1;
+      f_t partial    = 0.0;
+      for (i_t p = cs[dcol] + lane; p < cs[dcol + 1]; p += 32) { partial += gvx[p] * x[gri[p]]; }
+      const f_t theta = warp_reduce_add(partial) / gmu[k];
+      if (fabs(theta) > tol) {
+        for (i_t p = cs[acol] + lane; p < cs[acol + 1]; p += 32) { x[gri[p]] -= theta * gvx[p]; }
+      }
+      __syncwarp(0xffffffffu);
+      return;
+    }
     const i_t ka = asc ? s0 : num - s1, kb = asc ? s1 : num - s0;
     const i_t E = cs[2 * kb] - cs[2 * ka], n = kb - ka;
     const f_t* svx = buf[b];
@@ -844,6 +859,8 @@ __global__ void __launch_bounds__(kFissionThreads, 2)
 // Same contracts as fission_btran / fission_ftran above: shared w/z, acc (m doubles each) and lists
 // of kFissionCapA entries. List order and atomic summation order vary run to run.
 constexpr int kFissionCapA = 1536;
+constexpr size_t kFissionStage = 32768;  // CHOSEN: 2 blocks/SM at m = 5236 (8m + 32 KB + static)
+static_assert(kFissionStage >= kFissionCapA * (sizeof(f_t) + 2 * sizeof(i_t)), "lists live in the stage"); 
 
 // Compaction of a dense shared vector into (index, value) lists by an atomic counter; clears it.
 __device__ __forceinline__ int fission_compact_atomic(f_t* dense, int m, i_t* li, f_t* lx, int cap, int* cnt)
@@ -912,12 +929,12 @@ __global__ void __launch_bounds__(kFissionThreads, 2)
   const int m   = a.m;
   const auto& I = inv[blockIdx.x];
   f_t* w   = fsh;
-  f_t* acc = fsh + m;
-  f_t* lx  = fsh + 2 * m;
+  f_t* R   = fsh + m;  // replay staging, then the lists
+  f_t* lx  = R;
   i_t* li  = reinterpret_cast<i_t*>(lx + kFissionCapA);
   int* pre = reinterpret_cast<int*>(li + kFissionCapA);
   FSTEP_BEGIN
-  for (int k = threadIdx.x; k < m; k += blockDim.x) { w[k] = 0.0, acc[k] = 0.0; }
+  for (int k = threadIdx.x; k < m; k += blockDim.x) { w[k] = 0.0; }
   __syncthreads();
   FSTEP(S_B_ZERO)
   const i_t r   = st.basic_leaving;
@@ -937,17 +954,17 @@ __global__ void __launch_bounds__(kFissionThreads, 2)
   }
   __syncthreads();
   FSTEP(S_B_UROW)
-  fission_unstage(acc, fission_tloop_chunked(st.ft, w, false, 1e-13, acc, static_cast<size_t>(m) * sizeof(f_t)));
+  fission_tloop_chunked(st.ft, w, false, 1e-13, R, kFissionStage);
   FSTEP(S_B_TLOOP)
   const int nw = fission_compact_atomic(w, m, li, lx, kFissionCapA, &cnt);
   FSTEP(S_B_COMPACT)
-  fission_scatter_atomic(scs, I.Lr_p, I.Lr_i, I.Lr_x, li, lx, nw, pre, acc);
+  fission_scatter_atomic(scs, I.Lr_p, I.Lr_i, I.Lr_x, li, lx, nw, pre, w);
   FSTEP(S_B_LSCATTER)
   auto& dy = st.delta_y_sparse;
   if (threadIdx.x == 0) { cnt = 0; }
   __syncthreads();
   for (int k = threadIdx.x; k < m; k += blockDim.x) {
-    const f_t v = acc[k];
+    const f_t v = w[k];
     if (v != 0.0) {
       const int q = atomicAdd(&cnt, 1);
       dy.i[q]     = k;
@@ -977,12 +994,13 @@ __global__ void __launch_bounds__(kFissionThreads, 2)
   const int m   = a.m;
   const auto& I = inv[blockIdx.x];
   f_t* z   = fsh;
-  f_t* acc = fsh + m;
-  f_t* lx  = fsh + 2 * m;
+  f_t* R   = fsh + m;  // replay staging, then the lists
+  f_t* lx  = R;
   i_t* li  = reinterpret_cast<i_t*>(lx + kFissionCapA);
   int* pre = reinterpret_cast<int*>(li + kFissionCapA);
+  f_t* acc = z;      // the U step scatters back into z, zero after the compaction
   FSTEP_BEGIN
-  for (int k = threadIdx.x; k < m; k += blockDim.x) { z[k] = 0.0, acc[k] = 0.0; }
+  for (int k = threadIdx.x; k < m; k += blockDim.x) { z[k] = 0.0; }
   __syncthreads();
   FSTEP(S_F_ZERO)
   for (int r = 0; r < 2; ++r) {
@@ -991,7 +1009,7 @@ __global__ void __launch_bounds__(kFissionThreads, 2)
     if (nb > kFissionCapA) { __trap(); }
     fission_scatter_atomic(scs, I.Lc_p, I.Lc_i, I.Lc_x, b.i.data(), b.x.data(), nb, pre, z);
     FSTEP(S_F_LSCATTER)
-    fission_unstage(acc, fission_tloop_chunked(st.ft, z, true, 1e-16, acc, static_cast<size_t>(m) * sizeof(f_t)));
+    fission_tloop_chunked(st.ft, z, true, 1e-16, R, kFissionStage);
     FSTEP(S_F_TLOOP)
     const int nz = fission_compact_atomic(z, m, li, lx, kFissionCapA, &cnt);
     if (r == 0) {
@@ -1032,7 +1050,7 @@ __global__ void __launch_bounds__(kFissionThreads, 2)
       }
     } else {
       auto& v = st.ft.dense_scratch2_;
-      for (int k = threadIdx.x; k < m; k += blockDim.x) { v[k] = acc[k]; }
+      for (int k = threadIdx.x; k < m; k += blockDim.x) { v[k] = acc[k], acc[k] = 0.0; }
       if (threadIdx.x == 0) {
         v.set_size(m);
         st.v_sparse.clear();

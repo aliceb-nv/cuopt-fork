@@ -9480,7 +9480,7 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
       const size_t smem =
         det ? static_cast<size_t>(H->rows) * (2 * sizeof(f_t) + sizeof(i_t)) +
                 2 * sizeof(unsigned) * ((static_cast<size_t>(H->rows) + 31) / 32)
-            : 2 * static_cast<size_t>(H->rows) * sizeof(f_t) + kFissionCapA * (sizeof(f_t) + 2 * sizeof(i_t));
+            : static_cast<size_t>(H->rows) * sizeof(f_t) + kFissionStage;
       auto* k_btran = det ? fission_btran : fission_btran_atomic;
       auto* k_ftran = det ? fission_ftran : fission_ftran_atomic;
       RAFT_CUDA_TRY(cudaFuncSetAttribute(k_btran, cudaFuncAttributeMaxDynamicSharedMemorySize,
