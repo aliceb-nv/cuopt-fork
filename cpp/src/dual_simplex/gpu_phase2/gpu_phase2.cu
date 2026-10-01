@@ -3679,6 +3679,7 @@ struct slot_state {
   f_t step_length{0.0}, dy_norm_sq{0.0};
   bool used_transpose_dz{false};
   i_t f_state{0};  // fissioned pivot loop (fission.cuh): next phase
+  i_t f_lean{0};   // fission fresh seat: x_B, objective and infeasibilities come from fission_xb
   f_t f_pivot{0.0};    // FTRAN: (B^-1 a_q)[basic_leaving], 0 when absent
   i_t f_pivot_found{0};
 
@@ -3783,7 +3784,8 @@ struct slot_state {
 
     if (!refactor_resume) {
       set_primal_variables_on_bounds(lp, settings, z, vstatus, x);
-
+    }
+    if (!refactor_resume && f_lean == 0) {
       // Both of these solve through the factors, so they follow the kernel's geometry — the
       // monolith has always run them on the warp via Direct.
       compute_primal_variables(ft,
@@ -3850,8 +3852,10 @@ struct slot_state {
     });
     // WARP_PINF: scan the m basics one lane per k and compact the infeasible indices in order.
     // squared_infeas is read only through that freshly written index list.
-    compute_initial_primal_infeasibilities(
-      lp, settings, ft, basic_list, x, squared_infeas, infeas_idx, primal_inf);
+    if (f_lean == 0) {
+      compute_initial_primal_infeasibilities(
+        lp, settings, ft, basic_list, x, squared_infeas, infeas_idx, primal_inf);
+    }
 
     lane0_serial([&] {
     // Set the dimension and empty them IN PLACE. These used to be whole-object assignments
@@ -3872,7 +3876,7 @@ struct slot_state {
     // CONTINUE, do not restart. The CPU carries both across an in-place refactorization; only a
     // fresh solve derives them. Recomputing obj from x also silently changes the cutoff comparand
     // mid-solve, and resetting iter makes the driver's own iteration limit unreachable.
-    obj  = refactor_resume ? resume_obj : compute_objective(lp, x);
+    obj  = refactor_resume ? resume_obj : (f_lean != 0 ? f_t{0.0} : compute_objective(lp, x));
     iter = refactor_resume ? resume_iter : 0;
     });  // end lane-0 epilogue
   }
@@ -4815,8 +4819,10 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args,
   // constructor in that already-allocated memory; it does not allocate device memory.
   // Construction, ft wiring and S_.init_empty are RMW on shared state and belong to lane 0.
   const long long pcs = clock64();
+  // Fission fresh seat: no reader of the device transposes or the level schedules.
+  const bool lean = FissionSetup && !child_continue && a.refactor_resume == 0 && a.device_lu == 0;
   if constexpr (PersistentSeats) {
-    if (!child_continue && a.transpose_on_device != 0) {
+    if (!lean && !child_continue && a.transpose_on_device != 0) {
       warp_csc_transpose(m, a.L0_col_start, a.L0_i, a.L0_x, a.L0t_col_start, a.L0t_i, a.L0t_x, a.xi_workspace);
       warp_csc_transpose(m, a.U0_col_start, a.U0_i, a.U0_x, a.U0t_col_start, a.U0t_i, a.U0t_x, a.xi_workspace);
     }
@@ -4889,6 +4895,7 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args,
   // CUOPT_BNB_GPU_REUSE_LEVELS=0: rebuild the schedules for child continuations too.
   const bool reuse_levels = child_continue && st.cfg_built && c_reuse_levels != 0;
   ft.path(reuse_levels ? P_LEVEL_REUSE : P_LEVEL_BUILD);
+  if (!lean) {
   if (!reuse_levels && c_warp_levels != 0) {
     warp_build_config_all(ft, cfg_shared, st.lvl_lev, st.lvl_ls, st.lvl_co, st.sp_ls_v, st.sp_co_v,
                           st.sp_pos_v, st.lvl_pos_v);
@@ -4909,6 +4916,8 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args,
     }
     ft.warp_cfg_ = &cfg_shared;
   });
+  }
+  lane0_serial([&] { st.f_lean = lean ? 1 : 0; });
   if (threadIdx.x == 0) {
     const long long pc3 = clock64();
     st.pre[0] = pcb - pc0, st.pre[1] = pcs - pcb, st.pre[2] = pc1 - pcs;
@@ -9551,6 +9560,12 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
       }
       fission_presetup<<<Ni, kPresetupThreads, 0, cs>>>(H->d_args, Ni);
       fission_setup_kernel<<<Ni, 32, 0, cs>>>(H->d_args, Ni);
+      {
+        const size_t smem_x = 2 * static_cast<size_t>(H->rows) * sizeof(f_t);
+        RAFT_CUDA_TRY(cudaFuncSetAttribute(fission_xb, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                           static_cast<int>(smem_x)));
+        fission_xb<<<Ni, kXbThreads, smem_x, cs>>>(H->d_args, finv, Ni);
+      }
       int live0 = -1;
       bool yielding = false;
       for (;;) {

@@ -285,6 +285,10 @@ __global__ void __launch_bounds__(32) fission_setup_kernel(kernel_args* args, i_
     r.live = 1;
     for (int q = 0; q < 6; ++q) { r.sub[q] = static_cast<int>(a.slot->pre[q]); }
   }
+  if (a.slot->f_lean != 0) {  // fission_xb finishes this seat
+    emit();
+    return;
+  }
   // Incremental infeasibility list (fission_update): squared_infeas[j] != 0 exactly when j is
   // listed. Zero the whole array, then rebuild once.
   auto& st = *a.slot;
@@ -300,6 +304,67 @@ __global__ void __launch_bounds__(32) fission_setup_kernel(kernel_args* args, i_
   __syncwarp(0xffffffffu);
   if (tr && threadIdx.x == 0) { r.sub[6] = static_cast<int>(clock64() - c6); }
   emit();
+}
+
+// Fresh fission seat: x_B = U0^{-1} L0^{-1} (b - A_N x_N) through the explicit inverses (row-wise,
+// one owner per output, |x_j| < 10 tight_tol skipped as in compute_primal_variables), then the
+// objective c'x and the infeasibility list. Shared: two m-vectors.
+constexpr int kXbThreads = 512;
+__global__ void __launch_bounds__(kXbThreads) fission_xb(kernel_args* args, const gpu_fission_inv* inv, i_t n_problems)
+{
+  extern __shared__ f_t fsh[];
+  if (blockIdx.x >= n_problems) { return; }
+  kernel_args& a = args[blockIdx.x];
+  if (a.done != 0) { return; }
+  auto& st = *a.slot;
+  if (st.f_lean == 0) { return; }
+  __shared__ typename cub::BlockReduce<f_t, kXbThreads>::TempStorage otmp;
+  const i_t m = a.m, n = a.n;
+  const int tid = threadIdx.x;
+  f_t* r = fsh;
+  f_t* z = fsh + m;
+  f_t* x = a.x;
+  const f_t tt = a.tight_tol * 10;
+  for (i_t i = tid; i < m; i += kXbThreads) {
+    f_t v = a.rhs[i];
+    for (i_t p = a.Arow_row_start[i]; p < a.Arow_row_start[i + 1]; ++p) {
+      const i_t j = a.Arow_j[p];
+      if (a.vstatus[j] == variable_status_t::BASIC) { continue; }
+      const f_t xj = x[j];
+      if (fabs(xj) < tt) { continue; }
+      v -= a.Arow_x[p] * xj;
+    }
+    r[i] = v;
+  }
+  __syncthreads();
+  const auto& I = inv[blockIdx.x];
+  for (i_t i = tid; i < m; i += kXbThreads) {
+    f_t v = 0.0;
+    for (i_t p = I.Lr_p[i]; p < I.Lr_p[i + 1]; ++p) { v += I.Lr_x[p] * r[I.Lr_i[p]]; }
+    z[i] = v;
+  }
+  __syncthreads();
+  for (i_t k = tid; k < m; k += kXbThreads) {
+    f_t v = 0.0;
+    for (i_t p = I.Ur_p[k]; p < I.Ur_p[k + 1]; ++p) { v += I.Ur_x[p] * z[I.Ur_i[p]]; }
+    x[a.basic_list[k]] = v;
+  }
+  __syncthreads();
+  f_t part = 0.0;
+  for (i_t j = tid; j < n; j += kXbThreads) { part += a.objective[j] * x[j]; }
+  const f_t obj = cub::BlockReduce<f_t, kXbThreads>(otmp).Sum(part);
+  if (tid == 0) { st.obj = obj; }
+  if (tid < 32) {
+    gpu_lp lp;
+    gpu_settings settings;
+    gpu_solution sol;
+    fission_views(a, lp, settings, sol);
+    f_t* sq = st.squared_infeas.data();
+    for (i_t j = tid; j < n; j += 32) { sq[j] = 0.0; }
+    __syncwarp(0xffffffffu);
+    compute_initial_primal_infeasibilities(lp, settings, st.ft, a.basic_list, x, st.squared_infeas,
+                                           st.infeas_idx, st.primal_inf);
+  }
 }
 
 // Incremental infeasibility update after a pivot: the basic variables at the positions of
