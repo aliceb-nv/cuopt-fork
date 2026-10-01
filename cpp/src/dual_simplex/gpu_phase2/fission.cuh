@@ -26,6 +26,7 @@ enum fission_step_t : int {
   S_U_MPF, S_U_INFEAS, S_U_TAIL, S_U_JOIN,
   // fission_update_block's primal chain (warps 1..7), concurrent with S_U_MPF: not in the total.
   S_UP_DX, S_UP_PRIMAL, S_UP_OBJ, S_UP_CUTOFF, S_UP_SENORM, S_UP_SWAP,
+  S_TL_DOT, S_TL_AXPY, S_TL_UPD,  // EXP: replay internals (warp 0), not in the total
   kFissionSteps
 };
 __device__ unsigned long long g_fstep[kFissionSteps][2];
@@ -53,6 +54,8 @@ __device__ fission_utrace_t* g_ctrace;  // CUOPT_BNB_GPU_FISSION_CTRACE: same, p
 __device__ unsigned long long g_ctrace_n;
 __device__ fission_utrace_t* g_strace;  // CUOPT_BNB_GPU_FISSION_STRACE: same, per setup block
 __device__ unsigned long long g_strace_n;
+__device__ fission_utrace_t* g_ftrace;  // CUOPT_BNB_GPU_FISSION_FTRACE: same, per FTRAN block
+__device__ unsigned long long g_ftrace_n;
 constexpr unsigned long long kUtraceCap = 1ull << 21;
 __device__ __forceinline__ unsigned long long fission_gtime()
 {
@@ -62,6 +65,7 @@ __device__ __forceinline__ unsigned long long fission_gtime()
 }
 
 constexpr int kFissionThreads = 1024;
+constexpr int kShortDot = 2;   // CHOSEN: replay dots up to this length without shuffles
 constexpr int kShortSeg       = 8;  // gather/mark segments up to this length: one thread  // B/D block size (32 registers, 2 seats per SM)
 
 __device__ __forceinline__ void fission_views(const kernel_args& a, gpu_lp& lp, gpu_settings& settings,
@@ -285,6 +289,8 @@ __global__ void __launch_bounds__(32) fission_setup_kernel(kernel_args* args, i_
     r.live = 1;
     for (int q = 0; q < 6; ++q) { r.sub[q] = static_cast<int>(a.slot->pre[q]); }
   }
+  if (threadIdx.x == 0) { a.slot->f_mrows = a.slot->ft.num_updates_ == 0 ? 0 : -1; }
+  __syncwarp(0xffffffffu);
   if (a.slot->f_lean != 0) {  // fission_xb finishes this seat
     emit();
     return;
@@ -794,18 +800,25 @@ __device__ __forceinline__ size_t fission_tloop_chunked(const gpu_basis_update_t
     const f_t* smu = svx + E;
     const i_t* sri = reinterpret_cast<const i_t*>(smu + n);
     const i_t* scs = sri + E;
+    long long c_dot = 0, c_axpy = 0;
     for (i_t q = 0; q < n; ++q) {
+      const long long q0 = clock64();
       const i_t kl   = asc ? q : n - 1 - q;  // local update index
       const i_t dcol = asc ? 2 * kl + 1 : 2 * kl;
       const i_t acol = asc ? 2 * kl : 2 * kl + 1;
       const i_t d0 = scs[dcol], d1 = scs[dcol + 1];
       f_t dot;
-      if (d1 - d0 <= 2) {
-        // Every lane forms the short dot itself (broadcast reads); the barrier keeps these reads of
-        // x ahead of the axpy writes below.
-        dot = 0.0;
-        if (d1 - d0 >= 1) { dot = svx[d0] * x[sri[d0]]; }
-        if (d1 - d0 == 2) { dot += svx[d0 + 1] * x[sri[d0 + 1]]; }
+      if (d1 - d0 <= kShortDot) {
+        // Every lane forms the short dot itself (broadcast reads, no shuffles); the barrier keeps
+        // these reads of x ahead of the axpy writes below.
+        f_t d[4] = {0.0, 0.0, 0.0, 0.0};
+        i_t p    = d0;
+        for (; p + 4 <= d1; p += 4) {
+#pragma unroll
+          for (int u = 0; u < 4; ++u) { d[u] += svx[p + u] * x[sri[p + u]]; }
+        }
+        for (int u = 0; p < d1; ++p, ++u) { d[u] += svx[p] * x[sri[p]]; }
+        dot = (d[0] + d[1]) + (d[2] + d[3]);
         __syncwarp(0xffffffffu);
       } else {
         f_t partial = 0.0;
@@ -813,10 +826,19 @@ __device__ __forceinline__ size_t fission_tloop_chunked(const gpu_basis_update_t
         dot = warp_reduce_add(partial);
       }
       const f_t theta = dot * smu[kl];
+      const long long q1 = clock64();
       if (fabs(theta) > tol) {
         for (i_t p = scs[acol] + lane; p < scs[acol + 1]; p += 32) { x[sri[p]] -= theta * svx[p]; }
       }
       __syncwarp(0xffffffffu);
+      c_dot += q1 - q0, c_axpy += clock64() - q1;
+    }
+    if (lane == 0) {
+      atomicAdd(&g_fstep[S_TL_DOT][0], static_cast<unsigned long long>(c_dot));
+      atomicAdd(&g_fstep[S_TL_AXPY][0], static_cast<unsigned long long>(c_axpy));
+      atomicAdd(&g_fstep[S_TL_UPD][1], static_cast<unsigned long long>(n));
+      atomicAdd(&g_fstep[S_TL_AXPY][1], 1ull);
+      atomicAdd(&g_fstep[S_TL_DOT][1], 1ull);
     }
   };
   plan(0, 0, threadIdx.x, kFissionThreads, bar_all);
@@ -835,6 +857,88 @@ __device__ __forceinline__ size_t fission_tloop_chunked(const gpu_basis_update_t
     cur = 1 - cur;
   }
   return 2 * half;
+}
+
+// Product-form replay through M (see fission_update_block): all K dots against the input, the
+// thetas by a triangular solve on warp 0, then all axpys (shared float atomics). Same tolerance
+// rule: a theta with |theta| <= tol is dropped. scratch: 3K + 1024 doubles of shared memory.
+__device__ __forceinline__ void fission_tloop_m(const gpu_basis_update_t& ft, f_t* x, bool asc, f_t tol,
+                                                const f_t* M, int kc, f_t* scratch, size_t stage_doubles)
+{
+  const i_t K = ft.num_updates_;
+  if (K == 0) { return; }
+  const i_t* cs = ft.S_.col_start.data();
+  const i_t* ri = ft.S_.i.data();
+  const f_t* vx = ft.S_.x.data();
+  const f_t* mu = ft.mu_values_.data();
+  f_t* d        = scratch;
+  f_t* th       = scratch + K;
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+  const long long mc0 = clock64();
+  for (i_t k = warp; k < K; k += nw) {
+    const i_t c = asc ? 2 * k + 1 : 2 * k;
+    f_t part    = 0.0;
+    for (i_t p = cs[c] + lane; p < cs[c + 1]; p += 32) { part += vx[p] * x[ri[p]]; }
+    part = warp_reduce_add(part);
+    if (lane == 0) { d[k] = part; }
+  }
+  const long long mc1 = clock64();
+  // Thetas, 32 at a time: warp 0 solves the 32x32 diagonal block of M (shared) by shuffles, then
+  // one thread per remaining row applies the block's thetas (coalesced columns of M).
+  __syncthreads();  // d from the dot step
+  f_t* D   = th + K;                 // 32 x 32 diagonal block, D[kk * 32 + jj]
+  f_t* imu = D + 32 * 32;            // 1 / mu
+  for (i_t k = threadIdx.x; k < K; k += blockDim.x) { imu[k] = 1.0 / mu[k]; }
+  const i_t nblk = (K + 31) / 32;
+  for (i_t bq = 0; bq < nblk; ++bq) {
+    const i_t jb = asc ? 32 * bq : 32 * (nblk - 1 - bq);
+    const int nb = static_cast<int>(min(i_t{32}, K - jb));
+    for (int e = threadIdx.x; e < nb * nb; e += blockDim.x) {
+      const int kk = e / nb, jj = e % nb;
+      D[kk * 32 + jj] = asc ? (kk > jj ? M[static_cast<size_t>(jb + jj) * kc + jb + kk] : 0.0)
+                            : (kk < jj ? M[static_cast<size_t>(jb + kk) * kc + jb + jj] : 0.0);
+    }
+    __syncthreads();
+    if (warp == 0) {
+      f_t r = lane < nb ? d[jb + lane] : 0.0;
+      for (int s = 0; s < nb; ++s) {
+        const int jj = asc ? s : nb - 1 - s;
+        f_t t = __shfl_sync(0xffffffffu, r, jj) * imu[jb + jj];
+        if (fabs(t) <= tol) { t = 0.0; }
+        if (lane == jj) { th[jb + jj] = t; }
+        r -= D[lane * 32 + jj] * t;  // zero outside the strict triangle
+      }
+    }
+    __syncthreads();
+    // Rows outside this block that depend on it: asc k >= jb + nb, desc k < jb.
+    const i_t k0 = asc ? jb + nb : 0, k1 = asc ? K : jb;
+    for (i_t k = k0 + threadIdx.x; k < k1; k += blockDim.x) {
+      // Unconditional and unrolled so the loads of M are in flight together.
+      f_t acc[4] = {0.0, 0.0, 0.0, 0.0};
+      const f_t* mp = asc ? M + static_cast<size_t>(jb) * kc + k : M + static_cast<size_t>(k) * kc + jb;
+      const size_t st = asc ? static_cast<size_t>(kc) : 1;
+#pragma unroll 8
+      for (int jj = 0; jj < nb; ++jj) { acc[jj & 3] += mp[jj * st] * th[jb + jj]; }
+      d[k] -= (acc[0] + acc[1]) + (acc[2] + acc[3]);
+    }
+    __syncthreads();
+  }
+  const long long mc2 = clock64();
+  for (i_t k = warp; k < K; k += nw) {
+    const f_t t = th[k];
+    if (t == 0.0) { continue; }
+    const i_t c = asc ? 2 * k : 2 * k + 1;
+    for (i_t p = cs[c] + lane; p < cs[c + 1]; p += 32) { atomicAdd(&x[ri[p]], -t * vx[p]); }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    atomicAdd(&g_fstep[S_TL_DOT][0], static_cast<unsigned long long>(mc1 - mc0));
+    atomicAdd(&g_fstep[S_TL_AXPY][0], static_cast<unsigned long long>(mc2 - mc1));
+    atomicAdd(&g_fstep[S_TL_UPD][0], static_cast<unsigned long long>(clock64() - mc2));
+    atomicAdd(&g_fstep[S_TL_DOT][1], 1ull);
+    atomicAdd(&g_fstep[S_TL_AXPY][1], 1ull);
+    atomicAdd(&g_fstep[S_TL_UPD][1], static_cast<unsigned long long>(K));
+  }
 }
 
 __device__ __forceinline__ void fission_unstage(f_t* stage, size_t bytes)
@@ -1019,7 +1123,11 @@ __global__ void __launch_bounds__(kFissionThreads, 2)
   }
   __syncthreads();
   FSTEP(S_B_UROW)
-  fission_tloop_chunked(st.ft, w, false, 1e-13, R, kFissionStage);
+  if (st.f_mrows == st.ft.num_updates_) {
+    fission_tloop_m(st.ft, w, false, 1e-13, a.fm, a.fm_kcap, R, kFissionStage / sizeof(f_t));
+  } else {
+    fission_tloop_chunked(st.ft, w, false, 1e-13, R, kFissionStage);
+  }
   FSTEP(S_B_TLOOP)
   const int nw = fission_compact_atomic(w, m, li, lx, kFissionCapA, &cnt);
   FSTEP(S_B_COMPACT)
@@ -1046,12 +1154,39 @@ __global__ void __launch_bounds__(kFissionThreads, 2)
   FSTEP(S_B_OUT)
 }
 
+__device__ __forceinline__ void fission_ftran_atomic_body(kernel_args* args, const gpu_fission_inv* inv, i_t n_problems);
 __global__ void __launch_bounds__(kFissionThreads, 2)
   fission_ftran_atomic(kernel_args* args, const gpu_fission_inv* inv, i_t n_problems)
 {
+  __shared__ fission_utrace_t r;
+  const bool tr = g_ftrace != nullptr;
+  if (tr && threadIdx.x == 0) {
+    r      = fission_utrace_t{};
+    r.t0   = fission_gtime();
+    r.args = reinterpret_cast<unsigned long long>(args);
+    r.seat = blockIdx.x;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(r.sm));
+    if (blockIdx.x < n_problems && args[blockIdx.x].done == 0 && args[blockIdx.x].slot->f_state == F_FTRAN) {
+      r.live = 1;
+      r.nzx  = args[blockIdx.x].slot->ft.num_updates_;
+      r.unz  = static_cast<int>(args[blockIdx.x].slot->rhs_sparse.i.size());
+      r.enz  = static_cast<int>(args[blockIdx.x].slot->delta_y_sparse.i.size());
+    }
+  }
+  __syncthreads();
+  fission_ftran_atomic_body(args, inv, n_problems);
+  __syncthreads();
+  if (tr && threadIdx.x == 0) {
+    r.t1 = fission_gtime();
+    g_ftrace[atomicAdd(&g_ftrace_n, 1ull) & (kUtraceCap - 1)] = r;
+  }
+}
+__device__ __forceinline__ void fission_ftran_atomic_body(kernel_args* args, const gpu_fission_inv* inv, i_t n_problems)
+{
   extern __shared__ f_t fsh[];
+  if (blockIdx.x >= n_problems) { return; }
   kernel_args& a = args[blockIdx.x];
-  if (blockIdx.x >= n_problems || a.done != 0) { return; }
+  if (a.done != 0) { return; }
   auto& st = *a.slot;
   if (st.f_state != F_FTRAN) { return; }
   __shared__ fission_scan_smem_t scs;
@@ -1074,7 +1209,11 @@ __global__ void __launch_bounds__(kFissionThreads, 2)
     if (nb > kFissionCapA) { __trap(); }
     fission_scatter_atomic(scs, I.Lc_p, I.Lc_i, I.Lc_x, b.i.data(), b.x.data(), nb, pre, z);
     FSTEP(S_F_LSCATTER)
-    fission_tloop_chunked(st.ft, z, true, 1e-16, R, kFissionStage);
+    if (st.f_mrows == st.ft.num_updates_) {
+      fission_tloop_m(st.ft, z, true, 1e-16, a.fm, a.fm_kcap, R, kFissionStage / sizeof(f_t));
+    } else {
+      fission_tloop_chunked(st.ft, z, true, 1e-16, R, kFissionStage);
+    }
     FSTEP(S_F_TLOOP)
     const int nz = fission_compact_atomic(z, m, li, lx, kFissionCapA, &cnt);
     if (r == 0) {
@@ -1123,6 +1262,31 @@ __global__ void __launch_bounds__(kFissionThreads, 2)
     }
     __syncthreads();
     FSTEP(S_F_OUT)
+  }
+  // Row K = num_updates_ of M for the coming update: M[K][j] = UTsol . col(2j), j < K. acc is zero.
+  {
+    const i_t K = st.ft.num_updates_;
+    if (st.f_mrows == K && K < a.fm_kcap) {
+      const auto& UT = st.UTsol_sparse;
+      const i_t nu   = static_cast<i_t>(UT.i.size());
+      for (i_t p = threadIdx.x; p < nu; p += blockDim.x) { acc[UT.i[p]] = UT.x[p]; }
+      __syncthreads();
+      const i_t* cs = st.ft.S_.col_start.data();
+      const i_t* ri = st.ft.S_.i.data();
+      const f_t* vx = st.ft.S_.x.data();
+      const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+      for (i_t jq = warp; jq < K; jq += blockDim.x >> 5) {
+        f_t part = 0.0;
+        for (i_t p = cs[2 * jq] + lane; p < cs[2 * jq + 1]; p += 32) { part += vx[p] * acc[ri[p]]; }
+        part = warp_reduce_add(part);
+        if (lane == 0) { a.fm[static_cast<size_t>(jq) * a.fm_kcap + K] = part; }
+      }
+      __syncthreads();
+      for (i_t p = threadIdx.x; p < nu; p += blockDim.x) { acc[UT.i[p]] = 0.0; }
+      if (threadIdx.x == 0) { st.f_mrow_k = K; }
+    } else if (threadIdx.x == 0) {
+      st.f_mrow_k = -1;
+    }
   }
   if (threadIdx.x == 0) { st.f_state = F_UPDATE; }
 }
@@ -1798,6 +1962,11 @@ __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t
     return;
   }
   FSTEP(S_U_REFCHECK)
+  {
+    // Row K of M was written by FTRAN from UTsol (the column 2K+1 just appended).
+    const i_t K = ft.num_updates_ - 1;
+    if (tid == 0) { st.f_mrows = (K >= 0 && st.f_mrows == K && st.f_mrow_k == K) ? K + 1 : -1; }
+  }
   {
     // fission_infeas_update over the block, same list order.
     f_t* sq   = st.squared_infeas.data();

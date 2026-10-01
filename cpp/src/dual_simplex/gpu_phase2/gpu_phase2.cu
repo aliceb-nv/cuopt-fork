@@ -3680,6 +3680,8 @@ struct slot_state {
   bool used_transpose_dz{false};
   i_t f_state{0};  // fissioned pivot loop (fission.cuh): next phase
   i_t f_lean{0};   // fission fresh seat: x_B, objective and infeasibilities come from fission_xb
+  i_t f_mrows{-1}; // rows of the fission replay matrix M held (== num_updates_ when usable)
+  i_t f_mrow_k{-1}; // row of M written by the last FTRAN (from UTsol), pending the update
   f_t f_pivot{0.0};    // FTRAN: (B^-1 a_q)[basic_leaving], 0 when absent
   i_t f_pivot_found{0};
 
@@ -4357,6 +4359,8 @@ struct kernel_args {
   // Caps on the preallocated MPF rank-1 store (see gpu_basis_update_t). 0/0 = uncapped, i.e.
   // the historical grow-in-kernel behaviour. Sized by mpf_store_caps().
   i_t mpf_update_cap;
+  f_t* fm{nullptr};  // fission replay matrix M of this seat, fm_kcap^2 (column-major)
+  i_t fm_kcap{0};
   i_t mpf_eta_nnz_cap;
   // Per-slot PERSISTENT solve state (slot_state<FT>): host-allocated, ZEROED blob that the kernel
   // placement-news into on first entry and reuses thereafter. This is what lets the per-pivot
@@ -6841,6 +6845,7 @@ struct gpu_batch_handle_t {
   // Fissioned path (CUOPT_BNB_GPU_FISSION): per-seat explicit-inverse pointers, set at staging.
   std::vector<gpu_fission_inv> h_finv;
   std::optional<rmm::device_buffer> d_finv;
+  std::optional<rmm::device_buffer> d_fm;  // fission replay matrices, one per seat
   std::optional<rmm::device_buffer> d_live;
   // Bound deltas of one generation, uploaded by the relaunch in one copy.
   std::optional<pinned_buf<gpu_bound_delta<i_t, f_t>>> h_deltas;
@@ -8311,7 +8316,7 @@ std::string gpu_fission_step_report()
     "update.pivcheck", "update.dx", "update.primal", "update.obj", "update.cutoff", "update.se_norms",
     "update.swap", "update.refcheck", "update.mpf", "update.infeas", "update.tail", "update.join",
     "update.p.dx", "update.p.primal", "update.p.obj", "update.p.cutoff", "update.p.se_norms",
-    "update.p.swap"};
+    "update.p.swap", "tl.dot", "tl.axpy", "tl.updates"};
   const double iters = static_cast<double>(h[S_U_TAIL][1]);
   if (iters == 0) { return {}; }
   if (const char* ut = std::getenv("CUOPT_BNB_GPU_FISSION_UTRACE"); ut != nullptr && *ut != 0) {
@@ -8349,6 +8354,21 @@ std::string gpu_fission_step_report()
     unsigned long long n = 0;
     cudaMemcpyFromSymbol(&d, g_strace, sizeof(d));
     cudaMemcpyFromSymbol(&n, g_strace_n, sizeof(n));
+    if (d != nullptr) {
+      const unsigned long long k = n < kUtraceCap ? n : kUtraceCap;
+      std::vector<fission_utrace_t> h_tr(k);
+      cudaMemcpy(h_tr.data(), d, k * sizeof(fission_utrace_t), cudaMemcpyDeviceToHost);
+      if (FILE* f = std::fopen(ut, "wb")) {
+        std::fwrite(h_tr.data(), sizeof(fission_utrace_t), k, f);
+        std::fclose(f);
+      }
+    }
+  }
+  if (const char* ut = std::getenv("CUOPT_BNB_GPU_FISSION_FTRACE"); ut != nullptr && *ut != 0) {
+    fission_utrace_t* d = nullptr;
+    unsigned long long n = 0;
+    cudaMemcpyFromSymbol(&d, g_ftrace, sizeof(d));
+    cudaMemcpyFromSymbol(&n, g_ftrace_n, sizeof(n));
     if (d != nullptr) {
       const unsigned long long k = n < kUtraceCap ? n : kUtraceCap;
       std::vector<fission_utrace_t> h_tr(k);
@@ -9412,6 +9432,14 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
     H->delta_used = 0;
   }
   if (timed) { RAFT_CUDA_TRY(cudaEventRecord(H->ev_deltas, H->stream.value())); }
+  if (gpu_fission()) {
+    const size_t kc = static_cast<size_t>(mpf_update_cap());
+    if (!H->d_fm) { H->d_fm.emplace(N * kc * kc * sizeof(f_t), H->stream); }
+    for (size_t b = 0; b < N; ++b) {
+      H->h_args[b].fm      = static_cast<f_t*>(H->d_fm->data()) + b * kc * kc;
+      H->h_args[b].fm_kcap = static_cast<i_t>(kc);
+    }
+  }
   RAFT_CUDA_TRY(cudaMemcpyAsync(H->d_args,
                                 H->h_args.data(),
                                 N * sizeof(kernel_args),
@@ -9556,6 +9584,14 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
           void* p = nullptr;
           RAFT_CUDA_TRY(cudaMalloc(&p, kUtraceCap * sizeof(fission_utrace_t)));
           RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_strace, &p, sizeof(p)));
+        });
+      }
+      if (const char* ut = std::getenv("CUOPT_BNB_GPU_FISSION_FTRACE"); ut != nullptr && *ut != 0) {
+        static std::once_flag once;
+        std::call_once(once, [] {
+          void* p = nullptr;
+          RAFT_CUDA_TRY(cudaMalloc(&p, kUtraceCap * sizeof(fission_utrace_t)));
+          RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_ftrace, &p, sizeof(p)));
         });
       }
       fission_presetup<<<Ni, kPresetupThreads, 0, cs>>>(H->d_args, Ni);
