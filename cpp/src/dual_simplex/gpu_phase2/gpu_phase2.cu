@@ -9218,7 +9218,7 @@ bool gpu_simplified_dual_phase2_batch_stage(
             H->pack.add(dev.data() + seat * width, source.data(), width * sizeof(source[0]), H->stream);
           }
         };
-        put(F.x, item.sol->x, n);
+        // No x: a fresh setup sets the nonbasic values from the bounds and solves for the basics.
         put(F.vstatus, *item.vstatus, n);
         put(F.basic_list, *item.basic_list, m);
         put(F.nonbasic_list, *item.nonbasic_list, n - m);
