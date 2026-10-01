@@ -434,7 +434,7 @@ __device__ f_t fission_objective(const gpu_lp& lp, const f_t* x,
 }
 
 // A. Steepest-edge pricing.
-__global__ void __launch_bounds__(32) fission_price(kernel_args* args, i_t n_problems)
+__device__ __forceinline__ void fission_price_body(kernel_args* args, i_t n_problems)
 {
   kernel_args& a = args[blockIdx.x];
   if (blockIdx.x >= n_problems || a.done != 0) { return; }
@@ -465,6 +465,11 @@ __global__ void __launch_bounds__(32) fission_price(kernel_args* args, i_t n_pro
   });
 }
 
+__global__ void __launch_bounds__(32) fission_price(kernel_args* args, i_t n_problems)
+{
+  fission_price_body(args, n_problems);
+}
+
 // Deterministic block helpers. Lists are index-ordered (block scans), every float sum has a fixed
 // order (one owner thread per output entry, summing a row/column segment in storage order), and
 // pattern marks are idempotent writes. Results are bitwise reproducible run to run.
@@ -472,7 +477,7 @@ __global__ void __launch_bounds__(32) fission_price(kernel_args* args, i_t n_pro
 // out[0..count) = ascending k in [0, m) with pred(k); count returned on every thread. Each thread
 // owns a contiguous chunk of up to kChunk indices per pass (blocked arrangement), so one block scan
 // of per-thread counts orders a pass of kChunk * kFissionThreads indices.
-using fission_scan_t = cub::BlockScan<int, kFissionThreads>;
+using fission_scan_t = cub::BlockScan<int, kFissionThreads, cub::BLOCK_SCAN_WARP_SCANS>;  // small temp storage
 struct fission_scan_smem_t {
   typename fission_scan_t::TempStorage tmp;
   int base;
@@ -1039,7 +1044,7 @@ __device__ __forceinline__ void fission_scatter_atomic(fission_scan_smem_t& sm, 
     len[k]      = t < n ? cp[idx[t] + 1] - cp[idx[t]] : 0;
   }
   int agg = 0;
-  cub::BlockScan<int, kFissionThreads>(sm.tmp).ExclusiveSum(len, len, agg);
+  fission_scan_t(sm.tmp).ExclusiveSum(len, len, agg);
 #pragma unroll
   for (int k = 0; k < kItems; ++k) {
     const int t = threadIdx.x * kItems + k;
@@ -1060,8 +1065,7 @@ __device__ __forceinline__ void fission_scatter_atomic(fission_scan_smem_t& sm, 
   __syncthreads();
 }
 
-__global__ void __launch_bounds__(kFissionThreads, 2)
-  fission_btran_atomic(kernel_args* args, const gpu_fission_inv* inv, i_t n_problems)
+__device__ __forceinline__ void fission_btran_atomic_body(kernel_args* args, const gpu_fission_inv* inv, i_t n_problems)
 {
   extern __shared__ f_t fsh[];
   kernel_args& a = args[blockIdx.x];
@@ -1127,6 +1131,12 @@ __global__ void __launch_bounds__(kFissionThreads, 2)
     st.f_state = F_CHOOSE;
   }
   FSTEP(S_B_OUT)
+}
+
+__global__ void __launch_bounds__(kFissionThreads, 2)
+  fission_btran_atomic(kernel_args* args, const gpu_fission_inv* inv, i_t n_problems)
+{
+  fission_btran_atomic_body(args, inv, n_problems);
 }
 
 __device__ __forceinline__ void fission_ftran_atomic_body(kernel_args* args, const gpu_fission_inv* inv, i_t n_problems);
@@ -1751,8 +1761,10 @@ __global__ void __launch_bounds__(32) fission_update(kernel_args* args, i_t n_pr
 constexpr int kUpdThreads = 256;
 constexpr int kUpdPrimal  = kUpdThreads - 32;
 using fission_upd_scan_t   = cub::BlockScan<int, kUpdThreads>;
-__device__ __forceinline__ void fission_primal_sync() { asm volatile("bar.sync 1, %0;" ::"n"(kUpdPrimal) : "memory"); }
+template <int T>
+__device__ __forceinline__ void fission_primal_sync() { asm volatile("bar.sync 1, %0;" ::"n"(T - 32) : "memory"); }
 
+template <int T>
 __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t n_problems, fission_utrace_t& r);
 __global__ void __launch_bounds__(kUpdThreads) fission_update_block(kernel_args* args, i_t n_problems)
 {
@@ -1766,7 +1778,7 @@ __global__ void __launch_bounds__(kUpdThreads) fission_update_block(kernel_args*
     asm volatile("mov.u32 %0, %%smid;" : "=r"(r.sm));
   }
   __syncthreads();
-  fission_update_block_body(args, n_problems, r);
+  fission_update_block_body<kUpdThreads>(args, n_problems, r);
   __syncthreads();
   if (tr && threadIdx.x == 0) {
     r.t1 = fission_gtime();
@@ -1774,6 +1786,7 @@ __global__ void __launch_bounds__(kUpdThreads) fission_update_block(kernel_args*
   }
 }
 
+template <int T>
 __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t n_problems, fission_utrace_t& r)
 {
   if (blockIdx.x >= n_problems) { return; }
@@ -1788,8 +1801,8 @@ __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t
     r.enz  = static_cast<int>(st.UTsol_sparse.i.size());
   }
   const long long c_beg = clock64();
-  __shared__ typename fission_upd_scan_t::TempStorage scan_tmp;
-  __shared__ f_t s_part[kUpdThreads / 32];
+  __shared__ typename cub::BlockScan<int, T, cub::BLOCK_SCAN_WARP_SCANS>::TempStorage scan_tmp;
+  __shared__ f_t s_part[T / 32];
   __shared__ int s_cut, s_fu;
   gpu_lp lp;
   gpu_settings settings;
@@ -1803,10 +1816,10 @@ __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t
   const i_t direction = st.direction, nonbasic_entering = st.nonbasic_entering;
   f_t* x = sol.x.data();
   f_t scale = -st.f_pivot;
-  __shared__ typename cub::BlockReduce<f_t, kUpdThreads>::TempStorage otmp;
+  __shared__ typename cub::BlockReduce<f_t, T>::TempStorage otmp;
   if (st.f_pivot_found == 0) {
     if (st.delta_z[entering] == 0.0) {
-      const f_t obj = fission_objective<kUpdThreads>(lp, x, otmp);
+      const f_t obj = fission_objective<T>(lp, x, otmp);
       if (tid < 32) {
         ft.path(P_NAN_RECOVERY);
         fission_exit(a, st, lp, sol, dual::status_t::NUMERICAL, st.iter, false, 0, &obj);
@@ -1841,16 +1854,16 @@ __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t
       direction == 1 ? lp.lower[leaving] - x[leaving] : lp.upper[leaving] - x[leaving];
     const f_t primal_step_length = delta_x_leaving / scale;
     f_t* delta_x                 = st.delta_x.data();
-    for (i_t k = t; k < nzx; k += kUpdPrimal) { delta_x[a.basic_list[sdx.i[k]]] = primal_step_length * sdx.x[k]; }
-    fission_primal_sync();
+    for (i_t k = t; k < nzx; k += (T - 32)) { delta_x[a.basic_list[sdx.i[k]]] = primal_step_length * sdx.x[k]; }
+    fission_primal_sync<T>();
     if (t == 0) {
       delta_x[leaving]  = delta_x_leaving;
       delta_x[entering] = primal_step_length;
     }
-    fission_primal_sync();
+    fission_primal_sync<T>();
     FSTEP_AT(S_UP_DX, 32)
     f_t part = 0.0;
-    for (i_t k = t; k < nzx; k += kUpdPrimal) {
+    for (i_t k = t; k < nzx; k += (T - 32)) {
       const i_t j = a.basic_list[sdx.i[k]];
       x[j] += delta_x[j];
       part += delta_x[j] * lp.objective[j];
@@ -1859,18 +1872,18 @@ __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t
     FSTEP_AT(S_UP_PRIMAL, 32)
     part = warp_reduce_add(part);
     if ((t & 31) == 0) { s_part[t / 32] = part; }
-    fission_primal_sync();
+    fission_primal_sync<T>();
     if (t == 0) {
       f_t total = 0.0;
-      for (int w = 0; w < kUpdPrimal / 32; ++w) { total += s_part[w]; }
+      for (int w = 0; w < (T - 32) / 32; ++w) { total += s_part[w]; }
       st.obj += total;
       st.obj += delta_x[entering] * lp.objective[entering];
     }
-    fission_primal_sync();
+    fission_primal_sync<T>();
     FSTEP_AT(S_UP_OBJ, 32)
     if (isfinite(settings.cut_off) && st.obj >= settings.cut_off) {
       int bad = 0;
-      for (i_t j = t; j < a.n; j += kUpdPrimal) {
+      for (i_t j = t; j < a.n; j += (T - 32)) {
         const variable_status_t sj = a.vstatus[j];
         const f_t zj               = a.z[j];
         if (sj != variable_status_t::BASIC && !isfinite(zj)) { bad = 1; }
@@ -1879,9 +1892,9 @@ __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t
         else if (sj == variable_status_t::NONBASIC_FREE && fabs(zj) > settings.dual_tol) { bad = 1; }
       }
       if (t == 0) { s_cut = 1; }
-      fission_primal_sync();
+      fission_primal_sync<T>();
       if (bad) { s_cut = 0; }
-      fission_primal_sync();
+      fission_primal_sync<T>();
     }
     FSTEP_AT(S_UP_CUTOFF, 32)
     if (s_cut == 0) {
@@ -1891,15 +1904,15 @@ __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t
       if (v_dense) {
         v = ft.dense_scratch2_.data();
       } else {
-        for (i_t k = t; k < static_cast<i_t>(st.v_sparse.i.size()); k += kUpdPrimal) { v[st.v_sparse.i[k]] += st.v_sparse.x[k]; }
-        fission_primal_sync();
+        for (i_t k = t; k < static_cast<i_t>(st.v_sparse.i.size()); k += (T - 32)) { v[st.v_sparse.i[k]] += st.v_sparse.x[k]; }
+        fission_primal_sync<T>();
       }
       const f_t wr = -scale;
       if (wr != 0) {
         const f_t dyn    = st.dy_norm_sq;
         const f_t omegar = dyn / (wr * wr);
         f_t* dyse        = a.dy_se;
-        for (i_t h = t; h < nzx; h += kUpdPrimal) {
+        for (i_t h = t; h < nzx; h += (T - 32)) {
           const i_t k = sdx.i[h];
           const i_t j = a.basic_list[k];
           if (k == basic_leaving) {
@@ -1914,10 +1927,10 @@ __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t
         }
       }
       if (!v_dense) {
-        fission_primal_sync();
-        for (i_t k = t; k < static_cast<i_t>(st.v_sparse.i.size()); k += kUpdPrimal) { v[st.v_sparse.i[k]] = 0.0; }
+        fission_primal_sync<T>();
+        for (i_t k = t; k < static_cast<i_t>(st.v_sparse.i.size()); k += (T - 32)) { v[st.v_sparse.i[k]] = 0.0; }
       }
-      fission_primal_sync();
+      fission_primal_sync<T>();
       FSTEP_AT(S_UP_SENORM, 32)
       if (t == 0) {
         a.vstatus[entering] = variable_status_t::BASIC;
@@ -1937,7 +1950,7 @@ __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t
   __syncthreads();
   FSTEP(S_U_JOIN)
   if (s_cut != 0 || refac || s_fu != 0) {
-    const f_t obj = s_cut != 0 ? fission_objective<kUpdThreads>(lp, x, otmp) : f_t{0.0};
+    const f_t obj = s_cut != 0 ? fission_objective<T>(lp, x, otmp) : f_t{0.0};
     if (tid < 32) {
       if (s_cut != 0) {
         fission_exit(a, st, lp, sol, dual::status_t::CUTOFF, st.iter + 1, false, 0, &obj);
@@ -1962,7 +1975,7 @@ __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t
     __syncthreads();
     i_t count     = static_cast<i_t>(st.infeas_idx.size());
     const i_t nzx = static_cast<i_t>(sdx.i.size());
-    for (i_t base = 0; base < nzx; base += kUpdThreads) {
+    for (i_t base = 0; base < nzx; base += T) {
       const i_t k = base + tid;
       int add     = 0;
       i_t j       = -1;
@@ -1977,18 +1990,18 @@ __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t
         }
       }
       int pos = 0, agg = 0;
-      fission_upd_scan_t(scan_tmp).ExclusiveSum(add, pos, agg);
+      cub::BlockScan<int, T, cub::BLOCK_SCAN_WARP_SCANS>(scan_tmp).ExclusiveSum(add, pos, agg);
       if (add) { idx[count + pos] = j; }
       count += agg;
       __syncthreads();
     }
     i_t out = 0;
-    for (i_t base = 0; base < count; base += kUpdThreads) {
+    for (i_t base = 0; base < count; base += T) {
       const i_t k   = base + tid;
       const i_t j   = k < count ? idx[k] : -1;
       const int keep = (j >= 0 && sq[j] != 0.0) ? 1 : 0;
       int pos = 0, agg = 0;
-      fission_upd_scan_t(scan_tmp).ExclusiveSum(keep, pos, agg);
+      cub::BlockScan<int, T, cub::BLOCK_SCAN_WARP_SCANS>(scan_tmp).ExclusiveSum(keep, pos, agg);
       __syncthreads();  // all reads of this stride before any write into it
       if (keep) { idx[out + pos] = j; }
       out += agg;
@@ -1999,7 +2012,7 @@ __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t
   FSTEP(S_U_INFEAS)
   {
     const i_t nz = st.delta_z_indices.size();
-    for (i_t k = tid; k < nz; k += kUpdThreads) {
+    for (i_t k = tid; k < nz; k += T) {
       const i_t j          = st.delta_z_indices[k];
       st.delta_z[j]        = 0.0;
       st.delta_z_mark[j]   = 0;
@@ -2018,7 +2031,7 @@ __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t
 
 // Straggler cut: every live seat at an iteration boundary (F_PRICE) stops as REFACTOR_NEEDED
 // (reason 0); the host resumes it next generation. Seats mid-iteration reach F_PRICE within a round.
-__global__ void __launch_bounds__(32) fission_yield(kernel_args* args, i_t n_problems)
+__device__ __forceinline__ void fission_yield_body(kernel_args* args, i_t n_problems)
 {
   kernel_args& a = args[blockIdx.x];
   if (blockIdx.x >= n_problems || a.done != 0) { return; }
@@ -2029,6 +2042,35 @@ __global__ void __launch_bounds__(32) fission_yield(kernel_args* args, i_t n_pro
   gpu_solution sol;
   fission_views(a, lp, settings, sol);
   fission_exit(a, st, lp, sol, dual::status_t::REFACTOR_NEEDED, st.iter, true, 0);
+}
+
+__global__ void __launch_bounds__(32) fission_yield(kernel_args* args, i_t n_problems)
+{
+  fission_yield_body(args, n_problems);
+}
+
+// Fused rounds (CUOPT_EXP_FUSED): one block per seat runs `rounds` rounds of price, BTRAN, choose,
+// FTRAN and update with block barriers only, so seats do not wait for each other between phases.
+__global__ void __launch_bounds__(kFissionThreads, 2)
+  fission_fused(kernel_args* args, const gpu_fission_inv* inv, i_t n_problems, int rounds, int yielding)
+{
+  __shared__ fission_utrace_t r;
+  if (blockIdx.x >= n_problems) { return; }
+  for (int k = 0; k < rounds; ++k) {
+    if (args[blockIdx.x].done != 0 || args[blockIdx.x].slot->f_state == F_DONE) { return; }
+    if (yielding && threadIdx.x < 32) { fission_yield_body(args, n_problems); }
+    __syncthreads();
+    if (threadIdx.x < 32) { fission_price_body(args, n_problems); }
+    __syncthreads();
+    fission_btran_atomic_body(args, inv, n_problems);
+    __syncthreads();
+    fission_choose_block_body(args, n_problems, r);
+    __syncthreads();
+    fission_ftran_atomic_body(args, inv, n_problems);
+    __syncthreads();
+    fission_update_block_body<kFissionThreads>(args, n_problems, r);
+    __syncthreads();
+  }
 }
 
 __global__ void fission_count(const kernel_args* args, i_t n_problems, int* live)

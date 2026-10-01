@@ -2,7 +2,7 @@
 # acc.sh <tag> [device]: 1 clone, yield 0, 3 generations; compare with the existing-kernel reference.
 W=/home/scratch.yboucher_gpu_1/nvidia_cuopt-fission-exp; S=/home/scratch.yboucher_gpu_1/nvidia_cuopt/bench_results/2026-10-01/snapshot/lrsa-pool-120s.bin
 tag=$1; dev=${2:-1}; mkdir -p $W/exp/logs
-env CUDA_MODULE_LOADING=LAZY CUOPT_BNB_GPU_BATCH=auto CUOPT_BNB_GPU_FISSION=1 CUOPT_BNB_GPU_FISSION_YIELD=0 LD_LIBRARY_PATH=$W/cpp/build timeout 1800 \
+env CUDA_MODULE_LOADING=LAZY CUOPT_BNB_GPU_BATCH=auto CUOPT_BNB_GPU_FISSION=1 CUOPT_BNB_GPU_FISSION_YIELD=0 $ACC_ENV LD_LIBRARY_PATH=$W/cpp/build timeout 1800 \
   $W/cpp/build/test_netlib --replay-pool $S --device $dev --clones 1 --generations 3 --no-dive > $W/exp/logs/acc-$tag.log 2>&1
 echo "acc-$tag rc=$?"
 python3 - $W/exp/logs/acc-$tag.log <<'PY'

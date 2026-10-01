@@ -9604,8 +9604,17 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
       }
       int live0 = -1;
       bool yielding = false;
+      static const bool fused = !det && [] { const char* e = std::getenv("CUOPT_EXP_FUSED"); return e == nullptr || std::string(e) != "0"; }();
+      const size_t smem_f     = std::max(smem, smem_c);
+      if (fused) {
+        RAFT_CUDA_TRY(cudaFuncSetAttribute(fission_fused, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                           static_cast<int>(smem_f)));
+      }
       for (;;) {
-        for (int k = 0; k < gpu_fission_rounds(); ++k) {
+        if (fused) {
+          fission_fused<<<Ni, kFissionThreads, smem_f, cs>>>(H->d_args, finv, Ni, gpu_fission_rounds(), yielding ? 1 : 0);
+        }
+        for (int k = 0; k < (fused ? 0 : gpu_fission_rounds()); ++k) {
           if (yielding) { fission_yield<<<Ni, 32, 0, cs>>>(H->d_args, Ni); }
           fission_price<<<Ni, 32, 0, cs>>>(H->d_args, Ni);
           k_btran<<<Ni, kFissionThreads, smem, cs>>>(H->d_args, finv, Ni);
