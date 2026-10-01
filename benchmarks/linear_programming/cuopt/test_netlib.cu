@@ -40,6 +40,8 @@
 #include <argparse/argparse.hpp>
 
 #include <cuda_runtime.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <omp.h>
 
 #include <unordered_map>   // collapsing duplicate [TRUE MISMATCH] lines across replicas
@@ -2542,6 +2544,20 @@ void replay_pool_mode(const raft::handle_t& handle,
                       bool no_dive)
 {
   namespace ps = mip::pool_snapshot;
+  {
+    // The stored nodes stand in for nodes built by B&B workers spread over the machine: interleave
+    // this process's host pages over all NUMA nodes (one node's bandwidth caps the staging copies).
+    unsigned long mask[16] = {};
+    for (int nd = 0; nd < 1024; ++nd) {
+      if (access(("/sys/devices/system/node/node" + std::to_string(nd)).c_str(), F_OK) == 0) {
+        mask[nd / 64] |= 1ul << (nd % 64);
+      }
+    }
+    constexpr int kMpolInterleave = 3;
+    if (syscall(SYS_set_mempolicy, kMpolInterleave, mask, 1024) != 0) {
+      std::perror("replay-pool: set_mempolicy(MPOL_INTERLEAVE)");
+    }
+  }
   ps::pool_t<int, double> snap(&handle);
   std::string why;
   if (!ps::read<int, double>(file, snap, why)) {
