@@ -2807,6 +2807,10 @@ void replay_pool_mode(const raft::handle_t& handle,
                 host_s[host_s.size() / 2], host_s.back());
   }
   {
+    if (std::getenv("CUOPT_EXP_HOST_TIME") != nullptr) {
+      const std::string hv = gds::gpu_batch_harvest_report();
+      if (!hv.empty()) { std::printf("%s", hv.c_str()); }
+    }
     const std::string fs = gds::gpu_fission_step_report();
     std::istringstream in(fs);
     for (std::string line; std::getline(in, line);) { std::printf("%s\n", line.c_str()); }

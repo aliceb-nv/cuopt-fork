@@ -8527,7 +8527,8 @@ static void compact_unpack(gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H)
     }
   }
   H->seat_kind.resize(N);
-  for (size_t b = 0; b < N; ++b) {
+  const auto unpack = [&](size_t b0, size_t b1) {
+  for (size_t b = b0; b < b1; ++b) {
     const auto& e  = hd[b];
     H->seat_kind[b] = static_cast<unsigned char>(e.kind);
     if (e.kind == 1) {
@@ -8549,6 +8550,16 @@ static void compact_unpack(gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H)
       std::copy_n(reinterpret_cast<const variable_status_t*>(li + n), n, H->h_vstatus.data() + b * n);
     }
   }
+  };
+  constexpr int kUnpackThreads = 8;  // CHOSEN
+  if (full < 64) {
+    unpack(0, N);
+    return;
+  }
+  std::vector<std::thread> ths;
+  for (int t = 1; t < kUnpackThreads; ++t) { ths.emplace_back(unpack, N * t / kUnpackThreads, N * (t + 1) / kUnpackThreads); }
+  unpack(0, N / kUnpackThreads);
+  for (auto& th : ths) { th.join(); }
 }
 
 // Queue every returned field's copy (contiguous across seats) on the handle's stream.
