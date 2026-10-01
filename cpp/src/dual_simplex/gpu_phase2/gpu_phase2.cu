@@ -5563,35 +5563,39 @@ struct packed_upload_t {
     const size_t desc  = align(used);
     const size_t total = desc + P * (2 * sizeof(void*) + sizeof(size_t));
     reserve(total, s);
-    {
-      // Contiguous runs of pieces of about equal bytes per thread.
-      unsigned char* hb = hdata();
-      const auto run = [&](size_t k0, size_t k1) {
-        for (size_t k = k0; k < k1; ++k) { std::memcpy(hb + src[k], from[k], bytes[k]); }
-      };
-      static const int env_t = [] { const char* e = std::getenv("CUOPT_EXP_PACK_THREADS"); return e ? std::atoi(e) : 0; }();
-      const int T = used < (size_t{8} << 20) ? 1 : (env_t > 0 ? env_t : kCopyThreads);
-      const auto tc0 = std::chrono::steady_clock::now();
-      std::vector<std::thread> ths;
-      size_t k0 = 0;
-      for (int t = 0; t < T && k0 < P; ++t) {
-        const size_t goal = used * static_cast<size_t>(t + 1) / static_cast<size_t>(T);
-        size_t k1         = k0;
-        while (k1 < P && (t == T - 1 || src[k1] < goal)) { ++k1; }
-        if (t + 1 < T) { ths.emplace_back(run, k0, k1); } else { run(k0, k1); }
-        k0 = k1;
-      }
-      for (auto& th : ths) { th.join(); }
-      if (std::getenv("CUOPT_EXP_PACK_TIME") != nullptr && used > (size_t{8} << 20)) {
-        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc0).count();
-        std::fprintf(stderr, "[EXP-PACK] threads=%d pieces=%zu MB=%.1f copy_ms=%.2f GB/s=%.1f\n", T, P, used / 1e6, ms, used / 1e6 / ms);
-      }
-    }
     if (total > dev_cap) {
       d.emplace(cap, s);
       dev_cap = cap;
     }
     auto* base = static_cast<unsigned char*>(d->data());
+    {
+      // Chunks of whole pieces: chunk c is copied to the device while chunk c+1 is packed.
+      constexpr size_t kChunk = size_t{64} << 20;  // CHOSEN
+      unsigned char* hb = hdata();
+      const auto run = [&](size_t k0, size_t k1) {
+        for (size_t k = k0; k < k1; ++k) { std::memcpy(hb + src[k], from[k], bytes[k]); }
+      };
+      size_t c0 = 0;
+      while (c0 < P) {
+        size_t c1 = c0;
+        while (c1 < P && src[c1] + bytes[c1] - src[c0] <= kChunk) { ++c1; }
+        if (c1 == c0) { c1 = c0 + 1; }
+        const size_t b0 = src[c0], b1 = src[c1 - 1] + bytes[c1 - 1], cb = b1 - b0;
+        const int T     = cb < (size_t{4} << 20) ? 1 : kCopyThreads;
+        std::vector<std::thread> ths;
+        size_t k0 = c0;
+        for (int t = 0; t < T && k0 < c1; ++t) {
+          const size_t goal = b0 + cb * static_cast<size_t>(t + 1) / static_cast<size_t>(T);
+          size_t k1         = k0;
+          while (k1 < c1 && (t == T - 1 || src[k1] < goal)) { ++k1; }
+          if (t + 1 < T) { ths.emplace_back(run, k0, k1); } else { run(k0, k1); }
+          k0 = k1;
+        }
+        for (auto& th : ths) { th.join(); }
+        RAFT_CUDA_TRY(cudaMemcpyAsync(base + b0, hb + b0, cb, cudaMemcpyHostToDevice, s.value()));
+        c0 = c1;
+      }
+    }
     auto** hs  = reinterpret_cast<void**>(hdata() + desc);
     auto** hd  = hs + P;
     auto* hn   = reinterpret_cast<size_t*>(hd + P);
@@ -5600,7 +5604,7 @@ struct packed_upload_t {
       hd[k] = dst[k];
       hn[k] = bytes[k];
     }
-    RAFT_CUDA_TRY(cudaMemcpyAsync(base, hdata(), total, cudaMemcpyHostToDevice, s.value()));
+    RAFT_CUDA_TRY(cudaMemcpyAsync(base + desc, hdata() + desc, total - desc, cudaMemcpyHostToDevice, s.value()));
     if (mid != nullptr) { RAFT_CUDA_TRY(cudaEventRecord(mid, s.value())); }
     auto** ds = reinterpret_cast<void**>(base + desc);
     auto* dn  = reinterpret_cast<size_t*>(ds + 2 * P);
