@@ -9559,7 +9559,7 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
       RAFT_CUDA_TRY(cudaFuncSetAttribute(k_ftran, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                          static_cast<int>(smem)));
       const size_t smem_c = static_cast<size_t>(H->rows) * sizeof(f_t) +
-                            static_cast<size_t>(H->cols - H->rows) * (sizeof(f_t) + sizeof(i_t));
+                            static_cast<size_t>(H->cols - H->rows) * 2 * (sizeof(f_t) + sizeof(i_t));
       RAFT_CUDA_TRY(cudaFuncSetAttribute(fission_choose_block, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                          static_cast<int>(smem_c)));
       if (const char* ut = std::getenv("CUOPT_BNB_GPU_FISSION_UTRACE"); ut != nullptr && *ut != 0) {

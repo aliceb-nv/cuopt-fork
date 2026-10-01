@@ -1354,8 +1354,10 @@ __device__ __forceinline__ void fission_choose_block_body(kernel_args* args, i_t
   const int tid = threadIdx.x;
   const i_t m = a.m, n = a.n, nn = n - m;
   f_t* dyd  = fsh;
-  f_t* crat = fsh + m;
-  i_t* cpos = reinterpret_cast<i_t*>(crat + nn);
+  f_t* crat = fsh + m;          // candidate ratio
+  f_t* caz  = crat + nn;        // candidate |z_j|
+  i_t* cpos = reinterpret_cast<i_t*>(caz + nn);  // candidate nonbasic position k
+  i_t* cj   = cpos + nn;        // candidate column j
   FSTEP_BEGIN
   auto& dys      = st.delta_y_sparse;
   const i_t nzdy = static_cast<i_t>(dys.i.size());
@@ -1425,6 +1427,8 @@ __device__ __forceinline__ void fission_choose_block_body(kernel_args* args, i_t
     if (eligible) {
       cpos[ncand + pos] = k;
       crat[ncand + pos] = ratio;
+      cj[ncand + pos]   = j;
+      caz[ncand + pos]  = fabs(z[j]);
     }
     ncand += agg;
     __syncthreads();
@@ -1442,14 +1446,13 @@ __device__ __forceinline__ void fission_choose_block_body(kernel_args* args, i_t
     const f_t ztol = a.zero_tol;
     i_t entering = -1, nonbasic_entering = -1;
     f_t step = dev_inf(), min_val = dev_inf();
+    // Shared memory only: |z| of the current choice is carried in a register.
+    f_t az_e = 0.0;
     for (int c = 0; c < ncand; ++c) {
-      const i_t k  = cpos[c];
-      const i_t j  = a.nonbasic_list[k];
       const f_t rc = crat[c];
-      if (rc < min_val) {
-        min_val = rc, entering = j, step = rc, nonbasic_entering = k;
-      } else if (rc < min_val + ztol && fabs(z[j]) > fabs(z[entering])) {
-        min_val = rc, entering = j, step = rc, nonbasic_entering = k;
+      const f_t az = caz[c];
+      if (rc < min_val || (rc < min_val + ztol && az > az_e)) {
+        min_val = rc, step = rc, az_e = az, entering = cj[c], nonbasic_entering = cpos[c];
       }
     }
     st.entering          = entering;
