@@ -18,6 +18,8 @@
 
 #include <branch_and_bound/bad_node_dump.hpp>
 #include <branch_and_bound/gpu_node_pool.hpp>
+#include <branch_and_bound/pool_snapshot.hpp>
+#include <dual_simplex/gpu_phase2/explicit_inverse.hpp>
 #include <dual_simplex/basis_solves.hpp>
 #include <dual_simplex/basis_updates.hpp>
 #include <dual_simplex/gpu_phase2/gpu_phase2.cuh>
@@ -56,9 +58,11 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "benchmark_helper.hpp"
+#include "ftran_bench.hpp"
 
 // `NAME=0` must mean OFF. The older TEST_NETLIB_* switches test only for presence, so `=0` turns
 // them ON; the switches added here use this helper instead, matching the CUOPT_* convention.
@@ -2516,6 +2520,276 @@ void replay_node_mode(const raft::handle_t& handle, const std::string& file, dou
   }
 }
 
+
+// --replay-pool mode: steady-state emulation of one GPU from a pool snapshot
+// (CUOPT_BNB_GPU_SNAPSHOT). Every stored node is factorized once up front; `clones` copies of the
+// pool then run on their own host threads and streams for `seconds`, each finished or
+// rebuild-requesting seat restarting with the next stored node (each clone starting at its own
+// offset). Rates are taken over the window after `warmup` seconds.
+struct replay_gen_t {
+  double t_launch, t_done;
+  int64_t iters, finished, dive_nodes, abandoned, other;
+};
+
+void replay_pool_mode(const raft::handle_t& handle,
+                      const std::string& file,
+                      int device,
+                      int clones,
+                      double seconds,
+                      double warmup,
+                      int generations,
+                      int threads,
+                      bool no_dive)
+{
+  namespace ps = mip::pool_snapshot;
+  ps::pool_t<int, double> snap(&handle);
+  std::string why;
+  if (!ps::read<int, double>(file, snap, why)) {
+    std::fprintf(stderr, "replay-pool: cannot load %s (%s)\n", file.c_str(), why.c_str());
+    std::exit(1);
+  }
+  const auto& h  = snap.h;
+  const auto& lp = snap.lp;
+  const int m = h.m, n = h.n;
+  if (clones <= 0) { clones = h.pools_on_device; }
+  std::printf("replay-pool %s: m=%d n=%d seats=%d (new %d, rebuild %d, child %d, empty %d) captured "
+              "t=%.1fs on gpu %d with %d pools; replay on gpu %d with %d clones\n",
+              file.c_str(), m, n, h.seats, h.count[0], h.count[1], h.count[2], h.count[3],
+              h.elapsed, h.device, h.pools_on_device, device, clones);
+
+  // Stored nodes: every non-empty seat, as a new node from its basis.
+  std::vector<mip::gpu_batch_node_t<int, double>> stored;
+  for (const auto& s : snap.seats) {
+    if (s.rec.command == ps::PARKED) { continue; }
+    stored.emplace_back(m, n);
+    auto& node = stored.back();
+    node.lower = lp.lower;
+    node.upper = lp.upper;
+    for (size_t q = 0; q < s.cols.size(); ++q) {
+      node.lower[s.cols[q]] = s.lo[q];
+      node.upper[s.cols[q]] = s.up[q];
+    }
+    node.vstatus.resize(n);
+    for (int j = 0; j < n; ++j) { node.vstatus[j] = static_cast<ds::variable_status_t>(s.vstatus[j]); }
+    node.dy_se = s.dy_se;
+    ps::apply_settings<int, double>(s.rec, node.settings);
+    node.settings.time_limit = std::numeric_limits<double>::infinity();
+  }
+  std::vector<mip::batch_seat_state_t<int, double>> prepared;
+  const double f0 = mo::tic();
+  const auto ok   = mip::gpu_batch_factor_fresh<int, double>(lp, stored, prepared, threads);
+  std::vector<int> usable;
+  for (size_t k = 0; k < ok.size(); ++k) {
+    if (ok[k]) { usable.push_back(static_cast<int>(k)); }
+  }
+  std::printf("prepared %zu of %zu stored nodes (host LU + duals) in %.2fs\n", usable.size(),
+              stored.size(), mo::toc(f0));
+  if (usable.empty()) { std::exit(1); }
+  const int U = static_cast<int>(usable.size());
+
+  // CUOPT_BNB_GPU_FISSION: explicit inverses of every stored node, resident on the device for the
+  // whole replay (the analogue of the up-front LUs).
+  std::vector<gds::gpu_fission_inv> finv(stored.size());
+  if (const char* e = std::getenv("CUOPT_BNB_GPU_FISSION"); e != nullptr && std::string(e) != "0") {
+    namespace ei = cuopt::linear_programming::dual_simplex::explicit_inverse;
+    const double ti = mo::tic();
+    std::vector<ei::inverses_t> inv(stored.size());
+    std::atomic<int> next{0};
+    std::vector<std::thread> th;
+    for (int w = 0; w < std::max(1, threads); ++w) {
+      th.emplace_back([&] {
+        ei::workspace_t ws;
+        for (int q = next++; q < U; q = next++) {
+          const int k  = usable[q];
+          const auto& ft = prepared[k].ft;
+          ei::build(m, ft.L0().col_start.data(), ft.L0().i.data(), ft.L0().x.data(),
+                    ft.U0().col_start.data(), ft.U0().i.data(), ft.U0().x.data(),
+                    ft.row_permutation().data(), ws, inv[k]);
+        }
+      });
+    }
+    for (auto& t : th) { t.join(); }
+    size_t bytes = 0;
+    auto up = [&](const auto& v) {
+      using T = typename std::decay_t<decltype(v)>::value_type;
+      T* p    = nullptr;
+      const size_t nb = std::max<size_t>(1, v.size()) * sizeof(T);
+      cudaMalloc(&p, nb);
+      cudaMemcpy(p, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice);
+      bytes += nb;
+      return p;
+    };
+    for (int k : usable) {
+      auto& f = finv[k];
+      f.Lr_p = up(inv[k].Lr.p), f.Lr_i = up(inv[k].Lr.i), f.Lr_x = up(inv[k].Lr.x);
+      f.Lc_p = up(inv[k].Lc.p), f.Lc_i = up(inv[k].Lc.i), f.Lc_x = up(inv[k].Lc.x);
+      f.Ur_p = up(inv[k].Ur.p), f.Ur_i = up(inv[k].Ur.i), f.Ur_x = up(inv[k].Ur.x);
+      f.Uc_p = up(inv[k].Uc.p), f.Uc_i = up(inv[k].Uc.i), f.Uc_x = up(inv[k].Uc.x);
+    }
+    std::printf("fission: explicit inverses of %d nodes in %.2fs, %.2f GB on the device\n", U,
+                mo::toc(ti), bytes / 1e9);
+  }
+
+  std::vector<ds::variable_type_t> var_types(h.n_var_types);
+  for (int j = 0; j < h.n_var_types; ++j) {
+    var_types[j] = static_cast<ds::variable_type_t>(snap.var_types[j]);
+  }
+  std::vector<int> pc_num_down(snap.pc_num_down.begin(), snap.pc_num_down.end());
+  std::vector<int> pc_num_up(snap.pc_num_up.begin(), snap.pc_num_up.end());
+
+  auto* cache = gds::gpu_ro_cache_create<int, double>();
+  gds::gpu_ro_cache_prebuild<int, double>(cache, lp);
+
+  const int N = h.seats;
+  std::vector<std::vector<replay_gen_t>> gens(clones);
+  std::vector<std::string> errors(clones);
+  std::atomic<int> started{0};
+  const double t0 = mo::tic();
+  auto clone_main = [&](int c) {
+    cudaSetDevice(device);
+    rmm::cuda_stream stream;
+    std::vector<mip::gpu_batch_node_t<int, double>> nodes;
+    std::vector<mip::batch_seat_state_t<int, double>> seat_state;
+    int cursor = static_cast<int>((static_cast<int64_t>(c) * U) / clones);
+    std::vector<int> seat_node(N);
+    for (int s = 0; s < N; ++s) {
+      seat_node[s] = usable[cursor];
+      cursor       = (cursor + 1) % U;
+      nodes.push_back(stored[seat_node[s]]);
+    }
+    auto* run = mip::gpu_persistent_batch_begin<int, double>(
+      lp, nodes, stream.view(), cache, &seat_state, true, var_types.empty() ? nullptr : &var_types);
+    if (run == nullptr) {
+      errors[c] = "first launch failed";
+      return;
+    }
+    ++started;
+    double t_launch = mo::toc(t0);
+    std::string err;
+    for (int g = 0;; ++g) {
+      if (!mip::gpu_persistent_batch_harvest<int, double>(run)) {
+        errors[c] = "harvest failed";
+        break;
+      }
+      replay_gen_t r{t_launch, mo::toc(t0), 0, 0, 0, 0, 0};
+      for (int s = 0; s < N; ++s) {
+        if (h.dive_rounds > 0 && g > 0 && !no_dive) {
+          const auto dive = mip::gpu_persistent_batch_dive<int, double>(run, s);
+          for (int q = 0; q < dive.count; ++q) { r.iters += dive.records[q].iterations; }
+          r.dive_nodes += dive.count;
+        }
+        const auto v = mip::gpu_persistent_batch_result<int, double>(run, s);
+        r.iters += v.iterations;
+        if (v.status == ds::dual::status_t::REFACTOR_NEEDED) {
+          ++r.abandoned;
+        } else if (v.status == ds::dual::status_t::NUMERICAL ||
+                   v.status == ds::dual::status_t::ITERATION_LIMIT) {
+          ++r.other;
+        } else {
+          ++r.finished;
+        }
+      }
+      if (generations > 0 && c == 0 && g + 1 == generations) {
+        for (int s = 0; s < N; ++s) {
+          const auto v = mip::gpu_persistent_batch_result<int, double>(run, s);
+          std::printf("seat %4d node %4d %-18s obj=%.17g it=%d\n", s, seat_node[s],
+                      ds::dual_status_to_string(v.status).c_str(), v.objective, v.iterations);
+        }
+      }
+      gens[c].push_back(r);
+      if (generations > 0 ? g + 1 >= generations : r.t_done >= seconds) { break; }
+      for (int s = 0; s < N; ++s) {
+        seat_node[s] = usable[cursor];
+        cursor       = (cursor + 1) % U;
+        if (!mip::gpu_persistent_batch_stage_fresh_from<int, double>(
+              run, s, stored[seat_node[s]], prepared[seat_node[s]], err, &finv[seat_node[s]])) {
+          errors[c] = "stage: " + err;
+          break;
+        }
+      }
+      if (!errors[c].empty()) { break; }
+      if (h.n_pc > 0) {
+        mip::gpu_batch_run_set_pseudocosts<int, double>(run,
+                                                        snap.pc_sum_down.data(),
+                                                        snap.pc_sum_up.data(),
+                                                        pc_num_down.data(),
+                                                        pc_num_up.data(),
+                                                        h.pc_avg_down,
+                                                        h.pc_avg_up,
+                                                        h.reliable_threshold,
+                                                        h.integer_tol);
+        if (h.dive_rounds > 0 && !no_dive) {
+          mip::gpu_batch_run_set_dive<int, double>(run, h.dive_rounds, snap.root_x.data());
+        }
+      }
+      t_launch = mo::toc(t0);
+      if (!mip::gpu_persistent_batch_relaunch<int, double>(run, err)) {
+        errors[c] = "relaunch: " + err;
+        break;
+      }
+    }
+    mip::gpu_batch_run_end<int, double>(run);
+  };
+  std::vector<std::thread> workers;
+  for (int c = 0; c < clones; ++c) { workers.emplace_back(clone_main, c); }
+  for (auto& w : workers) { w.join(); }
+  gds::gpu_ro_cache_destroy<int, double>(cache);
+  for (int c = 0; c < clones; ++c) {
+    if (!errors[c].empty()) { std::printf("clone %d: ERROR %s\n", c, errors[c].c_str()); }
+  }
+
+  // Window: generations completing after `warmup`, up to the earliest clone's last completion.
+  double t_end = std::numeric_limits<double>::infinity();
+  for (const auto& gc : gens) {
+    if (!gc.empty()) { t_end = std::min(t_end, gc.back().t_done); }
+  }
+  const double t_beg = generations > 0 ? 0.0 : warmup;
+  int64_t iters = 0, finished = 0, dive_nodes = 0, abandoned = 0, other = 0, ngen = 0;
+  std::vector<double> gen_s, host_s;
+  for (const auto& gc : gens) {
+    for (size_t g = 0; g < gc.size(); ++g) {
+      const auto& r = gc[g];
+      if (r.t_done <= t_beg || r.t_done > t_end) { continue; }
+      if (g + 1 < gc.size()) { host_s.push_back(gc[g + 1].t_launch - r.t_done); }
+      iters += r.iters;
+      finished += r.finished;
+      dive_nodes += r.dive_nodes;
+      abandoned += r.abandoned;
+      other += r.other;
+      ++ngen;
+      gen_s.push_back(r.t_done - r.t_launch);
+    }
+  }
+  const double win = t_end - t_beg;
+  std::sort(gen_s.begin(), gen_s.end());
+  const auto pct = [&](double p) {
+    return gen_s.empty() ? 0.0 : gen_s[std::min(gen_s.size() - 1, size_t(p * gen_s.size()))];
+  };
+  std::printf("window %.2f-%.2fs (%.2fs): generations=%lld iterations=%lld -> %.3fM it/s | nodes "
+              "finished=%lld (+%lld in dives) -> %.0f nodes/s | abandoned (LU rebuild)=%lld "
+              "numerical/iter-limit=%lld\n",
+              t_beg, t_end, win, (long long)ngen, (long long)iters, iters / win / 1e6,
+              (long long)finished, (long long)dive_nodes, (finished + dive_nodes) / win,
+              (long long)abandoned, (long long)other);
+  std::printf("generation launch-to-results seconds: p10=%.3f p50=%.3f p90=%.3f max=%.3f\n",
+              pct(0.1), pct(0.5), pct(0.9), gen_s.empty() ? 0.0 : gen_s.back());
+  std::sort(host_s.begin(), host_s.end());
+  if (!host_s.empty()) {
+    std::printf("host results-to-relaunch seconds (restage all seats): p50=%.3f max=%.3f\n",
+                host_s[host_s.size() / 2], host_s.back());
+  }
+  {
+    const std::string fs = gds::gpu_fission_step_report();
+    std::istringstream in(fs);
+    for (std::string line; std::getline(in, line);) { std::printf("%s\n", line.c_str()); }
+  }
+  const std::string clk = gds::gpu_batch_seat_clock_report();
+  if (!clk.empty()) {
+    std::istringstream in(clk);
+    for (std::string line; std::getline(in, line);) { std::printf("%s\n", line.c_str()); }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char* argv[])
@@ -2558,6 +2832,33 @@ int main(int argc, char* argv[])
           "times and solve them ALL on the CPU (OpenMP across problems) and the GPU (one block per "
           "problem, single launch), reporting total runtime for each and verifying every result is "
           "bit-for-bit identical to a single-thread sequential reference");
+  program.add_argument("--ftran-bench")
+    .help("pool snapshot: batched base-factor FTRAN kernels on its nodes, --replicas copies each "
+          "(needs --device)");
+  program.add_argument("--ftran-repeats").default_value(5).scan<'i', int>();
+  program.add_argument("--replay-pool")
+    .help("pool snapshot written under CUOPT_BNB_GPU_SNAPSHOT=<file>: emulate one GPU's steady state "
+          "with --clones copies of the pool for --seconds (needs --device)");
+  program.add_argument("--device").help("CUDA device for --replay-pool").default_value(-1).scan<'i', int>();
+  program.add_argument("--clones")
+    .help("pool copies for --replay-pool (0: the captured GPU's pool count)")
+    .default_value(0)
+    .scan<'i', int>();
+  program.add_argument("--seconds").help("--replay-pool duration").default_value(30.0).scan<'g', double>();
+  program.add_argument("--warmup")
+    .help("--replay-pool: seconds excluded from the rates")
+    .default_value(5.0)
+    .scan<'g', double>();
+  program.add_argument("--generations")
+    .help("--replay-pool: run exactly this many launches per clone and print clone 0's seats "
+          "(correctness check); 0 = timed")
+    .default_value(0)
+    .scan<'i', int>();
+  program.add_argument("--no-dive").help("--replay-pool: no in-kernel dives").flag();
+  program.add_argument("--prepare-threads")
+    .help("--replay-pool: host threads for the up-front LUs")
+    .default_value(32)
+    .scan<'i', int>();
   program.add_argument("--replicas")
     .help("replication factor for --benchmark-parallel (unique nodes x this = total problems)")
     .default_value(10)
@@ -2596,6 +2897,23 @@ int main(int argc, char* argv[])
   //
   // NOTE make_pool() reserves 40% of FREE VRAM up front; the batch pre-flight adds the current RMM
   // pool's size back to free VRAM, so a batch is not rejected merely because the pool exists.
+  if (program.is_used("--replay-pool") || program.is_used("--ftran-bench")) {
+    const int dev = program.get<int>("--device");
+    if (dev < 0 || cudaSetDevice(dev) != cudaSuccess) {
+      std::fprintf(stderr, "--replay-pool needs a valid --device\n");
+      return 1;
+    }
+    cudaDeviceProp p{};
+    int clk_khz = 0, mclk_khz = 0;
+    cudaGetDeviceProperties(&p, dev);
+    cudaDeviceGetAttribute(&clk_khz, cudaDevAttrClockRate, dev);
+    cudaDeviceGetAttribute(&mclk_khz, cudaDevAttrMemoryClockRate, dev);
+    std::printf("[DEVICE] index=%d name=\"%s\" cc=%d.%d sms=%d max_sm_clock_mhz=%d mem_clock_mhz=%d "
+                "smem_per_sm_kb=%zu mem_gb=%.1f pci=%04x:%02x:%02x\n",
+                dev, p.name, p.major, p.minor, p.multiProcessorCount, clk_khz / 1000, mclk_khz / 1000,
+                p.sharedMemPerMultiprocessor / 1024, p.totalGlobalMem / 1e9, p.pciDomainID, p.pciBusID,
+                p.pciDeviceID);
+  }
   auto memory_resource = make_pool();
   rmm::mr::set_current_device_resource(memory_resource);
 
@@ -2612,6 +2930,26 @@ int main(int argc, char* argv[])
                             program.get<std::string>("--verify-nodes-batch"),
                             time_limit,
                             program.get<int>("--batch-seats"));
+    return 0;
+  }
+
+  if (program.is_used("--ftran-bench")) {
+    return ftran_bench_main(handle,
+                            program.get<std::string>("--ftran-bench"),
+                            program.get<int>("--replicas"),
+                            program.get<int>("--ftran-repeats"),
+                            program.get<int>("--prepare-threads"));
+  }
+  if (program.is_used("--replay-pool")) {
+    replay_pool_mode(handle,
+                     program.get<std::string>("--replay-pool"),
+                     program.get<int>("--device"),
+                     program.get<int>("--clones"),
+                     program.get<double>("--seconds"),
+                     program.get<double>("--warmup"),
+                     program.get<int>("--generations"),
+                     program.get<int>("--prepare-threads"),
+                     program.get<bool>("--no-dive"));
     return 0;
   }
 

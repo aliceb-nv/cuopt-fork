@@ -30,6 +30,7 @@
 #include <limits>
 #include <utility>
 #include <unistd.h>
+#include <thread>
 #include <vector>
 #include <algorithm>
 #include <string>
@@ -2044,6 +2045,49 @@ struct gpu_batch_run_t {
       error);
   }
 
+  // FRESH staging from a node prepared ahead (gpu_batch_factor_fresh): no host LU here. The source
+  // node and seat state are only read and must outlive the relaunch.
+  bool stage_persistent_fresh_from(i_t s,
+                                   const gpu_batch_node_t<i_t, f_t>& cn,
+                                   const batch_seat_state_t<i_t, f_t>& cw,
+                                   std::string& error,
+                                   const gds::gpu_fission_inv* finv = nullptr)
+  {
+    auto& node = nodes[s];
+    auto& w    = st[s];
+    node.solved                  = false;
+    node.status                  = simplex::dual_status_t::UNSET;
+    node.drop                    = gpu_batch_node_t<i_t, f_t>::drop_t::NONE;
+    w.total_iters                = 0;
+    w.leg_iters                  = 0;
+    w.zero_pivot_legs            = 0;
+    w.refactor_resume            = false;
+    w.terminal_certificate_retry = false;
+    w.refactor_reason            = 0;
+    w.fail                       = gpu_batch_node_t<i_t, f_t>::drop_t::NONE;
+    if (!gds::gpu_simplified_dual_phase2_batch_factor_fits<i_t, f_t>(handle, cw.ft, false)) {
+      error = "prepared LU exceeds the seat's factor slot";
+      return false;
+    }
+    gds::gpu_batch_item<i_t, f_t> it{};
+    it.lp              = &lp;
+    it.lower           = &cn.lower;
+    it.upper           = &cn.upper;
+    it.settings        = &cn.settings;
+    it.vstatus         = const_cast<std::vector<simplex::variable_status_t>*>(&cn.vstatus);
+    it.ft              = const_cast<simplex::basis_update_mpf_t<i_t, f_t>*>(&cw.ft);
+    it.basic_list      = const_cast<std::vector<i_t>*>(&cw.basic_list);
+    it.nonbasic_list   = const_cast<std::vector<i_t>*>(&cw.nonbasic_list);
+    it.sol             = const_cast<simplex::lp_solution_t<i_t, f_t>*>(&cn.sol);
+    it.dy_se           = const_cast<std::vector<f_t>*>(&cn.dy_se);
+    it.refactor_reason = &w.refactor_reason;
+    it.command         = gds::gpu_batch_seat_command::FRESH_NODE;
+    it.fission_inv     = finv;
+    static const std::vector<gds::gpu_bound_delta<i_t, f_t>> none;
+    return gds::gpu_simplified_dual_phase2_batch_stage<i_t, f_t>(
+      handle, static_cast<size_t>(s), it, gds::gpu_batch_seat_command::FRESH_NODE, none, error);
+  }
+
   bool relaunch_persistent(std::string& error)
   {
     if (!persistent_seats || handle == nullptr) { return false; }
@@ -2355,6 +2399,18 @@ void gpu_persistent_batch_fetch_seats(gpu_batch_run<i_t, f_t>* run, const std::v
 }
 
 template <typename i_t, typename f_t>
+void gpu_persistent_batch_read_seat(gpu_batch_run<i_t, f_t>* run,
+                                    i_t seat,
+                                    std::vector<simplex::variable_status_t>& vstatus,
+                                    std::vector<f_t>& lower,
+                                    std::vector<f_t>& upper,
+                                    std::vector<f_t>& dy_se)
+{
+  gds::gpu_simplified_dual_phase2_batch_read_seat<i_t, f_t>(
+    run->handle, static_cast<size_t>(seat), vstatus, lower, upper, dy_se);
+}
+
+template <typename i_t, typename f_t>
 bool gpu_persistent_batch_park(gpu_batch_run<i_t, f_t>* run, i_t seat)
 {
   run->nodes[seat].status = simplex::dual_status_t::NUMERICAL;
@@ -2395,6 +2451,47 @@ bool gpu_persistent_batch_stage_child(
   std::string& error)
 {
   return run != nullptr && run->stage_persistent_child(seat, deltas, error);
+}
+
+template <typename i_t, typename f_t>
+bool gpu_persistent_batch_stage_fresh_from(gpu_batch_run<i_t, f_t>* run,
+                                           i_t seat,
+                                           const gpu_batch_node_t<i_t, f_t>& node,
+                                           const batch_seat_state_t<i_t, f_t>& prepared,
+                                           std::string& error,
+                                           const gds::gpu_fission_inv* finv)
+{
+  return run != nullptr && run->stage_persistent_fresh_from(seat, node, prepared, error, finv);
+}
+
+template <typename i_t, typename f_t>
+std::vector<char> gpu_batch_factor_fresh(const simplex::lp_problem_t<i_t, f_t>& lp,
+                                         std::vector<gpu_batch_node_t<i_t, f_t>>& nodes,
+                                         std::vector<batch_seat_state_t<i_t, f_t>>& seats,
+                                         int threads)
+{
+  const i_t N = static_cast<i_t>(nodes.size());
+  while (static_cast<i_t>(seats.size()) < N) {
+    seats.emplace_back(lp.num_rows, nodes[seats.size()].settings.refactor_frequency);
+  }
+  for (auto& node : nodes) { node.sol.resize(lp.num_rows, lp.num_cols); }
+  threads = std::max(1, std::min<int>(threads, N));
+  // One run per thread (refactorize keeps per-run scratch), constructed before any thread starts.
+  std::vector<std::unique_ptr<gpu_batch_run_t<i_t, f_t>>> runs;
+  for (int t = 0; t < threads; ++t) {
+    runs.push_back(std::make_unique<gpu_batch_run_t<i_t, f_t>>(
+      lp, nodes, rmm::cuda_stream_view{}, nullptr, seats, true, true));
+  }
+  std::vector<char> ok(N, 0);
+  std::atomic<i_t> next{0};
+  std::vector<std::thread> pool;
+  for (int t = 0; t < threads; ++t) {
+    pool.emplace_back([&, t] {
+      for (i_t s = next++; s < N; s = next++) { ok[s] = runs[t]->refactorize(s, true) ? 1 : 0; }
+    });
+  }
+  for (auto& th : pool) { th.join(); }
+  return ok;
 }
 
 template <typename i_t, typename f_t>
@@ -2559,6 +2656,18 @@ template bool gpu_persistent_batch_harvest<int, double>(gpu_batch_run<int, doubl
 template gds::gpu_batch_result_view<int, double> gpu_persistent_batch_result<int, double>(
   gpu_batch_run<int, double>*, int);
 template void gpu_persistent_batch_fetch_seat<int, double>(gpu_batch_run<int, double>*, int);
+template bool gpu_persistent_batch_stage_fresh_from<int, double>(
+  gpu_batch_run<int, double>*, int, const gpu_batch_node_t<int, double>&,
+  const batch_seat_state_t<int, double>&, std::string&, const gds::gpu_fission_inv*);
+template std::vector<char> gpu_batch_factor_fresh<int, double>(
+  const simplex::lp_problem_t<int, double>&, std::vector<gpu_batch_node_t<int, double>>&,
+  std::vector<batch_seat_state_t<int, double>>&, int);
+template void gpu_persistent_batch_read_seat<int, double>(gpu_batch_run<int, double>*,
+                                                         int,
+                                                         std::vector<simplex::variable_status_t>&,
+                                                         std::vector<double>&,
+                                                         std::vector<double>&,
+                                                         std::vector<double>&);
 template void gpu_batch_run_set_dive<int, double>(gpu_batch_run<int, double>*, int, const double*);
 template gds::gpu_dive_view<int, double> gpu_persistent_batch_dive<int, double>(
   gpu_batch_run<int, double>*, int);

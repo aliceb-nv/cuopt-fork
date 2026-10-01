@@ -58,6 +58,9 @@
 #include <cuda/std/limits>
 #include <cuda/std/span>
 
+#include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_reduce.cuh>
+#include <cub/block/block_scan.cuh>
 #include <cub/device/device_memcpy.cuh>
 
 #include <new>  // placement new: construct the per-slot persistent state in host-allocated memory
@@ -1905,6 +1908,14 @@ __device__ __forceinline__ T lane0_bcast(T v)
 // L0_/U0_ (+ transposes) and permutations are fixed views uploaded from the
 // host; S_/mu_values_ grow in-kernel as rank-1 updates are stacked.
 // ---------------------------------------------------------------------------
+// Kernel path counters (CUOPT_BNB_GPU_SEAT_CLOCK report [GPUBATCH-PATHS]).
+enum path_t : int {
+  P_SE_RESET, P_DZ_ROWWISE, P_DZ_COLDOT, P_UT_SPARSE, P_UT_DENSE, P_LT_SPARSE, P_LT_DENSE,
+  P_L_PAIRED, P_L_SPLIT, P_U_PAIRED, P_U_SPLIT, P_FTRAN_SPARSE_RHS, P_MPF_LEN, P_UPD_OK,
+  P_UPD_FULL, P_UPD_MU, P_ETILDE_BUCKET, P_ETILDE_PERM, P_ETILDE_NZ, P_UTILDE_NZ, P_NAN_RECOVERY,
+  P_CUTOFF_SCAN, P_V_DENSE, P_V_SCATTER, P_REFACTOR, P_LEVEL_REUSE, P_LEVEL_BUILD, kPaths
+};
+
 struct gpu_basis_update_t {
   // Compile-time tag for the BU switch in the templated driver/kernel (mirrors the CPU
   // `is_mpf = std::is_same<BU, basis_update_mpf_t>` dispatch in simplified_dual_phase2).
@@ -1967,6 +1978,12 @@ struct gpu_basis_update_t {
   mutable long long sub_[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   mutable long long wop_[4] = {0, 0, 0, 0};   // dense wavefront cycles per operator (L, U, Lt, Ut)
   mutable unsigned wn_[4]   = {0u, 0u, 0u, 0u};
+  // Path counts (lane 0), see path_t; reported by the seat clock.
+  mutable unsigned cnt_[kPaths] = {};
+  __device__ __forceinline__ void path(int k, unsigned v = 1u) const
+  {
+    if (threadIdx.x == 0) { cnt_[k] += v; }
+  }
 
   // All of these are slices of the slot memory, wired once by attach_all_buffers.
   //
@@ -2550,6 +2567,8 @@ struct gpu_basis_update_t {
 
     gpu_span<f_t>& dense0 = dense_scratch_;
     gpu_span<f_t>& dense1 = dense_scratch2_;
+    path(!sparse0 && !sparse1 ? P_L_PAIRED : P_L_SPLIT);
+    path(P_FTRAN_SPARSE_RHS, static_cast<unsigned>(sparse0) + static_cast<unsigned>(sparse1));
     if (!sparse0 && !sparse1) {
       warp_to_dense(solution0, dense0);
       warp_to_dense(solution1, dense1);
@@ -2594,6 +2613,8 @@ struct gpu_basis_update_t {
     sparse1 = lane0_bcast(static_cast<int>(sparse1)) != 0;
 
     i_t output1_nz = 0;
+    path(!sparse0 && !sparse1 ? P_U_PAIRED : P_U_SPLIT);
+    path(P_FTRAN_SPARSE_RHS, static_cast<unsigned>(sparse0) + static_cast<unsigned>(sparse1));
     if (!sparse0 && !sparse1) {
       if (dense0.size() != static_cast<size_t>(L0_.m)) { warp_to_dense(solution0, dense0); }
       if (dense1.size() != static_cast<size_t>(L0_.m)) { warp_to_dense(solution1, dense1); }
@@ -2658,6 +2679,8 @@ struct gpu_basis_update_t {
         input_size, sum_U_transpose_, num_calls_U_transpose_, max_U_transpose_, use_hypersparse);
     });
     use_hypersparse = lane0_bcast(static_cast<int>(use_hypersparse)) != 0;
+    path(use_hypersparse ? P_UT_SPARSE : P_UT_DENSE);
+    path(P_MPF_LEN, static_cast<unsigned>(num_updates_));
     // NO redundant-to_dense elision here, unlike b_solve. It is valid, but u_transpose_solve routes
     // hypersparse on 99.9% of calls (2,131,200 vs 2,700), so the flag would almost always be false
     // — and carrying it cost one extra live register, which took the monolith 128 -> 129 and so
@@ -2684,6 +2707,7 @@ struct gpu_basis_update_t {
         rhs_size, sum_L_transpose_, num_calls_L_transpose_, max_L_transpose_, use_hypersparse);
     });
     use_hypersparse = lane0_bcast(static_cast<int>(use_hypersparse)) != 0;
+    path(use_hypersparse ? P_LT_SPARSE : P_LT_DENSE);
     if (use_hypersparse) {
       l_transpose_solve(solution);
     } else {
@@ -2706,22 +2730,46 @@ struct gpu_basis_update_t {
   // Collective form of update(). Same sequence, same results; only the data-parallel spans are
   // hoisted out of the lane-0 region. The fill-tracking add_sparse_column, the two sorts and the
   // mu dot product stay on lane 0 (order-dependent append cursor / floating-point order).
+  // sub (optional, diagnostics): lane 0 adds the cycles of each step to sub[0..8], merged nnz to sub[9].
   __device__ i_t warp_update(const gpu_sparse_vector& utilde, gpu_sparse_vector& etilde,
-                             i_t leaving_index)
+                             i_t leaving_index, int* sub = nullptr)
   {
     const i_t m = L0_.m;
     i_t nz      = static_cast<i_t>(utilde.i.size());
+    long long sub_t = clock64();
+    const auto sub_mark = [&](int k) {
+      if (sub != nullptr) {
+        __syncwarp(0xffffffffu);
+        if (threadIdx.x == 0) {
+          const long long c = clock64();
+          sub[k] += static_cast<int>(c - sub_t);
+          sub_t = c;
+        }
+      }
+    };
 
     warp_scatter_ws_body(utilde.i.data(), utilde.x.data(), m, nz, xi_workspace_.data(),
                          x_workspace_.data());
+    sub_mark(0);
 
     // add_sparse_column appends fill to the index list through a running cursor, and gpu_sort is
     // serial; grow_storage allocates. One lane, one region.
     i_t base = 0;
     lane0_serial([&] {
       add_sparse_column(U0_, leaving_index, -1.0, xi_workspace_.data(), nz, x_workspace_.data());
+      if (sub != nullptr) {
+        const long long c = clock64();
+        sub[1] += static_cast<int>(c - sub_t);
+        sub[9] = nz;
+        sub_t  = c;
+      }
       gpu_sort(xi_workspace_.data() + m, xi_workspace_.data() + m + nz,
                [] __device__(i_t a, i_t b) { return a < b; });
+      if (sub != nullptr) {
+        const long long c = clock64();
+        sub[2] += static_cast<int>(c - sub_t);
+        sub_t  = c;
+      }
       i_t S_start_l = 0, S_nz_l = 0;
       if (grow_storage(nz + static_cast<i_t>(etilde.i.size()), S_start_l, S_nz_l)) {
         base = S_.col_start[S_.n];
@@ -2730,25 +2778,37 @@ struct gpu_basis_update_t {
     // The store is full: stop before touching S_, so the stack stays exactly as it was and the host
     // can refactor from the CURRENT basis. Mirrors the bail-out below -- workspace not cleared,
     // num_updates_ not bumped.
-    if (lane0_bcast(store_exhausted_ ? 1 : 0)) { return 2; }
+    path(P_UTILDE_NZ, static_cast<unsigned>(utilde.i.size()));
+    if (lane0_bcast(store_exhausted_ ? 1 : 0)) {
+      path(P_UPD_FULL);
+      return 2;
+    }
     nz   = lane0_bcast(nz);     // add_sparse_column grew it on lane 0 only
     base = lane0_bcast(base);
+    sub_mark(3);
     // S_.i/S_.x may have been relocated by grow_storage — data() is read here, after the barrier.
     const i_t end1 =
       warp_append_scatter_body(base, S_.i.data(), S_.x.data(), xi_workspace_.data() + m, nz,
                                x_workspace_.data());
+    sub_mark(4);
 
     i_t base2 = 0;
     lane0_serial([&] {
       S_.col_start[S_.n + 1] = end1;
       S_.n++;
+      path(P_ETILDE_NZ, static_cast<unsigned>(etilde.i.size()));
+      if (etilde.i.size() > 1) {
+        path(etilde.i.size() > 0.3 * etilde.n ? P_ETILDE_BUCKET : P_ETILDE_PERM);
+      }
       etilde.sort(sort_bucket_, sort_i_, sort_x_, sort_perm_);   // reused scratch, may reallocate
       base2 = S_.col_start[S_.n];
     });
     base2 = lane0_bcast(base2);
+    sub_mark(5);
     const i_t enz  = static_cast<i_t>(etilde.i.size());
     const i_t end2 =
       warp_append_sv_body(base2, S_.i.data(), S_.x.data(), etilde.i.data(), etilde.x.data(), enz);
+    sub_mark(6);
 
     i_t status = 0;
     lane0_serial([&] {
@@ -2766,12 +2826,92 @@ struct gpu_basis_update_t {
       else { mu_values_.push_back(mu); }            // CPU form: store mu, divide at apply
     });
     status = lane0_bcast(status);
+    sub_mark(7);
     // Matches the serial version: on the numerical bail-out the workspace is NOT cleared and
     // num_updates_ is NOT bumped.
-    if (status == 1) { return 1; }
+    if (status == 1) {
+      path(P_UPD_MU);
+      return 1;
+    }
+    path(P_UPD_OK);
 
     warp_clear_ws_body(m, xi_workspace_.data(), nz, x_workspace_.data());
     lane0_serial([&] { num_updates_++; });
+    sub_mark(8);
+    return 0;
+  }
+
+  // warp_update without sorting (fission): both columns are appended in arrival order, and mu is a
+  // gather of etilde against column 2k, still dense in x_workspace_. Every reader of S_ gathers or
+  // scatters through a dense vector, so index order changes only summation order.
+  __device__ i_t warp_update_unsorted(const gpu_sparse_vector& utilde, const gpu_sparse_vector& etilde,
+                                      i_t leaving_index, int* sub = nullptr)
+  {
+    const i_t m     = L0_.m;
+    const int lane  = static_cast<int>(threadIdx.x);
+    i_t nz          = static_cast<i_t>(utilde.i.size());
+    const i_t enz   = static_cast<i_t>(etilde.i.size());
+    long long sub_t = clock64();
+    const auto sub_mark = [&](int k) {
+      if (sub != nullptr) {
+        __syncwarp(0xffffffffu);
+        if (threadIdx.x == 0) {
+          const long long c = clock64();
+          sub[k] += static_cast<int>(c - sub_t);
+          sub_t = c;
+        }
+      }
+    };
+    warp_scatter_ws_body(utilde.i.data(), utilde.x.data(), m, nz, xi_workspace_.data(),
+                         x_workspace_.data());
+    sub_mark(0);
+    i_t base = 0;
+    lane0_serial([&] {
+      add_sparse_column(U0_, leaving_index, -1.0, xi_workspace_.data(), nz, x_workspace_.data());
+      if (sub != nullptr) { sub[9] = nz; }
+    });
+    sub_mark(1);
+    lane0_serial([&] {
+      i_t S_start_l = 0, S_nz_l = 0;
+      if (grow_storage(nz + enz, S_start_l, S_nz_l)) { base = S_.col_start[S_.n]; }
+    });
+    path(P_UTILDE_NZ, static_cast<unsigned>(utilde.i.size()));
+    if (lane0_bcast(store_exhausted_ ? 1 : 0)) {
+      path(P_UPD_FULL);
+      return 2;
+    }
+    nz   = lane0_bcast(nz);
+    base = lane0_bcast(base);
+    sub_mark(3);
+    const i_t end1 =
+      warp_append_scatter_body(base, S_.i.data(), S_.x.data(), xi_workspace_.data() + m, nz,
+                               x_workspace_.data());
+    sub_mark(4);
+    const i_t end2 =
+      warp_append_sv_body(end1, S_.i.data(), S_.x.data(), etilde.i.data(), etilde.x.data(), enz);
+    sub_mark(6);
+    f_t part = 0.0;
+    for (i_t k = lane; k < enz; k += 32) { part += x_workspace_[etilde.i[k]] * etilde.x[k]; }
+    const f_t mu = 1.0 + warp_reduce_add(part);
+    i_t status   = 0;
+    lane0_serial([&] {
+      path(P_ETILDE_NZ, static_cast<unsigned>(enz));
+      S_.col_start[S_.n + 1] = end1;
+      S_.col_start[S_.n + 2] = end2;
+      S_.n += 2;
+      if (fabs(mu) < 1E-8 || fabs(mu) > 1E+8) { status = 1; }
+      else { mu_values_.push_back(mu); }
+    });
+    status = lane0_bcast(status);
+    sub_mark(7);
+    if (status == 1) {
+      path(P_UPD_MU);
+      return 1;
+    }
+    path(P_UPD_OK);
+    warp_clear_ws_body(m, xi_workspace_.data(), nz, x_workspace_.data());
+    lane0_serial([&] { num_updates_++; });
+    sub_mark(8);
     return 0;
   }
 
@@ -3149,6 +3289,7 @@ __device__ i_t compute_delta_x(const gpu_lp& lp,
   f_t scale     = scaled_delta_xB_sparse.find_coefficient(basic_leaving_index);
   i_t numerical = 0;
   if (isnan(scale)) {
+    ft.path(P_NAN_RECOVERY);
     // We could not find a coefficient for the basic leaving index; it may be very small.
     // Switch to a regular dense solve and try to recover -- mirrors the CPU compute_delta_x.
     //
@@ -3236,6 +3377,7 @@ __device__ i_t update_steepest_edge_norms(const gpu_settings& settings,
   // representation and preserves the original arithmetic for every updated edge norm.
   const bool v_is_dense =
     ft.dense_scratch2_.size() == static_cast<size_t>(delta_y_sparse.n);
+  ft.path(v_is_dense ? P_V_DENSE : P_V_SCATTER);
   if (v_is_dense) {
     v = ft.dense_scratch2_.data();
   } else {
@@ -3534,6 +3676,9 @@ struct slot_state {
   i_t leaving{-1}, entering{-1}, direction{0}, basic_leaving{-1}, nonbasic_entering{-1};
   f_t step_length{0.0}, dy_norm_sq{0.0};
   bool used_transpose_dz{false};
+  i_t f_state{0};  // fissioned pivot loop (fission.cuh): next phase
+  f_t f_pivot{0.0};    // FTRAN: (B^-1 a_q)[basic_leaving], 0 when absent
+  i_t f_pivot_found{0};
 
   // Price a plunge child from the LIVE factorization. A fresh GPU node is priced on the host and
   // uploads y/z along with its factorization. CHILD_CONTINUE deliberately avoids that host round
@@ -3760,7 +3905,7 @@ __device__ bool dual_feasible_within_tol(const gpu_lp& lp,
 // `Direct`: all 32 lanes execute the body. Direct=false is the historical single-thread monolith
 // (lane 0 alone runs this body); Direct=true means ALL 32 lanes run it, so every allocation and
 // read-modify-write must be inside lane0_serial and every `return` must be warp-uniform.
-template <class FT, bool AllowRefactorExit, bool PersistentSeats = false>
+template <class FT, bool AllowRefactorExit, bool PersistentSeats = false, bool FissionSetup = false>
 
 __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
                                                             const gpu_settings& settings,
@@ -3809,6 +3954,11 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
            resume_obj,
            resume_iter);
   if (threadIdx.x == 0) { st.pre[5] = clock64() - ps0; }
+  // Fissioned path: setup only; the phase kernels run the loop from slot_state.
+  if constexpr (FissionSetup) {
+    lane0_serial([&] { st.f_state = 0; });
+    return dual::status_t::UNSET;
+  }
 
   // Bind the persistent slot members under their original names, so the pivot loop below is
   // unchanged by the state externalization and stays line-diffable against the CPU simplified
@@ -3916,6 +4066,7 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     // reset it and re-price (strict port of the CPU simplified, phase2.cpp:4037).
     // monolith is the bit-exact reference.
     if (delta_y_steepest_edge[leaving] < settings.steepest_edge_ratio * dy_norm_sq) {
+      ft.path(P_SE_RESET);
       lane0_serial([&] { delta_y_steepest_edge[leaving] = dy_norm_sq; });
       continue;
     }
@@ -3940,6 +4091,7 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     }
     const f_t delta_y_nz_percentage = delta_y_nz0 / static_cast<f_t>(m) * 100.0;
     const bool used_transpose_dz    = delta_y_nz_percentage <= c_dz_sparse_pct;
+    ft.path(used_transpose_dz ? P_DZ_ROWWISE : P_DZ_COLDOT);
     if (used_transpose_dz) {
       compute_delta_z(ft, Arow, delta_y_sparse, leaving, direction,
                                     basic_mark.data(), delta_z_mark.data(), delta_z_indices,
@@ -4012,6 +4164,7 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
     // `obj` is not a bound on anything and fathoming on it can discard a live subtree.
     // Not a certificate, a precondition: it costs one pass over the columns and it is the exact
     // condition the objective's validity rests on.
+    if (isfinite(settings.cut_off) && obj >= settings.cut_off) { ft.path(P_CUTOFF_SCAN); }
     if (isfinite(settings.cut_off) && obj >= settings.cut_off &&
         dual_feasible_within_tol(lp, vstatus, z, settings.dual_tol)) {
       finish(iter + 1);
@@ -4056,6 +4209,7 @@ __device__ dual::status_t gpu_simplified_dual_phase2_device(const gpu_lp& lp,
         yield = __shfl_sync(0xffffffffu, done, 0) >= settings.yield_at;
       }
       if (ft.num_updates() > settings.refactor_frequency || yield) {
+        ft.path(P_REFACTOR);
         refactor_reason = 0;  // periodic schedule (or yield: same resume)
         suspend(iter + 1);
         return dual::status_t::REFACTOR_NEEDED;
@@ -4531,7 +4685,7 @@ __device__ __noinline__ void warp_csc_transpose(i_t m, const i_t* cs, const i_t*
   }
 }
 
-template <bool AllowRefactorExit, bool PersistentSeats = false>
+template <bool AllowRefactorExit, bool PersistentSeats = false, bool FissionSetup = false>
 __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args,
                                                        i_t idx,
                                                        const unsigned int* yield_count = nullptr,
@@ -4732,6 +4886,7 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args,
   // The trailing warp sync publishes the completed schedule and ft.warp_cfg_ to every lane.
   // CUOPT_BNB_GPU_REUSE_LEVELS=0: rebuild the schedules for child continuations too.
   const bool reuse_levels = child_continue && st.cfg_built && c_reuse_levels != 0;
+  ft.path(reuse_levels ? P_LEVEL_REUSE : P_LEVEL_BUILD);
   if (!reuse_levels && c_warp_levels != 0) {
     warp_build_config_all(ft, cfg_shared, st.lvl_lev, st.lvl_ls, st.lvl_co, st.sp_ls_v, st.sp_co_v,
                           st.sp_pos_v, st.lvl_pos_v);
@@ -4760,7 +4915,7 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args,
 
   i_t refactor_reason   = 0;
   dual::status_t status =
-    gpu_simplified_dual_phase2_device<FT, AllowRefactorExit, PersistentSeats>(lp,
+    gpu_simplified_dual_phase2_device<FT, AllowRefactorExit, PersistentSeats, FissionSetup>(lp,
                                                              settings,
                                                              a.vstatus,
                                                              st,
@@ -4775,6 +4930,7 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args,
                                                             a.resume_iter,
                                                             refactor_reason);
 
+  if constexpr (FissionSetup) { return; }
   // `status` is warp-uniform (every terminal condition in the driver is), so these are same-value
   // stores from every lane — but keep a single writer.
   lane0_serial([&] {
@@ -4797,6 +4953,7 @@ struct seat_clock_t {
   long long pre[6];            // leg set-up cycles (see slot_state::pre)
   long long wop[4];            // dense wavefront cycles per operator
   unsigned wn[4];              // dense wavefront solves per operator
+  unsigned path[kPaths];       // path counts (gpu_basis_update_t::cnt_)
 };
 
 __device__ __forceinline__ unsigned long long global_ns()
@@ -5020,6 +5177,11 @@ gpu_phase2_kernel_direct(kernel_args* args,
                 clk->sub[k] = sb[k];
                 sb[k]       = 0;
               }
+              auto& pc = args[problem_idx].slot->ft.cnt_;
+              for (int k = 0; k < kPaths; ++k) {
+                clk->path[k] = pc[k];
+                pc[k]        = 0u;
+              }
             }
           }
         }
@@ -5068,6 +5230,8 @@ __global__ void set_flag_kernel(std::uint32_t* flag)
   cuda::atomic_ref<std::uint32_t, cuda::thread_scope_system> ready(*flag);
   ready.store(1u, cuda::memory_order_release);
 }
+
+#include "fission.cuh"
 
 struct compact_hdr_t {
   double x, lower, upper;  // branch column (kind 1)
@@ -6634,6 +6798,10 @@ struct gpu_batch_handle_t {
   bool persistent_mode{false};
   bool view_mode{false};  // Nondeterministic pool consumes the host slabs without per-seat scatter.
   std::vector<unsigned char> staged;
+  // Fissioned path (CUOPT_BNB_GPU_FISSION): per-seat explicit-inverse pointers, set at staging.
+  std::vector<gpu_fission_inv> h_finv;
+  std::optional<rmm::device_buffer> d_finv;
+  std::optional<rmm::device_buffer> d_live;
   // Bound deltas of one generation, uploaded by the relaunch in one copy.
   std::optional<pinned_buf<gpu_bound_delta<i_t, f_t>>> h_deltas;
   std::optional<rmm::device_buffer> d_deltas;
@@ -7789,6 +7957,35 @@ void gpu_simplified_dual_phase2_batch_fetch_seat(gpu_phase2_detail::gpu_batch_ha
 }
 
 template <typename i_t, typename f_t>
+void gpu_simplified_dual_phase2_batch_read_seat(gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H,
+                                                std::size_t seat,
+                                                std::vector<variable_status_t>& vstatus,
+                                                std::vector<f_t>& lower,
+                                                std::vector<f_t>& upper,
+                                                std::vector<f_t>& dy_se)
+{
+  if (H == nullptr || H->launched || seat >= H->h_args.size()) {
+    throw std::runtime_error("read_seat: handle must be harvested and the seat in range");
+  }
+  const auto& a = H->h_args[seat];
+  if (a.vstatus == nullptr || a.lower == nullptr || a.upper == nullptr || a.dy_se == nullptr) {
+    throw std::runtime_error("read_seat: seat has no device state");
+  }
+  const size_t n        = static_cast<size_t>(a.n);
+  const cudaStream_t cs = H->stream.value();
+  vstatus.resize(n);
+  lower.resize(n);
+  upper.resize(n);
+  dy_se.resize(n);
+  RAFT_CUDA_TRY(cudaMemcpyAsync(vstatus.data(), a.vstatus, n * sizeof(variable_status_t),
+                                cudaMemcpyDeviceToHost, cs));
+  RAFT_CUDA_TRY(cudaMemcpyAsync(lower.data(), a.lower, n * sizeof(f_t), cudaMemcpyDeviceToHost, cs));
+  RAFT_CUDA_TRY(cudaMemcpyAsync(upper.data(), a.upper, n * sizeof(f_t), cudaMemcpyDeviceToHost, cs));
+  RAFT_CUDA_TRY(cudaMemcpyAsync(dy_se.data(), a.dy_se, n * sizeof(f_t), cudaMemcpyDeviceToHost, cs));
+  RAFT_CUDA_TRY(cudaStreamSynchronize(cs));
+}
+
+template <typename i_t, typename f_t>
 void gpu_simplified_dual_phase2_batch_fetch_seats(gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H,
                                                   const std::vector<int>& seats)
 {
@@ -7971,6 +8168,7 @@ struct clock_agg_t {
     it_max[R]{}, it_slowest[R]{};
   double ph[gpu_phase2_detail::kSolvePhases]{}, cyc_total{0.0}, it_total{0.0};
   double nlev_sum[4]{}, nlev_n{0.0}, route[3]{}, sub[8]{}, pre[6]{}, legs{0.0}, wop[4]{}, wn[4]{};
+  double path[gpu_phase2_detail::kPaths]{};
   int nlev_max[4]{};
 };
 clock_agg_t g_clock;
@@ -7989,6 +8187,7 @@ static void seat_clock_add(const gpu_phase2_detail::seat_clock_t* c, int rounds,
         std::lock_guard<std::mutex> lk(g_clock.mu);
         g_clock.nlev_n += 1;
         for (int q = 0; q < 3; ++q) { g_clock.route[q] += c[k].route[q]; }
+        for (int q = 0; q < gpu_phase2_detail::kPaths; ++q) { g_clock.path[q] += c[k].path[q]; }
         for (int q = 0; q < 8; ++q) { g_clock.sub[q] += static_cast<double>(c[k].sub[q]); }
         for (int q = 0; q < 4; ++q) {
           g_clock.wop[q] += static_cast<double>(c[k].wop[q]);
@@ -8059,6 +8258,87 @@ static void seat_clock_add(const gpu_phase2_detail::seat_clock_t* c, int rounds,
   }
 }
 
+std::string gpu_fission_step_report()
+{
+  using namespace gpu_phase2_detail;
+  unsigned long long h[kFissionSteps][2];
+  if (cudaMemcpyFromSymbol(h, g_fstep, sizeof(h)) != cudaSuccess) { return {}; }
+  static const char* names[kFissionSteps] = {
+    "price",
+    "btran.zero", "btran.Urow", "btran.tloop", "btran.compact", "btran.Lscatter", "btran.out",
+    "choose.norm", "choose.se_reset", "choose.dz", "choose.ratio", "choose.dual", "choose.prep",
+    "ftran.zero", "ftran.Lscatter", "ftran.tloop", "ftran.compact", "ftran.Uscatter", "ftran.out",
+    "update.pivcheck", "update.dx", "update.primal", "update.obj", "update.cutoff", "update.se_norms",
+    "update.swap", "update.refcheck", "update.mpf", "update.infeas", "update.tail", "update.join",
+    "update.p.dx", "update.p.primal", "update.p.obj", "update.p.cutoff", "update.p.se_norms",
+    "update.p.swap"};
+  const double iters = static_cast<double>(h[S_U_TAIL][1]);
+  if (iters == 0) { return {}; }
+  if (const char* ut = std::getenv("CUOPT_BNB_GPU_FISSION_UTRACE"); ut != nullptr && *ut != 0) {
+    fission_utrace_t* d = nullptr;
+    unsigned long long n = 0;
+    cudaMemcpyFromSymbol(&d, g_utrace, sizeof(d));
+    cudaMemcpyFromSymbol(&n, g_utrace_n, sizeof(n));
+    if (d != nullptr) {
+      const unsigned long long k = n < kUtraceCap ? n : kUtraceCap;
+      std::vector<fission_utrace_t> h_tr(k);
+      cudaMemcpy(h_tr.data(), d, k * sizeof(fission_utrace_t), cudaMemcpyDeviceToHost);
+      if (FILE* f = std::fopen(ut, "wb")) {
+        std::fwrite(h_tr.data(), sizeof(fission_utrace_t), k, f);
+        std::fclose(f);
+      }
+    }
+  }
+  if (const char* ut = std::getenv("CUOPT_BNB_GPU_FISSION_CTRACE"); ut != nullptr && *ut != 0) {
+    fission_utrace_t* d = nullptr;
+    unsigned long long n = 0;
+    cudaMemcpyFromSymbol(&d, g_ctrace, sizeof(d));
+    cudaMemcpyFromSymbol(&n, g_ctrace_n, sizeof(n));
+    if (d != nullptr) {
+      const unsigned long long k = n < kUtraceCap ? n : kUtraceCap;
+      std::vector<fission_utrace_t> h_tr(k);
+      cudaMemcpy(h_tr.data(), d, k * sizeof(fission_utrace_t), cudaMemcpyDeviceToHost);
+      if (FILE* f = std::fopen(ut, "wb")) {
+        std::fwrite(h_tr.data(), sizeof(fission_utrace_t), k, f);
+        std::fclose(f);
+      }
+    }
+  }
+  if (const char* ut = std::getenv("CUOPT_BNB_GPU_FISSION_STRACE"); ut != nullptr && *ut != 0) {
+    fission_utrace_t* d = nullptr;
+    unsigned long long n = 0;
+    cudaMemcpyFromSymbol(&d, g_strace, sizeof(d));
+    cudaMemcpyFromSymbol(&n, g_strace_n, sizeof(n));
+    if (d != nullptr) {
+      const unsigned long long k = n < kUtraceCap ? n : kUtraceCap;
+      std::vector<fission_utrace_t> h_tr(k);
+      cudaMemcpy(h_tr.data(), d, k * sizeof(fission_utrace_t), cudaMemcpyDeviceToHost);
+      if (FILE* f = std::fopen(ut, "wb")) {
+        std::fwrite(h_tr.data(), sizeof(fission_utrace_t), k, f);
+        std::fclose(f);
+      }
+    }
+  }
+  double total = 0;
+  for (int k = 0; k < S_UP_DX; ++k) { total += static_cast<double>(h[k][0]); }
+  std::string out;
+  char line[256];
+  std::snprintf(line, sizeof(line),
+                "[FISSION-STEPS] completed iterations=%.0f, seat cycles per iteration=%.0f (per seat, "
+                "excluding waits for other seats)\n",
+                iters, total / iters);
+  out += line;
+  for (int k = 0; k < kFissionSteps; ++k) {
+    if (h[k][1] == 0) { continue; }
+    std::snprintf(line, sizeof(line),
+                  "[FISSION-STEPS] %-16s calls/iteration=%5.2f cycles/call=%8.0f cycles/iteration=%8.0f share=%5.1f%%\n",
+                  names[k], h[k][1] / iters, static_cast<double>(h[k][0]) / h[k][1],
+                  static_cast<double>(h[k][0]) / iters, 100.0 * h[k][0] / total);
+    out += line;
+  }
+  return out;
+}
+
 std::string gpu_batch_seat_clock_report()
 {
   std::lock_guard<std::mutex> lk(g_clock.mu);
@@ -8115,6 +8395,36 @@ std::string gpu_batch_seat_clock_report()
       g_clock.wop[0] / std::max(1.0, g_clock.wn[0]), g_clock.wop[1] / std::max(1.0, g_clock.wn[1]),
       g_clock.wop[2] / std::max(1.0, g_clock.wn[2]), g_clock.wop[3] / std::max(1.0, g_clock.wn[3]));
     out += line;
+    {
+      using namespace gpu_phase2_detail;
+      const double* P = g_clock.path;
+      const auto pct  = [](double a, double b) { return b > 0 ? 100.0 * a / b : 0.0; };
+      const double upd = P[P_UPD_OK] + P[P_UPD_FULL] + P[P_UPD_MU];
+      const double ets = P[P_ETILDE_BUCKET] + P[P_ETILDE_PERM];
+      std::snprintf(line, sizeof(line),
+        "[GPUBATCH-PATHS] per iteration: se_resets=%.4f dz rowwise/coldot=%.1f%%/%.1f%% "
+        "btran Ut sparse=%.1f%% Lt sparse=%.1f%% | ftran L paired=%.1f%% U paired=%.1f%% "
+        "sparse_rhs=%.2f of 4 | mpf_updates_replayed=%.1f\n",
+        P[P_SE_RESET] / it, pct(P[P_DZ_ROWWISE], P[P_DZ_ROWWISE] + P[P_DZ_COLDOT]),
+        pct(P[P_DZ_COLDOT], P[P_DZ_ROWWISE] + P[P_DZ_COLDOT]),
+        pct(P[P_UT_SPARSE], P[P_UT_SPARSE] + P[P_UT_DENSE]),
+        pct(P[P_LT_SPARSE], P[P_LT_SPARSE] + P[P_LT_DENSE]),
+        pct(P[P_L_PAIRED], P[P_L_PAIRED] + P[P_L_SPLIT]),
+        pct(P[P_U_PAIRED], P[P_U_PAIRED] + P[P_U_SPLIT]),
+        P[P_FTRAN_SPARSE_RHS] / std::max(1.0, P[P_L_PAIRED] + P[P_L_SPLIT]),
+        P[P_MPF_LEN] / std::max(1.0, P[P_UT_SPARSE] + P[P_UT_DENSE]));
+      out += line;
+      std::snprintf(line, sizeof(line),
+        "[GPUBATCH-PATHS] updates: ok=%.0f store_full=%.0f mu_reject=%.0f | utilde nnz=%.0f etilde "
+        "nnz=%.0f sort bucket/perm=%.1f%%/%.1f%% | nan_recovery=%.0f cutoff_scans=%.0f "
+        "se_v dense=%.1f%% | refactor_exits=%.0f | legs: level reuse=%.0f build=%.0f\n",
+        P[P_UPD_OK], P[P_UPD_FULL], P[P_UPD_MU], P[P_UTILDE_NZ] / std::max(1.0, upd),
+        P[P_ETILDE_NZ] / std::max(1.0, P[P_UPD_OK] + P[P_UPD_MU]), pct(P[P_ETILDE_BUCKET], ets),
+        pct(P[P_ETILDE_PERM], ets), P[P_NAN_RECOVERY], P[P_CUTOFF_SCAN],
+        pct(P[P_V_DENSE], P[P_V_DENSE] + P[P_V_SCATTER]), P[P_REFACTOR], P[P_LEVEL_REUSE],
+        P[P_LEVEL_BUILD]);
+      out += line;
+    }
     const double lg = std::max(1.0, g_clock.legs);
     std::snprintf(line, sizeof(line),
       "[GPUBATCH-SETUP] legs=%.0f iterations/leg=%.1f | cycles per leg: bounds=%.0f strengthen=%.0f "
@@ -8685,6 +8995,14 @@ bool gpu_simplified_dual_phase2_batch_stage(
 
   H->items[seat]         = item;
   H->items[seat].command = command;
+  if (gpu_fission() && command != gpu_batch_seat_command::CHILD_CONTINUE) {
+    if (item.fission_inv == nullptr) {
+      error = "fissioned pivot loop (CUOPT_BNB_GPU_FISSION) needs the seat's explicit inverses";
+      return false;
+    }
+    if (H->h_finv.size() < H->h_args.size()) { H->h_finv.resize(H->h_args.size()); }
+    H->h_finv[seat] = *item.fission_inv;
+  }
   a.done                 = 0;
   a.device_lu            = 0;
   a.transpose_on_device  = 0;
@@ -9055,7 +9373,7 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
     H->relaunch_blocks = nb;
   }
   if (timed) { RAFT_CUDA_TRY(cudaEventRecord(H->ev_start, H->stream.value())); }
-  int rounds = H->scores_armed && H->dive_armed ? H->dive_rounds : 1;
+  int rounds = !gpu_phase2_detail::gpu_fission() && H->scores_armed && H->dive_armed ? H->dive_rounds : 1;
   auto* seat_scores =
     H->scores_armed ? reinterpret_cast<gpu_scores::seat_score_t*>(
                         static_cast<char*>(H->d_scores->data()) +
@@ -9116,6 +9434,105 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
       K.yield_at    = static_cast<unsigned int>(N - live) +
                    static_cast<unsigned int>(std::ceil(gpu_yield_frac() * static_cast<double>(live)));
     }
+    if (gpu_phase2_detail::gpu_fission()) {
+      using namespace gpu_phase2_detail;
+      // Fissioned pivot loop: setup, then rounds of the phase kernels until no seat is running.
+      const cudaStream_t cs = H->stream.value();
+      const i_t Ni          = static_cast<i_t>(N);
+      if (H->h_finv.size() != N) {
+        error = "fissioned pivot loop: seats without explicit inverses";
+        return false;
+      }
+      if (!H->d_finv) { H->d_finv.emplace(N * sizeof(gpu_fission_inv), H->stream); }
+      if (!H->d_live) { H->d_live.emplace(sizeof(int), H->stream); }
+      RAFT_CUDA_TRY(cudaMemcpyAsync(H->d_finv->data(), H->h_finv.data(), N * sizeof(gpu_fission_inv),
+                                    cudaMemcpyHostToDevice, cs));
+      const auto* finv = static_cast<const gpu_fission_inv*>(H->d_finv->data());
+      int* d_live      = static_cast<int*>(H->d_live->data());
+      const bool det = gpu_fission_deterministic();
+      const size_t smem =
+        det ? static_cast<size_t>(H->rows) * (2 * sizeof(f_t) + sizeof(i_t)) +
+                2 * sizeof(unsigned) * ((static_cast<size_t>(H->rows) + 31) / 32)
+            : 2 * static_cast<size_t>(H->rows) * sizeof(f_t) + kFissionCapA * (sizeof(f_t) + 2 * sizeof(i_t));
+      auto* k_btran = det ? fission_btran : fission_btran_atomic;
+      auto* k_ftran = det ? fission_ftran : fission_ftran_atomic;
+      RAFT_CUDA_TRY(cudaFuncSetAttribute(k_btran, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         static_cast<int>(smem)));
+      RAFT_CUDA_TRY(cudaFuncSetAttribute(k_ftran, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         static_cast<int>(smem)));
+      const size_t smem_c = static_cast<size_t>(H->rows) * sizeof(f_t) +
+                            static_cast<size_t>(H->cols - H->rows) * (sizeof(f_t) + sizeof(i_t));
+      RAFT_CUDA_TRY(cudaFuncSetAttribute(fission_choose_block, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         static_cast<int>(smem_c)));
+      if (const char* ut = std::getenv("CUOPT_BNB_GPU_FISSION_UTRACE"); ut != nullptr && *ut != 0) {
+        static std::once_flag once;
+        std::call_once(once, [] {
+          void* p = nullptr;
+          RAFT_CUDA_TRY(cudaMalloc(&p, kUtraceCap * sizeof(fission_utrace_t)));
+          RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_utrace, &p, sizeof(p)));
+        });
+      }
+      if (const char* ut = std::getenv("CUOPT_BNB_GPU_FISSION_CTRACE"); ut != nullptr && *ut != 0) {
+        static std::once_flag once;
+        std::call_once(once, [] {
+          void* p = nullptr;
+          RAFT_CUDA_TRY(cudaMalloc(&p, kUtraceCap * sizeof(fission_utrace_t)));
+          RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_ctrace, &p, sizeof(p)));
+        });
+      }
+      if (const char* ut = std::getenv("CUOPT_BNB_GPU_FISSION_STRACE"); ut != nullptr && *ut != 0) {
+        static std::once_flag once;
+        std::call_once(once, [] {
+          void* p = nullptr;
+          RAFT_CUDA_TRY(cudaMalloc(&p, kUtraceCap * sizeof(fission_utrace_t)));
+          RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_strace, &p, sizeof(p)));
+        });
+      }
+      fission_setup_kernel<<<Ni, 32, 0, cs>>>(H->d_args, Ni);
+      int live0 = -1;
+      bool yielding = false;
+      for (;;) {
+        for (int k = 0; k < gpu_fission_rounds(); ++k) {
+          if (yielding) { fission_yield<<<Ni, 32, 0, cs>>>(H->d_args, Ni); }
+          fission_price<<<Ni, 32, 0, cs>>>(H->d_args, Ni);
+          k_btran<<<Ni, kFissionThreads, smem, cs>>>(H->d_args, finv, Ni);
+          fission_choose_block<<<Ni, kFissionThreads, smem_c, cs>>>(H->d_args, Ni);
+          k_ftran<<<Ni, kFissionThreads, smem, cs>>>(H->d_args, finv, Ni);
+          fission_update_block<<<Ni, kUpdThreads, 0, cs>>>(H->d_args, Ni);
+        }
+        RAFT_CUDA_TRY(cudaMemsetAsync(d_live, 0, sizeof(int), cs));
+        fission_count<<<(Ni + 255) / 256, 256, 0, cs>>>(H->d_args, Ni, d_live);
+        int live = 0;
+        RAFT_CUDA_TRY(cudaMemcpyAsync(&live, d_live, sizeof(int), cudaMemcpyDeviceToHost, cs));
+        RAFT_CUDA_TRY(cudaStreamSynchronize(cs));
+        static const bool trace = std::getenv("CUOPT_BNB_GPU_FISSION_TRACE") != nullptr;
+        if (trace) {
+          // Per live seat: state, iteration, num_updates (first few).
+          std::vector<kernel_args> ha(N);
+          RAFT_CUDA_TRY(cudaMemcpy(ha.data(), H->d_args, N * sizeof(kernel_args), cudaMemcpyDeviceToHost));
+          int shown = 0;
+          std::string line;
+          for (size_t b = 0; b < N && shown < 6; ++b) {
+            if (ha[b].done != 0 || ha[b].slot == nullptr) { continue; }
+            int fs = 0, it = 0, nu = 0;
+            auto* sl = ha[b].slot;
+            RAFT_CUDA_TRY(cudaMemcpy(&fs, &sl->f_state, sizeof(int), cudaMemcpyDeviceToHost));
+            if (fs == F_DONE) { continue; }
+            RAFT_CUDA_TRY(cudaMemcpy(&it, &sl->iter, sizeof(int), cudaMemcpyDeviceToHost));
+            RAFT_CUDA_TRY(cudaMemcpy(&nu, &sl->ft.num_updates_, sizeof(int), cudaMemcpyDeviceToHost));
+            line += " seat" + std::to_string(b) + ":st" + std::to_string(fs) + ",it" + std::to_string(it) +
+                    ",nu" + std::to_string(nu);
+            ++shown;
+          }
+          std::fprintf(stderr, "[FISSION] live=%d%s\n", live, line.c_str());
+        }
+        if (live == 0) { break; }
+        if (live0 < 0) { live0 = live; }
+        if (!yielding && live <= gpu_fission_yield() * live0) { yielding = true; }
+      }
+      RAFT_CUDA_TRY(cudaPeekAtLastError());
+      if (last && !early) { set_flag_kernel<<<1, 1, 0, cs>>>(H->d_completion_flag); }
+    } else {
     gpu_phase2_kernel_direct<true, true>
       <<<nb, 32, 0, H->stream.value()>>>(
       H->d_args,
@@ -9124,6 +9541,7 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
       last ? H->d_completed_blocks : nullptr,
       last ? (early ? H->d_flag_sink : H->d_completion_flag) : nullptr,
       K);
+    }
     if (last) { RAFT_CUDA_TRY(cudaEventRecord(H->ev_stop, H->stream.value())); }
     if (seat_scores != nullptr && !in_kernel) {
       gpu_scores::score_seats(H->fixed->x.data(), H->d_var_int, static_cast<int>(N), H->cols,
@@ -9513,6 +9931,9 @@ template void gpu_simplified_dual_phase2_batch_fetch_seat<int, double>(
   gpu_phase2_detail::gpu_batch_handle_t<int, double>*, std::size_t);
 template void gpu_simplified_dual_phase2_batch_fetch_seats<int, double>(
   gpu_phase2_detail::gpu_batch_handle_t<int, double>*, const std::vector<int>&);
+template void gpu_simplified_dual_phase2_batch_read_seat<int, double>(
+  gpu_phase2_detail::gpu_batch_handle_t<int, double>*, std::size_t, std::vector<variable_status_t>&,
+  std::vector<double>&, std::vector<double>&, std::vector<double>&);
 template bool gpu_simplified_dual_phase2_batch_park<int, double>(
   gpu_phase2_detail::gpu_batch_handle_t<int, double>*, std::size_t);
 template void gpu_simplified_dual_phase2_batch_unstage<int, double>(

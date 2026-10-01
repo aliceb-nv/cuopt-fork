@@ -1265,7 +1265,8 @@ endif ()
 # target picks it up through cuopt_static. Its per-file properties are still set per-file rather
 # than via CMAKE_CUDA_FLAGS, which is global and would rebuild every CUDA TU in libcuopt.
 add_executable(test_netlib
-    ../benchmarks/linear_programming/cuopt/test_netlib.cu)
+    ../benchmarks/linear_programming/cuopt/test_netlib.cu
+    ../benchmarks/linear_programming/cuopt/ftran_bench.cu)
 
 # --fmad=false: no FMA contraction, so the device arithmetic matches the CPU
 #   simplified_dual_phase2 reference bit-for-bit. Every triangular-solve inner loop is

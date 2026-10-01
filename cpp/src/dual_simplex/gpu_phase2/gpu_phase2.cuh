@@ -77,6 +77,14 @@ struct gpu_bound_delta {
   unsigned char mask{};
 };
 
+// Device pointers to one seat's explicit inverses (explicit_inverse.hpp layout) for the fissioned
+// pivot loop (CUOPT_BNB_GPU_FISSION). Lr/Ur: row-wise; Lc/Uc: column-wise. Linv has P folded in.
+struct gpu_fission_inv {
+  const int *Lr_p{nullptr}, *Lr_i{nullptr}, *Lc_p{nullptr}, *Lc_i{nullptr};
+  const int *Ur_p{nullptr}, *Ur_i{nullptr}, *Uc_p{nullptr}, *Uc_i{nullptr};
+  const double *Lr_x{nullptr}, *Lc_x{nullptr}, *Ur_x{nullptr}, *Uc_x{nullptr};
+};
+
 template <typename i_t, typename f_t>
 struct gpu_batch_item {
   const lp_problem_t<i_t, f_t>* lp;
@@ -148,6 +156,10 @@ struct gpu_batch_item {
   // CHILD_CONTINUE keeps the live LU+MPF representation and applies only the sparse bound delta
   // before repricing the child.
   gpu_batch_seat_command command = gpu_batch_seat_command::FRESH_NODE;
+
+  // Fissioned path: this seat's inverses of the base factors (required for FRESH / REFACTOR_RESUME
+  // staging when CUOPT_BNB_GPU_FISSION is on; a child continuation keeps the seat's previous ones).
+  const gpu_fission_inv* fission_inv{nullptr};
 };
 
 // Timing + pre-flight result for a batch launch. If `rejected` is true the batch
@@ -290,7 +302,8 @@ void gpu_call_stats_begin();
 // [2] delta / argument uploads and memsets, [3] occupancy query + kernel launch.
 const double* gpu_batch_last_relaunch_split();
 void gpu_batch_enqueue_histogram(std::uint64_t* out);  // 16 entries, see gpu_phase2.cu
-std::string gpu_batch_seat_clock_report();  // CUOPT_BNB_GPU_SEAT_CLOCK summary lines
+std::string gpu_batch_seat_clock_report();
+std::string gpu_fission_step_report();  // CUOPT_BNB_GPU_FISSION per-step cycles  // CUOPT_BNB_GPU_SEAT_CLOCK summary lines
 std::string gpu_batch_harvest_report();  // harvest split, pool telemetry
 std::string gpu_batch_overlap_report();  // per-GPU launch / seat overlap, pool telemetry
 std::string gpu_batch_pinned_report();   // CUOPT_BNB_GPU_HUGE_ARENA arena / fallback mapping totals
@@ -334,6 +347,15 @@ void gpu_simplified_dual_phase2_batch_fetch_seats(gpu_batch_handle<i_t, f_t>* ha
 template <typename i_t, typename f_t>
 void gpu_simplified_dual_phase2_batch_fetch_seat(gpu_batch_handle<i_t, f_t>* handle,
                                                  std::size_t seat);
+
+// Snapshot support: the seat's current device vstatus, bounds and dy_se (harvested handle only).
+template <typename i_t, typename f_t>
+void gpu_simplified_dual_phase2_batch_read_seat(gpu_batch_handle<i_t, f_t>* handle,
+                                                std::size_t seat,
+                                                std::vector<variable_status_t>& vstatus,
+                                                std::vector<f_t>& lower,
+                                                std::vector<f_t>& upper,
+                                                std::vector<f_t>& dy_se);
 
 // Nondeterministic B&B keeps the harvested arrays as the authoritative host state. A view remains
 // valid until the next harvest or until the handle is destroyed; writes through it update the

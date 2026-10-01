@@ -11,6 +11,7 @@
 #include <malloc.h>
 #include <branch_and_bound/bad_node_dump.hpp>
 #include <branch_and_bound/gpu_node_pool.hpp>
+#include <branch_and_bound/pool_snapshot.hpp>
 #include <branch_and_bound/diving_heuristics.hpp>
 #include <branch_and_bound/mip_node.hpp>
 #include <branch_and_bound/pseudo_costs.hpp>
@@ -103,6 +104,24 @@ using simplex::variable_status_t;
 using simplex::variable_type_t;
 
 namespace {
+
+// CUOPT_BNB_GPU_SNAPSHOT=<file>: one pool's seats at its first relaunch after
+// CUOPT_BNB_GPU_SNAPSHOT_AT seconds (default 30), for offline kernel replay (pool_snapshot.hpp).
+const char* gpu_snapshot_path()
+{
+  static const char* p = std::getenv("CUOPT_BNB_GPU_SNAPSHOT");
+  return p;
+}
+
+bool gpu_snapshot_due(double elapsed)
+{
+  static const double at = [] {
+    const char* e = std::getenv("CUOPT_BNB_GPU_SNAPSHOT_AT");
+    return e != nullptr ? std::atof(e) : 30.0;
+  }();
+  static std::atomic<bool> taken{false};
+  return gpu_snapshot_path() != nullptr && elapsed >= at && !taken.exchange(true);
+}
 
 // GPU-pool host processing temporarily borrows the owning CPU worker's LP scratch. Preserve the
 // cached state only when the CPU was going to reuse it for a plunge child; otherwise the next CPU
@@ -3510,22 +3529,109 @@ bool branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_step(
     pool.seated = static_cast<int>(std::count_if(
       pool.ctx.begin(), pool.ctx.end(), [](const auto& c) { return c.node != nullptr; }));
   }
-  if (gpu_pool_device_scores() && worker->search_strategy == search_strategy_t::BEST_FIRST) {
+  const bool pc_set =
+    gpu_pool_device_scores() && worker->search_strategy == search_strategy_t::BEST_FIRST;
+  i_t pc_threshold = 0;
+  f_t pc_avg_down = 0.0, pc_avg_up = 0.0;
+  int dive_rounds = 0;
+  if (pc_set) {
     pc_.snapshot(pool.pc_sum_down, pool.pc_sum_up, pool.pc_num_down, pool.pc_num_up);
-    const i_t threshold =
+    pc_threshold =
       settings_.reliability_branching != 0 ? pc_.reliable_threshold_now(exploration_stats_) : 0;
+    pc_avg_down = pc_.compute_pseudocost_average_down();
+    pc_avg_up   = pc_.compute_pseudocost_average_up();
     gpu_batch_run_set_pseudocosts<i_t, f_t>(pool.run,
                                             pool.pc_sum_down.data(),
                                             pool.pc_sum_up.data(),
                                             pool.pc_num_down.data(),
                                             pool.pc_num_up.data(),
-                                            pc_.compute_pseudocost_average_down(),
-                                            pc_.compute_pseudocost_average_up(),
-                                            threshold,
+                                            pc_avg_down,
+                                            pc_avg_up,
+                                            pc_threshold,
                                             settings_.integer_tol);
     if (gpu_pool_dive() > 1 && gpu_pool_device_objective()) {
-      gpu_batch_run_set_dive<i_t, f_t>(pool.run, gpu_pool_dive(), worker->root_solution.data());
+      dive_rounds = gpu_pool_dive();
+      gpu_batch_run_set_dive<i_t, f_t>(pool.run, dive_rounds, worker->root_solution.data());
     }
+  }
+  if (gpu_snapshot_due(toc(exploration_stats_.start_time))) {
+    namespace ps   = pool_snapshot;
+    const auto& lp = worker->leaf_problem;
+    const i_t n    = lp.num_cols;
+    std::vector<int32_t> cmd(batch.size());
+    ps::header_t h{};
+    for (size_t s2 = 0; s2 < batch.size(); ++s2) {
+      cmd[s2] = ctx[s2].node == nullptr           ? ps::PARKED
+                : next[s2] == next_t::FRESH    ? ps::FRESH
+                : next[s2] == next_t::REFACTOR ? ps::REFACTOR
+                                               : ps::CHILD;
+      ++h.count[cmd[s2]];
+    }
+    std::copy_n(ps::kMagic, 8, h.magic);
+    h.version   = ps::kVersion;
+    h.m         = lp.num_rows;
+    h.n         = n;
+    h.seats     = static_cast<int32_t>(batch.size());
+    h.nnz       = lp.A.col_start[n];
+    h.device    = pool.device;
+    h.worker    = static_cast<int32_t>(worker->worker_id);
+    h.pools_on_device = static_cast<int32_t>(std::count_if(
+      gpu_batch_pools_.begin(), gpu_batch_pools_.end(),
+      [&](const auto& p) { return p != nullptr && p->device == pool.device; }));
+    std::vector<int8_t> vt;
+    if (gpu_pool_device_strengthen()) {
+      for (auto t : var_types_) { vt.push_back(static_cast<int8_t>(t)); }
+    }
+    h.n_var_types           = static_cast<int32_t>(vt.size());
+    h.n_pc                  = pc_set ? static_cast<int32_t>(pool.pc_sum_down.size()) : 0;
+    h.dive_rounds           = dive_rounds;
+    h.n_root_x              = dive_rounds > 0 ? static_cast<int32_t>(worker->root_solution.size()) : 0;
+    h.reliable_threshold    = static_cast<int32_t>(pc_threshold);
+    h.objective_is_integral = lp.objective_is_integral ? 1 : 0;
+    h.elapsed               = toc(exploration_stats_.start_time);
+    h.obj_constant          = lp.obj_constant;
+    h.obj_scale             = lp.obj_scale;
+    h.pc_avg_down           = pc_avg_down;
+    h.pc_avg_up             = pc_avg_up;
+    h.integer_tol           = settings_.integer_tol;
+    std::FILE* f = std::fopen(gpu_snapshot_path(), "wb");
+    bool ok      = f != nullptr && ps::write_head<i_t, f_t>(f, h, lp, vt, pool.pc_sum_down,
+                                                       pool.pc_sum_up, pool.pc_num_down,
+                                                       pool.pc_num_up, worker->root_solution.data());
+    std::vector<variable_status_t> vs;
+    std::vector<f_t> lo, up, se;
+    for (size_t s2 = 0; ok && s2 < batch.size(); ++s2) {
+      const auto rec = ps::seat_from_settings<i_t, f_t>(cmd[s2], batch[s2].settings);
+      if (cmd[s2] == ps::FRESH) {
+        if (batch[s2].root_lower != nullptr) {
+          std::fprintf(stderr, "[GPU-SNAPSHOT] path-bound fresh staging is not supported\n");
+          std::abort();
+        }
+        ok = ps::append_seat(f, rec, lp.lower, lp.upper, batch[s2].lower, batch[s2].upper,
+                             batch[s2].vstatus, batch[s2].dy_se);
+        continue;
+      }
+      if (cmd[s2] != ps::PARKED) {
+        gpu_persistent_batch_read_seat<i_t, f_t>(pool.run, static_cast<i_t>(s2), vs, lo, up, se);
+        if (cmd[s2] == ps::CHILD) {
+          for (const auto& d : deltas[s2]) {
+            if ((d.mask & 1u) != 0u) { lo[d.column] = d.lower; }
+            if ((d.mask & 2u) != 0u) { up[d.column] = d.upper; }
+          }
+        }
+      }
+      ok = ps::append_seat(f, rec, lp.lower, lp.upper, lo, up, vs, se);
+    }
+    if (f != nullptr) { ok = std::fclose(f) == 0 && ok; }
+    if (!ok) {
+      std::fprintf(stderr, "[GPU-SNAPSHOT] writing %s failed\n", gpu_snapshot_path());
+      std::abort();
+    }
+    settings_.log.printf(
+      "[GPU-SNAPSHOT] %s worker=%d gpu=%d pools_on_gpu=%d t=%.2f seats=%d fresh=%d refactor=%d "
+      "child=%d parked=%d pc=%d dive=%d\n",
+      gpu_snapshot_path(), h.worker, h.device, h.pools_on_device, h.elapsed, h.seats, h.count[0],
+      h.count[1], h.count[2], h.count[3], h.n_pc, h.dive_rounds);
   }
   nvtx_phase.emplace("GPUPool::relaunch");
   const double relaunch_t0 = telemetry ? tic() : 0.0;

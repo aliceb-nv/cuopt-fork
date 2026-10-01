@@ -673,6 +673,28 @@ void gpu_persistent_batch_fetch_seat(gpu_batch_run<i_t, f_t>* run, i_t seat);
 // One fetch (one stream sync) for all listed seats.
 template <typename i_t, typename f_t>
 void gpu_persistent_batch_fetch_seats(gpu_batch_run<i_t, f_t>* run, const std::vector<int>& seats);
+// Kernel replay: host LU + duals of every node from its own basis, `threads` at a time (1 = ok
+// per node); then FRESH staging from such a prepared node without a host LU.
+template <typename i_t, typename f_t>
+std::vector<char> gpu_batch_factor_fresh(const simplex::lp_problem_t<i_t, f_t>& lp,
+                                         std::vector<gpu_batch_node_t<i_t, f_t>>& nodes,
+                                         std::vector<batch_seat_state_t<i_t, f_t>>& seats,
+                                         int threads);
+template <typename i_t, typename f_t>
+bool gpu_persistent_batch_stage_fresh_from(gpu_batch_run<i_t, f_t>* run,
+                                           i_t seat,
+                                           const gpu_batch_node_t<i_t, f_t>& node,
+                                           const batch_seat_state_t<i_t, f_t>& prepared,
+                                           std::string& error,
+                                           const gds::gpu_fission_inv* finv = nullptr);
+// The seat's current device vstatus, bounds and dy_se (CUOPT_BNB_GPU_SNAPSHOT).
+template <typename i_t, typename f_t>
+void gpu_persistent_batch_read_seat(gpu_batch_run<i_t, f_t>* run,
+                                    i_t seat,
+                                    std::vector<simplex::variable_status_t>& vstatus,
+                                    std::vector<f_t>& lower,
+                                    std::vector<f_t>& upper,
+                                    std::vector<f_t>& dy_se);
 template <typename i_t, typename f_t>
 bool gpu_persistent_batch_park(gpu_batch_run<i_t, f_t>* run, i_t seat);
 template <typename i_t, typename f_t>
