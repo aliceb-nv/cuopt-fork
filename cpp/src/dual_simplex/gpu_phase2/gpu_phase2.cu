@@ -9165,6 +9165,24 @@ bool gpu_simplified_dual_phase2_batch_stage(
     } else if (H->view_mode) {
       // A resume already modified its harvested spans in place. A fresh replacement owns new
       // vectors, so only that seat is written into the host slabs before the full-pool upload.
+      // Fresh seats in slot mode upload straight from the node's vectors; the slab rows are
+      // rewritten by the next harvest, and nothing reads them in between.
+      if (command == gpu_batch_seat_command::FRESH_NODE && H->use_slots) {
+        auto& F        = *H->fixed;
+        const auto put = [&](auto& dev, const auto& source, size_t width) {
+          if (width != 0) {
+            H->pack.add(dev.data() + seat * width, source.data(), width * sizeof(source[0]), H->stream);
+          }
+        };
+        put(F.x, item.sol->x, n);
+        put(F.vstatus, *item.vstatus, n);
+        put(F.basic_list, *item.basic_list, m);
+        put(F.nonbasic_list, *item.nonbasic_list, n - m);
+        put(F.y, item.sol->y, m);
+        put(F.z, item.sol->z, n);
+        put(F.dy_se, *item.dy_se, n);
+        split(2);
+      } else {
       if (command == gpu_batch_seat_command::FRESH_NODE) {
         const auto copy_seat = [seat](auto& slab, size_t width, const auto& source) {
           if (width != 0) { std::copy_n(source.data(), width, slab.data() + seat * width); }
@@ -9196,6 +9214,7 @@ bool gpu_simplified_dual_phase2_batch_stage(
           slice(F.z, H->h_z, n);
           slice(F.dy_se, H->h_dy_se, n);
         }
+      }
       }
     } else {
       persistent_copy(a.vstatus, item.vstatus->data(), n, H->stream);

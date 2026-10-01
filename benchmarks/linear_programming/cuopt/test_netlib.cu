@@ -2666,11 +2666,15 @@ void replay_pool_mode(const raft::handle_t& handle,
     ++started;
     double t_launch = mo::toc(t0);
     std::string err;
+    const bool exp_ht = std::getenv("CUOPT_EXP_HOST_TIME") != nullptr;
+    std::vector<double> ht_h, ht_s, ht_r;
     for (int g = 0;; ++g) {
+      const double th0 = mo::toc(t0);
       if (!mip::gpu_persistent_batch_harvest<int, double>(run)) {
         errors[c] = "harvest failed";
         break;
       }
+      if (exp_ht) { ht_h.push_back(mo::toc(t0) - th0); }
       replay_gen_t r{t_launch, mo::toc(t0), 0, 0, 0, 0, 0};
       for (int s = 0; s < N; ++s) {
         if (h.dive_rounds > 0 && g > 0 && !no_dive) {
@@ -2698,6 +2702,7 @@ void replay_pool_mode(const raft::handle_t& handle,
       }
       gens[c].push_back(r);
       if (generations > 0 ? g + 1 >= generations : r.t_done >= seconds) { break; }
+      const double ts0 = mo::toc(t0);
       for (int s = 0; s < N; ++s) {
         seat_node[s] = usable[cursor];
         cursor       = (cursor + 1) % U;
@@ -2723,10 +2728,17 @@ void replay_pool_mode(const raft::handle_t& handle,
         }
       }
       t_launch = mo::toc(t0);
+      if (exp_ht) { ht_s.push_back(t_launch - ts0); }
       if (!mip::gpu_persistent_batch_relaunch<int, double>(run, err)) {
         errors[c] = "relaunch: " + err;
         break;
       }
+      if (exp_ht) { ht_r.push_back(mo::toc(t0) - t_launch); }
+    }
+    if (exp_ht && c == 0) {
+      auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v.empty() ? 0.0 : v[v.size() / 2]; };
+      std::printf("[EXP-HOST] per generation, median ms: harvest call %.1f (incl. GPU wait), stage loop %.1f, relaunch call %.1f\n",
+                  1e3 * med(ht_h), 1e3 * med(ht_s), 1e3 * med(ht_r));
     }
     mip::gpu_batch_run_end<int, double>(run);
   };
