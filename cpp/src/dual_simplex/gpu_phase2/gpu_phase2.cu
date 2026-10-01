@@ -4739,7 +4739,7 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args,
   bool child_continue = false;
   if constexpr (PersistentSeats) {
     child_continue = a.command == static_cast<i_t>(gpu_batch_seat_command::CHILD_CONTINUE);
-    if (a.bounds_from_root != 0) {
+    if (!FissionSetup && a.bounds_from_root != 0) {  // fission: fission_presetup did it
       for (i_t j = static_cast<i_t>(threadIdx.x); j < a.n; j += 32) {
         a.lower[j] = a.root_lower[j];
         a.upper[j] = a.root_upper[j];
@@ -4754,7 +4754,7 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args,
     }
   }
   if constexpr (PersistentSeats) {
-    if (child_continue) {
+    if (!FissionSetup && child_continue) {
     // The persistent seat already contains the parent's complete solve representation. Apply the
     // child's sparse bounds before constructing the lp view used by pricing/setup. One lane writes
     // the small ordered list; the warp fence publishes it before any lane reads the bounds.
@@ -4770,7 +4770,7 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args,
 
   const long long pcb = clock64();
   // FRESH (all rows) and CHILD_CONTINUE (rows of the delta columns); a resume keeps its bounds.
-  if (a.strengthen != 0 && (child_continue || a.refactor_resume == 0)) {
+  if (!FissionSetup && a.strengthen != 0 && (child_continue || a.refactor_resume == 0)) {
     __syncwarp(0xffffffffu);
     warp_strengthen_bounds(a, child_continue);
     __syncwarp(0xffffffffu);
@@ -9488,6 +9488,7 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
           RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_strace, &p, sizeof(p)));
         });
       }
+      fission_presetup<<<Ni, kPresetupThreads, 0, cs>>>(H->d_args, Ni);
       fission_setup_kernel<<<Ni, 32, 0, cs>>>(H->d_args, Ni);
       int live0 = -1;
       bool yielding = false;
