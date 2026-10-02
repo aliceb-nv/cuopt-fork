@@ -8390,6 +8390,7 @@ std::string gpu_fission_step_report()
     "btran.zero", "btran.Urow", "btran.tloop", "btran.compact", "btran.Lscatter", "btran.out",
     "choose.norm", "choose.se_reset", "choose.dz", "choose.ratio", "choose.dual", "choose.prep",
     "ftran.zero", "ftran.Lscatter", "ftran.tloop", "ftran.compact", "ftran.Uscatter", "ftran.out",
+    "ftran1.Lscatter", "ftran1.tloop", "ftran1.Ugather",
     "update.pivcheck", "update.dx", "update.primal", "update.obj", "update.cutoff", "update.se_norms",
     "update.swap", "update.refcheck", "update.mpf", "update.infeas", "update.tail", "update.join",
     "update.p.dx", "update.p.primal", "update.p.obj", "update.p.cutoff", "update.p.se_norms",

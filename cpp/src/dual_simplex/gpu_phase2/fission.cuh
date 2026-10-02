@@ -22,6 +22,7 @@ enum fission_step_t : int {
   S_B_ZERO, S_B_UROW, S_B_TLOOP, S_B_COMPACT, S_B_LSCATTER, S_B_OUT,
   S_C_NORM, S_C_SECHECK, S_C_DZ, S_C_RATIO, S_C_DUAL, S_C_PREP,
   S_F_ZERO, S_F_LSCATTER, S_F_TLOOP, S_F_COMPACT, S_F_USCATTER, S_F_OUT,
+  S_F1_LSCATTER, S_F1_TLOOP, S_F1_USCATTER,  // FTRAN dy solve (r = 1); S_F_* above: rhs solve
   S_U_PIVCHECK, S_U_DX, S_U_PRIMAL, S_U_OBJ, S_U_CUTOFF, S_U_SENORM, S_U_SWAP, S_U_REFCHECK,
   S_U_MPF, S_U_INFEAS, S_U_TAIL, S_U_JOIN,
   // fission_update_block's primal chain (warps 1..7), concurrent with S_U_MPF: not in the total.
@@ -581,7 +582,8 @@ __device__ __forceinline__ void fission_mark(const i_t* cp, const i_t* ri, const
 // positions so that the warps visit only those (overflow: the warps scan the whole list as without one).
 __device__ __forceinline__ void fission_gather(const i_t* cp, const i_t* ri, const f_t* cx,
                                                const i_t* list, int n, const f_t* in, f_t* out,
-                                               int* lq = nullptr, int qcap = 0, int* qn = nullptr)
+                                               int* lq = nullptr, int qcap = 0, int* qn = nullptr,
+                                               int shortseg = kShortSeg)
 {
   if (lq != nullptr) {
     if (threadIdx.x == 0) { *qn = 0; }
@@ -590,16 +592,21 @@ __device__ __forceinline__ void fission_gather(const i_t* cp, const i_t* ri, con
   for (int q = threadIdx.x; q < n; q += kFissionThreads) {
     const i_t i = list[q];
     const i_t b = cp[i], e = cp[i + 1];
-    if (e - b > kShortSeg) {
+    if (e - b > shortseg) {
       if (lq != nullptr) {
         const int k = atomicAdd(qn, 1);
         if (k < qcap) { lq[k] = q; }
       }
       continue;
     }
-    f_t s = 0.0;
-    for (i_t p = b; p < e; ++p) { s += cx[p] * in[ri[p]]; }
-    out[i] = s;
+    f_t s0 = 0.0, s1 = 0.0;
+    i_t p = b;
+    for (; p + 1 < e; p += 2) {
+      s0 += cx[p] * in[ri[p]];
+      s1 += cx[p + 1] * in[ri[p + 1]];
+    }
+    if (p < e) { s0 += cx[p] * in[ri[p]]; }
+    out[i] = s0 + s1;
   }
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   if (lq != nullptr) {
@@ -621,7 +628,7 @@ __device__ __forceinline__ void fission_gather(const i_t* cp, const i_t* ri, con
   for (int q = warp; q < n; q += kFissionThreads / 32) {
     const i_t i = list[q];
     const i_t b = cp[i], e = cp[i + 1];
-    if (e - b <= kShortSeg) { continue; }
+    if (e - b <= shortseg) { continue; }
     f_t s = 0.0;
     for (i_t p = b + lane; p < e; p += 32) { s += cx[p] * in[ri[p]]; }
     s = warp_reduce_add(s);
@@ -1527,13 +1534,13 @@ __device__ __forceinline__ void fission_ftran_atomic_body(kernel_args* args, con
     } else {
       fission_scatter_atomic(scs, I.Lc_p, I.Lc_i, I.Lc_x, b.i.data(), b.x.data(), nb, pre, pre + kFissionCapA, z, r);
     }
-    FSTEP(S_F_LSCATTER)
+    FSTEP(r == 0 ? S_F_LSCATTER : S_F1_LSCATTER)
     if (st.f_mrows == st.ft.num_updates_) {
       fission_tloop_m(st.ft, z, true, 1e-16, a.fm, a.fm_kcap, R, kFissionStage / sizeof(f_t), &scs);
     } else {
       fission_tloop_chunked(st.ft, z, true, 1e-16, R, kFissionStage);
     }
-    FSTEP(S_F_TLOOP)
+    FSTEP(r == 0 ? S_F_TLOOP : S_F1_TLOOP)
     // The dy solve's output v is read only at the rows of the rhs solve's result (the steepest-edge
     // update over scaled_dxB): by default gather just those rows of U0^-1 from z; CUOPT_EXP_FTRAN_DY=
     // gather: every row; =scatter: the full scatter.
@@ -1576,14 +1583,39 @@ __device__ __forceinline__ void fission_ftran_atomic_body(kernel_args* args, con
       fission_gather_rows(I.Ur_p, I.Ur_i, I.Ur_x, m, z, st.ft.dense_scratch2_.data(), li, 2 * kFissionCapA, &cnt);
     } else if (dy_gather) {
       const auto& dx = st.scaled_dxB_sparse;
+      if (c_scatstat != 0) {
+        // Stats class 3 (ftran.U dy): rows gathered, their total length, the longest.
+        __shared__ unsigned long long s_e;
+        __shared__ int s_l;
+        if (threadIdx.x == 0) { s_e = 0ull, s_l = 0; }
+        __syncthreads();
+        const int nr = static_cast<int>(dx.i.size());
+        unsigned long long e = 0;
+        int l = 0;
+        for (int q = threadIdx.x; q < nr; q += blockDim.x) {
+          const int len = I.Ur_p[dx.i[q] + 1] - I.Ur_p[dx.i[q]];
+          e += len, l = max(l, len);
+        }
+        atomicAdd(&s_e, e);
+        atomicMax(&s_l, l);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+          atomicAdd(&g_fscat[3][0], 1ull);
+          atomicAdd(&g_fscat[3][1], static_cast<unsigned long long>(nr));
+          atomicAdd(&g_fscat[3][2], s_e);
+          atomicAdd(&g_fscat[3][3], static_cast<unsigned long long>(s_l));
+          atomicAdd(&g_fscat_h[3][0][min(19, 32 - __clz(nr))], 1ull);
+          atomicAdd(&g_fscat_h[3][1][min(19, 32 - __clzll(static_cast<long long>(s_e)))], 1ull);
+        }
+      }
       fission_gather(I.Ur_p, I.Ur_i, I.Ur_x, dx.i.data(), static_cast<int>(dx.i.size()), z,
-                     st.ft.dense_scratch2_.data(), li, 2 * kFissionCapA, &cnt);
+                     st.ft.dense_scratch2_.data(), li, 2 * kFissionCapA, &cnt, kLongRow);
     } else if (direct) {
       fission_level_solve(st.ft.U0_transpose_, st.lvl_ls[1].data(), st.lvl_co[1].data(), st.cfg_nlev[1], true, acc);
     } else {
       fission_scatter_atomic(scs, I.Uc_p, I.Uc_i, I.Uc_x, li, lx, nz, pre, pre + kFissionCapA, acc, 2 + r);
     }
-    FSTEP(S_F_USCATTER)
+    FSTEP(r == 0 ? S_F_USCATTER : S_F1_USCATTER)
     if (r == 0) {
       auto& dx = st.scaled_dxB_sparse;
       if (threadIdx.x == 0) {
