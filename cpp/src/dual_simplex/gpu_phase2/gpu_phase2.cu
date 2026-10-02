@@ -209,6 +209,7 @@ __constant__ f_t c_hypersparse_threshold = 0.05;
 __constant__ int c_reuse_levels = 1;
 __constant__ int c_derive_levels = 1;  // CUOPT_BNB_GPU_DERIVE_LEVELS
 __constant__ int c_warp_levels = 1;    // CUOPT_BNB_GPU_WARP_LEVELS
+__constant__ int c_ftran_direct = 0;   // CUOPT_EXP_FTRAN=direct: fission FTRAN through L0/U0
 __constant__ int c_long_col = 32;      // CUOPT_BNB_GPU_LONG_COL: longer gather columns go to 8-lane groups
 // Transpose dz route at delta_y density <= this percent (CPU rule 30; CUOPT_BNB_GPU_DZ_DENSE_PCT).
 __constant__ f_t c_dz_sparse_pct = 30.0;
@@ -4821,10 +4822,12 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args,
   // constructor in that already-allocated memory; it does not allocate device memory.
   // Construction, ft wiring and S_.init_empty are RMW on shared state and belong to lane 0.
   const long long pcs = clock64();
-  // Fission fresh seat: no reader of the device transposes or the level schedules.
-  const bool lean = FissionSetup && !child_continue && a.refactor_resume == 0 && a.device_lu == 0;
+  // Fission fresh seat: x_B from the inverses. The transposes and level schedules are skipped unless
+  // the direct FTRAN (CUOPT_EXP_FTRAN=direct) solves through them.
+  const bool lean      = FissionSetup && !child_continue && a.refactor_resume == 0 && a.device_lu == 0;
+  const bool skip_tri  = lean && c_ftran_direct == 0;
   if constexpr (PersistentSeats) {
-    if (!lean && !child_continue && a.transpose_on_device != 0) {
+    if (!skip_tri && !child_continue && a.transpose_on_device != 0) {
       warp_csc_transpose(m, a.L0_col_start, a.L0_i, a.L0_x, a.L0t_col_start, a.L0t_i, a.L0t_x, a.xi_workspace);
       warp_csc_transpose(m, a.U0_col_start, a.U0_i, a.U0_x, a.U0t_col_start, a.U0t_i, a.U0t_x, a.xi_workspace);
     }
@@ -4897,7 +4900,7 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args,
   // CUOPT_BNB_GPU_REUSE_LEVELS=0: rebuild the schedules for child continuations too.
   const bool reuse_levels = child_continue && st.cfg_built && c_reuse_levels != 0;
   ft.path(reuse_levels ? P_LEVEL_REUSE : P_LEVEL_BUILD);
-  if (!lean) {
+  if (!skip_tri) {
   if (!reuse_levels && c_warp_levels != 0) {
     warp_build_config_all(ft, cfg_shared, st.lvl_lev, st.lvl_ls, st.lvl_co, st.sp_ls_v, st.sp_co_v,
                           st.sp_pos_v, st.lvl_pos_v);
@@ -9551,6 +9554,13 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
           RAFT_CUDA_TRY(cudaMalloc(&p, kUtraceCap * sizeof(fission_utrace_t)));
           RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_ftrace, &p, sizeof(p)));
         });
+      }
+      {
+        static const int direct = [] {
+          const char* e = std::getenv("CUOPT_EXP_FTRAN");
+          return (e != nullptr && std::string(e) == "direct") ? 1 : 0;
+        }();
+        RAFT_CUDA_TRY(cudaMemcpyToSymbolAsync(c_ftran_direct, &direct, sizeof(int), 0, cudaMemcpyHostToDevice, cs));
       }
       fission_presetup<<<Ni, kPresetupThreads, 0, cs>>>(H->d_args, Ni);
       fission_setup_kernel<<<Ni, 32, 0, cs>>>(H->d_args, Ni);

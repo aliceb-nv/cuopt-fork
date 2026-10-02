@@ -921,6 +921,28 @@ __device__ __forceinline__ void fission_tloop_m(const gpu_basis_update_t& ft, f_
   __syncthreads();
 }
 
+// In-place level-scheduled triangular solve over the transposed factor (row j's entries in column j
+// of `T`), schedule op `o` built by setup: level l's rows are co[ls[l-1] .. ls[l]); rows absent from
+// the schedule have only a unit diagonal. One thread per row, a block barrier between levels.
+__device__ __forceinline__ void fission_level_solve(const gpu_csc_view& T, const i_t* ls, const i_t* co,
+                                                    int nlev, bool diag_first, f_t* x)
+{
+  const i_t* cs = T.col_start.data();
+  const i_t* ri = T.i.data();
+  const f_t* vx = T.x.data();
+  for (int l = 1; l <= nlev; ++l) {
+    for (i_t q = ls[l - 1] + threadIdx.x; q < ls[l]; q += blockDim.x) {
+      const i_t j  = co[q] & ~kColNoop;
+      const i_t c0 = cs[j], c1 = cs[j + 1];
+      const i_t lo = diag_first ? c0 + 1 : c0, hi = diag_first ? c1 : c1 - 1;
+      f_t v        = x[j];
+      for (i_t p = lo; p < hi; ++p) { v -= vx[p] * x[ri[p]]; }
+      x[j] = v / (diag_first ? vx[c0] : vx[c1 - 1]);
+    }
+    __syncthreads();
+  }
+}
+
 __device__ __forceinline__ void fission_unstage(f_t* stage, size_t bytes)
 {
   const size_t words = (bytes + sizeof(f_t) - 1) / sizeof(f_t);
@@ -1192,7 +1214,15 @@ __device__ __forceinline__ void fission_ftran_atomic_body(kernel_args* args, con
     const gpu_sparse_vector& b = r == 0 ? st.rhs_sparse : st.delta_y_sparse;
     const int nb               = static_cast<int>(b.i.size());
     if (nb > kFissionCapA) { __trap(); }
-    fission_scatter_atomic(scs, I.Lc_p, I.Lc_i, I.Lc_x, b.i.data(), b.x.data(), nb, pre, z);
+    const bool direct = c_ftran_direct != 0;
+    if (direct) {
+      const i_t* ip = st.ft.inverse_row_permutation_.data();
+      for (int p = threadIdx.x; p < nb; p += blockDim.x) { z[ip[b.i[p]]] = b.x[p]; }
+      __syncthreads();
+      fission_level_solve(st.ft.L0_transpose_, st.lvl_ls[0].data(), st.lvl_co[0].data(), st.cfg_nlev[0], false, z);
+    } else {
+      fission_scatter_atomic(scs, I.Lc_p, I.Lc_i, I.Lc_x, b.i.data(), b.x.data(), nb, pre, z);
+    }
     FSTEP(S_F_LSCATTER)
     if (st.f_mrows == st.ft.num_updates_) {
       fission_tloop_m(st.ft, z, true, 1e-16, a.fm, a.fm_kcap, R, kFissionStage / sizeof(f_t));
@@ -1200,8 +1230,30 @@ __device__ __forceinline__ void fission_ftran_atomic_body(kernel_args* args, con
       fission_tloop_chunked(st.ft, z, true, 1e-16, R, kFissionStage);
     }
     FSTEP(S_F_TLOOP)
-    const int nz = fission_compact_atomic(z, m, li, lx, kFissionCapA, &cnt);
-    if (r == 0) {
+    int nz = 0;
+    if (direct) {
+      // utilde from the dense L-space vector, which the U solve then overwrites in place.
+      if (r == 0) {
+        if (threadIdx.x == 0) { cnt = 0; }
+        __syncthreads();
+        auto& ut = st.utilde_sparse;
+        for (int k = threadIdx.x; k < m; k += blockDim.x) {
+          if (z[k] != 0.0) {
+            const int q = atomicAdd(&cnt, 1);
+            ut.i[q] = k, ut.x[q] = z[k];
+          }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+          ut.n = m;
+          ut.i.set_size(cnt);
+          ut.x.set_size(cnt);
+        }
+      }
+    } else {
+      nz = fission_compact_atomic(z, m, li, lx, kFissionCapA, &cnt);
+    }
+    if (!direct && r == 0) {
       auto& ut = st.utilde_sparse;
       for (int k = threadIdx.x; k < nz; k += blockDim.x) { ut.i[k] = li[k], ut.x[k] = lx[k]; }
       if (threadIdx.x == 0) {
@@ -1211,7 +1263,11 @@ __device__ __forceinline__ void fission_ftran_atomic_body(kernel_args* args, con
       }
     }
     FSTEP(S_F_COMPACT)
-    fission_scatter_atomic(scs, I.Uc_p, I.Uc_i, I.Uc_x, li, lx, nz, pre, acc);
+    if (direct) {
+      fission_level_solve(st.ft.U0_transpose_, st.lvl_ls[1].data(), st.lvl_co[1].data(), st.cfg_nlev[1], true, acc);
+    } else {
+      fission_scatter_atomic(scs, I.Uc_p, I.Uc_i, I.Uc_x, li, lx, nz, pre, acc);
+    }
     FSTEP(S_F_USCATTER)
     if (r == 0) {
       auto& dx = st.scaled_dxB_sparse;
