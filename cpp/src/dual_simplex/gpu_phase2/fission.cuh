@@ -2088,37 +2088,15 @@ __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t
   FSTEP(S_U_TAIL)
 }
 
-// Straggler cut: every live seat at an iteration boundary (F_PRICE) stops as REFACTOR_NEEDED
-// (reason 0); the host resumes it next generation. Seats mid-iteration reach F_PRICE within a round.
-__device__ __forceinline__ void fission_yield_body(kernel_args* args, i_t n_problems)
-{
-  kernel_args& a = args[blockIdx.x];
-  if (blockIdx.x >= n_problems || a.done != 0) { return; }
-  auto& st = *a.slot;
-  if (st.f_state != F_PRICE) { return; }
-  gpu_lp lp;
-  gpu_settings settings;
-  gpu_solution sol;
-  fission_views(a, lp, settings, sol);
-  fission_exit(a, st, lp, sol, dual::status_t::REFACTOR_NEEDED, st.iter, true, 0);
-}
-
-__global__ void __launch_bounds__(32) fission_yield(kernel_args* args, i_t n_problems)
-{
-  fission_yield_body(args, n_problems);
-}
-
 // Fused rounds (CUOPT_EXP_FUSED): one block per seat runs `rounds` rounds of price, BTRAN, choose,
 // FTRAN and update with block barriers only, so seats do not wait for each other between phases.
 __global__ void __launch_bounds__(kFissionThreads, 2)
-  fission_fused(kernel_args* args, const gpu_fission_inv* inv, i_t n_problems, int rounds, int yielding)
+  fission_fused(kernel_args* args, const gpu_fission_inv* inv, i_t n_problems, int rounds)
 {
   __shared__ fission_utrace_t r;
   if (blockIdx.x >= n_problems) { return; }
   for (int k = 0; k < rounds; ++k) {
     if (args[blockIdx.x].done != 0 || args[blockIdx.x].slot->f_state == F_DONE) { return; }
-    if (yielding && threadIdx.x < 32) { fission_yield_body(args, n_problems); }
-    __syncthreads();
     if (threadIdx.x < 32) { fission_price_body(args, n_problems); }
     __syncthreads();
     fission_btran_atomic_body(args, inv, n_problems);
@@ -2382,15 +2360,6 @@ inline bool gpu_fission()
     return e != nullptr && std::string(e) != "0";
   }();
   return on;
-}
-
-inline double gpu_fission_yield()
-{
-  static const double f = [] {
-    const char* e = std::getenv("CUOPT_BNB_GPU_FISSION_YIELD");
-    return e != nullptr ? std::atof(e) : 0.5;  // CHOSEN: straggler cut at half the starting live seats
-  }();
-  return f;
 }
 
 inline int gpu_fission_rounds()

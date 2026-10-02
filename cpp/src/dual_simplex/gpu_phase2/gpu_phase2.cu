@@ -9631,8 +9631,6 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
                                            static_cast<int>(smem_x)));
         fission_xb<<<Ni, kXbThreads, smem_x, cs>>>(H->d_args, finv, Ni);
       }
-      int live0 = -1;
-      bool yielding = false;
       static const bool fused = !det && [] { const char* e = std::getenv("CUOPT_EXP_FUSED"); return e != nullptr && std::string(e) != "0"; }();  // opt-in
       const size_t smem_f     = std::max(smem, smem_c);
       if (fused) {
@@ -9641,10 +9639,9 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
       }
       for (;;) {
         if (fused) {
-          fission_fused<<<Ni, kFissionThreads, smem_f, cs>>>(H->d_args, finv, Ni, gpu_fission_rounds(), yielding ? 1 : 0);
+          fission_fused<<<Ni, kFissionThreads, smem_f, cs>>>(H->d_args, finv, Ni, gpu_fission_rounds());
         }
         for (int k = 0; k < (fused ? 0 : gpu_fission_rounds()); ++k) {
-          if (yielding) { fission_yield<<<Ni, 32, 0, cs>>>(H->d_args, Ni); }
           fission_price<<<Ni, 32, 0, cs>>>(H->d_args, Ni);
           k_btran<<<Ni, kFissionThreads, smem, cs>>>(H->d_args, finv, Ni);
           fission_choose_block<<<Ni, kFissionThreads, smem_c, cs>>>(H->d_args, Ni);
@@ -9681,8 +9678,6 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
           std::fprintf(stderr, "[FISSION] live=%d%s\n", live, line.c_str());
         }
         if (live == 0) { break; }
-        if (live0 < 0) { live0 = live; }
-        if (!yielding && live <= gpu_fission_yield() * live0) { yielding = true; }
       }
       RAFT_CUDA_TRY(cudaPeekAtLastError());
       if (last && !early) { set_flag_kernel<<<1, 1, 0, cs>>>(H->d_completion_flag); }
