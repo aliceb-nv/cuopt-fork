@@ -2562,6 +2562,7 @@ void replay_pool_mode(const raft::handle_t& handle,
                        " tloop=" + (env("CUOPT_EXP_TLOOP", "") == "old" ? "old" : "split-sums+balanced-axpy") +
                        " update=" + (env("CUOPT_EXP_UPDATE", "") == "old" ? "old" : "fused-cached") +
                        " tail=" + (env("CUOPT_EXP_TAIL", "") == "old" ? "old" : "btran-dots") +
+                       " restage-bounds=" + (env("CUOPT_EXP_PATH_BOUNDS", "") == "0" ? "full" : "root+deltas") +
                        " next-price=" + (env("CUOPT_EXP_UPDATE_PRICE", "") == "0" ? "price-kernel" : "in-update") +
                        " choose-dz=" + (env("CUOPT_EXP_CHOOSE", "") == "old" ? "in-strips" : "first+long-queue") +
                        " ftran-dy-U=" + (env("CUOPT_EXP_FTRAN_DY", "") == "gather" ? "all-rows" : env("CUOPT_EXP_FTRAN_DY", "") == "scatter" ? "scatter" : "se-rows") +
@@ -2609,6 +2610,13 @@ void replay_pool_mode(const raft::handle_t& handle,
     for (size_t q = 0; q < s.cols.size(); ++q) {
       node.lower[s.cols[q]] = s.lo[q];
       node.upper[s.cols[q]] = s.up[q];
+    }
+    // The same bounds as root + deltas, for restaging (as the B&B's path bounds; the first launch
+    // below stages full bounds).
+    node.root_lower = &lp.lower;
+    node.root_upper = &lp.upper;
+    for (size_t q = 0; q < s.cols.size(); ++q) {
+      node.path_deltas.push_back({s.cols[q], s.lo[q], s.up[q], 3});
     }
     node.vstatus.resize(n);
     for (int j = 0; j < n; ++j) { node.vstatus[j] = static_cast<ds::variable_status_t>(s.vstatus[j]); }
@@ -2663,6 +2671,7 @@ void replay_pool_mode(const raft::handle_t& handle,
       seat_node[s] = usable[cursor];
       cursor       = (cursor + 1) % U;
       nodes.push_back(stored[seat_node[s]]);
+      nodes.back().root_lower = nodes.back().root_upper = nullptr;
     }
     auto* run = mip::gpu_persistent_batch_begin<int, double>(
       lp, nodes, stream.view(), cache, &seat_state, true, var_types.empty() ? nullptr : &var_types);

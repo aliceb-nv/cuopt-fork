@@ -7168,6 +7168,17 @@ inline bool gpu_fission_price_fresh()
   return on;
 }
 
+// Fission fresh seats with a host LU may stage their bounds as root + path deltas
+// (CUOPT_EXP_PATH_BOUNDS=0: full bounds, as before).
+inline bool gpu_fission_path_bounds()
+{
+  static const bool on = [] {
+    const char* e = std::getenv("CUOPT_EXP_PATH_BOUNDS");
+    return e == nullptr || std::string(e) != "0";
+  }();
+  return on;
+}
+
 inline bool gpu_device_transpose()
 {
   static const bool on = [] {
@@ -9163,7 +9174,11 @@ bool gpu_simplified_dual_phase2_batch_stage(
 
   const bool from_root = command == gpu_batch_seat_command::FRESH_NODE && item.root_lower != nullptr;
   if (from_root) {
-    if (!gpu_simplified_dual_phase2_batch_lean_fresh(H) || !item.device_lu ||
+    // Fission seats with a host LU may take path bounds too: fission_presetup rebuilds lower/upper
+    // from the root and the deltas, and the rest of the seat stages as usual.
+    const bool host_lu_path = gpu_fission() && gpu_fission_path_bounds() && !item.device_lu &&
+                              item.packed_vstatus == nullptr;
+    if ((!host_lu_path && (!gpu_simplified_dual_phase2_batch_lean_fresh(H) || !item.device_lu)) ||
         item.root_lower->size() != static_cast<size_t>(n) ||
         item.root_upper->size() != static_cast<size_t>(n)) {
       error = "path bounds need lean fresh staging and root bounds";

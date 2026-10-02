@@ -2081,9 +2081,13 @@ struct gpu_batch_run_t {
     it.dy_se           = const_cast<std::vector<f_t>*>(&cn.dy_se);
     it.refactor_reason = &w.refactor_reason;
     it.command         = gds::gpu_batch_seat_command::FRESH_NODE;
+    // Root bounds + path deltas when the node carries them (as stage_persistent_fresh does).
+    it.root_lower = cn.root_lower;
+    it.root_upper = cn.root_upper;
     static const std::vector<gds::gpu_bound_delta<i_t, f_t>> none;
     return gds::gpu_simplified_dual_phase2_batch_stage<i_t, f_t>(
-      handle, static_cast<size_t>(s), it, gds::gpu_batch_seat_command::FRESH_NODE, none, error);
+      handle, static_cast<size_t>(s), it, gds::gpu_batch_seat_command::FRESH_NODE,
+      cn.root_lower != nullptr ? cn.path_deltas : none, error);
   }
 
   bool relaunch_persistent(std::string& error)
