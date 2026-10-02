@@ -1852,22 +1852,22 @@ __device__ __forceinline__ void fission_choose_block_body(kernel_args* args, i_t
         ratio = fmax((dtol - z[j]) / dzj, f_t{0.0}), eligible = 1;
       }
     }
+    // One scan for both lists: touched in the low 16 bits, eligible in the high 16 (each <= 512).
     int pos = 0, agg = 0;
-    fission_scan_t(scs.tmp).ExclusiveSum(touched, pos, agg);
+    fission_scan_t(scs.tmp).ExclusiveSum(touched | (eligible << 16), pos, agg);
     if (touched) {
-      dzi[nidx + pos] = j;
-      mark[j]         = 1;
+      dzi[nidx + (pos & 0xffff)] = j;
+      mark[j]                    = 1;
     }
-    nidx += agg;
-    __syncthreads();
-    fission_scan_t(scs.tmp).ExclusiveSum(eligible, pos, agg);
     if (eligible) {
-      cpos[ncand + pos] = k;
-      crat[ncand + pos] = ratio;
-      cj[ncand + pos]   = j;
-      caz[ncand + pos]  = fabs(z[j]);
+      const int q = ncand + (pos >> 16);
+      cpos[q]     = k;
+      crat[q]     = ratio;
+      cj[q]       = j;
+      caz[q]      = fabs(z[j]);
     }
-    ncand += agg;
+    nidx += agg & 0xffff;
+    ncand += agg >> 16;
     __syncthreads();
   }
   if (tid == 0) {
