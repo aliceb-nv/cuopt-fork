@@ -6818,6 +6818,9 @@ struct gpu_batch_handle_t {
   std::vector<gpu_fission_inv> h_finv;
   std::optional<rmm::device_buffer> d_finv;
   std::optional<rmm::device_buffer> d_fm;  // fission replay matrices, one per seat
+  std::optional<rmm::device_buffer> d_finv_mem;  // device-built explicit inverses (finv_build_t)
+  gpu_phase2_detail::finv_build_t finv_b{};
+  int* h_finv_err{nullptr};
   std::optional<rmm::device_buffer> d_live;
   // Bound deltas of one generation, uploaded by the relaunch in one copy.
   std::optional<pinned_buf<gpu_bound_delta<i_t, f_t>>> h_deltas;
@@ -9027,7 +9030,7 @@ bool gpu_simplified_dual_phase2_batch_stage(
 
   H->items[seat]         = item;
   H->items[seat].command = command;
-  if (gpu_fission() && command != gpu_batch_seat_command::CHILD_CONTINUE) {
+  if (gpu_fission() && gpu_fission_inv_library() && command != gpu_batch_seat_command::CHILD_CONTINUE) {
     if (item.fission_inv == nullptr) {
       error = "fissioned pivot loop (CUOPT_BNB_GPU_FISSION) needs the seat's explicit inverses";
       return false;
@@ -9498,11 +9501,70 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
       // Fissioned pivot loop: setup, then rounds of the phase kernels until no seat is running.
       const cudaStream_t cs = H->stream.value();
       const i_t Ni          = static_cast<i_t>(N);
-      if (H->h_finv.size() != N) {
+      const bool lib = gpu_fission_inv_library();
+      if (lib && H->h_finv.size() != N) {
         error = "fissioned pivot loop: seats without explicit inverses";
         return false;
       }
       if (!H->d_finv) { H->d_finv.emplace(N * sizeof(gpu_fission_inv), H->stream); }
+      if (!lib && !H->d_finv_mem) {
+        // Device-built inverses: one carved buffer, fixed per-seat capacities; seat pointers set once.
+        auto& b = H->finv_b;
+        b.N = static_cast<int>(N), b.m = static_cast<int>(H->rows);
+        int dev = 0, sms = 0, bps = 0;
+        RAFT_CUDA_TRY(cudaGetDevice(&dev));
+        RAFT_CUDA_TRY(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+        RAFT_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, finv_columns, 256, 0));
+        b.grid = sms * bps, b.warps = b.grid * 8;
+        const size_t m = b.m, Nn = N, W64 = (m + 63) / 64;
+        size_t bytes = 0;
+        auto need = [&](size_t nb) { bytes += (nb + 255) / 256 * 256; };
+        for (int f = 0; f < 2; ++f) {
+          const size_t ne = Nn * static_cast<size_t>(b.cap[f]);
+          need(Nn * 4); need(Nn * m * 4); need(Nn * m * 4); need(ne * 4); need(ne * 8);
+          need(Nn * (m + 1) * 4); need(ne * 4); need(ne * 8); need(Nn * (m + 1) * 4); need(ne * 4); need(ne * 8);
+        }
+        need(2 * Nn * m * 4); need(4 * 4);
+        need(static_cast<size_t>(b.warps) * m * 8); need(static_cast<size_t>(b.warps) * W64 * 8);
+        need(static_cast<size_t>(b.warps) * m * 4);
+        H->d_finv_mem.emplace(bytes, H->stream);
+        auto* p = static_cast<unsigned char*>(H->d_finv_mem->data());
+        auto take = [&](size_t nb) { auto* q = p; p += (nb + 255) / 256 * 256; return q; };
+        for (int f = 0; f < 2; ++f) {
+          const size_t ne = Nn * static_cast<size_t>(b.cap[f]);
+          b.cur[f] = reinterpret_cast<int*>(take(Nn * 4));
+          b.cstart[f] = reinterpret_cast<int*>(take(Nn * m * 4));
+          b.clen[f] = reinterpret_cast<int*>(take(Nn * m * 4));
+          b.si[f] = reinterpret_cast<int*>(take(ne * 4));
+          b.sx[f] = reinterpret_cast<double*>(take(ne * 8));
+          b.cp[f] = reinterpret_cast<int*>(take(Nn * (m + 1) * 4));
+          b.ci[f] = reinterpret_cast<int*>(take(ne * 4));
+          b.cv[f] = reinterpret_cast<double*>(take(ne * 8));
+          b.rp[f] = reinterpret_cast<int*>(take(Nn * (m + 1) * 4));
+          b.rj[f] = reinterpret_cast<int*>(take(ne * 4));
+          b.rv[f] = reinterpret_cast<double*>(take(ne * 8));
+        }
+        b.tasks  = reinterpret_cast<int*>(take(2 * Nn * m * 4));
+        b.ntasks = reinterpret_cast<int*>(take(16));
+        b.next = b.ntasks + 1, b.err = b.ntasks + 2;
+        b.ws_y = reinterpret_cast<double*>(take(static_cast<size_t>(b.warps) * m * 8));
+        b.ws_b = reinterpret_cast<unsigned long long*>(take(static_cast<size_t>(b.warps) * W64 * 8));
+        b.ws_l = reinterpret_cast<int*>(take(static_cast<size_t>(b.warps) * m * 4));
+        RAFT_CUDA_TRY(cudaMemsetAsync(b.ws_y, 0, static_cast<size_t>(b.warps) * m * 8, cs));
+        RAFT_CUDA_TRY(cudaMemsetAsync(b.ws_b, 0, static_cast<size_t>(b.warps) * W64 * 8, cs));
+        H->h_finv.assign(N, gpu_fission_inv{});
+        for (size_t s = 0; s < N; ++s) {
+          auto& v = H->h_finv[s];
+          const size_t pb = s * (m + 1), e0 = s * b.cap[0], e1 = s * b.cap[1];
+          v.Lc_p = b.cp[0] + pb, v.Lc_i = b.ci[0] + e0, v.Lc_x = b.cv[0] + e0;
+          v.Lr_p = b.rp[0] + pb, v.Lr_i = b.rj[0] + e0, v.Lr_x = b.rv[0] + e0;
+          v.Uc_p = b.cp[1] + pb, v.Uc_i = b.ci[1] + e1, v.Uc_x = b.cv[1] + e1;
+          v.Ur_p = b.rp[1] + pb, v.Ur_i = b.rj[1] + e1, v.Ur_x = b.rv[1] + e1;
+        }
+        RAFT_CUDA_TRY(cudaFuncSetAttribute(finv_transpose, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                           static_cast<int>(m * sizeof(int))));
+        RAFT_CUDA_TRY(cudaMallocHost(&H->h_finv_err, sizeof(int)));
+      }
       if (!H->d_live) { H->d_live.emplace(sizeof(int), H->stream); }
       RAFT_CUDA_TRY(cudaMemcpyAsync(H->d_finv->data(), H->h_finv.data(), N * sizeof(gpu_fission_inv),
                                     cudaMemcpyHostToDevice, cs));
@@ -9562,6 +9624,18 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
         }();
         RAFT_CUDA_TRY(cudaMemcpyToSymbolAsync(c_ftran_direct, &direct, sizeof(int), 0, cudaMemcpyHostToDevice, cs));
       }
+      if (!lib) {
+        // Every seat's inverses from the factors just staged: per-generation work.
+        auto& b = H->finv_b;
+        for (int f = 0; f < 2; ++f) { RAFT_CUDA_TRY(cudaMemsetAsync(b.cur[f], 0, N * sizeof(int), cs)); }
+        RAFT_CUDA_TRY(cudaMemsetAsync(b.ntasks, 0, 3 * sizeof(int), cs));
+        const long long T = 2LL * b.N * b.m;
+        finv_trivial<<<static_cast<unsigned>((T + 255) / 256), 256, 0, cs>>>(H->d_args, b);
+        finv_columns<<<b.grid, 256, 0, cs>>>(H->d_args, b);
+        finv_pack<<<2 * Ni, kFinvPack, 0, cs>>>(H->d_args, b);
+        finv_transpose<<<2 * Ni, kFinvTr, b.m * sizeof(int), cs>>>(H->d_args, b);
+        RAFT_CUDA_TRY(cudaMemcpyAsync(H->h_finv_err, b.err, sizeof(int), cudaMemcpyDeviceToHost, cs));
+      }
       fission_presetup<<<Ni, kPresetupThreads, 0, cs>>>(H->d_args, Ni);
       fission_setup_kernel<<<Ni, 32, 0, cs>>>(H->d_args, Ni);
       {
@@ -9595,6 +9669,9 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
         int live = 0;
         RAFT_CUDA_TRY(cudaMemcpyAsync(&live, d_live, sizeof(int), cudaMemcpyDeviceToHost, cs));
         RAFT_CUDA_TRY(cudaStreamSynchronize(cs));
+        if (!lib && *H->h_finv_err != 0) {
+          throw std::runtime_error("device explicit inverses: a seat exceeded its per-seat capacity");
+        }
         static const bool trace = std::getenv("CUOPT_BNB_GPU_FISSION_TRACE") != nullptr;
         if (trace) {
           // Per live seat: state, iteration, num_updates (first few).

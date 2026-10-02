@@ -2608,7 +2608,9 @@ void replay_pool_mode(const raft::handle_t& handle,
   // CUOPT_BNB_GPU_FISSION: explicit inverses of every stored node, resident on the device for the
   // whole replay (the analogue of the up-front LUs).
   std::vector<gds::gpu_fission_inv> finv(stored.size());
-  if (const char* e = std::getenv("CUOPT_BNB_GPU_FISSION"); e != nullptr && std::string(e) != "0") {
+  const char* inv_mode = std::getenv("CUOPT_EXP_INV");
+  if (const char* e = std::getenv("CUOPT_BNB_GPU_FISSION");
+      e != nullptr && std::string(e) != "0" && inv_mode != nullptr && std::string(inv_mode) == "library") {
     namespace ei = cuopt::linear_programming::dual_simplex::explicit_inverse;
     const double ti = mo::tic();
     std::vector<ei::inverses_t> inv(stored.size());
