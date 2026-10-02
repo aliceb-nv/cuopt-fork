@@ -53,6 +53,7 @@ struct fission_utrace_t {
 constexpr int kScatClasses = 5;
 __device__ unsigned long long g_fscat[kScatClasses][4];
 __device__ unsigned long long g_fscat_h[kScatClasses][2][20];
+__device__ unsigned long long g_ftl[2][3];  // replay (ascending, descending): calls, sum K, sum nonzero d
 __device__ fission_utrace_t* g_utrace;
 __device__ unsigned long long g_utrace_n;
 __device__ fission_utrace_t* g_ctrace;  // CUOPT_BNB_GPU_FISSION_CTRACE: same, per choose block
@@ -970,8 +971,9 @@ __device__ __forceinline__ void fission_tloop_m(const gpu_basis_update_t& ft, f_
   f_t* d        = scratch;
   f_t* th       = scratch + K;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
-  // CUOPT_EXP_SCATSTAT: ascending replay phase cycles (thread 0) into tl.dot / tl.updates / tl.axpy.
-  const bool clk = c_scatstat != 0 && asc && threadIdx.x == 0;
+  // CUOPT_EXP_SCATSTAT=<k>: ascending replay phase cycles (thread 0) into tl.dot / tl.updates /
+  // tl.axpy, for replays of at least k - 1 updates.
+  const bool clk = c_scatstat != 0 && asc && threadIdx.x == 0 && K + 1 >= c_scatstat;
   long long tc   = clk ? clock64() : 0;
   const auto tmark = [&](int s) {
     if (clk) {
@@ -990,25 +992,60 @@ __device__ __forceinline__ void fission_tloop_m(const gpu_basis_update_t& ft, f_
   }
   __syncthreads();
   tmark(S_TL_DOT);
-  const int Kp = (K + 31) & ~31;
-  if (asc && fast && Kp <= kFissionThreads) {
-    // Lanes over k (coalesced R reads), G groups over i; partial sums reduced in shared memory.
-    f_t* part   = scratch + 2 * K;
-    const int G = kFissionThreads / Kp;
-    const int k = threadIdx.x % Kp, g = threadIdx.x / Kp;
-    if (g < G && k < K) {
-      f_t acc[4] = {0.0, 0.0, 0.0, 0.0};
-      int q      = 0;
-#pragma unroll 4
-      for (i_t i = g; i < k; i += G, ++q) { acc[q & 3] += R[static_cast<size_t>(i) * kc + k] * d[i]; }
-      part[g * Kp + k] = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+  if (c_scatstat != 0) {
+    // Density of d: replay calls, sum of K, sum of nonzero d (ascending / descending).
+    __shared__ int s_nzd;
+    if (threadIdx.x == 0) { s_nzd = 0; }
+    __syncthreads();
+    int nzd = 0;
+    for (i_t k = threadIdx.x; k < K; k += blockDim.x) { nzd += d[k] != 0.0 ? 1 : 0; }
+    atomicAdd(&s_nzd, nzd);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      atomicAdd(&g_ftl[asc ? 0 : 1][0], 1ull);
+      atomicAdd(&g_ftl[asc ? 0 : 1][1], static_cast<unsigned long long>(K));
+      atomicAdd(&g_ftl[asc ? 0 : 1][2], static_cast<unsigned long long>(s_nzd));
+    }
+  }
+  if (fast && K <= kFissionThreads) {
+    // Only the nonzero d_i contribute: their indices, ascending, then R reads of those columns only.
+    int* nzl = reinterpret_cast<int*>(scratch + 2 * K);
+    __shared__ int s_nl;
+    {
+      const int flag = (static_cast<i_t>(threadIdx.x) < K && d[threadIdx.x] != 0.0) ? 1 : 0;
+      int pos = 0, L = 0;
+      fission_scan_t(sm->tmp).ExclusiveSum(flag, pos, L);
+      if (flag) { nzl[pos] = threadIdx.x; }
+      if (threadIdx.x == 0) { s_nl = L; }
     }
     __syncthreads();
-    for (i_t k2 = threadIdx.x; k2 < K; k2 += blockDim.x) {
-      f_t s = 0.0;
-      for (int g2 = 0; g2 < G; ++g2) { s += part[g2 * Kp + k2]; }
-      const f_t t = (d[k2] - s) / mu[k2];
-      th[k2]      = fabs(t) <= tol ? f_t{0.0} : t;
+    const int L = s_nl;
+    if (asc) {
+      // theta_k = (d_k - sum_{i<k, d_i != 0} R[k][i] d_i) / mu_k; lanes over k (coalesced R reads).
+      for (i_t k = threadIdx.x; k < K; k += blockDim.x) {
+        f_t acc[4] = {0.0, 0.0, 0.0, 0.0};
+#pragma unroll 4
+        for (int q = 0; q < L; ++q) {
+          const int i = nzl[q];
+          if (i < k) { acc[q & 3] += R[static_cast<size_t>(i) * kc + k] * d[i]; }
+        }
+        const f_t t = (d[k] - ((acc[0] + acc[1]) + (acc[2] + acc[3]))) / mu[k];
+        th[k]       = fabs(t) <= tol ? f_t{0.0} : t;
+      }
+    } else {
+      // theta_k = e_k - sum_{i>k, e_i != 0} R[i][k] e_i: a warp per k, lanes over the list.
+      for (i_t k = warp; k < K; k += nw) {
+        f_t part = 0.0;
+        for (int q = lane; q < L; q += 32) {
+          const int i = nzl[q];
+          if (i > k) { part += R[static_cast<size_t>(k) * kc + i] * d[i]; }
+        }
+        part = warp_reduce_add(part);
+        if (lane == 0) {
+          const f_t t = d[k] - part;
+          th[k]       = fabs(t) <= tol ? f_t{0.0} : t;
+        }
+      }
     }
   } else if (asc) {
     // theta_k = (d_k - sum_{i<k} R[k][i] d_i) / mu_k; R[k][i] at i * kc + k: coalesced over k.
@@ -1033,18 +1070,26 @@ __device__ __forceinline__ void fission_tloop_m(const gpu_basis_update_t& ft, f_
   }
   __syncthreads();
   tmark(S_TL_UPD);
-  if (fast) {
-    // x -= sum_k theta_k col(c_k): the K columns as segments of the balanced scatter (values -theta_k).
+  if (fast && K <= kFissionThreads) {
+    // x -= sum_k theta_k col(c_k) over the nonzero thetas, as segments of the balanced scatter.
     f_t* nv  = scratch + 2 * K + kFissionThreads;
     int* ci  = reinterpret_cast<int*>(nv + K);
     int* pre = ci + K;
     int* sb  = pre + K;
-    for (i_t k = threadIdx.x; k < K; k += blockDim.x) {
-      ci[k] = asc ? 2 * k : 2 * k + 1;
-      nv[k] = -th[k];
+    __shared__ int s_nt;
+    {
+      const i_t k    = threadIdx.x;
+      const int flag = (k < K && th[k] != 0.0) ? 1 : 0;
+      int pos = 0, nt = 0;
+      fission_scan_t(sm->tmp).ExclusiveSum(flag, pos, nt);
+      if (flag) {
+        ci[pos] = asc ? 2 * k : 2 * k + 1;
+        nv[pos] = -th[k];
+      }
+      if (threadIdx.x == 0) { s_nt = nt; }
     }
     __syncthreads();
-    fission_scatter_atomic(*sm, cs, ri, vx, ci, nv, K, pre, sb, x, -1);
+    fission_scatter_atomic(*sm, cs, ri, vx, ci, nv, s_nt, pre, sb, x, -1);
     tmark(S_TL_AXPY);
     return;
   }

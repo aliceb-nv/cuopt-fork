@@ -8348,6 +8348,17 @@ static std::string fission_scat_report()
   static const char* names[kScatClasses] = {"ftran.L rhs", "ftran.L dy", "ftran.U rhs", "ftran.U dy", "btran.L"};
   std::string out;
   char b[512];
+  unsigned long long tl[2][3];
+  if (cudaMemcpyFromSymbol(tl, g_ftl, sizeof(tl)) == cudaSuccess) {
+    for (int dir = 0; dir < 2; ++dir) {
+      if (tl[dir][0] == 0) { continue; }
+      std::snprintf(b, sizeof(b), "[FISSION-REPLAY] %s calls=%llu mean K=%.1f mean nonzero d=%.1f (%.1f%% of K)\n",
+                    dir == 0 ? "ascending (FTRAN)" : "descending (BTRAN)", tl[dir][0],
+                    double(tl[dir][1]) / tl[dir][0], double(tl[dir][2]) / tl[dir][0],
+                    tl[dir][1] ? 100.0 * tl[dir][2] / tl[dir][1] : 0.0);
+      out += b;
+    }
+  }
   for (int c = 0; c < kScatClasses; ++c) {
     if (s[c][0] == 0) { continue; }
     const double k = static_cast<double>(s[c][0]);
@@ -9701,7 +9712,10 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
           return (e != nullptr && std::string(e) == "direct") ? 1 : 0;
         }();
         RAFT_CUDA_TRY(cudaMemcpyToSymbolAsync(c_ftran_direct, &direct, sizeof(int), 0, cudaMemcpyHostToDevice, cs));
-        static const int scatstat = std::getenv("CUOPT_EXP_SCATSTAT") != nullptr ? 1 : 0;
+        static const int scatstat = [] {
+          const char* e = std::getenv("CUOPT_EXP_SCATSTAT");
+          return e == nullptr ? 0 : std::max(1, std::atoi(e));
+        }();
         RAFT_CUDA_TRY(cudaMemcpyToSymbolAsync(c_scatstat, &scatstat, sizeof(int), 0, cudaMemcpyHostToDevice, cs));
         static const int scatter_seg = [] {
           const char* e = std::getenv("CUOPT_EXP_SCATTER");
