@@ -8278,6 +8278,48 @@ static void seat_clock_add(const gpu_phase2_detail::seat_clock_t* c, int rounds,
   }
 }
 
+// Fission rounds launched per generation, and the live-seat count at each check (every `every` rounds).
+static struct {
+  std::mutex mu;
+  int every{0};
+  std::vector<int> rounds;
+  std::vector<double> live_sum;
+  std::vector<int> live_n;
+} g_frounds;
+
+static void fission_rounds_add(int every, const std::vector<int>& live)
+{
+  std::lock_guard<std::mutex> lk(g_frounds.mu);
+  g_frounds.every = every;
+  g_frounds.rounds.push_back(every * static_cast<int>(live.size()));
+  if (g_frounds.live_sum.size() < live.size()) {
+    g_frounds.live_sum.resize(live.size(), 0.0);
+    g_frounds.live_n.resize(live.size(), 0);
+  }
+  for (size_t k = 0; k < live.size(); ++k) { g_frounds.live_sum[k] += live[k], ++g_frounds.live_n[k]; }
+}
+
+static std::string fission_rounds_report()
+{
+  std::lock_guard<std::mutex> lk(g_frounds.mu);
+  if (g_frounds.rounds.empty()) { return {}; }
+  std::vector<int> r = g_frounds.rounds;
+  std::sort(r.begin(), r.end());
+  auto q = [&](double p) { return r[std::min(r.size() - 1, static_cast<size_t>(p * (r.size() - 1)))]; };
+  std::string out = "[FISSION-ROUNDS] generations=" + std::to_string(r.size()) +
+                    " (all, warmup included) rounds launched per generation: min=" + std::to_string(r.front()) +
+                    " p10=" + std::to_string(q(0.1)) + " p50=" + std::to_string(q(0.5)) +
+                    " p90=" + std::to_string(q(0.9)) + " max=" + std::to_string(r.back()) +
+                    " (live seats checked every " + std::to_string(g_frounds.every) + " rounds)\n";
+  out += "[FISSION-ROUNDS] mean live seats after round";
+  char b[48];
+  for (size_t k = 0; k < g_frounds.live_sum.size(); ++k) {
+    std::snprintf(b, sizeof(b), " %zu:%.0f", (k + 1) * g_frounds.every, g_frounds.live_sum[k] / g_frounds.live_n[k]);
+    out += b;
+  }
+  return out + "\n";
+}
+
 std::string gpu_fission_step_report()
 {
   using namespace gpu_phase2_detail;
@@ -8293,7 +8335,7 @@ std::string gpu_fission_step_report()
     "update.p.dx", "update.p.primal", "update.p.obj", "update.p.cutoff", "update.p.se_norms",
     "update.p.swap", "tl.dot", "tl.axpy", "tl.updates"};
   const double iters = static_cast<double>(h[S_U_TAIL][1]);
-  if (iters == 0) { return {}; }
+  if (iters == 0) { return fission_rounds_report(); }
   if (const char* ut = std::getenv("CUOPT_BNB_GPU_FISSION_UTRACE"); ut != nullptr && *ut != 0) {
     fission_utrace_t* d = nullptr;
     unsigned long long n = 0;
@@ -8356,7 +8398,7 @@ std::string gpu_fission_step_report()
   }
   double total = 0;
   for (int k = 0; k < S_UP_DX; ++k) { total += static_cast<double>(h[k][0]); }
-  std::string out;
+  std::string out = fission_rounds_report();
   char line[256];
   std::snprintf(line, sizeof(line),
                 "[FISSION-STEPS] completed iterations=%.0f, seat cycles per iteration=%.0f (per seat, "
@@ -9637,6 +9679,7 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
         RAFT_CUDA_TRY(cudaFuncSetAttribute(fission_fused, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                            static_cast<int>(smem_f)));
       }
+      std::vector<int> lives;
       for (;;) {
         if (fused) {
           fission_fused<<<Ni, kFissionThreads, smem_f, cs>>>(H->d_args, finv, Ni, gpu_fission_rounds());
@@ -9653,6 +9696,7 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
         int live = 0;
         RAFT_CUDA_TRY(cudaMemcpyAsync(&live, d_live, sizeof(int), cudaMemcpyDeviceToHost, cs));
         RAFT_CUDA_TRY(cudaStreamSynchronize(cs));
+        lives.push_back(live);
         if (*H->h_finv_err != 0) {
           throw std::runtime_error("device explicit inverses: a seat exceeded its per-seat capacity");
         }
@@ -9679,6 +9723,7 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
         }
         if (live == 0) { break; }
       }
+      fission_rounds_add(gpu_fission_rounds(), lives);
       RAFT_CUDA_TRY(cudaPeekAtLastError());
       if (last && !early) { set_flag_kernel<<<1, 1, 0, cs>>>(H->d_completion_flag); }
     } else {
