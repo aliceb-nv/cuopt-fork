@@ -4707,6 +4707,15 @@ template int phase2::compute_primal_solution_from_basis<int, double>(
   std::vector<double>&,
   double&);
 
+template int phase2::initialize_steepest_edge_norms<int, double>(
+  const lp_problem_t<int, double>&,
+  const simplex_solver_settings_t<int, double>&,
+  const double,
+  const std::vector<int>&,
+  basis_update_mpf_t<int, double>&,
+  std::vector<double>&,
+  double&);
+
 template void phase2::compute_dual_solution_from_basis<int, double>(
   const lp_problem_t<int, double>& lp,
   basis_update_mpf_t<int, double>& ft,

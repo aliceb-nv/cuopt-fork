@@ -144,6 +144,16 @@ void compute_initial_nonbasic_end(const std::vector<i_t>& basic_mark,
                                   std::vector<i_t>& nonbasic_end);
 
 namespace phase2 {
+// Exact steepest-edge weights of every basic row: one B^T solve per row (phase2.cpp).
+template <typename i_t, typename f_t>
+i_t initialize_steepest_edge_norms(const lp_problem_t<i_t, f_t>& lp,
+                                   const simplex_solver_settings_t<i_t, f_t>& settings,
+                                   const f_t start_time,
+                                   const std::vector<i_t>& basic_list,
+                                   basis_update_mpf_t<i_t, f_t>& ft,
+                                   std::vector<f_t>& delta_y_steepest_edge,
+                                   f_t& work_estimate);
+
 template <typename i_t, typename f_t>
 i_t compute_primal_solution_from_basis(const lp_problem_t<i_t, f_t>& lp,
                                        basis_update_mpf_t<i_t, f_t>& ft,

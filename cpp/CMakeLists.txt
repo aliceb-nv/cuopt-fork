@@ -1267,7 +1267,8 @@ endif ()
 add_executable(test_netlib
     ../benchmarks/linear_programming/cuopt/test_netlib.cu
     ../benchmarks/linear_programming/cuopt/ftran_bench.cu
-    ../benchmarks/linear_programming/cuopt/inv_bench.cu)
+    ../benchmarks/linear_programming/cuopt/inv_bench.cu
+    ../benchmarks/linear_programming/cuopt/se_bench.cu)
 
 # --fmad=false: no FMA contraction, so the device arithmetic matches the CPU
 #   simplified_dual_phase2 reference bit-for-bit. Every triangular-solve inner loop is

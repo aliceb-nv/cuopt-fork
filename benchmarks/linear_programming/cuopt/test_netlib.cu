@@ -66,6 +66,7 @@
 #include "benchmark_helper.hpp"
 #include "ftran_bench.hpp"
 #include "inv_bench.hpp"
+#include "se_bench.hpp"
 
 // `NAME=0` must mean OFF. The older TEST_NETLIB_* switches test only for presence, so `=0` turns
 // them ON; the switches added here use this helper instead, matching the CUOPT_* convention.
@@ -2841,6 +2842,13 @@ int main(int argc, char* argv[])
     .help("pool snapshot: batched base-factor FTRAN kernels on its nodes, --replicas copies each "
           "(needs --device)");
   program.add_argument("--ftran-repeats").default_value(5).scan<'i', int>();
+  program.add_argument("--se-bench")
+    .help("pool snapshot: exact steepest-edge weights of its nodes from device-built explicit inverses vs "
+          "the host initialize_steepest_edge_norms (needs --device)");
+  program.add_argument("--se-host-seats")
+    .help("--se-bench: seats timed single-threaded on the host")
+    .default_value(32)
+    .scan<'i', int>();
   program.add_argument("--inv-bench")
     .help("pool snapshot: explicit inverses of its nodes' base factors built on the device vs the "
           "single-thread host build plus upload (needs --device)");
@@ -2905,7 +2913,8 @@ int main(int argc, char* argv[])
   //
   // NOTE make_pool() reserves 40% of FREE VRAM up front; the batch pre-flight adds the current RMM
   // pool's size back to free VRAM, so a batch is not rejected merely because the pool exists.
-  if (program.is_used("--replay-pool") || program.is_used("--ftran-bench") || program.is_used("--inv-bench")) {
+  if (program.is_used("--replay-pool") || program.is_used("--ftran-bench") || program.is_used("--inv-bench") ||
+      program.is_used("--se-bench")) {
     const int dev = program.get<int>("--device");
     if (dev < 0 || cudaSetDevice(dev) != cudaSuccess) {
       std::fprintf(stderr, "--replay-pool needs a valid --device\n");
@@ -2941,6 +2950,10 @@ int main(int argc, char* argv[])
     return 0;
   }
 
+  if (program.is_used("--se-bench")) {
+    return se_bench_main(handle, program.get<std::string>("--se-bench"), program.get<int>("--ftran-repeats"),
+                         program.get<int>("--prepare-threads"), program.get<int>("--se-host-seats"));
+  }
   if (program.is_used("--inv-bench")) {
     return inv_bench_main(handle, program.get<std::string>("--inv-bench"), program.get<int>("--ftran-repeats"),
                           program.get<int>("--prepare-threads"));
