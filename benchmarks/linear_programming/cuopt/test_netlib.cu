@@ -47,6 +47,7 @@
 #include <unordered_map>   // collapsing duplicate [TRUE MISMATCH] lines across replicas
 
 #include <algorithm>
+#include <numeric>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -65,6 +66,7 @@
 
 #include "benchmark_helper.hpp"
 #include "ftran_bench.hpp"
+#include "inv_bench.hpp"
 
 // `NAME=0` must mean OFF. The older TEST_NETLIB_* switches test only for presence, so `=0` turns
 // them ON; the switches added here use this helper instead, matching the CUOPT_* convention.
@@ -2625,6 +2627,103 @@ void replay_pool_mode(const raft::handle_t& handle,
       });
     }
     for (auto& t : th) { t.join(); }
+    if (std::getenv("CUOPT_EXP_INV_LEVELS") != nullptr) {
+      // Levels of the column recurrence X(:,k) = (e_k - sum_i T_ik X(:,i)) / T_kk over every stored LU.
+      // Per level, summed over seats: columns, output nonzeros, source-column entries, factor entries.
+      struct acc_t { double cols = 0, out = 0, src = 0, fac = 0; };
+      std::vector<acc_t> per[2];
+      std::vector<int> nlev[2];
+      for (int q = 0; q < U; ++q) {
+        const int k0 = usable[q];
+        const auto& ft = prepared[k0].ft;
+        for (int f = 0; f < 2; ++f) {
+          const auto& F = f == 0 ? ft.L0() : ft.U0();
+          const int* cp = F.col_start.data();
+          const int* ri = F.i.data();
+          const auto& Inv = f == 0 ? inv[k0].Lc : inv[k0].Uc;
+          const int* perm = ft.row_permutation().data();
+          auto onz = [&](int k) { const int c = f == 0 ? perm[k] : k; return Inv.p[c + 1] - Inv.p[c]; };
+          std::vector<int> lev(m, 0);
+          int L = 0;
+          for (int t = 0; t < m; ++t) {
+            const int k = f == 0 ? m - 1 - t : t;  // L: deps i > k; U: deps i < k
+            int lv = 0;
+            for (int p = cp[k]; p < cp[k + 1]; ++p) {
+              const int i = ri[p];
+              if (i != k) { lv = std::max(lv, lev[i] + 1); }
+            }
+            lev[k] = lv;
+            L      = std::max(L, lv + 1);
+          }
+          if (static_cast<int>(per[f].size()) < L) { per[f].resize(L); }
+          nlev[f].push_back(L);
+          for (int k = 0; k < m; ++k) {
+            auto& a = per[f][lev[k]];
+            a.cols += 1, a.out += onz(k), a.fac += cp[k + 1] - cp[k];
+            for (int p = cp[k]; p < cp[k + 1]; ++p) {
+              if (ri[p] != k) { a.src += onz(ri[p]); }
+            }
+          }
+        }
+      }
+      {
+        // Per non-trivial column (with dependencies): output pattern size and serial steps
+        // (sum over the pattern's rows of that factor column's off-diagonal entries).
+        std::vector<double> csz[2], cwk[2], smax_sz[2], smax_wk[2];
+        for (int q = 0; q < U; ++q) {
+          const int k0 = usable[q];
+          const auto& ft = prepared[k0].ft;
+          for (int f = 0; f < 2; ++f) {
+            const auto& F = f == 0 ? ft.L0() : ft.U0();
+            const int* cp = F.col_start.data();
+            const auto& Inv = f == 0 ? inv[k0].Lc : inv[k0].Uc;
+            const int* perm = ft.row_permutation().data();
+            double msz = 0, mwk = 0;
+            for (int k = 0; k < m; ++k) {
+              const int c = f == 0 ? perm[k] : k;
+              const int nz = Inv.p[c + 1] - Inv.p[c];
+              if (nz <= 1) { continue; }
+              double wk = 0;
+              for (int t = Inv.p[c]; t < Inv.p[c + 1]; ++t) {
+                const int r = Inv.i[t];
+                wk += cp[r + 1] - cp[r] - 1;
+              }
+              csz[f].push_back(nz), cwk[f].push_back(wk);
+              msz = std::max<double>(msz, nz), mwk = std::max(mwk, wk);
+            }
+            smax_sz[f].push_back(msz), smax_wk[f].push_back(mwk);
+          }
+        }
+        auto pct = [](std::vector<double> v, double p) {
+          if (v.empty()) { return 0.0; }
+          std::sort(v.begin(), v.end());
+          return v[std::min(v.size() - 1, static_cast<size_t>(p * (v.size() - 1)))];
+        };
+        for (int f = 0; f < 2; ++f) {
+          const char* nm = f == 0 ? "Linv" : "Uinv";
+          std::printf("[EXP-INV-COLS] %s non-trivial columns=%zu (%.1f per seat)\n", nm, csz[f].size(), csz[f].size() / double(U));
+          for (auto [lab, v] : {std::pair{"pattern size", &csz[f]}, std::pair{"serial steps", &cwk[f]},
+                                std::pair{"per-seat max pattern size", &smax_sz[f]}, std::pair{"per-seat max serial steps", &smax_wk[f]}}) {
+            std::printf("[EXP-INV-COLS] %s %-26s p50=%8.0f p90=%8.0f p99=%8.0f p99.9=%8.0f max=%8.0f mean=%8.1f\n", nm, lab,
+                        pct(*v, 0.5), pct(*v, 0.9), pct(*v, 0.99), pct(*v, 0.999), pct(*v, 1.0),
+                        std::accumulate(v->begin(), v->end(), 0.0) / std::max<size_t>(1, v->size()));
+          }
+        }
+      }
+      for (int f = 0; f < 2; ++f) {
+        std::sort(nlev[f].begin(), nlev[f].end());
+        double tc = 0, to = 0, ts = 0, tf = 0;
+        for (auto& a : per[f]) { tc += a.cols, to += a.out, ts += a.src, tf += a.fac; }
+        std::printf("[EXP-INV-LEVELS] %s: seats=%d levels mean=%.1f median=%d max=%d | per seat: cols=%.0f out_nnz=%.0f src_entries=%.0f factor_entries=%.0f\n",
+                    f == 0 ? "Linv" : "Uinv", U, std::accumulate(nlev[f].begin(), nlev[f].end(), 0.0) / U,
+                    nlev[f][U / 2], nlev[f].back(), tc / U, to / U, ts / U, tf / U);
+        for (size_t l = 0; l < per[f].size(); ++l) {
+          const auto& a = per[f][l];
+          std::printf("[EXP-INV-LEVELS] %s level %2zu: per seat cols=%8.1f out_nnz=%9.1f src_entries=%9.1f factor_entries=%8.1f\n",
+                      f == 0 ? "Linv" : "Uinv", l, a.cols / U, a.out / U, a.src / U, a.fac / U);
+        }
+      }
+    }
     size_t bytes = 0;
     auto up = [&](const auto& v) {
       using T = typename std::decay_t<decltype(v)>::value_type;
@@ -2868,6 +2967,9 @@ int main(int argc, char* argv[])
     .help("pool snapshot: batched base-factor FTRAN kernels on its nodes, --replicas copies each "
           "(needs --device)");
   program.add_argument("--ftran-repeats").default_value(5).scan<'i', int>();
+  program.add_argument("--inv-bench")
+    .help("pool snapshot: explicit inverses of its nodes' base factors built on the device vs the "
+          "single-thread host build plus upload (needs --device)");
   program.add_argument("--replay-pool")
     .help("pool snapshot written under CUOPT_BNB_GPU_SNAPSHOT=<file>: emulate one GPU's steady state "
           "with --clones copies of the pool for --seconds (needs --device)");
@@ -2929,7 +3031,7 @@ int main(int argc, char* argv[])
   //
   // NOTE make_pool() reserves 40% of FREE VRAM up front; the batch pre-flight adds the current RMM
   // pool's size back to free VRAM, so a batch is not rejected merely because the pool exists.
-  if (program.is_used("--replay-pool") || program.is_used("--ftran-bench")) {
+  if (program.is_used("--replay-pool") || program.is_used("--ftran-bench") || program.is_used("--inv-bench")) {
     const int dev = program.get<int>("--device");
     if (dev < 0 || cudaSetDevice(dev) != cudaSuccess) {
       std::fprintf(stderr, "--replay-pool needs a valid --device\n");
@@ -2965,6 +3067,10 @@ int main(int argc, char* argv[])
     return 0;
   }
 
+  if (program.is_used("--inv-bench")) {
+    return inv_bench_main(handle, program.get<std::string>("--inv-bench"), program.get<int>("--ftran-repeats"),
+                          program.get<int>("--prepare-threads"));
+  }
   if (program.is_used("--ftran-bench")) {
     return ftran_bench_main(handle,
                             program.get<std::string>("--ftran-bench"),
