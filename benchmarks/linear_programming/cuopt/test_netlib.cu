@@ -2558,6 +2558,7 @@ void replay_pool_mode(const raft::handle_t& handle,
                        (env("CUOPT_EXP_FTRAN", "") == "direct" ? "direct" : "inverse") +
                        " phases=" + (env("CUOPT_EXP_FUSED", "0") != "0" ? "fused" : "separate") +
                        " scatter=" + (env("CUOPT_EXP_SCATTER", "") == "segment" ? "segment" : "balanced-batched") +
+                       " fresh-duals=" + (env("CUOPT_EXP_PRICE_FRESH", "") == "0" ? "host-uploaded" : "device") +
                        " tloop=" + (env("CUOPT_EXP_TLOOP", "") == "old" ? "old" : "split-sums+balanced-axpy") +
                        " ftran-dy-U=" + (env("CUOPT_EXP_FTRAN_DY", "") == "gather" ? "all-rows" : env("CUOPT_EXP_FTRAN_DY", "") == "scatter" ? "scatter" : "se-rows") +
                        " bounds-strengthen+setup=device")
@@ -2741,6 +2742,10 @@ void replay_pool_mode(const raft::handle_t& handle,
       auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v.empty() ? 0.0 : v[v.size() / 2]; };
       std::printf("[EXP-HOST] per generation, median ms: harvest call %.1f (incl. GPU wait), stage loop %.1f, relaunch call %.1f\n",
                   1e3 * med(ht_h), 1e3 * med(ht_s), 1e3 * med(ht_r));
+      const double* ss = gds::gpu_batch_stage_split();
+      const double g   = std::max<size_t>(1, ht_s.size() + 1);
+      std::printf("[EXP-HOST] stage split, mean ms per generation (clone 0's thread, first launch included): checks %.1f, bounds %.1f, seat vectors %.1f, factors+rest %.1f\n",
+                  1e3 * ss[0] / g, 1e3 * ss[1] / g, 1e3 * ss[2] / g, 1e3 * ss[3] / g);
     }
     mip::gpu_batch_run_end<int, double>(run);
   };

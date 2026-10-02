@@ -7152,6 +7152,17 @@ struct pinned_plan_t {
 // padding per piece and the flush descriptors (2 pointers + 1 size per piece). `small`: the kernel
 // arguments and the status / iteration / objective arrays created at the start of the first launch.
 // CUOPT_BNB_GPU_DEVICE_TRANSPOSE=0: upload the host's L0t/U0t instead of building them on the device.
+// Fission fresh seats price themselves on the device, so staging skips y and z
+// (CUOPT_EXP_PRICE_FRESH=0: host duals uploaded as before).
+inline bool gpu_fission_price_fresh()
+{
+  static const bool on = [] {
+    const char* e = std::getenv("CUOPT_EXP_PRICE_FRESH");
+    return e == nullptr || std::string(e) != "0";
+  }();
+  return on;
+}
+
 inline bool gpu_device_transpose()
 {
   static const bool on = [] {
@@ -9254,8 +9265,10 @@ bool gpu_simplified_dual_phase2_batch_stage(
         put(F.vstatus, *item.vstatus, n);
         put(F.basic_list, *item.basic_list, m);
         put(F.nonbasic_list, *item.nonbasic_list, n - m);
-        put(F.y, item.sol->y, m);
-        put(F.z, item.sol->z, n);
+        if (!(gpu_fission() && gpu_fission_price_fresh())) {
+          put(F.y, item.sol->y, m);
+          put(F.z, item.sol->z, n);
+        }
         put(F.dy_se, *item.dy_se, n);
         split(2);
       } else {
@@ -9718,6 +9731,12 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
         RAFT_CUDA_TRY(cudaMemcpyAsync(H->h_finv_err, b.err, sizeof(int), cudaMemcpyDeviceToHost, cs));
       }
       fission_presetup<<<Ni, kPresetupThreads, 0, cs>>>(H->d_args, Ni);
+      if (gpu_fission_price_fresh()) {
+        const size_t smem_d = 2 * static_cast<size_t>(H->rows) * sizeof(f_t);
+        RAFT_CUDA_TRY(cudaFuncSetAttribute(fission_duals, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                           static_cast<int>(smem_d)));
+        fission_duals<<<Ni, kXbThreads, smem_d, cs>>>(H->d_args, finv, Ni);
+      }
       fission_setup_kernel<<<Ni, 32, 0, cs>>>(H->d_args, Ni);
       {
         const size_t smem_x = 2 * static_cast<size_t>(H->rows) * sizeof(f_t);

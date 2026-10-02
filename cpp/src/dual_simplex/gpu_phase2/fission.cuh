@@ -323,6 +323,51 @@ __global__ void __launch_bounds__(32) fission_setup_kernel(kernel_args* args, i_
 // one owner per output, |x_j| < 10 tight_tol skipped as in compute_primal_variables), then the
 // objective c'x and the infeasibility list. Shared: two m-vectors.
 constexpr int kXbThreads = 512;
+__global__ void __launch_bounds__(kXbThreads) fission_xb(kernel_args* args, const gpu_fission_inv* inv, i_t n_problems);
+
+// Duals of a fresh host-factorized seat from the inverses, before setup places the nonbasics:
+// y' = (c_B' U0^-1) (L0^-1 P), z_N = c_N - A_N' y, z_B = 0. Shared: two m-vectors.
+__global__ void __launch_bounds__(kXbThreads) fission_duals(kernel_args* args, const gpu_fission_inv* inv, i_t n_problems)
+{
+  extern __shared__ f_t fsh[];
+  if (blockIdx.x >= n_problems) { return; }
+  kernel_args& a = args[blockIdx.x];
+  if (a.done != 0 || a.refactor_resume != 0 || a.device_lu != 0 ||
+      a.command == static_cast<i_t>(gpu_batch_seat_command::CHILD_CONTINUE)) {
+    return;
+  }
+  const i_t m = a.m, n = a.n;
+  const int tid = threadIdx.x;
+  f_t* cb = fsh;
+  f_t* w  = fsh + m;
+  for (i_t k = tid; k < m; k += kXbThreads) { cb[k] = a.objective[a.basic_list[k]]; }
+  __syncthreads();
+  const auto& I = inv[blockIdx.x];
+  for (i_t c = tid; c < m; c += kXbThreads) {
+    f_t v = 0.0;
+    for (i_t p = I.Uc_p[c]; p < I.Uc_p[c + 1]; ++p) { v += I.Uc_x[p] * cb[I.Uc_i[p]]; }
+    w[c] = v;
+  }
+  __syncthreads();
+  f_t* y = cb;
+  for (i_t j = tid; j < m; j += kXbThreads) {
+    f_t v = 0.0;
+    for (i_t p = I.Lc_p[j]; p < I.Lc_p[j + 1]; ++p) { v += I.Lc_x[p] * w[I.Lc_i[p]]; }
+    y[j]   = v;
+    a.y[j] = v;
+  }
+  __syncthreads();
+  for (i_t j = tid; j < n; j += kXbThreads) {
+    if (a.vstatus[j] == variable_status_t::BASIC) {
+      a.z[j] = 0.0;
+      continue;
+    }
+    f_t dot = 0.0;
+    for (i_t p = a.A_col_start[j]; p < a.A_col_start[j + 1]; ++p) { dot += a.A_x[p] * y[a.A_i[p]]; }
+    a.z[j] = a.objective[j] - dot;
+  }
+}
+
 __global__ void __launch_bounds__(kXbThreads) fission_xb(kernel_args* args, const gpu_fission_inv* inv, i_t n_problems)
 {
   extern __shared__ f_t fsh[];
