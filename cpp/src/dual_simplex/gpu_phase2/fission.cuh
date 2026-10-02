@@ -2571,6 +2571,7 @@ __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t
 __global__ void __launch_bounds__(kFissionThreads, 2)
   fission_fused(kernel_args* args, const gpu_fission_inv* inv, i_t n_problems, int rounds)
 {
+  extern __shared__ f_t fsh[];
   __shared__ fission_utrace_t r;
   if (blockIdx.x >= n_problems) { return; }
   for (int k = 0; k < rounds; ++k) {
@@ -2583,7 +2584,9 @@ __global__ void __launch_bounds__(kFissionThreads, 2)
     __syncthreads();
     fission_ftran_atomic_body(args, inv, n_problems);
     __syncthreads();
-    fission_update_block_body<kFissionThreads>(args, n_problems, r);
+    // FTRAN's shared memory is free here: the update's position cache (m + 1 ints) goes there.
+    fission_update_block_body<kFissionThreads>(args, n_problems, r,
+                                               c_update_old != 0 ? nullptr : reinterpret_cast<int*>(fsh));
     __syncthreads();
   }
 }
