@@ -2281,6 +2281,7 @@ __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t
   __shared__ typename cub::BlockScan<int, T, cub::BLOCK_SCAN_WARP_SCANS>::TempStorage scan_tmp;
   __shared__ f_t s_part[T / 32];
   __shared__ int s_cut, s_fu;
+  __shared__ i_t s_priced;
   gpu_lp lp;
   gpu_settings settings;
   gpu_solution sol;
@@ -2310,7 +2311,7 @@ __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t
       sdx.x.push_back(scale);
     }
   }
-  if (tid == 0) { s_cut = 0, s_fu = 0; }
+  if (tid == 0) { s_cut = 0, s_fu = 0, s_priced = -1; }
   __syncthreads();
   FSTEP(S_U_PIVCHECK)
   if (tid == 32) { fst_ = clock64(); }
@@ -2497,11 +2498,20 @@ __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t
       count += agg;
       __syncthreads();
     }
+    // The next pricing rides on this pass (CUOPT_EXP_UPDATE_PRICE=0: the price kernel does it): the
+    // argmax of sq / dy_se under fission_price's total order, so the same leaving row is chosen.
+    const bool pricing = c_update_price != 0;
+    f_t bv = 0.0;
+    i_t bj = -1;
     i_t out = 0;
     for (i_t base = 0; base < count; base += T) {
       const i_t k   = base + tid;
       const i_t j   = k < count ? idx[k] : -1;
       const int keep = (j >= 0 && sq[j] != 0.0) ? 1 : 0;
+      if (keep && pricing) {
+        const f_t val = sq[j] / a.dy_se[j];
+        if (val > bv || (val == bv && j > bj)) { bv = val, bj = j; }
+      }
       int pos = 0, agg = 0;
       cub::BlockScan<int, T, cub::BLOCK_SCAN_WARP_SCANS>(scan_tmp).ExclusiveSum(keep, pos, agg);
       __syncthreads();  // all reads of this stride before any write into it
@@ -2510,6 +2520,29 @@ __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t
       __syncthreads();
     }
     if (tid == 0) { st.infeas_idx.set_size(out); }
+    if (pricing) {
+      __shared__ f_t s_bv[T / 32];
+      __shared__ i_t s_bj[T / 32];
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) {
+        const f_t ov = __shfl_xor_sync(0xffffffffu, bv, off);
+        const i_t oj = __shfl_xor_sync(0xffffffffu, bj, off);
+        if (ov > bv || (ov == bv && oj > bj)) { bv = ov, bj = oj; }
+      }
+      if ((tid & 31) == 0) { s_bv[tid >> 5] = bv, s_bj[tid >> 5] = bj; }
+      __syncthreads();
+      if (tid == 0) {
+        for (int w = 1; w < T / 32; ++w) {
+          if (s_bv[w] > bv || (s_bv[w] == bv && s_bj[w] > bj)) { bv = s_bv[w], bj = s_bj[w]; }
+        }
+        s_priced = bj;
+        if (bj >= 0) {
+          st.leaving       = bj;
+          st.direction     = (lp.lower[bj] - x[bj] >= x[bj] - lp.upper[bj]) ? 1 : -1;
+          st.basic_leaving = st.basic_mark[bj];
+        }
+      }
+    }
   }
   FSTEP(S_U_INFEAS)
   {
@@ -2525,7 +2558,7 @@ __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t
       st.delta_z[leaving]  = 0.0;
       st.delta_z_indices.clear();
       st.iter++;
-      st.f_state = F_PRICE;
+      st.f_state = s_priced >= 0 ? F_BTRAN : F_PRICE;
     }
   }
   FSTEP(S_U_TAIL)

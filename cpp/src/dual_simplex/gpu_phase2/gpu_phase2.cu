@@ -212,6 +212,7 @@ __constant__ int c_warp_levels = 1;    // CUOPT_BNB_GPU_WARP_LEVELS
 __constant__ int c_ftran_direct = 0;   // CUOPT_EXP_FTRAN=direct: fission FTRAN through L0/U0
 __constant__ int c_scatstat = 0;       // CUOPT_EXP_SCATSTAT: fission scatter size statistics
 __constant__ int c_scatter_seg = 0;    // CUOPT_EXP_SCATTER=segment: fission scatter by segment (thread/warp)
+__constant__ int c_update_price = 1;  // CUOPT_EXP_UPDATE_PRICE=0: pricing only in fission_price
 __constant__ int c_choose_old = 0;  // CUOPT_EXP_CHOOSE=old: dz computed inside the compaction strips
 __constant__ int c_tail_old = 0;  // CUOPT_EXP_TAIL=old: FTRAN tail recomputes w (dots) and sums all of it
 __constant__ int c_update_old = 0;  // CUOPT_EXP_UPDATE=old: separate update passes, no cached positions
@@ -9751,6 +9752,11 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
           return (e != nullptr && std::string(e) == "old") ? 1 : 0;
         }();
         RAFT_CUDA_TRY(cudaMemcpyToSymbolAsync(c_choose_old, &choose_old, sizeof(int), 0, cudaMemcpyHostToDevice, cs));
+        static const int update_price = [] {
+          const char* e = std::getenv("CUOPT_EXP_UPDATE_PRICE");
+          return (e != nullptr && std::string(e) == "0") ? 0 : 1;
+        }();
+        RAFT_CUDA_TRY(cudaMemcpyToSymbolAsync(c_update_price, &update_price, sizeof(int), 0, cudaMemcpyHostToDevice, cs));
         static const int finv_gbits = [] {
           const char* e = std::getenv("CUOPT_EXP_FINV_GBITS");
           return (e != nullptr && std::string(e) != "0") ? 1 : 0;
