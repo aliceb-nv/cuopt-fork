@@ -210,6 +210,7 @@ __constant__ int c_reuse_levels = 1;
 __constant__ int c_derive_levels = 1;  // CUOPT_BNB_GPU_DERIVE_LEVELS
 __constant__ int c_warp_levels = 1;    // CUOPT_BNB_GPU_WARP_LEVELS
 __constant__ int c_ftran_direct = 0;   // CUOPT_EXP_FTRAN=direct: fission FTRAN through L0/U0
+__constant__ int c_scatstat_r = -1;  // CUOPT_EXP_SCATSTAT_R=<r>: replay phase timers for FTRAN solve r only
 __constant__ int c_scatstat = 0;       // CUOPT_EXP_SCATSTAT: fission scatter size statistics
 __constant__ int c_scatter_seg = 0;    // CUOPT_EXP_SCATTER=segment: fission scatter by segment (thread/warp)
 __constant__ int c_update_price = 1;  // CUOPT_EXP_UPDATE_PRICE=0: pricing only in fission_price
@@ -9736,6 +9737,11 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
           return e == nullptr ? 0 : std::max(1, std::atoi(e));
         }();
         RAFT_CUDA_TRY(cudaMemcpyToSymbolAsync(c_scatstat, &scatstat, sizeof(int), 0, cudaMemcpyHostToDevice, cs));
+        static const int scatstat_r = [] {
+          const char* e = std::getenv("CUOPT_EXP_SCATSTAT_R");
+          return e == nullptr ? -1 : std::atoi(e);
+        }();
+        RAFT_CUDA_TRY(cudaMemcpyToSymbolAsync(c_scatstat_r, &scatstat_r, sizeof(int), 0, cudaMemcpyHostToDevice, cs));
         static const int scatter_seg = [] {
           const char* e = std::getenv("CUOPT_EXP_SCATTER");
           return (e != nullptr && std::string(e) == "segment") ? 1 : 0;

@@ -966,7 +966,8 @@ __device__ __forceinline__ void fission_scatter_atomic(fission_scan_smem_t& sm, 
                                                        int* pre, int* sb, f_t* acc, int cls);
 __device__ __forceinline__ void fission_tloop_m(const gpu_basis_update_t& ft, f_t* x, bool asc, f_t tol,
                                                 const f_t* R, int kc, f_t* scratch, size_t,
-                                                fission_scan_smem_t* sm = nullptr, f_t* wsave = nullptr)
+                                                fission_scan_smem_t* sm = nullptr, f_t* wsave = nullptr,
+                                                bool timed = true)
 {
   const bool fast = sm != nullptr && c_tloop_old == 0;
   const i_t K = ft.num_updates_;
@@ -980,7 +981,7 @@ __device__ __forceinline__ void fission_tloop_m(const gpu_basis_update_t& ft, f_
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
   // CUOPT_EXP_SCATSTAT=<k>: ascending replay phase cycles (thread 0) into tl.dot / tl.updates /
   // tl.axpy, for replays of at least k - 1 updates.
-  const bool clk = c_scatstat != 0 && asc && threadIdx.x == 0 && K + 1 >= c_scatstat;
+  const bool clk = timed && c_scatstat != 0 && asc && threadIdx.x == 0 && K + 1 >= c_scatstat;
   long long tc   = clk ? clock64() : 0;
   const auto tmark = [&](int s) {
     if (clk) {
@@ -1536,7 +1537,8 @@ __device__ __forceinline__ void fission_ftran_atomic_body(kernel_args* args, con
     }
     FSTEP(r == 0 ? S_F_LSCATTER : S_F1_LSCATTER)
     if (st.f_mrows == st.ft.num_updates_) {
-      fission_tloop_m(st.ft, z, true, 1e-16, a.fm, a.fm_kcap, R, kFissionStage / sizeof(f_t), &scs);
+      fission_tloop_m(st.ft, z, true, 1e-16, a.fm, a.fm_kcap, R, kFissionStage / sizeof(f_t), &scs, nullptr,
+                      c_scatstat_r < 0 || c_scatstat_r == r);
     } else {
       fission_tloop_chunked(st.ft, z, true, 1e-16, R, kFissionStage);
     }
