@@ -531,18 +531,47 @@ __device__ __forceinline__ void fission_mark(const i_t* cp, const i_t* ri, const
 // out[list[q]] = sum over segment list[q] of (cp, ri, cx) of cx[p] * in[ri[p]]. Segments of up to
 // kShortSeg entries: one thread, storage order. Longer: one warp, lane-strided partials reduced by
 // a fixed butterfly. Both orders depend only on the data, so results are reproducible.
+// With a queue (lq, qcap entries, count *qn), the thread pass queues the long segments' list
+// positions so that the warps visit only those (overflow: the warps scan the whole list as without one).
 __device__ __forceinline__ void fission_gather(const i_t* cp, const i_t* ri, const f_t* cx,
-                                               const i_t* list, int n, const f_t* in, f_t* out)
+                                               const i_t* list, int n, const f_t* in, f_t* out,
+                                               int* lq = nullptr, int qcap = 0, int* qn = nullptr)
 {
+  if (lq != nullptr) {
+    if (threadIdx.x == 0) { *qn = 0; }
+    __syncthreads();
+  }
   for (int q = threadIdx.x; q < n; q += kFissionThreads) {
     const i_t i = list[q];
     const i_t b = cp[i], e = cp[i + 1];
-    if (e - b > kShortSeg) { continue; }
+    if (e - b > kShortSeg) {
+      if (lq != nullptr) {
+        const int k = atomicAdd(qn, 1);
+        if (k < qcap) { lq[k] = q; }
+      }
+      continue;
+    }
     f_t s = 0.0;
     for (i_t p = b; p < e; ++p) { s += cx[p] * in[ri[p]]; }
     out[i] = s;
   }
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  if (lq != nullptr) {
+    __syncthreads();
+    const int nq = *qn;
+    if (nq <= qcap) {
+      for (int k = warp; k < nq; k += kFissionThreads / 32) {
+        const i_t i = list[lq[k]];
+        const i_t b = cp[i], e = cp[i + 1];
+        f_t s = 0.0;
+        for (i_t p = b + lane; p < e; p += 32) { s += cx[p] * in[ri[p]]; }
+        s = warp_reduce_add(s);
+        if (lane == 0) { out[i] = s; }
+      }
+      __syncthreads();
+      return;
+    }
+  }
   for (int q = warp; q < n; q += kFissionThreads / 32) {
     const i_t i = list[q];
     const i_t b = cp[i], e = cp[i + 1];
@@ -1396,7 +1425,7 @@ __device__ __forceinline__ void fission_ftran_atomic_body(kernel_args* args, con
     } else if (dy_gather) {
       const auto& dx = st.scaled_dxB_sparse;
       fission_gather(I.Ur_p, I.Ur_i, I.Ur_x, dx.i.data(), static_cast<int>(dx.i.size()), z,
-                     st.ft.dense_scratch2_.data());
+                     st.ft.dense_scratch2_.data(), li, 2 * kFissionCapA, &cnt);
     } else if (direct) {
       fission_level_solve(st.ft.U0_transpose_, st.lvl_ls[1].data(), st.lvl_co[1].data(), st.cfg_nlev[1], true, acc);
     } else {
