@@ -2558,6 +2558,7 @@ void replay_pool_mode(const raft::handle_t& handle,
                        (env("CUOPT_EXP_FTRAN", "") == "direct" ? "direct" : "inverse") +
                        " phases=" + (env("CUOPT_EXP_FUSED", "0") != "0" ? "fused" : "separate") +
                        " scatter=" + (env("CUOPT_EXP_SCATTER", "") == "segment" ? "segment" : "balanced-batched") +
+                       " tloop=" + (env("CUOPT_EXP_TLOOP", "") == "old" ? "old" : "split-sums+balanced-axpy") +
                        " ftran-dy-U=" + (env("CUOPT_EXP_FTRAN_DY", "") == "gather" ? "all-rows" : env("CUOPT_EXP_FTRAN_DY", "") == "scatter" ? "scatter" : "se-rows") +
                        " bounds-strengthen+setup=device")
                           .c_str()
