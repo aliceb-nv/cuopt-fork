@@ -210,6 +210,7 @@ __constant__ int c_reuse_levels = 1;
 __constant__ int c_derive_levels = 1;  // CUOPT_BNB_GPU_DERIVE_LEVELS
 __constant__ int c_warp_levels = 1;    // CUOPT_BNB_GPU_WARP_LEVELS
 __constant__ int c_ftran_direct = 0;   // CUOPT_EXP_FTRAN=direct: fission FTRAN through L0/U0
+__constant__ int c_scatstat = 0;       // CUOPT_EXP_SCATSTAT: fission scatter size statistics
 __constant__ int c_long_col = 32;      // CUOPT_BNB_GPU_LONG_COL: longer gather columns go to 8-lane groups
 // Transpose dz route at delta_y density <= this percent (CPU rule 30; CUOPT_BNB_GPU_DZ_DENSE_PCT).
 __constant__ f_t c_dz_sparse_pct = 30.0;
@@ -8320,6 +8321,36 @@ static std::string fission_rounds_report()
   return out + "\n";
 }
 
+static std::string fission_scat_report()
+{
+  using namespace gpu_phase2_detail;
+  unsigned long long s[kScatClasses][4], hh[kScatClasses][2][20];
+  if (cudaMemcpyFromSymbol(s, g_fscat, sizeof(s)) != cudaSuccess ||
+      cudaMemcpyFromSymbol(hh, g_fscat_h, sizeof(hh)) != cudaSuccess) {
+    return {};
+  }
+  static const char* names[kScatClasses] = {"ftran.L rhs", "ftran.L dy", "ftran.U rhs", "ftran.U dy", "btran.L"};
+  std::string out;
+  char b[512];
+  for (int c = 0; c < kScatClasses; ++c) {
+    if (s[c][0] == 0) { continue; }
+    const double k = static_cast<double>(s[c][0]);
+    std::snprintf(b, sizeof(b), "[FISSION-SCAT] %-12s calls=%llu mean n=%.1f mean E=%.1f E/n=%.2f mean longest=%.1f | log2 bins n:",
+                  names[c], s[c][0], s[c][1] / k, s[c][2] / k, s[c][1] ? double(s[c][2]) / s[c][1] : 0.0, s[c][3] / k);
+    out += b;
+    for (int t = 0; t < 2; ++t) {
+      if (t == 1) { out += " E:"; }
+      for (int q = 0; q < 20; ++q) {
+        if (hh[c][t][q] == 0) { continue; }
+        std::snprintf(b, sizeof(b), " <%d:%.1f%%", 1 << q, 100.0 * hh[c][t][q] / k);
+        out += b;
+      }
+    }
+    out += "\n";
+  }
+  return out;
+}
+
 std::string gpu_fission_step_report()
 {
   using namespace gpu_phase2_detail;
@@ -8398,7 +8429,7 @@ std::string gpu_fission_step_report()
   }
   double total = 0;
   for (int k = 0; k < S_UP_DX; ++k) { total += static_cast<double>(h[k][0]); }
-  std::string out = fission_rounds_report();
+  std::string out = fission_rounds_report() + fission_scat_report();
   char line[256];
   std::snprintf(line, sizeof(line),
                 "[FISSION-STEPS] completed iterations=%.0f, seat cycles per iteration=%.0f (per seat, "
@@ -9652,6 +9683,8 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
           return (e != nullptr && std::string(e) == "direct") ? 1 : 0;
         }();
         RAFT_CUDA_TRY(cudaMemcpyToSymbolAsync(c_ftran_direct, &direct, sizeof(int), 0, cudaMemcpyHostToDevice, cs));
+        static const int scatstat = std::getenv("CUOPT_EXP_SCATSTAT") != nullptr ? 1 : 0;
+        RAFT_CUDA_TRY(cudaMemcpyToSymbolAsync(c_scatstat, &scatstat, sizeof(int), 0, cudaMemcpyHostToDevice, cs));
       }
       {
         // Every seat's inverses from the factors just staged: per-generation work.

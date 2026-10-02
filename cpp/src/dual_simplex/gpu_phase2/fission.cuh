@@ -48,6 +48,11 @@ struct fission_utrace_t {
   int unz, enz, c_mpf, c_primal;  // utilde / UTsol nonzeros; cycles of warp 0's and warps 1..7's chains
   int sub[10];                    // warp_update step cycles [0..8], merged nonzeros [9]
 };
+// CUOPT_EXP_SCATSTAT: per scatter class (FTRAN L r0/r1, FTRAN U r0/r1, BTRAN L): calls, sum n, sum E,
+// sum of the longest segment, and log2 histograms of n and E.
+constexpr int kScatClasses = 5;
+__device__ unsigned long long g_fscat[kScatClasses][4];
+__device__ unsigned long long g_fscat_h[kScatClasses][2][20];
 __device__ fission_utrace_t* g_utrace;
 __device__ unsigned long long g_utrace_n;
 __device__ fission_utrace_t* g_ctrace;  // CUOPT_BNB_GPU_FISSION_CTRACE: same, per choose block
@@ -1055,15 +1060,17 @@ __device__ __forceinline__ int fission_compact_atomic(f_t* dense, int m, i_t* li
 // acc[ri[p]] += cx[p] * val[t] over the segments idx[t], entries balanced across the block.
 __device__ __forceinline__ void fission_scatter_atomic(fission_scan_smem_t& sm, const i_t* cp, const i_t* ri,
                                                        const f_t* cx, const i_t* idx, const f_t* val, int n,
-                                                       int* pre, f_t* acc)
+                                                       int* pre, f_t* acc, int cls)
 {
   __shared__ int total;
   constexpr int kItems = (kFissionCapA + kFissionThreads - 1) / kFissionThreads;
   int len[kItems];
+  int ml = 0;
 #pragma unroll
   for (int k = 0; k < kItems; ++k) {
     const int t = threadIdx.x * kItems + k;
     len[k]      = t < n ? cp[idx[t] + 1] - cp[idx[t]] : 0;
+    ml          = max(ml, len[k]);
   }
   int agg = 0;
   fission_scan_t(sm.tmp).ExclusiveSum(len, len, agg);
@@ -1075,6 +1082,21 @@ __device__ __forceinline__ void fission_scatter_atomic(fission_scan_smem_t& sm, 
   if (threadIdx.x == 0) { total = agg; }
   __syncthreads();
   const int E = total;
+  if (c_scatstat != 0) {
+    __shared__ int s_ml;
+    if (threadIdx.x == 0) { s_ml = 0; }
+    __syncthreads();
+    atomicMax(&s_ml, ml);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      atomicAdd(&g_fscat[cls][0], 1ull);
+      atomicAdd(&g_fscat[cls][1], static_cast<unsigned long long>(n));
+      atomicAdd(&g_fscat[cls][2], static_cast<unsigned long long>(E));
+      atomicAdd(&g_fscat[cls][3], static_cast<unsigned long long>(s_ml));
+      atomicAdd(&g_fscat_h[cls][0][min(19, 32 - __clz(n))], 1ull);
+      atomicAdd(&g_fscat_h[cls][1][min(19, 32 - __clz(E))], 1ull);
+    }
+  }
   for (int e = threadIdx.x; e < E; e += kFissionThreads) {
     int lo = 0, hi = n - 1;
     while (lo < hi) {
@@ -1132,7 +1154,7 @@ __device__ __forceinline__ void fission_btran_atomic_body(kernel_args* args, con
   FSTEP(S_B_TLOOP)
   const int nw = fission_compact_atomic(w, m, li, lx, kFissionCapA, &cnt);
   FSTEP(S_B_COMPACT)
-  fission_scatter_atomic(scs, I.Lr_p, I.Lr_i, I.Lr_x, li, lx, nw, pre, w);
+  fission_scatter_atomic(scs, I.Lr_p, I.Lr_i, I.Lr_x, li, lx, nw, pre, w, 4);
   FSTEP(S_B_LSCATTER)
   auto& dy = st.delta_y_sparse;
   if (threadIdx.x == 0) { cnt = 0; }
@@ -1221,7 +1243,7 @@ __device__ __forceinline__ void fission_ftran_atomic_body(kernel_args* args, con
       __syncthreads();
       fission_level_solve(st.ft.L0_transpose_, st.lvl_ls[0].data(), st.lvl_co[0].data(), st.cfg_nlev[0], false, z);
     } else {
-      fission_scatter_atomic(scs, I.Lc_p, I.Lc_i, I.Lc_x, b.i.data(), b.x.data(), nb, pre, z);
+      fission_scatter_atomic(scs, I.Lc_p, I.Lc_i, I.Lc_x, b.i.data(), b.x.data(), nb, pre, z, r);
     }
     FSTEP(S_F_LSCATTER)
     if (st.f_mrows == st.ft.num_updates_) {
@@ -1266,7 +1288,7 @@ __device__ __forceinline__ void fission_ftran_atomic_body(kernel_args* args, con
     if (direct) {
       fission_level_solve(st.ft.U0_transpose_, st.lvl_ls[1].data(), st.lvl_co[1].data(), st.cfg_nlev[1], true, acc);
     } else {
-      fission_scatter_atomic(scs, I.Uc_p, I.Uc_i, I.Uc_x, li, lx, nz, pre, acc);
+      fission_scatter_atomic(scs, I.Uc_p, I.Uc_i, I.Uc_x, li, lx, nz, pre, acc, 2 + r);
     }
     FSTEP(S_F_USCATTER)
     if (r == 0) {
