@@ -1288,6 +1288,10 @@ add_executable(test_netlib
 set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/dual_simplex/gpu_phase2/gpu_phase2.cu PROPERTIES
     COMPILE_OPTIONS "--fmad=false;--split-compile=1;-Xptxas=-v")
 
+# -lineinfo: source-line attribution in Nsight Compute for the benchmark kernels (no codegen change).
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/../benchmarks/linear_programming/cuopt/se_bench.cu
+                            ${CMAKE_CURRENT_SOURCE_DIR}/../benchmarks/linear_programming/cuopt/inv_bench.cu
+                            PROPERTIES COMPILE_OPTIONS "-lineinfo")
 set_target_properties(test_netlib PROPERTIES CXX_SCAN_FOR_MODULES OFF)
 target_include_directories(test_netlib PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_options(test_netlib

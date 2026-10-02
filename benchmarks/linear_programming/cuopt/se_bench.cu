@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <thread>
+#include <string>
 
 namespace {
 
@@ -87,6 +88,66 @@ __global__ void __launch_bounds__(256) k_se(dev_out o, int N, int m, int* next, 
   }
 }
 
+// v2: the inner loop only issues non-returning operations: the accumulator add (global reduction)
+// and a mark in the warp's shared-memory bitset (m bits). After the row, the warp scans its mark
+// words: squares of the marked accumulator entries are summed, entries and words cleared.
+constexpr int kSeThreads = 256;
+__global__ void __launch_bounds__(kSeThreads) k_se2(dev_out o, int N, int m, int* next, double* w_out,
+                                                    double* ws_acc)
+{
+  extern __shared__ unsigned smark[];  // (kSeThreads / 32) * W32
+  const int lane = threadIdx.x & 31, wib = threadIdx.x >> 5;
+  const int gw   = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int W32  = (m + 31) / 32;
+  unsigned* mark = smark + wib * W32;
+  double* acc    = ws_acc + static_cast<size_t>(gw) * m;
+  for (int w = lane; w < W32; w += 32) { mark[w] = 0; }
+  __syncwarp();
+  const long long T = static_cast<long long>(N) * m;
+  for (;;) {
+    long long t0 = 0;
+    if (lane == 0) { t0 = atomicAdd(reinterpret_cast<unsigned long long*>(next), kSeChunk); }
+    t0 = __shfl_sync(0xffffffffu, t0, 0);
+    if (t0 >= T) { return; }
+    for (long long t = t0; t < min(T, t0 + kSeChunk); ++t) {
+      const int s = static_cast<int>(t / m), i = static_cast<int>(t % m);
+      const size_t pb = static_cast<size_t>(s) * (m + 1);
+      const int* urp = o.rp[1] + pb;
+      const int* urj = o.rj[1] + static_cast<size_t>(s) * o.cap[1];
+      const double* urv = o.rv[1] + static_cast<size_t>(s) * o.cap[1];
+      const int* lrp = o.rp[0] + pb;
+      const int* lrj = o.rj[0] + static_cast<size_t>(s) * o.cap[0];
+      const double* lrv = o.rv[0] + static_cast<size_t>(s) * o.cap[0];
+      for (int q = urp[i] + lane; q < urp[i + 1]; q += 32) {
+        const int c    = urj[q];
+        const double u = urv[q];
+        for (int p = lrp[c]; p < lrp[c + 1]; ++p) {
+          const int j = lrj[p];
+          atomicAdd(&acc[j], u * lrv[p]);
+          atomicOr(&mark[j >> 5], 1u << (j & 31));
+        }
+      }
+      __syncwarp();
+      double sum = 0.0;
+      for (int w = lane; w < W32; w += 32) {
+        unsigned b = mark[w];
+        if (b == 0) { continue; }
+        mark[w] = 0;
+        while (b != 0) {
+          const int j = w * 32 + __ffs(b) - 1;
+          b &= b - 1;
+          const double v = acc[j];
+          sum += v * v;
+          acc[j] = 0.0;
+        }
+      }
+      for (int off = 16; off > 0; off >>= 1) { sum += __shfl_xor_sync(0xffffffffu, sum, off); }
+      if (lane == 0) { w_out[t] = sum; }
+      __syncwarp();
+    }
+  }
+}
+
 }  // namespace
 
 int se_bench_main(const raft::handle_t& handle, const std::string& file, int repeats, int prepare_threads,
@@ -110,7 +171,13 @@ int se_bench_main(const raft::handle_t& handle, const std::string& file, int rep
   int dev = 0, sms = 0, bps = 0;
   IB_CHECK(cudaGetDevice(&dev));
   IB_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
-  IB_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, k_se, 256, 0));
+  const bool v1       = std::getenv("SE_KERNEL") != nullptr && std::string(std::getenv("SE_KERNEL")) == "1";
+  const size_t smem2  = static_cast<size_t>(kSeThreads / 32) * ((m + 31) / 32) * sizeof(unsigned);
+  if (v1) {
+    IB_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, k_se, 256, 0));
+  } else {
+    IB_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, k_se2, kSeThreads, smem2));
+  }
   const int grid = sms * bps, warps = grid * 8, W64 = (m + 63) / 64;
   double* ws_acc = dalloc<double>(static_cast<size_t>(warps) * m);
   auto* ws_bits  = dalloc<unsigned long long>(static_cast<size_t>(warps) * W64);
@@ -128,7 +195,11 @@ int se_bench_main(const raft::handle_t& handle, const std::string& file, int rep
   for (int rep = 0; rep < repeats; ++rep) {
     IB_CHECK(cudaMemset(d_next, 0, sizeof(long long)));
     IB_CHECK(cudaEventRecord(e0));
-    k_se<<<grid, 256>>>(db.out, N, m, reinterpret_cast<int*>(d_next), d_w, ws_acc, ws_bits, ws_list, ws_cnt);
+    if (v1) {
+      k_se<<<grid, 256>>>(db.out, N, m, reinterpret_cast<int*>(d_next), d_w, ws_acc, ws_bits, ws_list, ws_cnt);
+    } else {
+      k_se2<<<grid, kSeThreads, smem2>>>(db.out, N, m, reinterpret_cast<int*>(d_next), d_w, ws_acc);
+    }
     IB_CHECK(cudaEventRecord(e1));
     IB_CHECK(cudaEventSynchronize(e1));
     IB_CHECK(cudaGetLastError());
@@ -195,7 +266,8 @@ int se_bench_main(const raft::handle_t& handle, const std::string& file, int rep
   };
   cudaDeviceProp prop{};
   IB_CHECK(cudaGetDeviceProperties(&prop, dev));
-  std::printf("se-bench: %s, seats=%d m=%d, %d warps\n", prop.name, N, m, warps);
+  std::printf("se-bench: %s, seats=%d m=%d, %d warps, kernel %s\n", prop.name, N, m, warps,
+              v1 ? "v1 (global marks, returning atomics, touched list)" : "v2 (shared-memory marks, non-returning inner loop, mark scan)");
   std::printf("device weights (median of %d, max in brackets): %.3f (%.3f) ms for %d seats\n", repeats,
               1e3 * pct(t_dev, 0.5), 1e3 * pct(t_dev, 1.0), N);
   std::printf("host initialize_steepest_edge_norms (single thread): %.1f ms for %d seats = %.2f ms per seat -> %.0f ms for %d seats\n",
