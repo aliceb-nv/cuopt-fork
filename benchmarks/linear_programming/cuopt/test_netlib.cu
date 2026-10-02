@@ -2619,6 +2619,15 @@ void replay_pool_mode(const raft::handle_t& handle,
               stored.size(), mo::toc(f0));
   if (usable.empty()) { std::exit(1); }
   const int U = static_cast<int>(usable.size());
+  // Setup, untimed: every stored node starts from exact steepest-edge weights for its basis, so the
+  // kernels are compared on fresh weights. TEST_NETLIB_STORED_SE=1 keeps the snapshot's weights.
+  if (std::getenv("TEST_NETLIB_STORED_SE") != nullptr) {
+    std::printf("[SE] weights=stored (snapshot)\n");
+  } else {
+    cudaSetDevice(device);
+    const double t_se = se_exact_weights(m, prepared, usable, stored);
+    std::printf("[SE] weights=exact (device inverses + weight kernel, untimed setup) for %d stored nodes in %.3fs\n", U, t_se);
+  }
 
   std::vector<ds::variable_type_t> var_types(h.n_var_types);
   for (int j = 0; j < h.n_var_types; ++j) {

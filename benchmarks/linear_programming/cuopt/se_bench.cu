@@ -150,6 +150,42 @@ __global__ void __launch_bounds__(kSeThreads) k_se2(dev_out o, int N, int m, int
 
 }  // namespace
 
+double se_exact_weights(int m, const std::vector<mip::batch_seat_state_t<int, double>>& prepared,
+                        const std::vector<int>& seats, std::vector<mip::gpu_batch_node_t<int, double>>& nodes)
+{
+  const double t0        = mo::tic();
+  const int N            = static_cast<int>(seats.size());
+  const long long cap[2] = {kSeCapL, kSeCapU};
+  dev_build db           = make_dev_build(prepared, seats, m, cap);
+  if (run_dev_build(db, false) != 0) {
+    std::fprintf(stderr, "se_exact_weights: a seat's inverse exceeded its capacity (L %lld, U %lld entries)\n", cap[0], cap[1]);
+    std::exit(1);
+  }
+  int dev = 0, sms = 0, bps = 0;
+  IB_CHECK(cudaGetDevice(&dev));
+  IB_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+  const size_t smem = static_cast<size_t>(kSeThreads / 32) * ((m + 31) / 32) * sizeof(unsigned);
+  IB_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, k_se2, kSeThreads, smem));
+  const int grid = sms * bps, warps = grid * (kSeThreads / 32);
+  double* ws_acc = dalloc<double>(static_cast<size_t>(warps) * m);
+  long long* d_next = dalloc<long long>(1);
+  double* d_w       = dalloc<double>(static_cast<size_t>(N) * m);
+  IB_CHECK(cudaMemset(ws_acc, 0, static_cast<size_t>(warps) * m * sizeof(double)));
+  IB_CHECK(cudaMemset(d_next, 0, sizeof(long long)));
+  k_se2<<<grid, kSeThreads, smem>>>(db.out, N, m, reinterpret_cast<int*>(d_next), d_w, ws_acc);
+  IB_CHECK(cudaDeviceSynchronize());
+  IB_CHECK(cudaGetLastError());
+  const auto w = ddownload(d_w, static_cast<size_t>(N) * m);
+  for (const void* p : {(const void*)ws_acc, (const void*)d_next, (const void*)d_w}) { IB_CHECK(cudaFree(const_cast<void*>(p))); }
+  free_dev_build(db);
+  for (int s = 0; s < N; ++s) {
+    auto& dy        = nodes[seats[s]].dy_se;
+    const auto& bl  = prepared[seats[s]].basic_list;
+    for (int i = 0; i < m; ++i) { dy.at(bl[i]) = w[static_cast<size_t>(s) * m + i]; }
+  }
+  return mo::toc(t0);
+}
+
 int se_bench_main(const raft::handle_t& handle, const std::string& file, int repeats, int prepare_threads,
                   int host_timed_seats)
 {

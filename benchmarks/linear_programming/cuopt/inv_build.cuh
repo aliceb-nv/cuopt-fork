@@ -384,10 +384,11 @@ struct dev_build {
   int* ws_l{nullptr};
 };
 
-inline dev_build make_dev_build(const bench_data& d, const long long cap[2])
+inline dev_build make_dev_build(const std::vector<mip::batch_seat_state_t<int, double>>& prepared,
+                                const std::vector<int>& seats, int m, const long long cap[2])
 {
   dev_build b;
-  const int N = static_cast<int>(d.seats.size()), m = d.m;
+  const int N = static_cast<int>(seats.size());
   b.in.N = N, b.in.m = m;
   std::vector<int> perm(static_cast<size_t>(N) * m);
   for (int f = 0; f < 2; ++f) {
@@ -395,7 +396,7 @@ inline dev_build make_dev_build(const bench_data& d, const long long cap[2])
     std::vector<long long> eo(N);
     std::vector<double> cx;
     for (int s = 0; s < N; ++s) {
-      const auto& ft = d.prepared[d.seats[s]].ft;
+      const auto& ft = prepared[seats[s]].ft;
       const auto& F  = f == 0 ? ft.L0() : ft.U0();
       eo[s]          = static_cast<long long>(ri.size());
       std::copy(F.col_start.begin(), F.col_start.end(), cp.begin() + static_cast<size_t>(s) * (m + 1));
@@ -432,6 +433,23 @@ inline dev_build make_dev_build(const bench_data& d, const long long cap[2])
   IB_CHECK(cudaFuncSetAttribute(k_transpose<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, m * static_cast<int>(sizeof(int))));
   IB_CHECK(cudaFuncSetAttribute(k_transpose<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, m * static_cast<int>(sizeof(int))));
   return b;
+}
+
+inline dev_build make_dev_build(const bench_data& d, const long long cap[2])
+{
+  return make_dev_build(d.prepared, d.seats, d.m, cap);
+}
+
+inline void free_dev_build(dev_build& b)
+{
+  std::vector<const void*> ps{b.in.perm, b.out.tasks, b.out.ntasks, b.out.next, b.out.err, b.ws_y, b.ws_b, b.ws_l};
+  for (int f = 0; f < 2; ++f) {
+    ps.insert(ps.end(), {b.in.cp[f], b.in.eo[f], b.in.ri[f], b.in.cx[f], b.out.cur[f], b.out.cstart[f],
+                         b.out.clen[f], b.out.si[f], b.out.sx[f], b.out.cp[f], b.out.ci[f], b.out.cv[f],
+                         b.out.rp[f], b.out.rj[f], b.out.rv[f]});
+  }
+  for (const void* p : ps) { IB_CHECK(cudaFree(const_cast<void*>(p))); }
+  b = dev_build{};
 }
 
 // The four build kernels; events (optional, 5) bracket them. Returns the capacity error flag.
