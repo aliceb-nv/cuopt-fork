@@ -2092,9 +2092,12 @@ template <int T>
 __device__ __forceinline__ void fission_primal_sync() { asm volatile("bar.sync 1, %0;" ::"n"(T - 32) : "memory"); }
 
 template <int T>
-__device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t n_problems, fission_utrace_t& r);
+__device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t n_problems, fission_utrace_t& r,
+                                                          int* s_j = nullptr);
+// Dynamic shared memory: m + 1 ints, the basic variable at each position of scaled_dxB.
 __global__ void __launch_bounds__(kUpdThreads) fission_update_block(kernel_args* args, i_t n_problems)
 {
+  extern __shared__ f_t fsh[];
   __shared__ fission_utrace_t r;
   const bool tr = g_utrace != nullptr;
   if (tr && threadIdx.x == 0) {
@@ -2105,7 +2108,8 @@ __global__ void __launch_bounds__(kUpdThreads) fission_update_block(kernel_args*
     asm volatile("mov.u32 %0, %%smid;" : "=r"(r.sm));
   }
   __syncthreads();
-  fission_update_block_body<kUpdThreads>(args, n_problems, r);
+  fission_update_block_body<kUpdThreads>(args, n_problems, r,
+                                         c_update_old != 0 ? nullptr : reinterpret_cast<int*>(fsh));
   __syncthreads();
   if (tr && threadIdx.x == 0) {
     r.t1 = fission_gtime();
@@ -2114,7 +2118,8 @@ __global__ void __launch_bounds__(kUpdThreads) fission_update_block(kernel_args*
 }
 
 template <int T>
-__device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t n_problems, fission_utrace_t& r)
+__device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t n_problems, fission_utrace_t& r,
+                                                          int* s_j)
 {
   if (blockIdx.x >= n_problems) { return; }
   kernel_args& a = args[blockIdx.x];
@@ -2181,21 +2186,41 @@ __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t
       direction == 1 ? lp.lower[leaving] - x[leaving] : lp.upper[leaving] - x[leaving];
     const f_t primal_step_length = delta_x_leaving / scale;
     f_t* delta_x                 = st.delta_x.data();
-    for (i_t k = t; k < nzx; k += (T - 32)) { delta_x[a.basic_list[sdx.i[k]]] = primal_step_length * sdx.x[k]; }
-    fission_primal_sync<T>();
-    if (t == 0) {
-      delta_x[leaving]  = delta_x_leaving;
-      delta_x[entering] = primal_step_length;
+    f_t part                     = 0.0;
+    if (s_j != nullptr) {
+      // One pass: each position's basic variable is looked up once and kept in s_j for the later
+      // passes; the leaving row takes delta_x_leaving exactly, as the separate passes did.
+      for (i_t k = t; k < nzx; k += (T - 32)) {
+        const i_t ik  = sdx.i[k];
+        const i_t j   = a.basic_list[ik];
+        s_j[k]        = j;
+        const f_t dxj = ik == basic_leaving ? delta_x_leaving : primal_step_length * sdx.x[k];
+        delta_x[j]    = dxj;
+        x[j] += dxj;
+        part += dxj * lp.objective[j];
+      }
+      if (t == 0) {
+        delta_x[leaving]  = delta_x_leaving;
+        delta_x[entering] = primal_step_length;
+        x[entering] += primal_step_length;
+      }
+      FSTEP_AT(S_UP_DX, 32)
+    } else {
+      for (i_t k = t; k < nzx; k += (T - 32)) { delta_x[a.basic_list[sdx.i[k]]] = primal_step_length * sdx.x[k]; }
+      fission_primal_sync<T>();
+      if (t == 0) {
+        delta_x[leaving]  = delta_x_leaving;
+        delta_x[entering] = primal_step_length;
+      }
+      fission_primal_sync<T>();
+      FSTEP_AT(S_UP_DX, 32)
+      for (i_t k = t; k < nzx; k += (T - 32)) {
+        const i_t j = a.basic_list[sdx.i[k]];
+        x[j] += delta_x[j];
+        part += delta_x[j] * lp.objective[j];
+      }
+      if (t == 0) { x[entering] += delta_x[entering]; }
     }
-    fission_primal_sync<T>();
-    FSTEP_AT(S_UP_DX, 32)
-    f_t part = 0.0;
-    for (i_t k = t; k < nzx; k += (T - 32)) {
-      const i_t j = a.basic_list[sdx.i[k]];
-      x[j] += delta_x[j];
-      part += delta_x[j] * lp.objective[j];
-    }
-    if (t == 0) { x[entering] += delta_x[entering]; }
     FSTEP_AT(S_UP_PRIMAL, 32)
     part = warp_reduce_add(part);
     if ((t & 31) == 0) { s_part[t / 32] = part; }
@@ -2241,7 +2266,7 @@ __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t
         f_t* dyse        = a.dy_se;
         for (i_t h = t; h < nzx; h += (T - 32)) {
           const i_t k = sdx.i[h];
-          const i_t j = a.basic_list[k];
+          const i_t j = s_j != nullptr ? s_j[h] : a.basic_list[k];
           if (k == basic_leaving) {
             const f_t w    = sdx.x[h];
             dyse[entering] = (1.0 / (w * w)) * dyn;
@@ -2307,7 +2332,12 @@ __device__ __forceinline__ void fission_update_block_body(kernel_args* args, i_t
       int add     = 0;
       i_t j       = -1;
       if (k < nzx) {
-        j                = a.basic_list[sdx.i[k]];
+        // After the swap: the leaving position now holds the entering variable.
+        if (s_j != nullptr) {
+          j = sdx.i[k] == basic_leaving ? entering : s_j[k];
+        } else {
+          j = a.basic_list[sdx.i[k]];
+        }
         const f_t infeas = fmax(lp.lower[j] - x[j], x[j] - lp.upper[j]);
         if (infeas > settings.primal_tol) {
           add   = sq[j] == 0.0 ? 1 : 0;

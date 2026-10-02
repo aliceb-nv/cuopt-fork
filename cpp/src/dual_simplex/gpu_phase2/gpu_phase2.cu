@@ -212,6 +212,7 @@ __constant__ int c_warp_levels = 1;    // CUOPT_BNB_GPU_WARP_LEVELS
 __constant__ int c_ftran_direct = 0;   // CUOPT_EXP_FTRAN=direct: fission FTRAN through L0/U0
 __constant__ int c_scatstat = 0;       // CUOPT_EXP_SCATSTAT: fission scatter size statistics
 __constant__ int c_scatter_seg = 0;    // CUOPT_EXP_SCATTER=segment: fission scatter by segment (thread/warp)
+__constant__ int c_update_old = 0;  // CUOPT_EXP_UPDATE=old: separate update passes, no cached positions
 __constant__ int c_tloop_old = 0;  // CUOPT_EXP_TLOOP=old: thread-per-k R d and warp-per-k axpys in the replay
 __constant__ int c_ftran_dy = 0;  // fission dy solve's U step: 0 rows read by the SE update, 1 scatter, 2 all rows
 __constant__ int c_long_col = 32;      // CUOPT_BNB_GPU_LONG_COL: longer gather columns go to 8-lane groups
@@ -9717,6 +9718,11 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
           return (e != nullptr && std::string(e) == "old") ? 1 : 0;
         }();
         RAFT_CUDA_TRY(cudaMemcpyToSymbolAsync(c_tloop_old, &tloop_old, sizeof(int), 0, cudaMemcpyHostToDevice, cs));
+        static const int update_old = [] {
+          const char* e = std::getenv("CUOPT_EXP_UPDATE");
+          return (e != nullptr && std::string(e) == "old") ? 1 : 0;
+        }();
+        RAFT_CUDA_TRY(cudaMemcpyToSymbolAsync(c_update_old, &update_old, sizeof(int), 0, cudaMemcpyHostToDevice, cs));
       }
       {
         // Every seat's inverses from the factors just staged: per-generation work.
@@ -9760,7 +9766,7 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
           k_btran<<<Ni, kFissionThreads, smem, cs>>>(H->d_args, finv, Ni);
           fission_choose_block<<<Ni, kFissionThreads, smem_c, cs>>>(H->d_args, Ni);
           k_ftran<<<Ni, kFissionThreads, smem, cs>>>(H->d_args, finv, Ni);
-          fission_update_block<<<Ni, kUpdThreads, 0, cs>>>(H->d_args, Ni);
+          fission_update_block<<<Ni, kUpdThreads, (static_cast<size_t>(H->rows) + 1) * sizeof(int), cs>>>(H->d_args, Ni);
         }
         RAFT_CUDA_TRY(cudaMemsetAsync(d_live, 0, sizeof(int), cs));
         fission_count<<<(Ni + 255) / 256, 256, 0, cs>>>(H->d_args, Ni, d_live);
