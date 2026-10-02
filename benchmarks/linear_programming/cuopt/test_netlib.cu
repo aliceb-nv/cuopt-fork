@@ -2545,6 +2545,21 @@ void replay_pool_mode(const raft::handle_t& handle,
                       bool no_dive)
 {
   namespace ps = mip::pool_snapshot;
+  // Default benchmark mode: the fissioned kernels (CUOPT_BNB_GPU_FISSION=0 selects the existing
+  // kernel), set before anything reads it. Inverses are built on the device every generation; FTRAN
+  // uses them unless CUOPT_EXP_FTRAN=direct; phase kernels are separate unless CUOPT_EXP_FUSED=1.
+  setenv("CUOPT_BNB_GPU_FISSION", "1", 0);
+  {
+    auto env = [](const char* k, const char* d) { const char* e = std::getenv(k); return std::string(e != nullptr ? e : d); };
+    const bool fis = env("CUOPT_BNB_GPU_FISSION", "1") != "0";
+    std::printf("[MODE] kernel=%s%s\n", fis ? "fission" : "existing (one warp per seat)",
+                fis ? (std::string(" inverses=device-built-per-generation ftran=") +
+                       (env("CUOPT_EXP_FTRAN", "") == "direct" ? "direct" : "inverse") +
+                       " phases=" + (env("CUOPT_EXP_FUSED", "0") != "0" ? "fused" : "separate") +
+                       " bounds-strengthen+setup=device")
+                          .c_str()
+                    : "");
+  }
   {
     // The stored nodes stand in for nodes built by B&B workers spread over the machine: interleave
     // this process's host pages over all NUMA nodes (one node's bandwidth caps the staging copies).
