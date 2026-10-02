@@ -2388,7 +2388,7 @@ inline double gpu_fission_yield()
 {
   static const double f = [] {
     const char* e = std::getenv("CUOPT_BNB_GPU_FISSION_YIELD");
-    return e != nullptr ? std::atof(e) : 0.1;
+    return e != nullptr ? std::atof(e) : 0.5;  // CHOSEN: straggler cut at half the starting live seats
   }();
   return f;
 }
