@@ -39,6 +39,31 @@ Every change keeps the old path behind an env switch (see the `[MODE]` line in e
 - Dynamic warp scheduling of the replay dots: no gain.
 - Padding to 1 seat/SM (test): FTRAN only +13% -> 3 seats/SM would not pay for FTRAN.
 
+## Final state (HEAD 6f6f060b)
+
+- Separate kernels (default): 0.205-0.206M it/s over 5 runs (+26% over 0.162-0.163M); generation
+  0.374 s, host restage 0.072-0.073 s.
+- Fused kernel (`CUOPT_EXP_FUSED=1`, still opt-in): 0.216-0.218M it/s over 5 runs (+33%).
+  With 2 clones: fused 0.287M vs separate 0.284M aggregate, so most of fused's 1-clone gain is the
+  tail (seats no longer wait for each other between phases), which a second clone also hides.
+- Gate, 3 runs of the default: same-status 1033/1034/1035, max rel <= 4.5e-14.
+
+## Blockers and structural findings
+
+- Memory: each clone allocates 12.8 GiB for the per-generation inverse buffers (per-seat capacity
+  at the measured maximum, kInvCapU = 329296, three forms, 1056 seats). 4 and 8 clones fail with
+  out_of_memory on the 80 GB A100, so fission cannot run the 8 pools of a real run here. Actual
+  per-generation inverse nnz is ~49M entries vs ~369M reserved; sizing by actual counts (prefix
+  sum of per-seat counts after the column solve) would cut it ~7.5x. Not changed.
+- 1-clone ceiling: kernel times stay flat or grow through a generation while live seats drop from
+  ~940 to ~160 (replay cost grows with K), so the second half of each generation runs a few slow
+  high-K seats on a mostly idle GPU. 2 clones reach 0.284M aggregate. Reaching 0.3M on 1 clone needs
+  a structural change, e.g. refilling finished seats mid-generation; that changes pool scheduling
+  and was not attempted.
+- Also tried after the table above: update kernel at 4 blocks/SM (no change: latency-bound, not
+  occupancy-bound); L0 staged without its diagonal (the diagonal is +-1, not always 1, and the
+  host compaction costs what the copy saves); unordered infeasibility list (no gain).
+
 ## Where a generation goes now (A100, 1 clone)
 
 GPU ~0.375 s + host ~0.072 s. Per seat and iteration (cycles): FTRAN dy solve (L 31k, replay 82k,
