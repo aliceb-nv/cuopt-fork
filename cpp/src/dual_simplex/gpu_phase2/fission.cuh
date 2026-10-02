@@ -1799,6 +1799,35 @@ __device__ __forceinline__ void fission_choose_block_body(kernel_args* args, i_t
   const f_t ptol = a.pivot_tol, dtol = a.dual_tol / 10;
   const f_t* z   = a.z;
   int nidx = 0, ncand = 0;
+  const bool pre_dz = c_choose_old == 0;
+  if (pre_dz) {
+    // dz first, so the compaction scans below do not wait on column dots: columns up to kLongRow
+    // nonzeros one thread each, longer ones queued (in cj) for a warp each.
+    __shared__ int s_nq;
+    if (tid == 0) { s_nq = 0; }
+    __syncthreads();
+    for (i_t k = tid; k < nn; k += kFissionThreads) {
+      const i_t j = a.nonbasic_list[k];
+      const i_t b = Acs[j], e = Acs[j + 1];
+      if (e - b > kLongRow) {
+        cj[atomicAdd(&s_nq, 1)] = k;
+        continue;
+      }
+      f_t dot = 0.0;
+      for (i_t p = b; p < e; ++p) { dot += Ax[p] * dyd[Ai[p]]; }
+      dz[j] = -dot;
+    }
+    __syncthreads();
+    const int nq = s_nq, lane = tid & 31, warp = tid >> 5;
+    for (int q = warp; q < nq; q += kFissionThreads / 32) {
+      const i_t j = a.nonbasic_list[cj[q]];
+      f_t dot     = 0.0;
+      for (i_t p = Acs[j] + lane; p < Acs[j + 1]; p += 32) { dot += Ax[p] * dyd[Ai[p]]; }
+      dot = warp_reduce_add(dot);
+      if (lane == 0) { dz[j] = -dot; }
+    }
+    __syncthreads();
+  }
   for (i_t t0 = 0; t0 < nn; t0 += kFissionThreads) {
     const i_t k  = t0 + tid;
     i_t j        = -1;
@@ -1807,10 +1836,14 @@ __device__ __forceinline__ void fission_choose_block_body(kernel_args* args, i_t
     int touched  = 0, eligible = 0;
     if (k < nn) {
       j = a.nonbasic_list[k];
-      f_t dot = 0.0;
-      for (i_t p = Acs[j]; p < Acs[j + 1]; ++p) { dot += Ax[p] * dyd[Ai[p]]; }
-      dzj   = -dot;
-      dz[j] = dzj;
+      if (pre_dz) {
+        dzj = dz[j];
+      } else {
+        f_t dot = 0.0;
+        for (i_t p = Acs[j]; p < Acs[j + 1]; ++p) { dot += Ax[p] * dyd[Ai[p]]; }
+        dzj   = -dot;
+        dz[j] = dzj;
+      }
       touched = dzj != 0.0 ? 1 : 0;
       const variable_status_t sj = a.vstatus[j];
       if (sj == variable_status_t::NONBASIC_LOWER && dzj < -ptol) {

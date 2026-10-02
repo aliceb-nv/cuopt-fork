@@ -2561,6 +2561,8 @@ void replay_pool_mode(const raft::handle_t& handle,
                        " fresh-duals=" + (env("CUOPT_EXP_PRICE_FRESH", "") == "0" ? "host-uploaded" : "device") +
                        " tloop=" + (env("CUOPT_EXP_TLOOP", "") == "old" ? "old" : "split-sums+balanced-axpy") +
                        " update=" + (env("CUOPT_EXP_UPDATE", "") == "old" ? "old" : "fused-cached") +
+                       " tail=" + (env("CUOPT_EXP_TAIL", "") == "old" ? "old" : "btran-dots") +
+                       " choose-dz=" + (env("CUOPT_EXP_CHOOSE", "") == "old" ? "in-strips" : "first+long-queue") +
                        " ftran-dy-U=" + (env("CUOPT_EXP_FTRAN_DY", "") == "gather" ? "all-rows" : env("CUOPT_EXP_FTRAN_DY", "") == "scatter" ? "scatter" : "se-rows") +
                        " bounds-strengthen+setup=device")
                           .c_str()
