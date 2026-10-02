@@ -213,6 +213,7 @@ __constant__ int c_ftran_direct = 0;   // CUOPT_EXP_FTRAN=direct: fission FTRAN 
 __constant__ int c_scatstat = 0;       // CUOPT_EXP_SCATSTAT: fission scatter size statistics
 __constant__ int c_scatter_seg = 0;    // CUOPT_EXP_SCATTER=segment: fission scatter by segment (thread/warp)
 __constant__ int c_update_old = 0;  // CUOPT_EXP_UPDATE=old: separate update passes, no cached positions
+__constant__ int c_finv_gbits = 0;  // CUOPT_EXP_FINV_GBITS=1: finv_columns bitsets in global memory
 __constant__ int c_tloop_old = 0;  // CUOPT_EXP_TLOOP=old: thread-per-k R d and warp-per-k axpys in the replay
 __constant__ int c_ftran_dy = 0;  // fission dy solve's U step: 0 rows read by the SE update, 1 scatter, 2 all rows
 __constant__ int c_long_col = 32;      // CUOPT_BNB_GPU_LONG_COL: longer gather columns go to 8-lane groups
@@ -9723,6 +9724,11 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
           return (e != nullptr && std::string(e) == "old") ? 1 : 0;
         }();
         RAFT_CUDA_TRY(cudaMemcpyToSymbolAsync(c_update_old, &update_old, sizeof(int), 0, cudaMemcpyHostToDevice, cs));
+        static const int finv_gbits = [] {
+          const char* e = std::getenv("CUOPT_EXP_FINV_GBITS");
+          return (e != nullptr && std::string(e) != "0") ? 1 : 0;
+        }();
+        RAFT_CUDA_TRY(cudaMemcpyToSymbolAsync(c_finv_gbits, &finv_gbits, sizeof(int), 0, cudaMemcpyHostToDevice, cs));
       }
       {
         // Every seat's inverses from the factors just staged: per-generation work.
@@ -9731,9 +9737,15 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
         RAFT_CUDA_TRY(cudaMemsetAsync(b.ntasks, 0, 3 * sizeof(int), cs));
         const long long T = 2LL * b.N * b.m;
         finv_trivial<<<static_cast<unsigned>((T + 255) / 256), 256, 0, cs>>>(H->d_args, b);
-        finv_columns<<<b.grid, 256, 0, cs>>>(H->d_args, b);
+        finv_columns<<<b.grid, 256, 8 * ((static_cast<size_t>(b.m) + 63) / 64) * sizeof(unsigned long long), cs>>>(H->d_args, b);
         finv_pack<<<2 * Ni, kFinvPack, 0, cs>>>(H->d_args, b);
-        finv_transpose<<<2 * Ni, kFinvTr, b.m * sizeof(int), cs>>>(H->d_args, b);
+        {
+          const size_t smem_t = 2 * static_cast<size_t>(b.m) * sizeof(int);
+          RAFT_CUDA_TRY(cudaFuncSetAttribute(finv_transpose, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                             static_cast<int>(smem_t)));
+          finv_transpose<<<2 * Ni, kFinvTr, smem_t, cs>>>(H->d_args, b);
+        }
+        RAFT_CUDA_TRY(cudaPeekAtLastError());
         RAFT_CUDA_TRY(cudaMemcpyAsync(H->h_finv_err, b.err, sizeof(int), cudaMemcpyDeviceToHost, cs));
       }
       fission_presetup<<<Ni, kPresetupThreads, 0, cs>>>(H->d_args, Ni);

@@ -2469,13 +2469,20 @@ __global__ void finv_trivial(const kernel_args* args, finv_build_t b)
 
 // Warp per non-trivial column: T y = e_k with rows finalized in index order (ascending for L0,
 // descending for U0), discovered rows in a bitset; per-warp workspace left zero after each task.
+// Dynamic shared memory: the warps' bitsets, 8 * W64 words (CUOPT_EXP_FINV_GBITS=1: global, as before).
 __global__ void __launch_bounds__(256) finv_columns(const kernel_args* args, finv_build_t b)
 {
+  extern __shared__ unsigned long long fbits[];
   const int lane = threadIdx.x & 31;
   const int gw   = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const int m = b.m, W64 = (m + 63) / 64;
   double* y = b.ws_y + static_cast<size_t>(gw) * m;
   unsigned long long* bits = b.ws_b + static_cast<size_t>(gw) * W64;
+  if (c_finv_gbits == 0) {
+    bits = fbits + static_cast<size_t>(threadIdx.x >> 5) * W64;
+    for (int w = lane; w < W64; w += 32) { bits[w] = 0ull; }
+    __syncwarp();
+  }
   int* lst = b.ws_l + static_cast<size_t>(gw) * m;
   const int nt = *b.ntasks;
   for (;;) {
@@ -2607,15 +2614,18 @@ __global__ void __launch_bounds__(kFinvPack) finv_pack(const kernel_args* args, 
 }
 
 // Block per (seat, factor): CSR by count, scan and a scatter with shared atomic row cursors (order
-// within a row varies run to run).
+// within a row varies run to run). The scatter: columns of up to 32 entries one thread each, longer
+// ones queued for a warp each. Dynamic shared memory: 2m ints (row cursors, queue).
 constexpr int kFinvTr = 256;
 __global__ void __launch_bounds__(kFinvTr) finv_transpose(const kernel_args* args, finv_build_t b)
 {
   extern __shared__ int rc[];
   using scan_t = cub::BlockScan<int, kFinvTr, cub::BLOCK_SCAN_WARP_SCANS>;
   __shared__ typename scan_t::TempStorage tmp;
+  __shared__ int nq;
   const int s = blockIdx.x / 2, f = blockIdx.x % 2, m = b.m;
   if (args[s].done != 0) { return; }
+  if (threadIdx.x == 0) { nq = 0; }
   const size_t base = static_cast<size_t>(s) * b.cap[f];
   const int* cp     = b.cp[f] + static_cast<size_t>(s) * (m + 1);
   const int* ci     = b.ci[f] + base;
@@ -2641,7 +2651,22 @@ __global__ void __launch_bounds__(kFinvTr) finv_transpose(const kernel_args* arg
   if (threadIdx.x == 0) { rp[m] = tot; }
   __syncthreads();
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  for (int c = warp; c < m; c += kFinvTr / 32) {
+  int* lq = rc + m;
+  for (int c = threadIdx.x; c < m; c += kFinvTr) {
+    const int q0 = cp[c], q1 = cp[c + 1];
+    if (q1 - q0 > 32) {
+      lq[atomicAdd(&nq, 1)] = c;
+      continue;
+    }
+    for (int q = q0; q < q1; ++q) {
+      const int o = atomicAdd(&rc[ci[q]], 1);
+      b.rj[f][base + o] = c;
+      b.rv[f][base + o] = cv[q];
+    }
+  }
+  __syncthreads();
+  for (int k = warp; k < nq; k += kFinvTr / 32) {
+    const int c = lq[k];
     for (int q = cp[c] + lane; q < cp[c + 1]; q += 32) {
       const int o = atomicAdd(&rc[ci[q]], 1);
       b.rj[f][base + o] = c;
