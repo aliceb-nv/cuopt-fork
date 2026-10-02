@@ -959,7 +959,7 @@ __device__ __forceinline__ void fission_scatter_atomic(fission_scan_smem_t& sm, 
                                                        int* pre, int* sb, f_t* acc, int cls);
 __device__ __forceinline__ void fission_tloop_m(const gpu_basis_update_t& ft, f_t* x, bool asc, f_t tol,
                                                 const f_t* R, int kc, f_t* scratch, size_t,
-                                                fission_scan_smem_t* sm = nullptr)
+                                                fission_scan_smem_t* sm = nullptr, f_t* wsave = nullptr)
 {
   const bool fast = sm != nullptr && c_tloop_old == 0;
   const i_t K = ft.num_updates_;
@@ -988,7 +988,11 @@ __device__ __forceinline__ void fission_tloop_m(const gpu_basis_update_t& ft, f_
     f_t part    = 0.0;
     for (i_t p = cs[c] + lane; p < cs[c + 1]; p += 32) { part += vx[p] * x[ri[p]]; }
     part = warp_reduce_add(part);
-    if (lane == 0) { d[k] = asc ? part : part / mu[k]; }
+    if (lane == 0) {
+      d[k] = asc ? part : part / mu[k];
+      // wsave (descending, BTRAN): d_k = sgn w_k for the FTRAN tail's row K of R, stride kc.
+      if (wsave != nullptr) { wsave[static_cast<size_t>(k) * kc] = d[k]; }
+    }
   }
   __syncthreads();
   tmark(S_TL_DOT);
@@ -1423,7 +1427,9 @@ __device__ __forceinline__ void fission_btran_atomic_body(kernel_args* args, con
   __syncthreads();
   FSTEP(S_B_UROW)
   if (st.f_mrows == st.ft.num_updates_) {
-    fission_tloop_m(st.ft, w, false, 1e-13, a.fm, a.fm_kcap, R, kFissionStage / sizeof(f_t), &scs);
+    const i_t K = st.ft.num_updates_;
+    fission_tloop_m(st.ft, w, false, 1e-13, a.fm, a.fm_kcap, R, kFissionStage / sizeof(f_t), &scs,
+                    K < a.fm_kcap ? a.fm + K : nullptr);
   } else {
     fission_tloop_chunked(st.ft, w, false, 1e-13, R, kFissionStage);
   }
@@ -1622,33 +1628,62 @@ __device__ __forceinline__ void fission_ftran_atomic_body(kernel_args* args, con
   {
     const i_t K = st.ft.num_updates_;
     if (st.f_mrows == K && K < a.fm_kcap) {
-      const auto& UT = st.UTsol_sparse;
-      const i_t nu   = static_cast<i_t>(UT.i.size());
       f_t* w         = R;
-      for (i_t p = threadIdx.x; p < nu; p += blockDim.x) { acc[UT.i[p]] = UT.x[p]; }
-      __syncthreads();
-      const i_t* cs = st.ft.S_.col_start.data();
-      const i_t* ri = st.ft.S_.i.data();
-      const f_t* vx = st.ft.S_.x.data();
-      const f_t* mu = st.ft.mu_values_.data();
       const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-      for (i_t jq = warp; jq < K; jq += blockDim.x >> 5) {
-        f_t part = 0.0;
-        for (i_t p = cs[2 * jq] + lane; p < cs[2 * jq + 1]; p += 32) { part += vx[p] * acc[ri[p]]; }
-        part = warp_reduce_add(part);
-        if (lane == 0) { w[jq] = part / mu[jq]; }
-      }
-      __syncthreads();
-      for (i_t p = threadIdx.x; p < nu; p += blockDim.x) { acc[UT.i[p]] = 0.0; }
-      f_t* Rm = a.fm;
+      f_t* Rm         = a.fm;
       const size_t kc = static_cast<size_t>(a.fm_kcap);
-      for (i_t iq = warp; iq < K; iq += blockDim.x >> 5) {
-        f_t part = 0.0;
-        for (i_t jq = iq + 1 + lane; jq < K; jq += 32) { part += w[jq] * Rm[iq * kc + jq]; }
-        part = warp_reduce_add(part);
-        if (lane == 0) { Rm[iq * kc + K] = w[iq] - part; }
+      if (c_tail_old == 0 && K <= kFissionThreads) {
+        // BTRAN's replay left d_j = sgn w_j in row K of R (fission_tloop_m's wsave): no dots here,
+        // and the sums run over the nonzero w only.
+        const f_t sgn = static_cast<f_t>(-st.direction);
+        int* nzl      = reinterpret_cast<int*>(w + K);
+        {
+          const i_t j    = threadIdx.x;
+          const f_t wj   = j < K ? sgn * Rm[static_cast<size_t>(j) * kc + K] : f_t{0.0};
+          if (j < K) { w[j] = wj; }
+          const int flag = wj != 0.0 ? 1 : 0;
+          int pos = 0, L = 0;
+          fission_scan_t(scs.tmp).ExclusiveSum(flag, pos, L);
+          if (flag) { nzl[pos] = j; }
+          if (threadIdx.x == 0) { cnt = L; }
+        }
+        __syncthreads();
+        const int L = cnt;
+        for (i_t iq = warp; iq < K; iq += blockDim.x >> 5) {
+          f_t part = 0.0;
+          for (int q = lane; q < L; q += 32) {
+            const int jq = nzl[q];
+            if (jq > iq) { part += w[jq] * Rm[iq * kc + jq]; }
+          }
+          part = warp_reduce_add(part);
+          if (lane == 0) { Rm[iq * kc + K] = w[iq] - part; }
+        }
+        __syncthreads();
+      } else {
+        const auto& UT = st.UTsol_sparse;
+        const i_t nu   = static_cast<i_t>(UT.i.size());
+        for (i_t p = threadIdx.x; p < nu; p += blockDim.x) { acc[UT.i[p]] = UT.x[p]; }
+        __syncthreads();
+        const i_t* cs = st.ft.S_.col_start.data();
+        const i_t* ri = st.ft.S_.i.data();
+        const f_t* vx = st.ft.S_.x.data();
+        const f_t* mu = st.ft.mu_values_.data();
+        for (i_t jq = warp; jq < K; jq += blockDim.x >> 5) {
+          f_t part = 0.0;
+          for (i_t p = cs[2 * jq] + lane; p < cs[2 * jq + 1]; p += 32) { part += vx[p] * acc[ri[p]]; }
+          part = warp_reduce_add(part);
+          if (lane == 0) { w[jq] = part / mu[jq]; }
+        }
+        __syncthreads();
+        for (i_t p = threadIdx.x; p < nu; p += blockDim.x) { acc[UT.i[p]] = 0.0; }
+        for (i_t iq = warp; iq < K; iq += blockDim.x >> 5) {
+          f_t part = 0.0;
+          for (i_t jq = iq + 1 + lane; jq < K; jq += 32) { part += w[jq] * Rm[iq * kc + jq]; }
+          part = warp_reduce_add(part);
+          if (lane == 0) { Rm[iq * kc + K] = w[iq] - part; }
+        }
+        __syncthreads();
       }
-      __syncthreads();
       if (threadIdx.x == 0) { st.f_mrow_k = K; }
     } else if (threadIdx.x == 0) {
       st.f_mrow_k = -1;
