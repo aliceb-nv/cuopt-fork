@@ -9604,7 +9604,7 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
       }
       int live0 = -1;
       bool yielding = false;
-      static const bool fused = !det && [] { const char* e = std::getenv("CUOPT_EXP_FUSED"); return e == nullptr || std::string(e) != "0"; }();
+      static const bool fused = !det && [] { const char* e = std::getenv("CUOPT_EXP_FUSED"); return e != nullptr && std::string(e) != "0"; }();  // opt-in
       const size_t smem_f     = std::max(smem, smem_c);
       if (fused) {
         RAFT_CUDA_TRY(cudaFuncSetAttribute(fission_fused, cudaFuncAttributeMaxDynamicSharedMemorySize,
