@@ -69,7 +69,9 @@ __device__ __forceinline__ unsigned long long fission_gtime()
   return t;
 }
 
-constexpr int kFissionThreads = 1024;
+// CHOSEN: 512 so that 2 blocks per SM (the shared-memory limit) get 64 registers per thread; at 1024
+// the 32-register cap spilled (A100: more local-load sectors than global-load sectors in FTRAN).
+constexpr int kFissionThreads = 512;
 constexpr int kShortDot = 2;   // CHOSEN: replay dots up to this length without shuffles
 constexpr int kShortSeg       = 8;  // gather/mark segments up to this length: one thread  // B/D block size (32 registers, 2 seats per SM)
 
@@ -1057,11 +1059,85 @@ __device__ __forceinline__ int fission_compact_atomic(f_t* dense, int m, i_t* li
   return c;
 }
 
-// acc[ri[p]] += cx[p] * val[t] over the segments idx[t], entries balanced across the block.
-__device__ __forceinline__ void fission_scatter_atomic(fission_scan_smem_t& sm, const i_t* cp, const i_t* ri,
-                                                       const f_t* cx, const i_t* idx, const f_t* val, int n,
-                                                       int* pre, f_t* acc, int cls)
+// acc[ri[p]] += cx[p] * val[t] over the segments idx[t]. Segments of up to kShortSeg entries: one
+// thread; longer: one warp, lane-strided (coalesced, and a segment's rows are distinct, so the lanes
+// of one atomic never collide). No scan or per-entry search.
+__device__ __forceinline__ void fission_scatter_seg(const i_t* cp, const i_t* __restrict__ ri,
+                                                    const f_t* __restrict__ cx, const i_t* idx, const f_t* val,
+                                                    int n, f_t* acc)
 {
+  for (int t = threadIdx.x; t < n; t += kFissionThreads) {
+    const i_t c = idx[t];
+    const i_t b = __ldg(cp + c), e = __ldg(cp + c + 1);
+    if (e - b > kShortSeg) { continue; }
+    const f_t v = val[t];
+    for (i_t p = b; p < e; ++p) { atomicAdd(&acc[__ldg(ri + p)], __ldg(cx + p) * v); }
+  }
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  for (int t = warp; t < n; t += kFissionThreads / 32) {
+    const i_t c = idx[t];
+    const i_t b = __ldg(cp + c), e = __ldg(cp + c + 1);
+    if (e - b <= kShortSeg) { continue; }
+    const f_t v = val[t];
+    for (i_t p = b + lane; p < e; p += 32) { atomicAdd(&acc[__ldg(ri + p)], __ldg(cx + p) * v); }
+  }
+  __syncthreads();
+}
+
+// out[i] = sum over row i of (rp, rj, rx) of rx[p] * in[rj[p]] for every row i < m: no atomics. Rows up to
+// kLongRow entries: one thread; longer: queued in q (qcap entries; overflow rows stay with their thread),
+// then one warp each.
+constexpr int kLongRow = 32;  // CHOSEN
+__device__ __forceinline__ void fission_gather_rows(const i_t* __restrict__ rp, const i_t* __restrict__ rj,
+                                                    const f_t* __restrict__ rx, int m, const f_t* in, f_t* out,
+                                                    int* q, int qcap, int* qn)
+{
+  if (threadIdx.x == 0) { *qn = 0; }
+  __syncthreads();
+  for (int i = threadIdx.x; i < m; i += kFissionThreads) {
+    const i_t b = __ldg(rp + i), e = __ldg(rp + i + 1);
+    if (e - b > kLongRow) {
+      const int k = atomicAdd(qn, 1);
+      if (k < qcap) {
+        q[k] = i;
+        continue;
+      }
+    }
+    f_t s0 = 0.0, s1 = 0.0;
+    i_t p = b;
+    for (; p + 1 < e; p += 2) {
+      s0 += __ldg(rx + p) * in[__ldg(rj + p)];
+      s1 += __ldg(rx + p + 1) * in[__ldg(rj + p + 1)];
+    }
+    if (p < e) { s0 += __ldg(rx + p) * in[__ldg(rj + p)]; }
+    out[i] = s0 + s1;
+  }
+  __syncthreads();
+  const int nq = min(*qn, qcap);
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  for (int k = warp; k < nq; k += kFissionThreads / 32) {
+    const i_t i = q[k];
+    const i_t b = __ldg(rp + i), e = __ldg(rp + i + 1);
+    f_t s = 0.0;
+    for (i_t p = b + lane; p < e; p += 32) { s += __ldg(rx + p) * in[__ldg(rj + p)]; }
+    s = warp_reduce_add(s);
+    if (lane == 0) { out[i] = s; }
+  }
+  __syncthreads();
+}
+
+// Same sum, entries balanced across the block (default; CUOPT_EXP_SCATTER=segment selects the above).
+// Each thread takes kScatBatch entries per pass and runs their searches, loads and atomics side by
+// side, so one pass costs about one entry's latency chain. sb: the segments' start offsets (n ints).
+constexpr int kScatBatch = 4;  // CHOSEN
+__device__ __forceinline__ void fission_scatter_atomic(fission_scan_smem_t& sm, const i_t* cp, const i_t* __restrict__ ri,
+                                                       const f_t* __restrict__ cx, const i_t* idx, const f_t* val, int n,
+                                                       int* pre, int* sb, f_t* acc, int cls)
+{
+  if (c_scatter_seg != 0) {
+    fission_scatter_seg(cp, ri, cx, idx, val, n, acc);
+    return;
+  }
   __shared__ int total;
   constexpr int kItems = (kFissionCapA + kFissionThreads - 1) / kFissionThreads;
   int len[kItems];
@@ -1069,8 +1145,14 @@ __device__ __forceinline__ void fission_scatter_atomic(fission_scan_smem_t& sm, 
 #pragma unroll
   for (int k = 0; k < kItems; ++k) {
     const int t = threadIdx.x * kItems + k;
-    len[k]      = t < n ? cp[idx[t] + 1] - cp[idx[t]] : 0;
-    ml          = max(ml, len[k]);
+    len[k]      = 0;
+    if (t < n) {
+      const i_t c = idx[t];
+      const i_t b = __ldg(cp + c);
+      sb[t]       = b;
+      len[k]      = __ldg(cp + c + 1) - b;
+    }
+    ml = max(ml, len[k]);
   }
   int agg = 0;
   fission_scan_t(sm.tmp).ExclusiveSum(len, len, agg);
@@ -1097,14 +1179,33 @@ __device__ __forceinline__ void fission_scatter_atomic(fission_scan_smem_t& sm, 
       atomicAdd(&g_fscat_h[cls][1][min(19, 32 - __clz(E))], 1ull);
     }
   }
-  for (int e = threadIdx.x; e < E; e += kFissionThreads) {
-    int lo = 0, hi = n - 1;
-    while (lo < hi) {
-      const int mid = (lo + hi + 1) >> 1;
-      if (pre[mid] <= e) { lo = mid; } else { hi = mid - 1; }
+  // Segment of entry e: the largest lo with pre[lo] <= e (fixed-trip, branch-free over the batch).
+  const int top = n > 1 ? 1 << (31 - __clz(n - 1)) : 0;
+  for (int e0 = threadIdx.x; e0 < E; e0 += kScatBatch * kFissionThreads) {
+    int e[kScatBatch], lo[kScatBatch];
+#pragma unroll
+    for (int k = 0; k < kScatBatch; ++k) { e[k] = e0 + k * kFissionThreads, lo[k] = 0; }
+    for (int step = top; step > 0; step >>= 1) {
+#pragma unroll
+      for (int k = 0; k < kScatBatch; ++k) {
+        const int c = lo[k] + step;
+        if (c < n && pre[c] <= e[k]) { lo[k] = c; }
+      }
     }
-    const int p = cp[idx[lo]] + (e - pre[lo]);
-    atomicAdd(&acc[ri[p]], cx[p] * val[lo]);
+    i_t row[kScatBatch];
+    f_t prod[kScatBatch];
+#pragma unroll
+    for (int k = 0; k < kScatBatch; ++k) {
+      if (e[k] < E) {
+        const int p = sb[lo[k]] + (e[k] - pre[lo[k]]);
+        row[k]      = __ldg(ri + p);
+        prod[k]     = __ldg(cx + p) * val[lo[k]];
+      }
+    }
+#pragma unroll
+    for (int k = 0; k < kScatBatch; ++k) {
+      if (e[k] < E) { atomicAdd(&acc[row[k]], prod[k]); }
+    }
   }
   __syncthreads();
 }
@@ -1154,7 +1255,7 @@ __device__ __forceinline__ void fission_btran_atomic_body(kernel_args* args, con
   FSTEP(S_B_TLOOP)
   const int nw = fission_compact_atomic(w, m, li, lx, kFissionCapA, &cnt);
   FSTEP(S_B_COMPACT)
-  fission_scatter_atomic(scs, I.Lr_p, I.Lr_i, I.Lr_x, li, lx, nw, pre, w, 4);
+  fission_scatter_atomic(scs, I.Lr_p, I.Lr_i, I.Lr_x, li, lx, nw, pre, pre + kFissionCapA, w, 4);
   FSTEP(S_B_LSCATTER)
   auto& dy = st.delta_y_sparse;
   if (threadIdx.x == 0) { cnt = 0; }
@@ -1243,7 +1344,7 @@ __device__ __forceinline__ void fission_ftran_atomic_body(kernel_args* args, con
       __syncthreads();
       fission_level_solve(st.ft.L0_transpose_, st.lvl_ls[0].data(), st.lvl_co[0].data(), st.cfg_nlev[0], false, z);
     } else {
-      fission_scatter_atomic(scs, I.Lc_p, I.Lc_i, I.Lc_x, b.i.data(), b.x.data(), nb, pre, z, r);
+      fission_scatter_atomic(scs, I.Lc_p, I.Lc_i, I.Lc_x, b.i.data(), b.x.data(), nb, pre, pre + kFissionCapA, z, r);
     }
     FSTEP(S_F_LSCATTER)
     if (st.f_mrows == st.ft.num_updates_) {
@@ -1252,8 +1353,13 @@ __device__ __forceinline__ void fission_ftran_atomic_body(kernel_args* args, con
       fission_tloop_chunked(st.ft, z, true, 1e-16, R, kFissionStage);
     }
     FSTEP(S_F_TLOOP)
+    // The dy solve's output v is read only at the rows of the rhs solve's result (the steepest-edge
+    // update over scaled_dxB): by default gather just those rows of U0^-1 from z; CUOPT_EXP_FTRAN_DY=
+    // gather: every row; =scatter: the full scatter.
+    const bool dy_gather = r == 1 && !direct && c_ftran_dy != 1;
     int nz = 0;
-    if (direct) {
+    if (dy_gather) {
+    } else if (direct) {
       // utilde from the dense L-space vector, which the U solve then overwrites in place.
       if (r == 0) {
         if (threadIdx.x == 0) { cnt = 0; }
@@ -1285,10 +1391,16 @@ __device__ __forceinline__ void fission_ftran_atomic_body(kernel_args* args, con
       }
     }
     FSTEP(S_F_COMPACT)
-    if (direct) {
+    if (dy_gather && c_ftran_dy == 2) {
+      fission_gather_rows(I.Ur_p, I.Ur_i, I.Ur_x, m, z, st.ft.dense_scratch2_.data(), li, 2 * kFissionCapA, &cnt);
+    } else if (dy_gather) {
+      const auto& dx = st.scaled_dxB_sparse;
+      fission_gather(I.Ur_p, I.Ur_i, I.Ur_x, dx.i.data(), static_cast<int>(dx.i.size()), z,
+                     st.ft.dense_scratch2_.data());
+    } else if (direct) {
       fission_level_solve(st.ft.U0_transpose_, st.lvl_ls[1].data(), st.lvl_co[1].data(), st.cfg_nlev[1], true, acc);
     } else {
-      fission_scatter_atomic(scs, I.Uc_p, I.Uc_i, I.Uc_x, li, lx, nz, pre, acc, 2 + r);
+      fission_scatter_atomic(scs, I.Uc_p, I.Uc_i, I.Uc_x, li, lx, nz, pre, pre + kFissionCapA, acc, 2 + r);
     }
     FSTEP(S_F_USCATTER)
     if (r == 0) {
@@ -1317,7 +1429,11 @@ __device__ __forceinline__ void fission_ftran_atomic_body(kernel_args* args, con
       }
     } else {
       auto& v = st.ft.dense_scratch2_;
-      for (int k = threadIdx.x; k < m; k += blockDim.x) { v[k] = acc[k], acc[k] = 0.0; }
+      if (dy_gather) {
+        for (int k = threadIdx.x; k < m; k += blockDim.x) { z[k] = 0.0; }
+      } else {
+        for (int k = threadIdx.x; k < m; k += blockDim.x) { v[k] = acc[k], acc[k] = 0.0; }
+      }
       if (threadIdx.x == 0) {
         v.set_size(m);
         st.v_sparse.clear();
