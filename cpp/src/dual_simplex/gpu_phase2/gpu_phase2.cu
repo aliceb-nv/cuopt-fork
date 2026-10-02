@@ -9030,14 +9030,6 @@ bool gpu_simplified_dual_phase2_batch_stage(
 
   H->items[seat]         = item;
   H->items[seat].command = command;
-  if (gpu_fission() && gpu_fission_inv_library() && command != gpu_batch_seat_command::CHILD_CONTINUE) {
-    if (item.fission_inv == nullptr) {
-      error = "fissioned pivot loop (CUOPT_BNB_GPU_FISSION) needs the seat's explicit inverses";
-      return false;
-    }
-    if (H->h_finv.size() < H->h_args.size()) { H->h_finv.resize(H->h_args.size()); }
-    H->h_finv[seat] = *item.fission_inv;
-  }
   a.done                 = 0;
   a.device_lu            = 0;
   a.transpose_on_device  = 0;
@@ -9501,13 +9493,8 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
       // Fissioned pivot loop: setup, then rounds of the phase kernels until no seat is running.
       const cudaStream_t cs = H->stream.value();
       const i_t Ni          = static_cast<i_t>(N);
-      const bool lib = gpu_fission_inv_library();
-      if (lib && H->h_finv.size() != N) {
-        error = "fissioned pivot loop: seats without explicit inverses";
-        return false;
-      }
       if (!H->d_finv) { H->d_finv.emplace(N * sizeof(gpu_fission_inv), H->stream); }
-      if (!lib && !H->d_finv_mem) {
+      if (!H->d_finv_mem) {
         // Device-built inverses: one carved buffer, fixed per-seat capacities; seat pointers set once.
         auto& b = H->finv_b;
         b.N = static_cast<int>(N), b.m = static_cast<int>(H->rows);
@@ -9624,7 +9611,7 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
         }();
         RAFT_CUDA_TRY(cudaMemcpyToSymbolAsync(c_ftran_direct, &direct, sizeof(int), 0, cudaMemcpyHostToDevice, cs));
       }
-      if (!lib) {
+      {
         // Every seat's inverses from the factors just staged: per-generation work.
         auto& b = H->finv_b;
         for (int f = 0; f < 2; ++f) { RAFT_CUDA_TRY(cudaMemsetAsync(b.cur[f], 0, N * sizeof(int), cs)); }
@@ -9669,7 +9656,7 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
         int live = 0;
         RAFT_CUDA_TRY(cudaMemcpyAsync(&live, d_live, sizeof(int), cudaMemcpyDeviceToHost, cs));
         RAFT_CUDA_TRY(cudaStreamSynchronize(cs));
-        if (!lib && *H->h_finv_err != 0) {
+        if (*H->h_finv_err != 0) {
           throw std::runtime_error("device explicit inverses: a seat exceeded its per-seat capacity");
         }
         static const bool trace = std::getenv("CUOPT_BNB_GPU_FISSION_TRACE") != nullptr;

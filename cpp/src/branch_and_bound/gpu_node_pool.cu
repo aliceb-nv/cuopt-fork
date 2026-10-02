@@ -2050,8 +2050,7 @@ struct gpu_batch_run_t {
   bool stage_persistent_fresh_from(i_t s,
                                    const gpu_batch_node_t<i_t, f_t>& cn,
                                    const batch_seat_state_t<i_t, f_t>& cw,
-                                   std::string& error,
-                                   const gds::gpu_fission_inv* finv = nullptr)
+                                   std::string& error)
   {
     auto& node = nodes[s];
     auto& w    = st[s];
@@ -2082,7 +2081,6 @@ struct gpu_batch_run_t {
     it.dy_se           = const_cast<std::vector<f_t>*>(&cn.dy_se);
     it.refactor_reason = &w.refactor_reason;
     it.command         = gds::gpu_batch_seat_command::FRESH_NODE;
-    it.fission_inv     = finv;
     static const std::vector<gds::gpu_bound_delta<i_t, f_t>> none;
     return gds::gpu_simplified_dual_phase2_batch_stage<i_t, f_t>(
       handle, static_cast<size_t>(s), it, gds::gpu_batch_seat_command::FRESH_NODE, none, error);
@@ -2458,10 +2456,9 @@ bool gpu_persistent_batch_stage_fresh_from(gpu_batch_run<i_t, f_t>* run,
                                            i_t seat,
                                            const gpu_batch_node_t<i_t, f_t>& node,
                                            const batch_seat_state_t<i_t, f_t>& prepared,
-                                           std::string& error,
-                                           const gds::gpu_fission_inv* finv)
+                                           std::string& error)
 {
-  return run != nullptr && run->stage_persistent_fresh_from(seat, node, prepared, error, finv);
+  return run != nullptr && run->stage_persistent_fresh_from(seat, node, prepared, error);
 }
 
 template <typename i_t, typename f_t>
@@ -2658,7 +2655,7 @@ template gds::gpu_batch_result_view<int, double> gpu_persistent_batch_result<int
 template void gpu_persistent_batch_fetch_seat<int, double>(gpu_batch_run<int, double>*, int);
 template bool gpu_persistent_batch_stage_fresh_from<int, double>(
   gpu_batch_run<int, double>*, int, const gpu_batch_node_t<int, double>&,
-  const batch_seat_state_t<int, double>&, std::string&, const gds::gpu_fission_inv*);
+  const batch_seat_state_t<int, double>&, std::string&);
 template std::vector<char> gpu_batch_factor_fresh<int, double>(
   const simplex::lp_problem_t<int, double>&, std::vector<gpu_batch_node_t<int, double>>&,
   std::vector<batch_seat_state_t<int, double>>&, int);

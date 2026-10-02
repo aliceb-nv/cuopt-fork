@@ -685,8 +685,7 @@ bool gpu_persistent_batch_stage_fresh_from(gpu_batch_run<i_t, f_t>* run,
                                            i_t seat,
                                            const gpu_batch_node_t<i_t, f_t>& node,
                                            const batch_seat_state_t<i_t, f_t>& prepared,
-                                           std::string& error,
-                                           const gds::gpu_fission_inv* finv = nullptr);
+                                           std::string& error);
 // The seat's current device vstatus, bounds and dy_se (CUOPT_BNB_GPU_SNAPSHOT).
 template <typename i_t, typename f_t>
 void gpu_persistent_batch_read_seat(gpu_batch_run<i_t, f_t>* run,

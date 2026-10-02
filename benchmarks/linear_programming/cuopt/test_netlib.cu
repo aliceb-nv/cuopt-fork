@@ -19,7 +19,6 @@
 #include <branch_and_bound/bad_node_dump.hpp>
 #include <branch_and_bound/gpu_node_pool.hpp>
 #include <branch_and_bound/pool_snapshot.hpp>
-#include <dual_simplex/gpu_phase2/explicit_inverse.hpp>
 #include <dual_simplex/basis_solves.hpp>
 #include <dual_simplex/basis_updates.hpp>
 #include <dual_simplex/gpu_phase2/gpu_phase2.cuh>
@@ -2605,148 +2604,6 @@ void replay_pool_mode(const raft::handle_t& handle,
   if (usable.empty()) { std::exit(1); }
   const int U = static_cast<int>(usable.size());
 
-  // CUOPT_BNB_GPU_FISSION: explicit inverses of every stored node, resident on the device for the
-  // whole replay (the analogue of the up-front LUs).
-  std::vector<gds::gpu_fission_inv> finv(stored.size());
-  const char* inv_mode = std::getenv("CUOPT_EXP_INV");
-  if (const char* e = std::getenv("CUOPT_BNB_GPU_FISSION");
-      e != nullptr && std::string(e) != "0" && inv_mode != nullptr && std::string(inv_mode) == "library") {
-    namespace ei = cuopt::linear_programming::dual_simplex::explicit_inverse;
-    const double ti = mo::tic();
-    std::vector<ei::inverses_t> inv(stored.size());
-    std::atomic<int> next{0};
-    std::vector<std::thread> th;
-    for (int w = 0; w < std::max(1, threads); ++w) {
-      th.emplace_back([&] {
-        ei::workspace_t ws;
-        for (int q = next++; q < U; q = next++) {
-          const int k  = usable[q];
-          const auto& ft = prepared[k].ft;
-          ei::build(m, ft.L0().col_start.data(), ft.L0().i.data(), ft.L0().x.data(),
-                    ft.U0().col_start.data(), ft.U0().i.data(), ft.U0().x.data(),
-                    ft.row_permutation().data(), ws, inv[k]);
-        }
-      });
-    }
-    for (auto& t : th) { t.join(); }
-    if (std::getenv("CUOPT_EXP_INV_LEVELS") != nullptr) {
-      // Levels of the column recurrence X(:,k) = (e_k - sum_i T_ik X(:,i)) / T_kk over every stored LU.
-      // Per level, summed over seats: columns, output nonzeros, source-column entries, factor entries.
-      struct acc_t { double cols = 0, out = 0, src = 0, fac = 0; };
-      std::vector<acc_t> per[2];
-      std::vector<int> nlev[2];
-      for (int q = 0; q < U; ++q) {
-        const int k0 = usable[q];
-        const auto& ft = prepared[k0].ft;
-        for (int f = 0; f < 2; ++f) {
-          const auto& F = f == 0 ? ft.L0() : ft.U0();
-          const int* cp = F.col_start.data();
-          const int* ri = F.i.data();
-          const auto& Inv = f == 0 ? inv[k0].Lc : inv[k0].Uc;
-          const int* perm = ft.row_permutation().data();
-          auto onz = [&](int k) { const int c = f == 0 ? perm[k] : k; return Inv.p[c + 1] - Inv.p[c]; };
-          std::vector<int> lev(m, 0);
-          int L = 0;
-          for (int t = 0; t < m; ++t) {
-            const int k = f == 0 ? m - 1 - t : t;  // L: deps i > k; U: deps i < k
-            int lv = 0;
-            for (int p = cp[k]; p < cp[k + 1]; ++p) {
-              const int i = ri[p];
-              if (i != k) { lv = std::max(lv, lev[i] + 1); }
-            }
-            lev[k] = lv;
-            L      = std::max(L, lv + 1);
-          }
-          if (static_cast<int>(per[f].size()) < L) { per[f].resize(L); }
-          nlev[f].push_back(L);
-          for (int k = 0; k < m; ++k) {
-            auto& a = per[f][lev[k]];
-            a.cols += 1, a.out += onz(k), a.fac += cp[k + 1] - cp[k];
-            for (int p = cp[k]; p < cp[k + 1]; ++p) {
-              if (ri[p] != k) { a.src += onz(ri[p]); }
-            }
-          }
-        }
-      }
-      {
-        // Per non-trivial column (with dependencies): output pattern size and serial steps
-        // (sum over the pattern's rows of that factor column's off-diagonal entries).
-        std::vector<double> csz[2], cwk[2], smax_sz[2], smax_wk[2];
-        for (int q = 0; q < U; ++q) {
-          const int k0 = usable[q];
-          const auto& ft = prepared[k0].ft;
-          for (int f = 0; f < 2; ++f) {
-            const auto& F = f == 0 ? ft.L0() : ft.U0();
-            const int* cp = F.col_start.data();
-            const auto& Inv = f == 0 ? inv[k0].Lc : inv[k0].Uc;
-            const int* perm = ft.row_permutation().data();
-            double msz = 0, mwk = 0;
-            for (int k = 0; k < m; ++k) {
-              const int c = f == 0 ? perm[k] : k;
-              const int nz = Inv.p[c + 1] - Inv.p[c];
-              if (nz <= 1) { continue; }
-              double wk = 0;
-              for (int t = Inv.p[c]; t < Inv.p[c + 1]; ++t) {
-                const int r = Inv.i[t];
-                wk += cp[r + 1] - cp[r] - 1;
-              }
-              csz[f].push_back(nz), cwk[f].push_back(wk);
-              msz = std::max<double>(msz, nz), mwk = std::max(mwk, wk);
-            }
-            smax_sz[f].push_back(msz), smax_wk[f].push_back(mwk);
-          }
-        }
-        auto pct = [](std::vector<double> v, double p) {
-          if (v.empty()) { return 0.0; }
-          std::sort(v.begin(), v.end());
-          return v[std::min(v.size() - 1, static_cast<size_t>(p * (v.size() - 1)))];
-        };
-        for (int f = 0; f < 2; ++f) {
-          const char* nm = f == 0 ? "Linv" : "Uinv";
-          std::printf("[EXP-INV-COLS] %s non-trivial columns=%zu (%.1f per seat)\n", nm, csz[f].size(), csz[f].size() / double(U));
-          for (auto [lab, v] : {std::pair{"pattern size", &csz[f]}, std::pair{"serial steps", &cwk[f]},
-                                std::pair{"per-seat max pattern size", &smax_sz[f]}, std::pair{"per-seat max serial steps", &smax_wk[f]}}) {
-            std::printf("[EXP-INV-COLS] %s %-26s p50=%8.0f p90=%8.0f p99=%8.0f p99.9=%8.0f max=%8.0f mean=%8.1f\n", nm, lab,
-                        pct(*v, 0.5), pct(*v, 0.9), pct(*v, 0.99), pct(*v, 0.999), pct(*v, 1.0),
-                        std::accumulate(v->begin(), v->end(), 0.0) / std::max<size_t>(1, v->size()));
-          }
-        }
-      }
-      for (int f = 0; f < 2; ++f) {
-        std::sort(nlev[f].begin(), nlev[f].end());
-        double tc = 0, to = 0, ts = 0, tf = 0;
-        for (auto& a : per[f]) { tc += a.cols, to += a.out, ts += a.src, tf += a.fac; }
-        std::printf("[EXP-INV-LEVELS] %s: seats=%d levels mean=%.1f median=%d max=%d | per seat: cols=%.0f out_nnz=%.0f src_entries=%.0f factor_entries=%.0f\n",
-                    f == 0 ? "Linv" : "Uinv", U, std::accumulate(nlev[f].begin(), nlev[f].end(), 0.0) / U,
-                    nlev[f][U / 2], nlev[f].back(), tc / U, to / U, ts / U, tf / U);
-        for (size_t l = 0; l < per[f].size(); ++l) {
-          const auto& a = per[f][l];
-          std::printf("[EXP-INV-LEVELS] %s level %2zu: per seat cols=%8.1f out_nnz=%9.1f src_entries=%9.1f factor_entries=%8.1f\n",
-                      f == 0 ? "Linv" : "Uinv", l, a.cols / U, a.out / U, a.src / U, a.fac / U);
-        }
-      }
-    }
-    size_t bytes = 0;
-    auto up = [&](const auto& v) {
-      using T = typename std::decay_t<decltype(v)>::value_type;
-      T* p    = nullptr;
-      const size_t nb = std::max<size_t>(1, v.size()) * sizeof(T);
-      cudaMalloc(&p, nb);
-      cudaMemcpy(p, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice);
-      bytes += nb;
-      return p;
-    };
-    for (int k : usable) {
-      auto& f = finv[k];
-      f.Lr_p = up(inv[k].Lr.p), f.Lr_i = up(inv[k].Lr.i), f.Lr_x = up(inv[k].Lr.x);
-      f.Lc_p = up(inv[k].Lc.p), f.Lc_i = up(inv[k].Lc.i), f.Lc_x = up(inv[k].Lc.x);
-      f.Ur_p = up(inv[k].Ur.p), f.Ur_i = up(inv[k].Ur.i), f.Ur_x = up(inv[k].Ur.x);
-      f.Uc_p = up(inv[k].Uc.p), f.Uc_i = up(inv[k].Uc.i), f.Uc_x = up(inv[k].Uc.x);
-    }
-    std::printf("fission: explicit inverses of %d nodes in %.2fs, %.2f GB on the device\n", U,
-                mo::toc(ti), bytes / 1e9);
-  }
-
   std::vector<ds::variable_type_t> var_types(h.n_var_types);
   for (int j = 0; j < h.n_var_types; ++j) {
     var_types[j] = static_cast<ds::variable_type_t>(snap.var_types[j]);
@@ -2824,7 +2681,7 @@ void replay_pool_mode(const raft::handle_t& handle,
         seat_node[s] = usable[cursor];
         cursor       = (cursor + 1) % U;
         if (!mip::gpu_persistent_batch_stage_fresh_from<int, double>(
-              run, s, stored[seat_node[s]], prepared[seat_node[s]], err, &finv[seat_node[s]])) {
+              run, s, stored[seat_node[s]], prepared[seat_node[s]], err)) {
           errors[c] = "stage: " + err;
           break;
         }

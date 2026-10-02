@@ -2374,15 +2374,6 @@ __global__ void __launch_bounds__(kFinvTr) finv_transpose(const kernel_args* arg
   }
 }
 
-// CUOPT_EXP_INV=library: the harness's start-up inverse library (not per-generation work).
-inline bool gpu_fission_inv_library()
-{
-  static const bool on = [] {
-    const char* e = std::getenv("CUOPT_EXP_INV");
-    return e != nullptr && std::string(e) == "library";
-  }();
-  return on;
-}
 
 inline bool gpu_fission()
 {

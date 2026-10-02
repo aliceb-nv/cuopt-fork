@@ -156,10 +156,6 @@ struct gpu_batch_item {
   // CHILD_CONTINUE keeps the live LU+MPF representation and applies only the sparse bound delta
   // before repricing the child.
   gpu_batch_seat_command command = gpu_batch_seat_command::FRESH_NODE;
-
-  // Fissioned path: this seat's inverses of the base factors (required for FRESH / REFACTOR_RESUME
-  // staging when CUOPT_BNB_GPU_FISSION is on; a child continuation keeps the seat's previous ones).
-  const gpu_fission_inv* fission_inv{nullptr};
 };
 
 // Timing + pre-flight result for a batch launch. If `rejected` is true the batch
