@@ -2605,6 +2605,11 @@ void replay_pool_mode(const raft::handle_t& handle,
               h.elapsed, h.device, h.pools_on_device, device, clones);
 
   // Stored nodes: every non-empty seat, as a new node from its basis.
+  const bool path_bounds = [] {
+    const char* f = std::getenv("CUOPT_BNB_GPU_FISSION");
+    const char* p = std::getenv("CUOPT_EXP_PATH_BOUNDS");
+    return (f == nullptr || std::string(f) != "0") && (p == nullptr || std::string(p) != "0");
+  }();
   std::vector<mip::gpu_batch_node_t<int, double>> stored;
   for (const auto& s : snap.seats) {
     if (s.rec.command == ps::PARKED) { continue; }
@@ -2618,10 +2623,13 @@ void replay_pool_mode(const raft::handle_t& handle,
     }
     // The same bounds as root + deltas, for restaging (as the B&B's path bounds; the first launch
     // below stages full bounds).
-    node.root_lower = &lp.lower;
-    node.root_upper = &lp.upper;
-    for (size_t q = 0; q < s.cols.size(); ++q) {
-      node.path_deltas.push_back({s.cols[q], s.lo[q], s.up[q], 3});
+    // Only the fission path stages host-LU seats from root + deltas.
+    if (path_bounds) {
+      node.root_lower = &lp.lower;
+      node.root_upper = &lp.upper;
+      for (size_t q = 0; q < s.cols.size(); ++q) {
+        node.path_deltas.push_back({s.cols[q], s.lo[q], s.up[q], 3});
+      }
     }
     node.vstatus.resize(n);
     for (int j = 0; j < n; ++j) { node.vstatus[j] = static_cast<ds::variable_status_t>(s.vstatus[j]); }
