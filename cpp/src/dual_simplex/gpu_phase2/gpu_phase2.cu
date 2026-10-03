@@ -218,6 +218,8 @@ __constant__ int c_choose_old = 0;  // CUOPT_EXP_CHOOSE=old: dz computed inside 
 __constant__ int c_tail_old = 0;  // CUOPT_EXP_TAIL=old: FTRAN tail recomputes w (dots) and sums all of it
 __constant__ int c_update_old = 0;  // CUOPT_EXP_UPDATE=old: separate update passes, no cached positions
 __constant__ int c_finv_gbits = 0;  // CUOPT_EXP_FINV_GBITS=1: finv_columns bitsets in global memory
+__constant__ int c_fb_force = 0;  // CUOPT_EXP_FB_FORCE=1 (test): every BTRAN/FTRAN list takes its fallback
+__constant__ int c_no_lean = 0;  // CUOPT_EXP_FLEAN=0: fission fresh seats use the classic setup x_B
 __constant__ int c_tloop_old = 0;  // CUOPT_EXP_TLOOP=old: thread-per-k R d and warp-per-k axpys in the replay
 __constant__ int c_ftran_dy = 0;  // fission dy solve's U step: 0 rows read by the SE update, 1 scatter, 2 all rows
 __constant__ int c_long_col = 32;      // CUOPT_BNB_GPU_LONG_COL: longer gather columns go to 8-lane groups
@@ -3583,6 +3585,9 @@ struct slot_state {
   i_t cfg_nlev[4]{};
   // A FRESH seat factorized on the device has no host-priced duals: setup prices them.
   bool price_fresh{false};
+  // The slot's L0/U0 transposes match its factor. A lean fission fresh seat skips them; its plunge
+  // children reprice through them (price_child_duals), so a child builds them first.
+  bool tri_built{false};
 
   FT ft;  // basis update: S_/mu_values_, num_updates_, routing stats, reused scratch
 
@@ -4834,14 +4839,40 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args,
   const long long pcs = clock64();
   // Fission fresh seat: x_B from the inverses. The transposes and level schedules are skipped unless
   // the direct FTRAN (CUOPT_EXP_FTRAN=direct) solves through them.
-  const bool lean      = FissionSetup && !child_continue && a.refactor_resume == 0 && a.device_lu == 0;
-  const bool skip_tri  = lean && c_ftran_direct == 0;
+  const bool lean      = FissionSetup && !child_continue && a.refactor_resume == 0 && a.device_lu == 0 &&
+                    c_no_lean != 1;
+  const bool skip_tri  = lean && c_ftran_direct == 0 && c_no_lean != 2;
   if constexpr (PersistentSeats) {
-    if (!skip_tri && !child_continue && a.transpose_on_device != 0) {
-      warp_csc_transpose(m, a.L0_col_start, a.L0_i, a.L0_x, a.L0t_col_start, a.L0t_i, a.L0t_x, a.xi_workspace);
-      warp_csc_transpose(m, a.U0_col_start, a.U0_i, a.U0_x, a.U0t_col_start, a.U0t_i, a.U0t_x, a.xi_workspace);
+    if (c_no_lean == 6 && !child_continue) {  // DEBUG: lean setup delayed, no writes
+      const long long t0 = clock64();
+      while (clock64() - t0 < 2000000) {}
+      __syncwarp(0xffffffffu);
+    }
+    if (c_no_lean == 7 && skip_tri && !child_continue) {  // DEBUG: poison the skipped transposes
+      const f_t nan = __longlong_as_double(0x7ff8dead00000000ll);
+      for (i_t p = static_cast<i_t>(threadIdx.x); p < a.L0t_nz; p += 32) { a.L0t_x[p] = nan; }
+      for (i_t p = static_cast<i_t>(threadIdx.x); p < a.U0t_nz; p += 32) { a.U0t_x[p] = nan; }
+      __syncwarp(0xffffffffu);
+    }
+    // A child stages no factor (transpose_on_device is 0); the slot still holds the lean parent's.
+    const bool child_tri = child_continue && !a.slot->tri_built;
+    if (((!skip_tri || (c_no_lean >= 3 && c_no_lean <= 5)) && !child_continue && a.transpose_on_device != 0) ||
+        child_tri) {
+      if (c_no_lean != 5) {
+        warp_csc_transpose(m, a.L0_col_start, a.L0_i, a.L0_x, a.L0t_col_start, a.L0t_i, a.L0t_x, a.xi_workspace);
+      }
+      if (c_no_lean != 4) {
+        warp_csc_transpose(m, a.U0_col_start, a.U0_i, a.U0_x, a.U0t_col_start, a.U0t_i, a.U0t_x, a.xi_workspace);
+      }
+      if (child_tri) {  // a child keeps its workspaces: restore the zeroed scratch the transpose used
+        for (i_t k = static_cast<i_t>(threadIdx.x); k < m; k += 32) { a.xi_workspace[k] = 0; }
+        __syncwarp(0xffffffffu);
+        lane0_serial([&] { a.slot->tri_built = true; });
+      }
     }
   }
+  const bool tri_now = !child_continue && (a.transpose_on_device == 0 ||
+                                           ((!skip_tri || c_no_lean == 3) && c_no_lean != 4 && c_no_lean != 5));
   const long long pc1 = clock64();
   if (!child_continue) {
     lane0_serial([&] {
@@ -4867,6 +4898,7 @@ __device__ __forceinline__ void gpu_phase2_kernel_body(kernel_args* args,
     ft.reserve_store(m);
       ft.hypersparse_threshold_ = c_hypersparse_threshold;
       if constexpr (PersistentSeats) { st.price_fresh = a.device_lu != 0; }
+      st.tri_built = tri_now;
     });   // end lane-0 construction
   }
   slot_state<FT>& st = *a.slot;
@@ -6833,6 +6865,9 @@ struct gpu_batch_handle_t {
   gpu_phase2_detail::finv_build_t finv_b{};
   int* h_finv_err{nullptr};
   long long* h_finv_need{nullptr};  // pinned: gcur[2], off[0][N], off[1][N] after a build
+  std::optional<rmm::device_buffer> d_fission_fb;  // fission_fb_t counters (cumulative)
+  unsigned long long h_fission_fb[8]{};             // their values at the previous relaunch
+  long long fission_launches{0};
   std::optional<rmm::device_buffer> d_live;
   // Bound deltas of one generation, uploaded by the relaunch in one copy.
   std::optional<pinned_buf<gpu_bound_delta<i_t, f_t>>> h_deltas;
@@ -8354,6 +8389,72 @@ static std::string fission_rounds_report()
   return out + "\n";
 }
 
+// List-capacity fallbacks of the atomic BTRAN / FTRAN, summed over every pool of the process.
+static struct {
+  std::mutex mu;
+  unsigned long long c[gpu_phase2_detail::FB_COUNT]{};
+  long long launches{0}, launches_with{0};
+} g_ffb;
+
+// After a relaunch: this launch's fallback counts (cumulative device counters minus the previous
+// read) go into g_ffb; a launch that fell back logs one [FISSION-FALLBACK] line.
+template <typename handle_t>
+static void fission_fb_collect(handle_t* H, cudaStream_t cs)
+{
+  using namespace gpu_phase2_detail;
+  if (!H->d_fission_fb) { return; }
+  unsigned long long now[FB_COUNT];
+  RAFT_CUDA_TRY(cudaMemcpyAsync(now, H->d_fission_fb->data(), sizeof(now), cudaMemcpyDeviceToHost, cs));
+  RAFT_CUDA_TRY(cudaStreamSynchronize(cs));
+  unsigned long long d[FB_COUNT];
+  for (int k = 0; k < FB_COUNT; ++k) { d[k] = k == FB_MAX_LIST ? now[k] : now[k] - H->h_fission_fb[k]; }
+  const unsigned long long fell =
+    d[FB_BTRAN_DENSE] + d[FB_FTRAN_U0_DENSE] + d[FB_FTRAN_U1_DENSE] + d[FB_FTRAN_IN_CHUNKED];
+  ++H->fission_launches;
+  {
+    std::lock_guard<std::mutex> lk(g_ffb.mu);
+    for (int k = 0; k < FB_COUNT; ++k) {
+      if (k == FB_MAX_LIST) {
+        g_ffb.c[k] = std::max(g_ffb.c[k], now[k]);
+      } else {
+        g_ffb.c[k] += d[k];
+      }
+    }
+    ++g_ffb.launches;
+    if (fell != 0) { ++g_ffb.launches_with; }
+  }
+  if (fell != 0) {
+    std::fprintf(stderr,
+                 "[FISSION-FALLBACK] pool launch %lld: btran dense %llu of %llu solves, ftran U dense "
+                 "%llu (a_q) + %llu (delta_y) of %llu solves, ftran input chunked %llu of %llu right-hand "
+                 "sides, longest list so far %llu (capacity %d)\n",
+                 H->fission_launches, d[FB_BTRAN_DENSE], d[FB_BTRAN_CALLS], d[FB_FTRAN_U0_DENSE],
+                 d[FB_FTRAN_U1_DENSE], d[FB_FTRAN_CALLS], d[FB_FTRAN_IN_CHUNKED], 2 * d[FB_FTRAN_CALLS],
+                 now[FB_MAX_LIST], kFissionCapA);
+  }
+  for (int k = 0; k < FB_COUNT; ++k) { H->h_fission_fb[k] = now[k]; }
+}
+
+std::string gpu_fission_fallback_report()
+{
+  using namespace gpu_phase2_detail;
+  std::lock_guard<std::mutex> lk(g_ffb.mu);
+  if (g_ffb.launches == 0) { return {}; }
+  const auto& c = g_ffb.c;
+  const auto pct = [](unsigned long long a, unsigned long long b) { return b == 0 ? 0.0 : 100.0 * a / b; };
+  char out[512];
+  std::snprintf(out, sizeof(out),
+                "[FISSION-FALLBACK] total over %lld launches (%lld with a fallback): btran dense %llu of %llu "
+                "solves (%.4f%%), ftran U dense %llu (a_q) + %llu (delta_y) of %llu solves (%.4f%%), ftran "
+                "input chunked %llu of %llu right-hand sides (%.4f%%), longest list %llu (capacity %d)\n",
+                g_ffb.launches, g_ffb.launches_with, c[FB_BTRAN_DENSE], c[FB_BTRAN_CALLS],
+                pct(c[FB_BTRAN_DENSE], c[FB_BTRAN_CALLS]), c[FB_FTRAN_U0_DENSE], c[FB_FTRAN_U1_DENSE],
+                c[FB_FTRAN_CALLS], pct(c[FB_FTRAN_U0_DENSE] + c[FB_FTRAN_U1_DENSE], c[FB_FTRAN_CALLS]),
+                c[FB_FTRAN_IN_CHUNKED], 2 * c[FB_FTRAN_CALLS], pct(c[FB_FTRAN_IN_CHUNKED], 2 * c[FB_FTRAN_CALLS]),
+                c[FB_MAX_LIST], kFissionCapA);
+  return out;
+}
+
 static std::string fission_scat_report()
 {
   using namespace gpu_phase2_detail;
@@ -8411,7 +8512,7 @@ std::string gpu_fission_step_report()
     "update.p.dx", "update.p.primal", "update.p.obj", "update.p.cutoff", "update.p.se_norms",
     "update.p.swap", "tl.dot", "tl.axpy", "tl.updates"};
   const double iters = static_cast<double>(h[S_U_TAIL][1]);
-  if (iters == 0) { return fission_rounds_report(); }
+  if (iters == 0) { return fission_rounds_report() + gpu_fission_fallback_report(); }
   if (const char* ut = std::getenv("CUOPT_BNB_GPU_FISSION_UTRACE"); ut != nullptr && *ut != 0) {
     fission_utrace_t* d = nullptr;
     unsigned long long n = 0;
@@ -8474,7 +8575,7 @@ std::string gpu_fission_step_report()
   }
   double total = 0;
   for (int k = 0; k < S_UP_DX; ++k) { total += static_cast<double>(h[k][0]); }
-  std::string out = fission_rounds_report() + fission_scat_report();
+  std::string out = fission_rounds_report() + gpu_fission_fallback_report() + fission_scat_report();
   char line[256];
   std::snprintf(line, sizeof(line),
                 "[FISSION-STEPS] completed iterations=%.0f, seat cycles per iteration=%.0f (per seat, "
@@ -9401,6 +9502,41 @@ bool gpu_simplified_dual_phase2_batch_stage(
   return true;
 }
 
+// CUOPT_EXP_FISSION_SYNC=1 (debug): synchronize after each relaunch step and name the first that fails.
+// CUOPT_EXP_NANCHECK=1 (debug): after each step, count seats with NaN in x/y/z/dy_se; print changes.
+struct fission_nan_ctx_t {
+  gpu_phase2_detail::kernel_args* args{nullptr};
+  int N{0};
+  unsigned long long prev{0};
+};
+static thread_local fission_nan_ctx_t g_nan_ctx;
+static void fission_dbg_sync(cudaStream_t s, const char* step)
+{
+  static const bool nan_on = std::getenv("CUOPT_EXP_NANCHECK") != nullptr;
+  if (nan_on && g_nan_ctx.args != nullptr) {
+    unsigned long long* d = nullptr;
+    RAFT_CUDA_TRY(cudaMallocAsync(&d, 8 * sizeof(unsigned long long), s));
+    RAFT_CUDA_TRY(cudaMemsetAsync(d, 0, 8 * sizeof(unsigned long long), s));
+    gpu_phase2_detail::fission_nan_check<<<g_nan_ctx.N, 256, 0, s>>>(g_nan_ctx.args, g_nan_ctx.N, d);
+    unsigned long long h[8];
+    RAFT_CUDA_TRY(cudaMemcpyAsync(h, d, sizeof(h), cudaMemcpyDeviceToHost, s));
+    RAFT_CUDA_TRY(cudaFreeAsync(d, s));
+    RAFT_CUDA_TRY(cudaStreamSynchronize(s));
+    if (h[0] != g_nan_ctx.prev) {
+      std::fprintf(stderr, "[NAN] after '%s': %llu seats (was %llu), first seat %llu array %llu lean %llu flags %llx L0t_x %llx L0_x %llx L0t_nz %llu\n",
+                   step, h[0], g_nan_ctx.prev, h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+      g_nan_ctx.prev = h[0];
+    }
+  }
+  static const bool on = std::getenv("CUOPT_EXP_FISSION_SYNC") != nullptr;
+  if (!on) { return; }
+  const cudaError_t e = cudaStreamSynchronize(s);
+  if (e != cudaSuccess) {
+    std::fprintf(stderr, "[FISSION-SYNC] step '%s' failed: %s\n", step, cudaGetErrorString(e));
+    throw std::runtime_error(std::string("fission debug sync: ") + step);
+  }
+}
+
 template <typename i_t, typename f_t>
 bool gpu_simplified_dual_phase2_batch_relaunch(
   gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H,
@@ -9459,6 +9595,7 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
   }
   if (H->use_slots) {
     H->pack.flush(H->stream, timed ? H->ev_h2d : nullptr);
+    if (gpu_fission()) { fission_dbg_sync(H->stream.value(), "staging flush"); }
   } else if (timed) {
     RAFT_CUDA_TRY(cudaEventRecord(H->ev_h2d, H->stream.value()));
   }
@@ -9525,6 +9662,7 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
                                 N * sizeof(kernel_args),
                                 cudaMemcpyHostToDevice,
                                 H->stream.value()));
+  if (gpu_fission()) { fission_dbg_sync(H->stream.value(), "expand/deltas/args"); }
   if (!gpu_few_calls()) {
     RAFT_CUDA_TRY(cudaMemsetAsync(H->d_next, 0, sizeof(unsigned int), H->stream.value()));
     RAFT_CUDA_TRY(
@@ -9617,6 +9755,8 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
       // Fissioned pivot loop: setup, then rounds of the phase kernels until no seat is running.
       const cudaStream_t cs = H->stream.value();
       const i_t Ni          = static_cast<i_t>(N);
+      g_nan_ctx.args = H->d_args, g_nan_ctx.N = static_cast<int>(Ni), g_nan_ctx.prev = 0;
+      fission_dbg_sync(cs, "relaunch start");
       if (!H->d_finv) { H->d_finv.emplace(N * sizeof(gpu_fission_inv), H->stream); }
       if (!H->d_finv_mem) {
         // Device-built inverses: a fixed part carved once, and per-factor entry pools that grow on
@@ -9659,6 +9799,10 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
         RAFT_CUDA_TRY(cudaMemsetAsync(b.ws_y, 0, static_cast<size_t>(b.warps) * m * 8, cs));
         RAFT_CUDA_TRY(cudaMemsetAsync(b.ws_b, 0, static_cast<size_t>(b.warps) * W64 * 8, cs));
         b.inv = static_cast<gpu_fission_inv*>(H->d_finv->data());
+        static_assert(FB_COUNT <= 8, "h_fission_fb holds the fallback counters");
+        H->d_fission_fb.emplace(FB_COUNT * sizeof(unsigned long long), H->stream);
+        RAFT_CUDA_TRY(cudaMemsetAsync(H->d_fission_fb->data(), 0, H->d_fission_fb->size(), cs));
+        b.fb = static_cast<unsigned long long*>(H->d_fission_fb->data());
         // CHOSEN: initial pools of 2m entries per seat per factor; they grow on the first overflows.
         for (int f = 0; f < 2; ++f) { b.scap[f] = b.pcap[f] = 2 * static_cast<long long>(Nn) * static_cast<long long>(m); }
         RAFT_CUDA_TRY(cudaFuncSetAttribute(finv_transpose, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -9790,6 +9934,16 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
           return (e != nullptr && std::string(e) != "0") ? 1 : 0;
         }();
         RAFT_CUDA_TRY(cudaMemcpyToSymbolAsync(c_finv_gbits, &finv_gbits, sizeof(int), 0, cudaMemcpyHostToDevice, cs));
+        static const int fb_force = [] {
+          const char* e = std::getenv("CUOPT_EXP_FB_FORCE");
+          return (e != nullptr && std::string(e) != "0") ? 1 : 0;
+        }();
+        RAFT_CUDA_TRY(cudaMemcpyToSymbolAsync(c_fb_force, &fb_force, sizeof(int), 0, cudaMemcpyHostToDevice, cs));
+        static const int no_lean = [] {
+          const char* e = std::getenv("CUOPT_EXP_FLEAN");
+          return e == nullptr ? 0 : std::string(e) == "0" ? 1 : std::string(e) == "tri" ? 2 : std::string(e) == "tonly" ? 3 : std::string(e) == "lonly" ? 4 : std::string(e) == "uonly" ? 5 : std::string(e) == "delay" ? 6 : std::string(e) == "poison" ? 7 : 0;
+        }();
+        RAFT_CUDA_TRY(cudaMemcpyToSymbolAsync(c_no_lean, &no_lean, sizeof(int), 0, cudaMemcpyHostToDevice, cs));
       }
       {
         // Every seat's inverses from the factors just staged: per-generation work. On a pool
@@ -9801,14 +9955,19 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
         RAFT_CUDA_TRY(cudaMemsetAsync(b.gcur, 0, 2 * sizeof(int), cs));
         const long long T = 2LL * b.N * b.m;
         finv_trivial<<<static_cast<unsigned>((T + 255) / 256), 256, 0, cs>>>(H->d_args, b);
+        fission_dbg_sync(cs, "finv_trivial");
         finv_columns<<<b.grid, 256, 8 * ((static_cast<size_t>(b.m) + 63) / 64) * sizeof(unsigned long long), cs>>>(H->d_args, b);
+        fission_dbg_sync(cs, "finv_columns");
         finv_offsets<<<1, kFinvOff, 0, cs>>>(b);
+        fission_dbg_sync(cs, "finv_offsets");
         finv_pack<<<2 * Ni, kFinvPack, 0, cs>>>(H->d_args, b);
+        fission_dbg_sync(cs, "finv_pack");
         {
           const size_t smem_t = 2 * static_cast<size_t>(b.m) * sizeof(int);
           RAFT_CUDA_TRY(cudaFuncSetAttribute(finv_transpose, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                              static_cast<int>(smem_t)));
           finv_transpose<<<2 * Ni, kFinvTr, smem_t, cs>>>(H->d_args, b);
+          fission_dbg_sync(cs, "finv_transpose");
         }
         RAFT_CUDA_TRY(cudaPeekAtLastError());
         RAFT_CUDA_TRY(cudaMemcpyAsync(H->h_finv_err, b.err, sizeof(int), cudaMemcpyDeviceToHost, cs));
@@ -9846,18 +10005,46 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
         }
       }
       fission_presetup<<<Ni, kPresetupThreads, 0, cs>>>(H->d_args, Ni);
+      fission_dbg_sync(cs, "presetup");
+      static const bool bcheck = [] { const char* e = std::getenv("CUOPT_EXP_XBCHECK"); return e != nullptr && std::string(e) != "0"; }();
+      if (bcheck) {
+        rmm::device_buffer d_chk(5 * sizeof(unsigned long long), H->stream);
+        RAFT_CUDA_TRY(cudaMemsetAsync(d_chk.data(), 0, d_chk.size(), cs));
+        fission_basis_check<<<Ni, 256, 0, cs>>>(H->d_args, Ni, static_cast<unsigned long long*>(d_chk.data()));
+        unsigned long long h[5];
+        RAFT_CUDA_TRY(cudaMemcpyAsync(h, d_chk.data(), sizeof(h), cudaMemcpyDeviceToHost, cs));
+        RAFT_CUDA_TRY(cudaStreamSynchronize(cs));
+        std::fprintf(stderr, "[BASIS-CHECK] seats %llu bad %llu first seat %llu cmd/resume %llx bad entries %llu\n",
+                     h[0], h[1], h[2], h[3], h[4]);
+      }
       if (gpu_fission_price_fresh()) {
         const size_t smem_d = 2 * static_cast<size_t>(H->rows) * sizeof(f_t);
         RAFT_CUDA_TRY(cudaFuncSetAttribute(fission_duals, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                            static_cast<int>(smem_d)));
         fission_duals<<<Ni, kXbThreads, smem_d, cs>>>(H->d_args, finv, Ni);
+        fission_dbg_sync(cs, "duals");
       }
       fission_setup_kernel<<<Ni, 32, 0, cs>>>(H->d_args, Ni);
+      fission_dbg_sync(cs, "setup");
       {
         const size_t smem_x = 2 * static_cast<size_t>(H->rows) * sizeof(f_t);
         RAFT_CUDA_TRY(cudaFuncSetAttribute(fission_xb, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                            static_cast<int>(smem_x)));
         fission_xb<<<Ni, kXbThreads, smem_x, cs>>>(H->d_args, finv, Ni);
+        fission_dbg_sync(cs, "xb");
+        static const bool xbcheck = [] { const char* e = std::getenv("CUOPT_EXP_XBCHECK"); return e != nullptr && std::string(e) != "0"; }();
+        if (xbcheck) {
+          rmm::device_buffer d_chk(4 * sizeof(unsigned long long), H->stream);
+          RAFT_CUDA_TRY(cudaMemsetAsync(d_chk.data(), 0, d_chk.size(), cs));
+          fission_xb_check<<<Ni, kXbThreads, 0, cs>>>(H->d_args, Ni, static_cast<unsigned long long*>(d_chk.data()));
+          unsigned long long h[4];
+          RAFT_CUDA_TRY(cudaMemcpyAsync(h, d_chk.data(), sizeof(h), cudaMemcpyDeviceToHost, cs));
+          RAFT_CUDA_TRY(cudaStreamSynchronize(cs));
+          double worst;
+          std::memcpy(&worst, &h[2], sizeof(worst));
+          std::fprintf(stderr, "[XB-CHECK] lean seats %llu, residual > 1e-6: %llu, max %.3e (seat %llu)\n",
+                       h[0], h[1], worst, h[3]);
+        }
       }
       static const bool fused = !det && [] { const char* e = std::getenv("CUOPT_EXP_FUSED"); return e != nullptr && std::string(e) != "0"; }();  // opt-in
       const size_t smem_f     = std::max(smem, smem_c);
@@ -9872,16 +10059,32 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
         }
         for (int k = 0; k < (fused ? 0 : gpu_fission_rounds()); ++k) {
           fission_price<<<Ni, 32, 0, cs>>>(H->d_args, Ni);
+          fission_dbg_sync(cs, "price");
           k_btran<<<Ni, kFissionThreads, smem, cs>>>(H->d_args, finv, Ni);
+          fission_dbg_sync(cs, "btran");
           fission_choose_block<<<Ni, kFissionThreads, smem_c, cs>>>(H->d_args, Ni);
+          fission_dbg_sync(cs, "choose");
           k_ftran<<<Ni, kFissionThreads, smem, cs>>>(H->d_args, finv, Ni);
+          fission_dbg_sync(cs, "ftran");
           fission_update_block<<<Ni, kUpdThreads, (static_cast<size_t>(H->rows) + 1) * sizeof(int), cs>>>(H->d_args, Ni);
+          fission_dbg_sync(cs, "update");
         }
         RAFT_CUDA_TRY(cudaMemsetAsync(d_live, 0, sizeof(int), cs));
         fission_count<<<(Ni + 255) / 256, 256, 0, cs>>>(H->d_args, Ni, d_live);
         int live = 0;
         RAFT_CUDA_TRY(cudaMemcpyAsync(&live, d_live, sizeof(int), cudaMemcpyDeviceToHost, cs));
         RAFT_CUDA_TRY(cudaStreamSynchronize(cs));
+        static const bool unb0 = [] { const char* e = std::getenv("CUOPT_EXP_XBCHECK"); return e != nullptr && std::string(e) != "0"; }();
+        if (unb0) {
+          double u[16];
+          RAFT_CUDA_TRY(cudaMemcpyFromSymbol(u, g_unb0, sizeof(u)));
+          if (u[0] != 0.0) {
+            std::fprintf(stderr, "[UNB0] count %.0f first: seat %.0f leaving %.0f dir %.0f x %.17g lower %.17g upper %.17g ncand %.0f nidx %.0f nzdy %.0f lean %.0f cmd %.0f resume %.0f sq %.3e ninf %.0f tod %.0f\n",
+                         u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+            const double zero[16]{};
+            RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_unb0, zero, sizeof(zero)));
+          }
+        }
         lives.push_back(live);
         if (*H->h_finv_err != 0) {
           throw std::runtime_error("device explicit inverses: pool overflow after the grow-and-rebuild loop");
@@ -9910,6 +10113,7 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
         if (live == 0) { break; }
       }
       fission_rounds_add(gpu_fission_rounds(), lives);
+      fission_fb_collect(H, cs);
       RAFT_CUDA_TRY(cudaPeekAtLastError());
       if (last && !early) { set_flag_kernel<<<1, 1, 0, cs>>>(H->d_completion_flag); }
     } else {

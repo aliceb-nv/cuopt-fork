@@ -83,6 +83,7 @@ struct gpu_fission_inv {
   const int *Lr_p{nullptr}, *Lr_i{nullptr}, *Lc_p{nullptr}, *Lc_i{nullptr};
   const int *Ur_p{nullptr}, *Ur_i{nullptr}, *Uc_p{nullptr}, *Uc_i{nullptr};
   const double *Lr_x{nullptr}, *Lc_x{nullptr}, *Ur_x{nullptr}, *Uc_x{nullptr};
+  unsigned long long* fb{nullptr};  // the pool's list-capacity fallback counters (fission_fb_t)
 };
 
 template <typename i_t, typename f_t>
@@ -299,6 +300,7 @@ void gpu_call_stats_begin();
 const double* gpu_batch_last_relaunch_split();
 void gpu_batch_enqueue_histogram(std::uint64_t* out);  // 16 entries, see gpu_phase2.cu
 std::string gpu_batch_seat_clock_report();
+std::string gpu_fission_fallback_report();  // fission list-capacity fallbacks; empty if fission never ran
 std::string gpu_fission_step_report();  // CUOPT_BNB_GPU_FISSION per-step cycles  // CUOPT_BNB_GPU_SEAT_CLOCK summary lines
 std::string gpu_batch_harvest_report();  // harvest split, pool telemetry
 std::string gpu_batch_overlap_report();  // per-GPU launch / seat overlap, pool telemetry

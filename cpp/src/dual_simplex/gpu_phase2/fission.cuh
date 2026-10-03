@@ -427,6 +427,86 @@ __global__ void __launch_bounds__(kXbThreads) fission_xb(kernel_args* args, cons
   }
 }
 
+// DEBUG (CUOPT_EXP_XBCHECK=1): seats fission_duals will price whose basis is invalid (basic_list
+// entry out of range or not BASIC in vstatus). out[0] seats checked, out[1] bad, out[2] first bad
+// seat, out[3] its command | refactor_resume << 4 | lean-eligible << 8, out[4] its bad entries.
+__global__ void fission_basis_check(const kernel_args* args, i_t n_problems, unsigned long long* out)
+{
+  if (blockIdx.x >= n_problems) { return; }
+  const kernel_args& a = args[blockIdx.x];
+  if (a.done != 0 || a.refactor_resume != 0 || a.device_lu != 0 ||
+      a.command == static_cast<i_t>(gpu_batch_seat_command::CHILD_CONTINUE)) {
+    return;
+  }
+  __shared__ int bad;
+  if (threadIdx.x == 0) { bad = 0; }
+  __syncthreads();
+  for (i_t k = threadIdx.x; k < a.m; k += blockDim.x) {
+    const i_t j = a.basic_list[k];
+    if (j < 0 || j >= a.n || a.vstatus[j] != variable_status_t::BASIC) { atomicAdd(&bad, 1); }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    atomicAdd(out, 1ull);
+    if (bad != 0 && atomicAdd(out + 1, 1ull) == 0) {
+      out[2] = blockIdx.x, out[3] = a.command | (a.refactor_resume << 4), out[4] = bad;
+    }
+  }
+}
+
+// DEBUG (CUOPT_EXP_NANCHECK=1): seats (not done before this step) with a NaN in x, y, z or dy_se.
+// out[0] count, out[1] first seat, out[2] which array (1 x, 2 y, 3 z, 4 dy_se), out[3] its lean flag.
+__global__ void fission_nan_check(const kernel_args* args, i_t n_problems, unsigned long long* out)
+{
+  if (blockIdx.x >= n_problems) { return; }
+  const kernel_args& a = args[blockIdx.x];
+  if (a.slot == nullptr) { return; }
+  __shared__ int which;
+  if (threadIdx.x == 0) { which = 0; }
+  __syncthreads();
+  for (i_t j = threadIdx.x; j < a.n; j += blockDim.x) {
+    if (isnan(a.x[j])) { atomicMax(&which, 1); }
+    if (isnan(a.z[j])) { atomicMax(&which, 3); }
+    if (isnan(a.dy_se[j])) { atomicMax(&which, 4); }
+  }
+  for (i_t i = threadIdx.x; i < a.m; i += blockDim.x) {
+    if (isnan(a.y[i])) { atomicMax(&which, 2); }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0 && which != 0) {
+    if (atomicAdd(out, 1ull) == 0) {
+      out[1] = blockIdx.x, out[2] = which, out[3] = a.slot->f_lean;
+      out[4] = a.command | (a.refactor_resume << 4) | (a.transpose_on_device << 8) | (a.device_lu << 12);
+      out[5] = reinterpret_cast<unsigned long long>(a.L0t_x), out[6] = reinterpret_cast<unsigned long long>(a.L0_x);
+      out[7] = a.L0t_nz;
+    }
+  }
+}
+
+// DEBUG (CUOPT_EXP_XBCHECK=1): max_i |b_i - (A x)_i| of each lean seat after fission_xb.
+// out[0] seats checked, out[1] seats over 1e-6, out[2] bits of the max residual, out[3] its seat.
+__global__ void __launch_bounds__(kXbThreads) fission_xb_check(const kernel_args* args, i_t n_problems,
+                                                              unsigned long long* out)
+{
+  if (blockIdx.x >= n_problems) { return; }
+  const kernel_args& a = args[blockIdx.x];
+  if (a.done != 0 || a.slot->f_lean == 0) { return; }
+  __shared__ typename cub::BlockReduce<f_t, kXbThreads>::TempStorage tmp;
+  f_t worst = 0.0;
+  for (i_t i = threadIdx.x; i < a.m; i += kXbThreads) {
+    f_t v = a.rhs[i];
+    for (i_t p = a.Arow_row_start[i]; p < a.Arow_row_start[i + 1]; ++p) { v -= a.Arow_x[p] * a.x[a.Arow_j[p]]; }
+    worst = fmax(worst, fabs(v));
+  }
+  const f_t w = cub::BlockReduce<f_t, kXbThreads>(tmp).Reduce(worst, [](f_t p, f_t q) { return fmax(p, q); });
+  if (threadIdx.x == 0) {
+    atomicAdd(out, 1ull);
+    if (w > 1e-6) { atomicAdd(out + 1, 1ull); }
+    const unsigned long long bits = __double_as_longlong(w);
+    if (atomicMax(out + 2, bits) < bits) { out[3] = blockIdx.x; }
+  }
+}
+
 // Incremental infeasibility update after a pivot: the basic variables at the positions of
 // scaled_dxB (basis after the swap, so the entering variable is covered) and the leaving variable.
 // Invariant: sq[j] != 0 exactly when j is listed. Newly infeasible variables are appended; entries
@@ -1227,7 +1307,33 @@ constexpr int kFissionCapA = 1536;
 constexpr size_t kFissionStage = 32768;  // CHOSEN: 2 blocks/SM at m = 5236 (8m + 32 KB + static)
 static_assert(kFissionStage >= kFissionCapA * (sizeof(f_t) + 2 * sizeof(i_t)), "lists live in the stage"); 
 
-// Compaction of a dense shared vector into (index, value) lists by an atomic counter; clears it.
+// DEBUG (CUOPT_EXP_XBCHECK): count of iteration-0 choose exits with no entering column, then the
+// first one's seat, leaving, direction, x, lower, upper of the leaving column, ncand, nidx, nzdy.
+__device__ double g_unb0[16];
+
+// Per-pool counters of the list-capacity fallbacks (gpu_fission_inv::fb), read by the host after
+// each relaunch: calls of each solve, dense fallbacks per site, the longest list that fell back.
+enum fission_fb_t : int {
+  FB_BTRAN_CALLS = 0,  // BTRAN solves
+  FB_FTRAN_CALLS,      // FTRAN solves (two right-hand sides each)
+  FB_BTRAN_DENSE,      // BTRAN L step: w over capacity, dense row gather over Lc
+  FB_FTRAN_U0_DENSE,   // FTRAN U step of a_q: z over capacity, dense row gather over Ur
+  FB_FTRAN_U1_DENSE,   // FTRAN U step of delta_y (CUOPT_EXP_FTRAN_DY=scatter only)
+  FB_FTRAN_IN_CHUNKED, // FTRAN L step: input list over capacity, scattered in chunks
+  FB_MAX_LIST,         // longest list that took a fallback
+  FB_COUNT
+};
+__device__ __forceinline__ void fission_fb_note(unsigned long long* fb, int site, int len)
+{
+  if (fb != nullptr && threadIdx.x == 0) {
+    atomicAdd(fb + site, 1ull);
+    if (site >= FB_BTRAN_DENSE) { atomicMax(fb + FB_MAX_LIST, static_cast<unsigned long long>(len)); }
+  }
+}
+
+// Compaction of a dense shared vector into (index, value) lists by an atomic counter. Returns the
+// nonzero count. Up to cap: the lists hold them and the vector is cleared. Over cap: the lists are
+// partial and the vector is left intact for a dense fallback.
 __device__ __forceinline__ int fission_compact_atomic(f_t* dense, int m, i_t* li, f_t* lx, int cap, int* cnt)
 {
   if (threadIdx.x == 0) { *cnt = 0; }
@@ -1238,11 +1344,13 @@ __device__ __forceinline__ int fission_compact_atomic(f_t* dense, int m, i_t* li
       const int q = atomicAdd(cnt, 1);
       if (q < cap) { li[q] = k, lx[q] = v; }
     }
-    dense[k] = 0.0;
   }
   __syncthreads();
   const int c = *cnt;
-  if (c > cap) { __trap(); }
+  if (c <= cap) {
+    for (int q = threadIdx.x; q < c; q += blockDim.x) { dense[li[q]] = 0.0; }
+    __syncthreads();
+  }
   return c;
 }
 
@@ -1442,9 +1550,20 @@ __device__ __forceinline__ void fission_btran_atomic_body(kernel_args* args, con
     fission_tloop_chunked(st.ft, w, false, 1e-13, R, kFissionStage);
   }
   FSTEP(S_B_TLOOP)
-  const int nw = fission_compact_atomic(w, m, li, lx, kFissionCapA, &cnt);
+  fission_fb_note(I.fb, FB_BTRAN_CALLS, 0);
+  const int capA = c_fb_force != 0 ? 0 : kFissionCapA;  // CUOPT_EXP_FB_FORCE=1: every list falls back
+  const int nw   = fission_compact_atomic(w, m, li, lx, capA, &cnt);
   FSTEP(S_B_COMPACT)
-  fission_scatter_atomic(scs, I.Lr_p, I.Lr_i, I.Lr_x, li, lx, nw, pre, pre + kFissionCapA, w, 4);
+  if (nw <= capA) {
+    fission_scatter_atomic(scs, I.Lr_p, I.Lr_i, I.Lr_x, li, lx, nw, pre, pre + kFissionCapA, w, 4);
+  } else {
+    // Dense fallback: (w' Linv)_j = sum over column j of Linv of Lc_x * w, into the per-seat scratch.
+    fission_fb_note(I.fb, FB_BTRAN_DENSE, nw);
+    f_t* out = st.ft.dense_scratch2_.data();
+    fission_gather_rows(I.Lc_p, I.Lc_i, I.Lc_x, m, w, out, li, 2 * kFissionCapA, &cnt);
+    for (int k = threadIdx.x; k < m; k += blockDim.x) { w[k] = out[k]; }
+    __syncthreads();
+  }
   FSTEP(S_B_LSCATTER)
   auto& dy = st.delta_y_sparse;
   if (threadIdx.x == 0) { cnt = 0; }
@@ -1518,14 +1637,15 @@ __device__ __forceinline__ void fission_ftran_atomic_body(kernel_args* args, con
   i_t* li  = reinterpret_cast<i_t*>(lx + kFissionCapA);
   int* pre = reinterpret_cast<int*>(li + kFissionCapA);
   f_t* acc = z;      // the U step scatters back into z, zero after the compaction
+  const int capU = c_fb_force != 0 ? 0 : kFissionCapA;  // CUOPT_EXP_FB_FORCE=1: every list falls back
   FSTEP_BEGIN
   for (int k = threadIdx.x; k < m; k += blockDim.x) { z[k] = 0.0; }
   __syncthreads();
   FSTEP(S_F_ZERO)
   for (int r = 0; r < 2; ++r) {
     const gpu_sparse_vector& b = r == 0 ? st.rhs_sparse : st.delta_y_sparse;
+    if (r == 0) { fission_fb_note(I.fb, FB_FTRAN_CALLS, 0); }
     const int nb               = static_cast<int>(b.i.size());
-    if (nb > kFissionCapA) { __trap(); }
     const bool direct = c_ftran_direct != 0;
     if (direct) {
       const i_t* ip = st.ft.inverse_row_permutation_.data();
@@ -1533,7 +1653,13 @@ __device__ __forceinline__ void fission_ftran_atomic_body(kernel_args* args, con
       __syncthreads();
       fission_level_solve(st.ft.L0_transpose_, st.lvl_ls[0].data(), st.lvl_co[0].data(), st.cfg_nlev[0], false, z);
     } else {
-      fission_scatter_atomic(scs, I.Lc_p, I.Lc_i, I.Lc_x, b.i.data(), b.x.data(), nb, pre, pre + kFissionCapA, z, r);
+      // The L step is additive in its input: a list over capacity goes through in chunks.
+      const int chunk = c_fb_force != 0 ? 64 : kFissionCapA;
+      if (nb > chunk) { fission_fb_note(I.fb, FB_FTRAN_IN_CHUNKED, nb); }
+      for (int o = 0; o < nb || o == 0; o += chunk) {
+        fission_scatter_atomic(scs, I.Lc_p, I.Lc_i, I.Lc_x, b.i.data() + o, b.x.data() + o,
+                               min(chunk, nb - o), pre, pre + kFissionCapA, z, r);
+      }
     }
     FSTEP(r == 0 ? S_F_LSCATTER : S_F1_LSCATTER)
     if (st.f_mrows == st.ft.num_updates_) {
@@ -1569,11 +1695,25 @@ __device__ __forceinline__ void fission_ftran_atomic_body(kernel_args* args, con
         }
       }
     } else {
-      nz = fission_compact_atomic(z, m, li, lx, kFissionCapA, &cnt);
+      nz = fission_compact_atomic(z, m, li, lx, capU, &cnt);
     }
+    const bool u_dense = nz > capU;  // z left intact: dense fallback for the U step
     if (!direct && r == 0) {
       auto& ut = st.utilde_sparse;
-      for (int k = threadIdx.x; k < nz; k += blockDim.x) { ut.i[k] = li[k], ut.x[k] = lx[k]; }
+      if (!u_dense) {
+        for (int k = threadIdx.x; k < nz; k += blockDim.x) { ut.i[k] = li[k], ut.x[k] = lx[k]; }
+      } else {
+        __syncthreads();
+        if (threadIdx.x == 0) { cnt = 0; }
+        __syncthreads();
+        for (int k = threadIdx.x; k < m; k += blockDim.x) {
+          if (z[k] != 0.0) {
+            const int q = atomicAdd(&cnt, 1);
+            ut.i[q] = k, ut.x[q] = z[k];
+          }
+        }
+        __syncthreads();
+      }
       if (threadIdx.x == 0) {
         ut.n = m;
         ut.i.set_size(nz);
@@ -1614,8 +1754,15 @@ __device__ __forceinline__ void fission_ftran_atomic_body(kernel_args* args, con
                      st.ft.dense_scratch2_.data(), li, 2 * kFissionCapA, &cnt, kLongRow);
     } else if (direct) {
       fission_level_solve(st.ft.U0_transpose_, st.lvl_ls[1].data(), st.lvl_co[1].data(), st.cfg_nlev[1], true, acc);
-    } else {
+    } else if (!u_dense) {
       fission_scatter_atomic(scs, I.Uc_p, I.Uc_i, I.Uc_x, li, lx, nz, pre, pre + kFissionCapA, acc, 2 + r);
+    } else {
+      // Dense fallback: (Uinv z)_i over row i of Uinv, into the per-seat scratch, then back into acc.
+      fission_fb_note(I.fb, r == 0 ? FB_FTRAN_U0_DENSE : FB_FTRAN_U1_DENSE, nz);
+      f_t* out = st.ft.dense_scratch2_.data();
+      fission_gather_rows(I.Ur_p, I.Ur_i, I.Ur_x, m, z, out, li, 2 * kFissionCapA, &cnt);
+      for (int k = threadIdx.x; k < m; k += blockDim.x) { acc[k] = out[k]; }
+      __syncthreads();
     }
     FSTEP(r == 0 ? S_F_USCATTER : S_F1_USCATTER)
     if (r == 0) {
@@ -1935,6 +2082,16 @@ __device__ __forceinline__ void fission_choose_block_body(kernel_args* args, i_t
   cmark(3);
   const i_t entering = st.entering;
   if (entering == -1) {
+    if (tid == 0 && st.iter == 0) {  // DEBUG (CUOPT_EXP_XBCHECK): iteration-0 "infeasible" exits
+      if (atomicAdd(&g_unb0[0], 1.0) == 0.0) {
+        const i_t jl = a.basic_list[leaving];
+        g_unb0[1] = blockIdx.x, g_unb0[2] = leaving, g_unb0[3] = direction, g_unb0[4] = a.x[jl];
+        g_unb0[5] = a.lower[jl], g_unb0[6] = a.upper[jl], g_unb0[7] = ncand, g_unb0[8] = nidx;
+        g_unb0[9] = nzdy;
+        g_unb0[10] = st.f_lean, g_unb0[11] = a.command, g_unb0[12] = a.refactor_resume;
+        g_unb0[13] = st.squared_infeas[jl], g_unb0[14] = st.infeas_idx.size(), g_unb0[15] = a.transpose_on_device;
+      }
+    }
     gpu_lp lp;
     gpu_settings settings;
     gpu_solution sol;
@@ -2613,6 +2770,7 @@ struct finv_build_t {
   int* gcur;            // [2] scratch cursors
   long long* off[2];    // N + 1 packed offsets per factor (off[f][N]: total)
   gpu_fission_inv* inv; // per-seat views, written by finv_offsets
+  unsigned long long* fb;  // fission_fb_t counters, copied into every view
   double* ws_y;
   unsigned long long* ws_b;
   int* ws_l;
@@ -2795,6 +2953,7 @@ __global__ void __launch_bounds__(kFinvOff) finv_offsets(finv_build_t b)
     v.Lr_p = b.rp[0] + pb, v.Lr_i = b.rj[0] + e0, v.Lr_x = b.rv[0] + e0;
     v.Uc_p = b.cp[1] + pb, v.Uc_i = b.ci[1] + e1, v.Uc_x = b.cv[1] + e1;
     v.Ur_p = b.rp[1] + pb, v.Ur_i = b.rj[1] + e1, v.Ur_x = b.rv[1] + e1;
+    v.fb     = b.fb;
     b.inv[s] = v;
   }
 }

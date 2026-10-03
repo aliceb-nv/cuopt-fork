@@ -2610,13 +2610,16 @@ dual_status_t branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_install_re
       if (decision_differs) { ++gpu_batch_corrected_decision_; }
       else { ++gpu_batch_corrected_obj_; }
       settings_.log.printf(
-        "[GPUPOOL-MISMATCH] node=%d %s gpu=%s/%.17g cpu=%s/%.17g\n",
+        "[GPUPOOL-MISMATCH] node=%d %s gpu=%s/%.17g cpu=%s/%.17g child=%d gpu_iters=%d cpu_iters=%d\n",
         (int)node->node_id,
         decision_differs ? "DECISION" : "OBJECTIVE",
         dual_status_to_string(result.status).c_str(),
         result.objective,
         dual_status_to_string(cpu_status).c_str(),
-        cpu_solution.objective);
+        cpu_solution.objective,
+        batch_node.continue_basis ? 1 : 0,
+        (int)result.iterations,
+        (int)cpu_iterations);
       accepted_status     = cpu_status;
       worker->leaf_vstatus    = std::move(cpu_vstatus);
       worker->basic_list      = std::move(cpu_basic);
@@ -6352,6 +6355,9 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
       (long)gpu_batch_plunged_.load(),
       (long)gpu_batch_overlap_nodes_.load(),
       (long)gpu_batch_plunge_stop_heap_.load());
+    if (const std::string fb = gds::gpu_fission_fallback_report(); !fb.empty()) {
+      settings_.log.printf("%s", fb.c_str());
+    }
     settings_.log.printf("[GPUBATCH-DIVE] rounds=%d dive_nodes=%ld lost=%ld\n",
                          gpu_pool_dive(),
                          (long)gpu_batch_dive_nodes_.load(),
@@ -7323,6 +7329,9 @@ void branch_and_bound_t<i_t, f_t>::run_deterministic_coordinator(const csr_matri
       (long)gpu_batch_plunged_.load(),
       (long)gpu_batch_overlap_nodes_.load(),
       (long)gpu_batch_plunge_stop_heap_.load());
+    if (const std::string fb = gds::gpu_fission_fallback_report(); !fb.empty()) {
+      settings_.log.printf("%s", fb.c_str());
+    }
     settings_.log.printf("[GPUBATCH-DIVE] rounds=%d dive_nodes=%ld lost=%ld\n",
                          gpu_pool_dive(),
                          (long)gpu_batch_dive_nodes_.load(),

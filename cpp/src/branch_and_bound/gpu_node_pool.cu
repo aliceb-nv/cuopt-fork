@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <stdexcept>
 #include <utility>
 #include <unistd.h>
 #include <thread>
@@ -1877,8 +1878,12 @@ struct gpu_batch_run_t {
       w.leg_iters   = iterations - w.total_iters;
       w.total_iters = iterations;
       if (result_views) { w.refactor_reason = result.refactor_reason; }
-      if (!result.lower.empty() &&
+      // A never-staged (empty) seat has no host bounds to mirror into.
+      if (!result.lower.empty() && !node.lower.empty() &&
           (bounds_mirror || out[s] == simplex::dual_status_t::REFACTOR_NEEDED)) {
+        if (node.lower.size() != result.lower.size() || node.upper.size() != result.upper.size()) {
+          throw std::logic_error("GPU harvest: seat bounds size does not match the result");
+        }
         std::copy(result.lower.begin(), result.lower.end(), node.lower.begin());
         std::copy(result.upper.begin(), result.upper.end(), node.upper.begin());
       }
