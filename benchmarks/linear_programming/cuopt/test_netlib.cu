@@ -67,6 +67,11 @@
 #include "ftran_bench.hpp"
 #include "inv_bench.hpp"
 #include "se_bench.hpp"
+#include <rmm/mr/statistics_resource_adaptor.hpp>
+#include <rmm/mr/logging_resource_adaptor.hpp>
+#include <optional>
+// Device bytes allocated through RMM (current / peak), for the replay's [MEM] line.
+static std::optional<rmm::mr::statistics_resource_adaptor> g_mem_stats;
 
 // `NAME=0` must mean OFF. The older TEST_NETLIB_* switches test only for presence, so `=0` turns
 // them ON; the switches added here use this helper instead, matching the CUOPT_* convention.
@@ -2717,6 +2722,11 @@ void replay_pool_mode(const raft::handle_t& handle,
         }
       }
       gens[c].push_back(r);
+      if (c == 0 && g == 2) {
+        const auto bc = g_mem_stats->get_bytes_counter();
+        std::printf("[MEM] after 3 generations of clone 0 (%d clones): RMM bytes allocated %.2f GiB, peak %.2f GiB\n",
+                    clones, bc.value / 1073741824.0, bc.peak / 1073741824.0);
+      }
       if (generations > 0 ? g + 1 >= generations : r.t_done >= seconds) { break; }
       const double ts0 = mo::toc(t0);
       for (int s = 0; s < N; ++s) {
@@ -2962,7 +2972,13 @@ int main(int argc, char* argv[])
                 p.pciDeviceID);
   }
   auto memory_resource = make_pool();
-  rmm::mr::set_current_device_resource(memory_resource);
+  g_mem_stats.emplace(memory_resource);
+  rmm::mr::set_current_device_resource(*g_mem_stats);
+  static std::optional<rmm::mr::logging_resource_adaptor> mem_log;  // TEST_NETLIB_RMM_LOG=<csv>
+  if (const char* lf = std::getenv("TEST_NETLIB_RMM_LOG"); lf != nullptr && *lf != 0) {
+    mem_log.emplace(*g_mem_stats, std::string(lf), true);
+    rmm::mr::set_current_device_resource(*mem_log);
+  }
 
   const raft::handle_t handle{};
 

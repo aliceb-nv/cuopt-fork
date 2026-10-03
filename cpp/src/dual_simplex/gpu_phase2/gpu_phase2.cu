@@ -6828,9 +6828,11 @@ struct gpu_batch_handle_t {
   std::vector<gpu_fission_inv> h_finv;
   std::optional<rmm::device_buffer> d_finv;
   std::optional<rmm::device_buffer> d_fm;  // fission replay matrices, one per seat
-  std::optional<rmm::device_buffer> d_finv_mem;  // device-built explicit inverses (finv_build_t)
+  std::optional<rmm::device_buffer> d_finv_mem;  // device-built explicit inverses: fixed part
+  std::optional<rmm::device_buffer> d_finv_pool[2];  // per factor: scratch (scap) + packed (pcap) entries
   gpu_phase2_detail::finv_build_t finv_b{};
   int* h_finv_err{nullptr};
+  long long* h_finv_need{nullptr};  // pinned: gcur[2], off[0][N], off[1][N] after a build
   std::optional<rmm::device_buffer> d_live;
   // Bound deltas of one generation, uploaded by the relaunch in one copy.
   std::optional<pinned_buf<gpu_bound_delta<i_t, f_t>>> h_deltas;
@@ -9617,7 +9619,8 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
       const i_t Ni          = static_cast<i_t>(N);
       if (!H->d_finv) { H->d_finv.emplace(N * sizeof(gpu_fission_inv), H->stream); }
       if (!H->d_finv_mem) {
-        // Device-built inverses: one carved buffer, fixed per-seat capacities; seat pointers set once.
+        // Device-built inverses: a fixed part carved once, and per-factor entry pools that grow on
+        // overflow (finv_build_t).
         auto& b = H->finv_b;
         b.N = static_cast<int>(N), b.m = static_cast<int>(H->rows);
         int dev = 0, sms = 0, bps = 0;
@@ -9629,54 +9632,58 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
         size_t bytes = 0;
         auto need = [&](size_t nb) { bytes += (nb + 255) / 256 * 256; };
         for (int f = 0; f < 2; ++f) {
-          const size_t ne = Nn * static_cast<size_t>(b.cap[f]);
-          need(Nn * 4); need(Nn * m * 4); need(Nn * m * 4); need(ne * 4); need(ne * 8);
-          need(Nn * (m + 1) * 4); need(ne * 4); need(ne * 8); need(Nn * (m + 1) * 4); need(ne * 4); need(ne * 8);
+          need(Nn * 4); need(Nn * m * 4); need(Nn * m * 4); need(Nn * (m + 1) * 4); need(Nn * (m + 1) * 4);
+          need((Nn + 1) * 8);
         }
-        need(2 * Nn * m * 4); need(4 * 4);
+        need(2 * Nn * m * 4); need(4 * 4); need(2 * 4);
         need(static_cast<size_t>(b.warps) * m * 8); need(static_cast<size_t>(b.warps) * W64 * 8);
         need(static_cast<size_t>(b.warps) * m * 4);
         H->d_finv_mem.emplace(bytes, H->stream);
         auto* p = static_cast<unsigned char*>(H->d_finv_mem->data());
         auto take = [&](size_t nb) { auto* q = p; p += (nb + 255) / 256 * 256; return q; };
         for (int f = 0; f < 2; ++f) {
-          const size_t ne = Nn * static_cast<size_t>(b.cap[f]);
-          b.cur[f] = reinterpret_cast<int*>(take(Nn * 4));
+          b.cur[f]    = reinterpret_cast<int*>(take(Nn * 4));
           b.cstart[f] = reinterpret_cast<int*>(take(Nn * m * 4));
-          b.clen[f] = reinterpret_cast<int*>(take(Nn * m * 4));
-          b.si[f] = reinterpret_cast<int*>(take(ne * 4));
-          b.sx[f] = reinterpret_cast<double*>(take(ne * 8));
-          b.cp[f] = reinterpret_cast<int*>(take(Nn * (m + 1) * 4));
-          b.ci[f] = reinterpret_cast<int*>(take(ne * 4));
-          b.cv[f] = reinterpret_cast<double*>(take(ne * 8));
-          b.rp[f] = reinterpret_cast<int*>(take(Nn * (m + 1) * 4));
-          b.rj[f] = reinterpret_cast<int*>(take(ne * 4));
-          b.rv[f] = reinterpret_cast<double*>(take(ne * 8));
+          b.clen[f]   = reinterpret_cast<int*>(take(Nn * m * 4));
+          b.cp[f]     = reinterpret_cast<int*>(take(Nn * (m + 1) * 4));
+          b.rp[f]     = reinterpret_cast<int*>(take(Nn * (m + 1) * 4));
+          b.off[f]    = reinterpret_cast<long long*>(take((Nn + 1) * 8));
         }
         b.tasks  = reinterpret_cast<int*>(take(2 * Nn * m * 4));
         b.ntasks = reinterpret_cast<int*>(take(16));
         b.next = b.ntasks + 1, b.err = b.ntasks + 2;
+        b.gcur = reinterpret_cast<int*>(take(2 * 4));
         b.ws_y = reinterpret_cast<double*>(take(static_cast<size_t>(b.warps) * m * 8));
         b.ws_b = reinterpret_cast<unsigned long long*>(take(static_cast<size_t>(b.warps) * W64 * 8));
         b.ws_l = reinterpret_cast<int*>(take(static_cast<size_t>(b.warps) * m * 4));
         RAFT_CUDA_TRY(cudaMemsetAsync(b.ws_y, 0, static_cast<size_t>(b.warps) * m * 8, cs));
         RAFT_CUDA_TRY(cudaMemsetAsync(b.ws_b, 0, static_cast<size_t>(b.warps) * W64 * 8, cs));
-        H->h_finv.assign(N, gpu_fission_inv{});
-        for (size_t s = 0; s < N; ++s) {
-          auto& v = H->h_finv[s];
-          const size_t pb = s * (m + 1), e0 = s * b.cap[0], e1 = s * b.cap[1];
-          v.Lc_p = b.cp[0] + pb, v.Lc_i = b.ci[0] + e0, v.Lc_x = b.cv[0] + e0;
-          v.Lr_p = b.rp[0] + pb, v.Lr_i = b.rj[0] + e0, v.Lr_x = b.rv[0] + e0;
-          v.Uc_p = b.cp[1] + pb, v.Uc_i = b.ci[1] + e1, v.Uc_x = b.cv[1] + e1;
-          v.Ur_p = b.rp[1] + pb, v.Ur_i = b.rj[1] + e1, v.Ur_x = b.rv[1] + e1;
-        }
+        b.inv = static_cast<gpu_fission_inv*>(H->d_finv->data());
+        // CHOSEN: initial pools of 2m entries per seat per factor; they grow on the first overflows.
+        for (int f = 0; f < 2; ++f) { b.scap[f] = b.pcap[f] = 2 * static_cast<long long>(Nn) * static_cast<long long>(m); }
         RAFT_CUDA_TRY(cudaFuncSetAttribute(finv_transpose, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                            static_cast<int>(m * sizeof(int))));
         RAFT_CUDA_TRY(cudaMallocHost(&H->h_finv_err, sizeof(int)));
+        RAFT_CUDA_TRY(cudaMallocHost(&H->h_finv_need, 4 * sizeof(long long)));
+      }
+      for (int f = 0; f < 2; ++f) {
+        // (Re)carve factor f's pool: scratch si/sx (scap), packed ci/cv and rj/rv (pcap).
+        auto& b = H->finv_b;
+        const size_t sc = static_cast<size_t>(b.scap[f]), pc = static_cast<size_t>(b.pcap[f]);
+        const size_t bytes = sc * 12 + pc * 24 + 6 * 256;
+        if (H->d_finv_pool[f] && H->d_finv_pool[f]->size() >= bytes) { continue; }
+        H->d_finv_pool[f].reset();
+        H->d_finv_pool[f].emplace(bytes, H->stream);
+        auto* p   = static_cast<unsigned char*>(H->d_finv_pool[f]->data());
+        auto take = [&](size_t nb) { auto* q = p; p += (nb + 255) / 256 * 256; return q; };
+        b.si[f] = reinterpret_cast<int*>(take(sc * 4));
+        b.sx[f] = reinterpret_cast<double*>(take(sc * 8));
+        b.ci[f] = reinterpret_cast<int*>(take(pc * 4));
+        b.cv[f] = reinterpret_cast<double*>(take(pc * 8));
+        b.rj[f] = reinterpret_cast<int*>(take(pc * 4));
+        b.rv[f] = reinterpret_cast<double*>(take(pc * 8));
       }
       if (!H->d_live) { H->d_live.emplace(sizeof(int), H->stream); }
-      RAFT_CUDA_TRY(cudaMemcpyAsync(H->d_finv->data(), H->h_finv.data(), N * sizeof(gpu_fission_inv),
-                                    cudaMemcpyHostToDevice, cs));
       const auto* finv = static_cast<const gpu_fission_inv*>(H->d_finv->data());
       int* d_live      = static_cast<int*>(H->d_live->data());
       const bool det = gpu_fission_deterministic();
@@ -9785,13 +9792,17 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
         RAFT_CUDA_TRY(cudaMemcpyToSymbolAsync(c_finv_gbits, &finv_gbits, sizeof(int), 0, cudaMemcpyHostToDevice, cs));
       }
       {
-        // Every seat's inverses from the factors just staged: per-generation work.
+        // Every seat's inverses from the factors just staged: per-generation work. On a pool
+        // overflow (err) the host grows that pool and reruns the build.
         auto& b = H->finv_b;
+        for (;;) {
         for (int f = 0; f < 2; ++f) { RAFT_CUDA_TRY(cudaMemsetAsync(b.cur[f], 0, N * sizeof(int), cs)); }
         RAFT_CUDA_TRY(cudaMemsetAsync(b.ntasks, 0, 3 * sizeof(int), cs));
+        RAFT_CUDA_TRY(cudaMemsetAsync(b.gcur, 0, 2 * sizeof(int), cs));
         const long long T = 2LL * b.N * b.m;
         finv_trivial<<<static_cast<unsigned>((T + 255) / 256), 256, 0, cs>>>(H->d_args, b);
         finv_columns<<<b.grid, 256, 8 * ((static_cast<size_t>(b.m) + 63) / 64) * sizeof(unsigned long long), cs>>>(H->d_args, b);
+        finv_offsets<<<1, kFinvOff, 0, cs>>>(b);
         finv_pack<<<2 * Ni, kFinvPack, 0, cs>>>(H->d_args, b);
         {
           const size_t smem_t = 2 * static_cast<size_t>(b.m) * sizeof(int);
@@ -9801,6 +9812,38 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
         }
         RAFT_CUDA_TRY(cudaPeekAtLastError());
         RAFT_CUDA_TRY(cudaMemcpyAsync(H->h_finv_err, b.err, sizeof(int), cudaMemcpyDeviceToHost, cs));
+        RAFT_CUDA_TRY(cudaMemcpyAsync(H->h_finv_need, b.gcur, 2 * sizeof(int), cudaMemcpyDeviceToHost, cs));
+        RAFT_CUDA_TRY(cudaMemcpyAsync(H->h_finv_need + 2, b.off[0] + N, sizeof(long long), cudaMemcpyDeviceToHost, cs));
+        RAFT_CUDA_TRY(cudaMemcpyAsync(H->h_finv_need + 3, b.off[1] + N, sizeof(long long), cudaMemcpyDeviceToHost, cs));
+        RAFT_CUDA_TRY(cudaStreamSynchronize(cs));
+        if (*H->h_finv_err == 0) { break; }
+        const int* gc = reinterpret_cast<const int*>(H->h_finv_need);
+        for (int f = 0; f < 2; ++f) {
+          const long long ns = gc[f], np = H->h_finv_need[2 + f];
+          const auto grow = [](long long cap, long long need) {
+            return need <= cap ? cap : std::max(2 * cap, need + need / 4);
+          };
+          const long long sc = grow(b.scap[f], ns), pc = grow(b.pcap[f], np);
+          if (sc != b.scap[f] || pc != b.pcap[f]) {
+            std::fprintf(stderr, "[FINV-GROW] factor %s: scratch %lld -> %lld, packed %lld -> %lld entries (needed %lld, %lld)\n",
+                         f == 0 ? "L" : "U", b.scap[f], sc, b.pcap[f], pc, ns, np);
+          }
+          b.scap[f] = sc, b.pcap[f] = pc;
+          const size_t bytes = static_cast<size_t>(sc) * 12 + static_cast<size_t>(pc) * 24 + 6 * 256;
+          if (H->d_finv_pool[f]->size() < bytes) {
+            H->d_finv_pool[f].reset();
+            H->d_finv_pool[f].emplace(bytes, H->stream);
+            auto* p   = static_cast<unsigned char*>(H->d_finv_pool[f]->data());
+            auto take = [&](size_t nb) { auto* q = p; p += (nb + 255) / 256 * 256; return q; };
+            b.si[f] = reinterpret_cast<int*>(take(static_cast<size_t>(sc) * 4));
+            b.sx[f] = reinterpret_cast<double*>(take(static_cast<size_t>(sc) * 8));
+            b.ci[f] = reinterpret_cast<int*>(take(static_cast<size_t>(pc) * 4));
+            b.cv[f] = reinterpret_cast<double*>(take(static_cast<size_t>(pc) * 8));
+            b.rj[f] = reinterpret_cast<int*>(take(static_cast<size_t>(pc) * 4));
+            b.rv[f] = reinterpret_cast<double*>(take(static_cast<size_t>(pc) * 8));
+          }
+        }
+        }
       }
       fission_presetup<<<Ni, kPresetupThreads, 0, cs>>>(H->d_args, Ni);
       if (gpu_fission_price_fresh()) {
@@ -9841,7 +9884,7 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
         RAFT_CUDA_TRY(cudaStreamSynchronize(cs));
         lives.push_back(live);
         if (*H->h_finv_err != 0) {
-          throw std::runtime_error("device explicit inverses: a seat exceeded its per-seat capacity");
+          throw std::runtime_error("device explicit inverses: pool overflow after the grow-and-rebuild loop");
         }
         static const bool trace = std::getenv("CUOPT_BNB_GPU_FISSION_TRACE") != nullptr;
         if (trace) {

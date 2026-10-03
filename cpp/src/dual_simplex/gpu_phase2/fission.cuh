@@ -2601,14 +2601,18 @@ __global__ void fission_count(const kernel_args* args, i_t n_problems, int* live
 
 // ---- Explicit inverses built on the device every relaunch (see benchmarks/.../inv_bench.cu).
 // L0^{-1} P and U0^{-1} of every seat, column (CSC) and row (CSR) forms, from the staged factors.
-// Capacities: the per-seat maxima measured on lrsa-pool-120s (--inv-bench); exceeding one fails loudly.
-constexpr long long kInvCapL = 19926, kInvCapU = 329296;
+// Entries live in shared pools per factor, not per-seat slices: the column solve takes scratch space
+// from one cursor (gcur), finv_offsets turns per-seat counts (cur) into packed offsets (off). A pool
+// that overflows sets err; the host grows it and reruns the build (grow on overflow).
 struct finv_build_t {
   int N{0}, m{0}, warps{0}, grid{0};
-  long long cap[2]{kInvCapL, kInvCapU};
+  long long scap[2]{0, 0}, pcap[2]{0, 0};  // scratch / packed pool entries per factor
   int *cur[2], *cstart[2], *clen[2], *si[2], *cp[2], *ci[2], *rp[2], *rj[2];
   double *sx[2], *cv[2], *rv[2];
   int *tasks, *ntasks, *next, *err;
+  int* gcur;            // [2] scratch cursors
+  long long* off[2];    // N + 1 packed offsets per factor (off[f][N]: total)
+  gpu_fission_inv* inv; // per-seat views, written by finv_offsets
   double* ws_y;
   unsigned long long* ws_b;
   int* ws_l;
@@ -2637,17 +2641,11 @@ __global__ void finv_trivial(const kernel_args* args, finv_build_t b)
     b.tasks[atomicAdd(b.ntasks, 1)] = (s * 2 + f) * m + k;
     return;
   }
-  const int pos = atomicAdd(&b.cur[f][s], 1);
-  if (pos >= b.cap[f]) {
-    atomicExch(b.err, 1);
-    return;
-  }
-  const size_t base     = static_cast<size_t>(s) * b.cap[f];
-  b.si[f][base + pos]   = k;
-  b.sx[f][base + pos]   = 1.0 / cx[cp[k]];
-  const size_t c        = static_cast<size_t>(s) * m + (f == 0 ? a.row_perm[k] : k);
-  b.cstart[f][c]        = pos;
-  b.clen[f][c]          = 1;
+  // No scratch: finv_pack writes row k with 1 / diagonal (cstart = -(k + 1)).
+  atomicAdd(&b.cur[f][s], 1);
+  const size_t c = static_cast<size_t>(s) * m + (f == 0 ? a.row_perm[k] : k);
+  b.cstart[f][c] = -(k + 1);
+  b.clen[f][c]   = 1;
 }
 
 // Warp per non-trivial column: T y = e_k with rows finalized in index order (ascending for L0,
@@ -2733,11 +2731,14 @@ __global__ void __launch_bounds__(256) finv_columns(const kernel_args* args, fin
     for (int q = lane; q < cnt; q += 32) { nz += y[lst[q]] != 0.0 ? 1 : 0; }
     for (int o = 16; o > 0; o >>= 1) { nz += __shfl_xor_sync(0xffffffffu, nz, o); }
     int pos = 0;
-    if (lane == 0) { pos = atomicAdd(&b.cur[f][s], nz); }
+    if (lane == 0) {
+      atomicAdd(&b.cur[f][s], nz);
+      pos = atomicAdd(b.gcur + f, nz);
+    }
     pos = __shfl_sync(0xffffffffu, pos, 0);
-    const bool fit = pos + nz <= b.cap[f];
+    const bool fit = static_cast<long long>(pos) + nz <= b.scap[f];
     if (!fit && lane == 0) { atomicExch(b.err, 1); }
-    const size_t base = static_cast<size_t>(s) * b.cap[f];
+    const size_t base = 0;
     int w = 0;
     for (int q0 = 0; q0 < cnt; q0 += 32) {
       const int q = q0 + lane;
@@ -2762,6 +2763,42 @@ __global__ void __launch_bounds__(256) finv_columns(const kernel_args* args, fin
   }
 }
 
+// One block: per-seat packed offsets from the per-seat counts (seats in index order), the packed
+// pools' fit (err), and every seat's inverse views.
+constexpr int kFinvOff = 1024;
+__global__ void __launch_bounds__(kFinvOff) finv_offsets(finv_build_t b)
+{
+  using scan_t = cub::BlockScan<long long, kFinvOff, cub::BLOCK_SCAN_WARP_SCANS>;
+  __shared__ typename scan_t::TempStorage tmp;
+  const int N = b.N, m = b.m;
+  for (int f = 0; f < 2; ++f) {
+    long long carry = 0;
+    for (int s0 = 0; s0 < N; s0 += kFinvOff) {
+      const int s       = s0 + threadIdx.x;
+      const long long v = s < N ? b.cur[f][s] : 0;
+      long long o = 0, tot = 0;
+      scan_t(tmp).ExclusiveSum(v, o, tot);
+      if (s < N) { b.off[f][s] = carry + o; }
+      carry += tot;
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      b.off[f][N] = carry;
+      if (carry > b.pcap[f]) { atomicExch(b.err, 1); }
+    }
+  }
+  __syncthreads();
+  for (int s = threadIdx.x; s < N; s += kFinvOff) {
+    gpu_fission_inv v;
+    const size_t pb = static_cast<size_t>(s) * (m + 1), e0 = b.off[0][s], e1 = b.off[1][s];
+    v.Lc_p = b.cp[0] + pb, v.Lc_i = b.ci[0] + e0, v.Lc_x = b.cv[0] + e0;
+    v.Lr_p = b.rp[0] + pb, v.Lr_i = b.rj[0] + e0, v.Lr_x = b.rv[0] + e0;
+    v.Uc_p = b.cp[1] + pb, v.Uc_i = b.ci[1] + e1, v.Uc_x = b.cv[1] + e1;
+    v.Ur_p = b.rp[1] + pb, v.Ur_i = b.rj[1] + e1, v.Ur_x = b.rv[1] + e1;
+    b.inv[s] = v;
+  }
+}
+
 // Block per (seat, factor): CSC column pointers by scan, entries copied in.
 constexpr int kFinvPack = 1024;
 __global__ void __launch_bounds__(kFinvPack) finv_pack(const kernel_args* args, finv_build_t b)
@@ -2769,7 +2806,7 @@ __global__ void __launch_bounds__(kFinvPack) finv_pack(const kernel_args* args, 
   using scan_t = cub::BlockScan<int, kFinvPack, cub::BLOCK_SCAN_WARP_SCANS>;
   __shared__ typename scan_t::TempStorage tmp;
   const int s = blockIdx.x / 2, f = blockIdx.x % 2, m = b.m;
-  if (args[s].done != 0) { return; }
+  if (args[s].done != 0 || *b.err != 0) { return; }
   const int per = (m + kFinvPack - 1) / kFinvPack;
   const int c0 = threadIdx.x * per, c1 = min(m, c0 + per);
   const int* clen = b.clen[f] + static_cast<size_t>(s) * m;
@@ -2785,13 +2822,24 @@ __global__ void __launch_bounds__(kFinvPack) finv_pack(const kernel_args* args, 
   }
   if (threadIdx.x == 0) { cp[m] = tot; }
   __syncthreads();
-  const size_t base = static_cast<size_t>(s) * b.cap[f];
+  const size_t base = static_cast<size_t>(b.off[f][s]);
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const i_t *fcp, *fri;
+  const f_t* fcx;
+  finv_factor(args[s], f, fcp, fri, fcx);
   for (int c = warp; c < m; c += kFinvPack / 32) {
     const int src = cst[c], dst = cp[c], len = clen[c];
+    if (src < 0) {  // trivial column: row k, 1 / diagonal
+      if (lane == 0) {
+        const int k              = -src - 1;
+        b.ci[f][base + dst]      = k;
+        b.cv[f][base + dst]      = 1.0 / fcx[fcp[k]];
+      }
+      continue;
+    }
     for (int q = lane; q < len; q += 32) {
-      b.ci[f][base + dst + q] = b.si[f][base + src + q];
-      b.cv[f][base + dst + q] = b.sx[f][base + src + q];
+      b.ci[f][base + dst + q] = b.si[f][static_cast<size_t>(src) + q];
+      b.cv[f][base + dst + q] = b.sx[f][static_cast<size_t>(src) + q];
     }
   }
 }
@@ -2807,9 +2855,9 @@ __global__ void __launch_bounds__(kFinvTr) finv_transpose(const kernel_args* arg
   __shared__ typename scan_t::TempStorage tmp;
   __shared__ int nq;
   const int s = blockIdx.x / 2, f = blockIdx.x % 2, m = b.m;
-  if (args[s].done != 0) { return; }
+  if (args[s].done != 0 || *b.err != 0) { return; }
   if (threadIdx.x == 0) { nq = 0; }
-  const size_t base = static_cast<size_t>(s) * b.cap[f];
+  const size_t base = static_cast<size_t>(b.off[f][s]);
   const int* cp     = b.cp[f] + static_cast<size_t>(s) * (m + 1);
   const int* ci     = b.ci[f] + base;
   const double* cv  = b.cv[f] + base;
