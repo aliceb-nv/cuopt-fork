@@ -427,6 +427,63 @@ __global__ void __launch_bounds__(kBuildRThreads) fission_build_r(kernel_args* a
   if (threadIdx.x == 0) { st.f_mrows = K; }
 }
 
+// CUOPT_EXP_EXACT_SE=1: exact dual steepest-edge weights for fresh (lean) seats, whose staged
+// weights are the root's for a different basis. dy_se[basic_list[i]] = ||row i of B^-1||^2 with
+// row i of B^-1 = sum_c Uinv(i, c) Linv P(c, :) (row forms). A warp per (seat, row) task, taken in
+// chunks from a counter; per-warp global accumulator (m doubles) and shared-memory marks (m bits).
+constexpr int kExactSeThreads = 256, kExactSeChunk = 8;  // as se_bench.cu kSeChunk
+__global__ void __launch_bounds__(kExactSeThreads) fission_exact_se(kernel_args* args, const gpu_fission_inv* inv,
+                                                                  i_t n_problems, i_t m,
+                                                                  unsigned long long* next, f_t* ws_acc)
+{
+  extern __shared__ unsigned smark[];
+  const int lane = threadIdx.x & 31, wib = threadIdx.x >> 5;
+  const int gw   = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int W32  = (m + 31) / 32;
+  unsigned* mark = smark + wib * W32;
+  f_t* acc       = ws_acc + static_cast<size_t>(gw) * m;
+  for (int w = lane; w < W32; w += 32) { mark[w] = 0; }
+  __syncwarp();
+  const unsigned long long T = static_cast<unsigned long long>(n_problems) * m;
+  for (;;) {
+    unsigned long long t0 = 0;
+    if (lane == 0) { t0 = atomicAdd(next, static_cast<unsigned long long>(kExactSeChunk)); }
+    t0 = __shfl_sync(0xffffffffu, t0, 0);
+    if (t0 >= T) { return; }
+    for (unsigned long long t = t0; t < min(T, t0 + kExactSeChunk); ++t) {
+      const int s = static_cast<int>(t / m), i = static_cast<int>(t % m);
+      const kernel_args& a = args[s];
+      if (a.done != 0 || a.slot == nullptr || a.slot->f_lean == 0) { continue; }
+      const auto& I = inv[s];
+      for (i_t q = I.Ur_p[i] + lane; q < I.Ur_p[i + 1]; q += 32) {
+        const i_t c = I.Ur_i[q];
+        const f_t u = I.Ur_x[q];
+        for (i_t p = I.Lr_p[c]; p < I.Lr_p[c + 1]; ++p) {
+          const i_t j = I.Lr_i[p];
+          atomicAdd(&acc[j], u * I.Lr_x[p]);
+          atomicOr(&mark[j >> 5], 1u << (j & 31));
+        }
+      }
+      __syncwarp();
+      f_t sum = 0.0;
+      for (int w = lane; w < W32; w += 32) {
+        unsigned b = mark[w];
+        if (b == 0) { continue; }
+        mark[w] = 0;
+        while (b != 0) {
+          const int j = w * 32 + __ffs(b) - 1;
+          b &= b - 1;
+          sum += acc[j] * acc[j];
+          acc[j] = 0.0;
+        }
+      }
+      sum = warp_reduce_add(sum);
+      if (lane == 0) { a.dy_se[a.basic_list[i]] = sum; }
+      __syncwarp();
+    }
+  }
+}
+
 // Fresh fission seat: x_B = U0^{-1} L0^{-1} (b - A_N x_N) through the explicit inverses (row-wise,
 // one owner per output, |x_j| < 10 tight_tol skipped as in compute_primal_variables), then the
 // objective c'x and the infeasibility list. Shared: two m-vectors.

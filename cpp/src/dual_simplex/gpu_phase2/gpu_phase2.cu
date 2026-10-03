@@ -6883,6 +6883,7 @@ struct gpu_batch_handle_t {
   const void* fission_graph_key[3]{};
   int fission_graph_n{0};
   std::optional<rmm::device_buffer> d_live;
+  std::optional<rmm::device_buffer> d_exact_se;  // CUOPT_EXP_EXACT_SE: task counter + per-warp accumulators
   // Bound deltas of one generation, uploaded by the relaunch in one copy.
   std::optional<pinned_buf<gpu_bound_delta<i_t, f_t>>> h_deltas;
   std::optional<rmm::device_buffer> d_deltas;
@@ -10112,6 +10113,26 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
                                            static_cast<int>(smem_x)));
         fission_xb<<<Ni, kXbThreads, smem_x, cs>>>(H->d_args, finv, Ni);
         fission_dbg_sync(cs, "xb");
+      }
+      static const bool exact_se = [] { const char* e = std::getenv("CUOPT_EXP_EXACT_SE"); return e != nullptr && std::string(e) != "0"; }();
+      if (exact_se && r == 0) {
+        int dev = 0, sms = 0, bps = 0;
+        RAFT_CUDA_TRY(cudaGetDevice(&dev));
+        RAFT_CUDA_TRY(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+        const size_t smem_se = static_cast<size_t>(kExactSeThreads / 32) * ((H->rows + 31) / 32) * sizeof(unsigned);
+        RAFT_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, fission_exact_se, kExactSeThreads, smem_se));
+        const int grid = sms * std::max(1, bps), warps = grid * (kExactSeThreads / 32);
+        const size_t ws = static_cast<size_t>(warps) * H->rows * sizeof(f_t) + 256;
+        if (!H->d_exact_se || H->d_exact_se->size() < ws) {
+          H->d_exact_se.emplace(ws, H->stream);
+          RAFT_CUDA_TRY(cudaMemsetAsync(H->d_exact_se->data(), 0, ws, cs));
+        }
+        auto* base = static_cast<char*>(H->d_exact_se->data());
+        auto* nxt  = reinterpret_cast<unsigned long long*>(base);
+        RAFT_CUDA_TRY(cudaMemsetAsync(nxt, 0, sizeof(unsigned long long), cs));
+        fission_exact_se<<<grid, kExactSeThreads, smem_se, cs>>>(H->d_args, finv, Ni, static_cast<i_t>(H->rows), nxt,
+                                                                reinterpret_cast<f_t*>(base + 256));
+        fission_dbg_sync(cs, "exact_se");
       }
       static const bool fused = !det && [] { const char* e = std::getenv("CUOPT_EXP_FUSED"); return e != nullptr && std::string(e) != "0"; }();  // opt-in
       const size_t smem_f     = std::max(smem, smem_c);
