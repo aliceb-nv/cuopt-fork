@@ -1884,7 +1884,9 @@ struct gpu_batch_run_t {
       }
       if (result_views) { w.refactor_reason = result.refactor_reason; }
       // A never-staged (empty) seat has no host bounds to mirror into.
-      if (!result.lower.empty() && !node.lower.empty() &&
+      // Reason 3 (fission yield in place): the seat's bounds were not copied back.
+      const bool in_place = out[s] == simplex::dual_status_t::REFACTOR_NEEDED && w.refactor_reason == 3;
+      if (!result.lower.empty() && !node.lower.empty() && !in_place &&
           (bounds_mirror || out[s] == simplex::dual_status_t::REFACTOR_NEEDED)) {
         if (node.lower.size() != result.lower.size() || node.upper.size() != result.upper.size()) {
           throw std::logic_error("GPU harvest: seat bounds size does not match the result");

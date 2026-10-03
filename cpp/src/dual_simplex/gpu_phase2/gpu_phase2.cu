@@ -5377,6 +5377,11 @@ __global__ void compact_gather_kernel(const kernel_args* args,
     if (lane == 0) { hdr[seat] = {0.0, 0.0, 0.0, 2, -1}; }
     return;
   }
+  // Fission seat yielded in place (refactor reason 3): its state stays on the device.
+  if (status == dual::status_t::REFACTOR_NEEDED && a.out_status[1] == 3) {
+    if (lane == 0) { hdr[seat] = {0.0, 0.0, 0.0, 4, -1}; }
+    return;
+  }
   int slot = 0;
   if (lane == 0) { slot = atomicAdd(full_count, 1); }
   slot    = __shfl_sync(0xffffffffu, slot, 0);
@@ -8933,7 +8938,8 @@ void gpu_simplified_dual_phase2_batch_harvest(
     bool any = false;
     for (size_t b = 0; b < N; ++b) {
       if (H->compact_valid && H->seat_kind[b] == 3) { continue; }
-      if (H->h_status->data()[2 * b] == static_cast<i_t>(dual::status_t::REFACTOR_NEEDED)) {
+      if (H->h_status->data()[2 * b] == static_cast<i_t>(dual::status_t::REFACTOR_NEEDED) &&
+          H->h_status->data()[2 * b + 1] != 3) {  // reason 3: resumed in place, nothing to read
         enqueue_seat_rest(H, b);
         any = true;
       }
