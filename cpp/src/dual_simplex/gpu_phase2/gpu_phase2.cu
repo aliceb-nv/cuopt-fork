@@ -9689,7 +9689,7 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
     H->relaunch_blocks = nb;
   }
   if (timed) { RAFT_CUDA_TRY(cudaEventRecord(H->ev_start, H->stream.value())); }
-  int rounds = !gpu_phase2_detail::gpu_fission() && H->scores_armed && H->dive_armed ? H->dive_rounds : 1;
+  int rounds = H->scores_armed && H->dive_armed ? H->dive_rounds : 1;
   auto* seat_scores =
     H->scores_armed ? reinterpret_cast<gpu_scores::seat_score_t*>(
                         static_cast<char*>(H->d_scores->data()) +
@@ -9706,7 +9706,8 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
     D.log     = reinterpret_cast<gpu_dive_record<i_t, f_t>*>(d + H->dive_off[2]);
     D.packed  = reinterpret_cast<std::uint8_t*>(d + H->dive_off[3]);
   }
-  const bool in_kernel = rounds > 1 && gpu_dive_in_kernel();
+  // Fission dives between launches: dive_advance_kernel turns OPTIMAL seats into CHILD_CONTINUE.
+  const bool in_kernel = rounds > 1 && gpu_dive_in_kernel() && !gpu_phase2_detail::gpu_fission();
   const int launches   = in_kernel ? 1 : rounds;
   H->clk_rounds        = gpu_seat_clock() ? rounds : 0;
   if (H->clk_rounds > 0) {
@@ -9945,9 +9946,10 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
         }();
         RAFT_CUDA_TRY(cudaMemcpyToSymbolAsync(c_no_lean, &no_lean, sizeof(int), 0, cudaMemcpyHostToDevice, cs));
       }
-      {
+      if (r == 0) {
         // Every seat's inverses from the factors just staged: per-generation work. On a pool
-        // overflow (err) the host grows that pool and reruns the build.
+        // overflow (err) the host grows that pool and reruns the build. Dive rounds (r > 0) continue
+        // seats on the same factors, so their inverses stay valid.
         auto& b = H->finv_b;
         for (;;) {
         for (int f = 0; f < 2; ++f) { RAFT_CUDA_TRY(cudaMemsetAsync(b.cur[f], 0, N * sizeof(int), cs)); }
