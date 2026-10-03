@@ -466,6 +466,35 @@ f_t branch_and_bound_t<i_t, f_t>::get_lower_bound()
     }
   }
 
+  // DEBUG CUOPT_EXP_LB_TRACE=1: every 10 s, the minimum of each bound source and who holds it.
+  static const bool lb_trace = std::getenv("CUOPT_EXP_LB_TRACE") != nullptr;
+  static std::atomic<double> lb_trace_next{0.0};
+  if (lb_trace && bfs_worker_pool_.is_initialized()) {
+    const double now = toc(exploration_stats_.start_time);
+    double due = lb_trace_next.load();
+    if (now >= due && lb_trace_next.compare_exchange_strong(due, now + 10.0)) {
+      f_t wl = inf, ql = inf, pl = inf;
+      i_t wi = -1, qi = -1, pi = -1;
+      for (i_t i = 0; i < bfs_worker_pool_.size(); ++i) {
+        if (!bfs_worker_pool_[i]->is_active) { continue; }
+        const f_t w = bfs_worker_pool_[i]->lower_bound.load();
+        const f_t q = bfs_worker_pool_[i]->node_queue.get_lower_bound();
+        if (w < wl) { wl = w, wi = i; }
+        if (q < ql) { ql = q, qi = i; }
+        for (int k = 0; k < gpu_pool_pipeline(); ++k) {
+          const i_t p = i * gpu_pool_pipeline() + k;
+          if (p < static_cast<i_t>(gpu_batch_pools_.size()) && gpu_batch_pools_[p] != nullptr &&
+              gpu_batch_pools_[p]->busy && gpu_batch_pools_[p]->lower_bound.load() < pl) {
+            pl = gpu_batch_pools_[p]->lower_bound.load(), pi = p;
+          }
+        }
+      }
+      settings_.log.printf("[LB-TRACE] t=%.1f numerical=%.6g worker=%.6g (w%d) queue=%.6g (w%d) pool=%.6g (p%d)\n",
+                           now, (double)lower_bound_numerical_.load(), (double)wl, (int)wi, (double)ql,
+                           (int)qi, (double)pl, (int)pi);
+    }
+  }
+
   if (std::isfinite(lower_bound)) {
     return lower_bound;
   } else if (std::isfinite(root_objective_)) {
@@ -2125,7 +2154,9 @@ void branch_and_bound_t<i_t, f_t>::nondeterministic_gpu_pool_update_lower_bound(
 template <typename i_t, typename f_t>
 static bool gpu_pool_inplace_bounds(const bfs_worker_t<i_t, f_t>* worker, int symmetry)
 {
-  return gpu_pool_inplace() && gpu_pool_device_strengthen() && !gpu_pool_recheck() &&
+  // DEBUG CUOPT_EXP_RECHECK_INPLACE=1: recheck with in-place (device-resident, delta) bounds kept on.
+  static const bool recheck_inplace = std::getenv("CUOPT_EXP_RECHECK_INPLACE") != nullptr;
+  return gpu_pool_inplace() && gpu_pool_device_strengthen() && (!gpu_pool_recheck() || recheck_inplace) &&
          dump_bad_nodes_dir() == nullptr && worker->orbital_fixing == nullptr &&
          (symmetry != 2 || worker->lexical_reduction == nullptr);
 }

@@ -6868,6 +6868,12 @@ struct gpu_batch_handle_t {
   std::optional<rmm::device_buffer> d_fission_fb;  // fission_fb_t counters (cumulative)
   unsigned long long h_fission_fb[8]{};             // their values at the previous relaunch
   long long fission_launches{0};
+  // The fission rounds loop as a CUDA graph (conditional WHILE on the live count), built for the
+  // device pointers in fission_graph_key and fission_graph_n seats.
+  cudaGraph_t fission_graph{nullptr};
+  cudaGraphExec_t fission_graph_exec{nullptr};
+  const void* fission_graph_key[3]{};
+  int fission_graph_n{0};
   std::optional<rmm::device_buffer> d_live;
   // Bound deltas of one generation, uploaded by the relaunch in one copy.
   std::optional<pinned_buf<gpu_bound_delta<i_t, f_t>>> h_deltas;
@@ -6949,6 +6955,8 @@ struct gpu_batch_handle_t {
     if (ev_d2h0 != nullptr) { cudaEventDestroy(ev_d2h0); }
     if (ev_g0 != nullptr) { cudaEventDestroy(ev_g0); }
     if (ev_g1 != nullptr) { cudaEventDestroy(ev_g1); }
+    if (fission_graph_exec != nullptr) { cudaGraphExecDestroy(fission_graph_exec); }
+    if (fission_graph != nullptr) { cudaGraphDestroy(fission_graph); }
   }
 };
 
@@ -8957,6 +8965,7 @@ void gpu_simplified_dual_phase2_batch_harvest(
     H->pre_recorded    = false;
   }
   H->launched = false;
+  if (gpu_fission()) { fission_fb_collect(H, H->stream.value()); }
   for (size_t b = 0; b < N; ++b) {
     if (items[b].terminal_status != dual::status_t::UNSET) {
       out_status[b] = items[b].terminal_status;
@@ -10008,17 +10017,6 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
       }
       fission_presetup<<<Ni, kPresetupThreads, 0, cs>>>(H->d_args, Ni);
       fission_dbg_sync(cs, "presetup");
-      static const bool bcheck = [] { const char* e = std::getenv("CUOPT_EXP_XBCHECK"); return e != nullptr && std::string(e) != "0"; }();
-      if (bcheck) {
-        rmm::device_buffer d_chk(5 * sizeof(unsigned long long), H->stream);
-        RAFT_CUDA_TRY(cudaMemsetAsync(d_chk.data(), 0, d_chk.size(), cs));
-        fission_basis_check<<<Ni, 256, 0, cs>>>(H->d_args, Ni, static_cast<unsigned long long*>(d_chk.data()));
-        unsigned long long h[5];
-        RAFT_CUDA_TRY(cudaMemcpyAsync(h, d_chk.data(), sizeof(h), cudaMemcpyDeviceToHost, cs));
-        RAFT_CUDA_TRY(cudaStreamSynchronize(cs));
-        std::fprintf(stderr, "[BASIS-CHECK] seats %llu bad %llu first seat %llu cmd/resume %llx bad entries %llu\n",
-                     h[0], h[1], h[2], h[3], h[4]);
-      }
       if (gpu_fission_price_fresh()) {
         const size_t smem_d = 2 * static_cast<size_t>(H->rows) * sizeof(f_t);
         RAFT_CUDA_TRY(cudaFuncSetAttribute(fission_duals, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -10034,19 +10032,6 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
                                            static_cast<int>(smem_x)));
         fission_xb<<<Ni, kXbThreads, smem_x, cs>>>(H->d_args, finv, Ni);
         fission_dbg_sync(cs, "xb");
-        static const bool xbcheck = [] { const char* e = std::getenv("CUOPT_EXP_XBCHECK"); return e != nullptr && std::string(e) != "0"; }();
-        if (xbcheck) {
-          rmm::device_buffer d_chk(4 * sizeof(unsigned long long), H->stream);
-          RAFT_CUDA_TRY(cudaMemsetAsync(d_chk.data(), 0, d_chk.size(), cs));
-          fission_xb_check<<<Ni, kXbThreads, 0, cs>>>(H->d_args, Ni, static_cast<unsigned long long*>(d_chk.data()));
-          unsigned long long h[4];
-          RAFT_CUDA_TRY(cudaMemcpyAsync(h, d_chk.data(), sizeof(h), cudaMemcpyDeviceToHost, cs));
-          RAFT_CUDA_TRY(cudaStreamSynchronize(cs));
-          double worst;
-          std::memcpy(&worst, &h[2], sizeof(worst));
-          std::fprintf(stderr, "[XB-CHECK] lean seats %llu, residual > 1e-6: %llu, max %.3e (seat %llu)\n",
-                       h[0], h[1], worst, h[3]);
-        }
       }
       static const bool fused = !det && [] { const char* e = std::getenv("CUOPT_EXP_FUSED"); return e != nullptr && std::string(e) != "0"; }();  // opt-in
       const size_t smem_f     = std::max(smem, smem_c);
@@ -10054,8 +10039,8 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
         RAFT_CUDA_TRY(cudaFuncSetAttribute(fission_fused, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                            static_cast<int>(smem_f)));
       }
-      std::vector<int> lives;
-      for (;;) {
+      // One group of rounds: every phase kernel once per round (seats not in a phase return at once).
+      const auto enqueue_rounds = [&] {
         if (fused) {
           fission_fused<<<Ni, kFissionThreads, smem_f, cs>>>(H->d_args, finv, Ni, gpu_fission_rounds());
         }
@@ -10071,51 +10056,83 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
           fission_update_block<<<Ni, kUpdThreads, (static_cast<size_t>(H->rows) + 1) * sizeof(int), cs>>>(H->d_args, Ni);
           fission_dbg_sync(cs, "update");
         }
-        RAFT_CUDA_TRY(cudaMemsetAsync(d_live, 0, sizeof(int), cs));
-        fission_count<<<(Ni + 255) / 256, 256, 0, cs>>>(H->d_args, Ni, d_live);
-        int live = 0;
-        RAFT_CUDA_TRY(cudaMemcpyAsync(&live, d_live, sizeof(int), cudaMemcpyDeviceToHost, cs));
-        RAFT_CUDA_TRY(cudaStreamSynchronize(cs));
-        static const bool unb0 = [] { const char* e = std::getenv("CUOPT_EXP_XBCHECK"); return e != nullptr && std::string(e) != "0"; }();
-        if (unb0) {
-          double u[16];
-          RAFT_CUDA_TRY(cudaMemcpyFromSymbol(u, g_unb0, sizeof(u)));
-          if (u[0] != 0.0) {
-            std::fprintf(stderr, "[UNB0] count %.0f first: seat %.0f leaving %.0f dir %.0f x %.17g lower %.17g upper %.17g ncand %.0f nidx %.0f nzdy %.0f lean %.0f cmd %.0f resume %.0f sq %.3e ninf %.0f tod %.0f\n",
-                         u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
-            const double zero[16]{};
-            RAFT_CUDA_TRY(cudaMemcpyToSymbol(g_unb0, zero, sizeof(zero)));
+      };
+      // CUOPT_EXP_FISSION_HOSTLOOP=1 (and the debug-sync / NaN-check modes): the host reads the live
+      // count after every group and blocks this thread until no seat runs. Default: one CUDA graph
+      // whose conditional WHILE node repeats the groups until the device-side live count is zero, so
+      // the relaunch returns at once like the original kernel's launch.
+      static const bool host_loop = std::getenv("CUOPT_EXP_FISSION_HOSTLOOP") != nullptr ||
+                                    std::getenv("CUOPT_EXP_FISSION_SYNC") != nullptr ||
+                                    std::getenv("CUOPT_EXP_NANCHECK") != nullptr;
+      if (!host_loop) {
+        const void* key[3] = {H->d_args, finv, d_live};
+        if (H->fission_graph_exec == nullptr || std::memcmp(key, H->fission_graph_key, sizeof(key)) != 0 ||
+            H->fission_graph_n != Ni) {
+          if (H->fission_graph_exec != nullptr) {
+            RAFT_CUDA_TRY(cudaGraphExecDestroy(H->fission_graph_exec));
+            RAFT_CUDA_TRY(cudaGraphDestroy(H->fission_graph));
           }
+          cudaGraph_t g = nullptr;
+          RAFT_CUDA_TRY(cudaGraphCreate(&g, 0));
+          cudaGraphConditionalHandle cond{};
+          RAFT_CUDA_TRY(cudaGraphConditionalHandleCreate(&cond, g, 1, cudaGraphCondAssignDefault));
+          cudaGraphNodeParams cp{};
+          cp.type                 = cudaGraphNodeTypeConditional;
+          cp.conditional.handle   = cond;
+          cp.conditional.type     = cudaGraphCondTypeWhile;
+          cp.conditional.size     = 1;
+          cudaGraphNode_t node    = nullptr;
+          RAFT_CUDA_TRY(cudaGraphAddNode(&node, g, nullptr, nullptr, 0, &cp));
+          cudaGraph_t body = cp.conditional.phGraph_out[0];
+          RAFT_CUDA_TRY(cudaStreamBeginCaptureToGraph(cs, body, nullptr, nullptr, 0,
+                                                      cudaStreamCaptureModeThreadLocal));
+          enqueue_rounds();
+          RAFT_CUDA_TRY(cudaMemsetAsync(d_live, 0, sizeof(int), cs));
+          fission_count<<<(Ni + 255) / 256, 256, 0, cs>>>(H->d_args, Ni, d_live);
+          fission_set_cond<<<1, 1, 0, cs>>>(cond, d_live);
+          cudaGraph_t captured = nullptr;
+          RAFT_CUDA_TRY(cudaStreamEndCapture(cs, &captured));
+          RAFT_CUDA_TRY(cudaGraphInstantiate(&H->fission_graph_exec, g, 0));
+          H->fission_graph = g;
+          std::memcpy(H->fission_graph_key, key, sizeof(key));
+          H->fission_graph_n = Ni;
         }
-        lives.push_back(live);
-        if (*H->h_finv_err != 0) {
-          throw std::runtime_error("device explicit inverses: pool overflow after the grow-and-rebuild loop");
-        }
-        static const bool trace = std::getenv("CUOPT_BNB_GPU_FISSION_TRACE") != nullptr;
-        if (trace) {
-          // Per live seat: state, iteration, num_updates (first few).
-          std::vector<kernel_args> ha(N);
-          RAFT_CUDA_TRY(cudaMemcpy(ha.data(), H->d_args, N * sizeof(kernel_args), cudaMemcpyDeviceToHost));
-          int shown = 0;
-          std::string line;
-          for (size_t b = 0; b < N && shown < 6; ++b) {
-            if (ha[b].done != 0 || ha[b].slot == nullptr) { continue; }
-            int fs = 0, it = 0, nu = 0;
-            auto* sl = ha[b].slot;
-            RAFT_CUDA_TRY(cudaMemcpy(&fs, &sl->f_state, sizeof(int), cudaMemcpyDeviceToHost));
-            if (fs == F_DONE) { continue; }
-            RAFT_CUDA_TRY(cudaMemcpy(&it, &sl->iter, sizeof(int), cudaMemcpyDeviceToHost));
-            RAFT_CUDA_TRY(cudaMemcpy(&nu, &sl->ft.num_updates_, sizeof(int), cudaMemcpyDeviceToHost));
-            line += " seat" + std::to_string(b) + ":st" + std::to_string(fs) + ",it" + std::to_string(it) +
-                    ",nu" + std::to_string(nu);
-            ++shown;
+        RAFT_CUDA_TRY(cudaGraphLaunch(H->fission_graph_exec, cs));
+      } else {
+        std::vector<int> lives;
+        for (;;) {
+          enqueue_rounds();
+          RAFT_CUDA_TRY(cudaMemsetAsync(d_live, 0, sizeof(int), cs));
+          fission_count<<<(Ni + 255) / 256, 256, 0, cs>>>(H->d_args, Ni, d_live);
+          int live = 0;
+          RAFT_CUDA_TRY(cudaMemcpyAsync(&live, d_live, sizeof(int), cudaMemcpyDeviceToHost, cs));
+          RAFT_CUDA_TRY(cudaStreamSynchronize(cs));
+          lives.push_back(live);
+          static const bool trace = std::getenv("CUOPT_BNB_GPU_FISSION_TRACE") != nullptr;
+          if (trace) {
+            // Per live seat: state, iteration, num_updates (first few).
+            std::vector<kernel_args> ha(N);
+            RAFT_CUDA_TRY(cudaMemcpy(ha.data(), H->d_args, N * sizeof(kernel_args), cudaMemcpyDeviceToHost));
+            int shown = 0;
+            std::string line;
+            for (size_t b = 0; b < N && shown < 6; ++b) {
+              if (ha[b].done != 0 || ha[b].slot == nullptr) { continue; }
+              int fs = 0, it = 0, nu = 0;
+              auto* sl = ha[b].slot;
+              RAFT_CUDA_TRY(cudaMemcpy(&fs, &sl->f_state, sizeof(int), cudaMemcpyDeviceToHost));
+              if (fs == F_DONE) { continue; }
+              RAFT_CUDA_TRY(cudaMemcpy(&it, &sl->iter, sizeof(int), cudaMemcpyDeviceToHost));
+              RAFT_CUDA_TRY(cudaMemcpy(&nu, &sl->ft.num_updates_, sizeof(int), cudaMemcpyDeviceToHost));
+              line += " seat" + std::to_string(b) + ":st" + std::to_string(fs) + ",it" + std::to_string(it) +
+                      ",nu" + std::to_string(nu);
+              ++shown;
+            }
+            std::fprintf(stderr, "[FISSION] live=%d%s\n", live, line.c_str());
           }
-          std::fprintf(stderr, "[FISSION] live=%d%s\n", live, line.c_str());
+          if (live == 0) { break; }
         }
-        if (live == 0) { break; }
+        fission_rounds_add(gpu_fission_rounds(), lives);
       }
-      fission_rounds_add(gpu_fission_rounds(), lives);
-      fission_fb_collect(H, cs);
       RAFT_CUDA_TRY(cudaPeekAtLastError());
       if (last && !early) { set_flag_kernel<<<1, 1, 0, cs>>>(H->d_completion_flag); }
     } else {

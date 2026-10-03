@@ -2756,6 +2756,12 @@ __global__ void fission_count(const kernel_args* args, i_t n_problems, int* live
   if (a.done == 0 && a.slot != nullptr && a.slot->f_state != F_DONE) { atomicAdd(live, 1); }
 }
 
+// The rounds graph's WHILE condition: repeat while any seat runs.
+__global__ void fission_set_cond(cudaGraphConditionalHandle cond, const int* live)
+{
+  cudaGraphSetConditional(cond, *live > 0 ? 1u : 0u);
+}
+
 // ---- Explicit inverses built on the device every relaunch (see benchmarks/.../inv_bench.cu).
 // L0^{-1} P and U0^{-1} of every seat, column (CSC) and row (CSR) forms, from the staged factors.
 // Entries live in shared pools per factor, not per-seat slices: the column solve takes scratch space

@@ -1877,6 +1877,11 @@ struct gpu_batch_run_t {
       const i_t iterations = result_views ? result.iterations : node.sol.iterations;
       w.leg_iters   = iterations - w.total_iters;
       w.total_iters = iterations;
+      // DEBUG: seats whose solve runs past every 20,000 iterations.
+      if (iterations / 20000 != (iterations - w.leg_iters) / 20000 && iterations >= 20000) {
+        std::fprintf(stderr, "[SEAT-LONG] seat=%d iterations=%d leg=%d status=%d refactor_reason=%d\n",
+                     (int)s, (int)iterations, (int)w.leg_iters, (int)out[s], (int)w.refactor_reason);
+      }
       if (result_views) { w.refactor_reason = result.refactor_reason; }
       // A never-staged (empty) seat has no host bounds to mirror into.
       if (!result.lower.empty() && !node.lower.empty() &&
