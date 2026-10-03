@@ -4374,6 +4374,7 @@ struct kernel_args {
   // the historical grow-in-kernel behaviour. Sized by mpf_store_caps().
   i_t mpf_update_cap;
   f_t* fm{nullptr};  // fission replay matrix M of this seat, fm_kcap^2 (column-major)
+  unsigned long long* fstats{nullptr};  // fission: the pool's fission_fb_t counters
   i_t fm_kcap{0};
   i_t mpf_eta_nnz_cap;
   // Per-slot PERSISTENT solve state (slot_state<FT>): host-allocated, ZEROED blob that the kernel
@@ -6866,7 +6867,7 @@ struct gpu_batch_handle_t {
   int* h_finv_err{nullptr};
   long long* h_finv_need{nullptr};  // pinned: gcur[2], off[0][N], off[1][N] after a build
   std::optional<rmm::device_buffer> d_fission_fb;  // fission_fb_t counters (cumulative)
-  unsigned long long h_fission_fb[8]{};             // their values at the previous relaunch
+  unsigned long long h_fission_fb[32]{};             // their values at the previous relaunch
   long long fission_launches{0};
   // The fission rounds loop as a CUDA graph (conditional WHILE on the live count), built for the
   // device pointers in fission_graph_key and fission_graph_n seats.
@@ -8402,6 +8403,7 @@ static struct {
   std::mutex mu;
   unsigned long long c[gpu_phase2_detail::FB_COUNT]{};
   long long launches{0}, launches_with{0};
+  std::atomic<long long> passes{0};  // fission passes (one per dive round of a relaunch)
 } g_ffb;
 
 // After a relaunch: this launch's fallback counts (cumulative device counters minus the previous
@@ -8460,7 +8462,28 @@ std::string gpu_fission_fallback_report()
                 c[FB_FTRAN_CALLS], pct(c[FB_FTRAN_U0_DENSE] + c[FB_FTRAN_U1_DENSE], c[FB_FTRAN_CALLS]),
                 c[FB_FTRAN_IN_CHUNKED], 2 * c[FB_FTRAN_CALLS], pct(c[FB_FTRAN_IN_CHUNKED], 2 * c[FB_FTRAN_CALLS]),
                 c[FB_MAX_LIST], kFissionCapA);
-  return out;
+  std::string r = out;
+  const unsigned long long seats = c[FB_SEAT_FRESH] + c[FB_SEAT_CHILD] + c[FB_SEAT_RESUME];
+  const long long passes         = g_ffb.passes.load();
+  std::snprintf(out, sizeof(out),
+                "[FISSION-STATS] %lld passes, %.1f groups of rounds per pass (graph mode) | seats set up %llu: "
+                "fresh %.1f%% child %.1f%% resume %.1f%%, children start at %.1f MPF updates | steepest-edge "
+                "resets %llu of %llu choose passes (%.2f%%)\n",
+                passes, passes == 0 ? 0.0 : static_cast<double>(c[FB_GROUPS]) / passes, seats,
+                pct(c[FB_SEAT_FRESH], seats), pct(c[FB_SEAT_CHILD], seats), pct(c[FB_SEAT_RESUME], seats),
+                c[FB_SEAT_CHILD] == 0 ? 0.0 : static_cast<double>(c[FB_CHILD_K]) / c[FB_SEAT_CHILD],
+                c[FB_SE_RESETS], c[FB_CHOOSE_CALLS], pct(c[FB_SE_RESETS], c[FB_CHOOSE_CALLS]));
+  r += out;
+  std::snprintf(out, sizeof(out), "[FISSION-STATS] seats yielded to a later launch: %llu\n", c[FB_YIELDED]);
+  r += out;
+  const char* nm[7] = {"fresh", "child", "resume", "it<10", "it<50", "it<200", "it>=200"};
+  std::string by = "[FISSION-STATS] steepest-edge resets by seat kind and iteration:";
+  for (int k = 0; k < 7; ++k) {
+    std::snprintf(out, sizeof(out), " %s %.1f%% of %llu", nm[k], pct(c[FB_RESET_BY + k], c[FB_CHOOSE_BY + k]),
+                  c[FB_CHOOSE_BY + k]);
+    by += out;
+  }
+  return fission_rounds_report() + r + by + "\n";
 }
 
 static std::string fission_scat_report()
@@ -8520,7 +8543,7 @@ std::string gpu_fission_step_report()
     "update.p.dx", "update.p.primal", "update.p.obj", "update.p.cutoff", "update.p.se_norms",
     "update.p.swap", "tl.dot", "tl.axpy", "tl.updates"};
   const double iters = static_cast<double>(h[S_U_TAIL][1]);
-  if (iters == 0) { return fission_rounds_report() + gpu_fission_fallback_report(); }
+  if (iters == 0) { return gpu_fission_fallback_report(); }
   if (const char* ut = std::getenv("CUOPT_BNB_GPU_FISSION_UTRACE"); ut != nullptr && *ut != 0) {
     fission_utrace_t* d = nullptr;
     unsigned long long n = 0;
@@ -8583,7 +8606,7 @@ std::string gpu_fission_step_report()
   }
   double total = 0;
   for (int k = 0; k < S_UP_DX; ++k) { total += static_cast<double>(h[k][0]); }
-  std::string out = fission_rounds_report() + gpu_fission_fallback_report() + fission_scat_report();
+  std::string out = gpu_fission_fallback_report() + fission_scat_report();
   char line[256];
   std::snprintf(line, sizeof(line),
                 "[FISSION-STEPS] completed iterations=%.0f, seat cycles per iteration=%.0f (per seat, "
@@ -9665,6 +9688,14 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
       H->h_args[b].fm      = static_cast<f_t*>(H->d_fm->data()) + b * kc * kc;
       H->h_args[b].fm_kcap = static_cast<i_t>(kc);
     }
+    if (!H->d_fission_fb) {
+      static_assert(gpu_phase2_detail::FB_COUNT <= 32, "h_fission_fb holds the fission counters");
+      H->d_fission_fb.emplace(gpu_phase2_detail::FB_COUNT * sizeof(unsigned long long), H->stream);
+      RAFT_CUDA_TRY(cudaMemsetAsync(H->d_fission_fb->data(), 0, H->d_fission_fb->size(), H->stream.value()));
+    }
+    for (size_t b = 0; b < N; ++b) {
+      H->h_args[b].fstats = static_cast<unsigned long long*>(H->d_fission_fb->data());
+    }
   }
   RAFT_CUDA_TRY(cudaMemcpyAsync(H->d_args,
                                 H->h_args.data(),
@@ -9809,9 +9840,6 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
         RAFT_CUDA_TRY(cudaMemsetAsync(b.ws_y, 0, static_cast<size_t>(b.warps) * m * 8, cs));
         RAFT_CUDA_TRY(cudaMemsetAsync(b.ws_b, 0, static_cast<size_t>(b.warps) * W64 * 8, cs));
         b.inv = static_cast<gpu_fission_inv*>(H->d_finv->data());
-        static_assert(FB_COUNT <= 8, "h_fission_fb holds the fallback counters");
-        H->d_fission_fb.emplace(FB_COUNT * sizeof(unsigned long long), H->stream);
-        RAFT_CUDA_TRY(cudaMemsetAsync(H->d_fission_fb->data(), 0, H->d_fission_fb->size(), cs));
         b.fb = static_cast<unsigned long long*>(H->d_fission_fb->data());
         // CHOSEN: initial pools of 2m entries per seat per factor; they grow on the first overflows.
         for (int f = 0; f < 2; ++f) { b.scap[f] = b.pcap[f] = 2 * static_cast<long long>(Nn) * static_cast<long long>(m); }
@@ -10026,6 +10054,15 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
       }
       fission_setup_kernel<<<Ni, 32, 0, cs>>>(H->d_args, Ni);
       fission_dbg_sync(cs, "setup");
+      // CUOPT_EXP_BUILD_R=0: children replay their inherited updates through the chunked loop.
+      static const bool build_r = [] { const char* e = std::getenv("CUOPT_EXP_BUILD_R"); return e == nullptr || std::string(e) != "0"; }();
+      if (build_r && mpf_update_cap() <= kBuildRThreads) {
+        const size_t smem_r = static_cast<size_t>(H->rows) * sizeof(f_t);
+        RAFT_CUDA_TRY(cudaFuncSetAttribute(fission_build_r, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                           static_cast<int>(smem_r)));
+        fission_build_r<<<Ni, kBuildRThreads, smem_r, cs>>>(H->d_args, Ni);
+        fission_dbg_sync(cs, "build_r");
+      }
       {
         const size_t smem_x = 2 * static_cast<size_t>(H->rows) * sizeof(f_t);
         RAFT_CUDA_TRY(cudaFuncSetAttribute(fission_xb, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -10039,6 +10076,7 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
         RAFT_CUDA_TRY(cudaFuncSetAttribute(fission_fused, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                            static_cast<int>(smem_f)));
       }
+      ++g_ffb.passes;
       // One group of rounds: every phase kernel once per round (seats not in a phase return at once).
       const auto enqueue_rounds = [&] {
         if (fused) {
@@ -10051,6 +10089,13 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
           fission_dbg_sync(cs, "btran");
           fission_choose_block<<<Ni, kFissionThreads, smem_c, cs>>>(H->d_args, Ni);
           fission_dbg_sync(cs, "choose");
+          // A steepest-edge reset sends a seat back to pricing; CUOPT_EXP_RESET_PASSES extra
+          // price/BTRAN/choose passes let it pivot in this round (other seats return at once).
+          for (int q = 0; q < gpu_fission_reset_passes(); ++q) {
+            fission_price<<<Ni, 32, 0, cs>>>(H->d_args, Ni);
+            k_btran<<<Ni, kFissionThreads, smem, cs>>>(H->d_args, finv, Ni);
+            fission_choose_block<<<Ni, kFissionThreads, smem_c, cs>>>(H->d_args, Ni);
+          }
           k_ftran<<<Ni, kFissionThreads, smem, cs>>>(H->d_args, finv, Ni);
           fission_dbg_sync(cs, "ftran");
           fission_update_block<<<Ni, kUpdThreads, (static_cast<size_t>(H->rows) + 1) * sizeof(int), cs>>>(H->d_args, Ni);
@@ -10061,11 +10106,12 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
       // count after every group and blocks this thread until no seat runs. Default: one CUDA graph
       // whose conditional WHILE node repeats the groups until the device-side live count is zero, so
       // the relaunch returns at once like the original kernel's launch.
+      const int yield_at = static_cast<int>(gpu_fission_yield() * static_cast<double>(Ni));
       static const bool host_loop = std::getenv("CUOPT_EXP_FISSION_HOSTLOOP") != nullptr ||
                                     std::getenv("CUOPT_EXP_FISSION_SYNC") != nullptr ||
                                     std::getenv("CUOPT_EXP_NANCHECK") != nullptr;
       if (!host_loop) {
-        const void* key[3] = {H->d_args, finv, d_live};
+        const void* key[3] = {H->d_args, finv, d_live};  // yield_at is a static of the process
         if (H->fission_graph_exec == nullptr || std::memcmp(key, H->fission_graph_key, sizeof(key)) != 0 ||
             H->fission_graph_n != Ni) {
           if (H->fission_graph_exec != nullptr) {
@@ -10089,7 +10135,8 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
           enqueue_rounds();
           RAFT_CUDA_TRY(cudaMemsetAsync(d_live, 0, sizeof(int), cs));
           fission_count<<<(Ni + 255) / 256, 256, 0, cs>>>(H->d_args, Ni, d_live);
-          fission_set_cond<<<1, 1, 0, cs>>>(cond, d_live);
+          fission_set_cond<<<1, 1, 0, cs>>>(cond, d_live, static_cast<unsigned long long*>(H->d_fission_fb->data()),
+                                            yield_at);
           cudaGraph_t captured = nullptr;
           RAFT_CUDA_TRY(cudaStreamEndCapture(cs, &captured));
           RAFT_CUDA_TRY(cudaGraphInstantiate(&H->fission_graph_exec, g, 0));
@@ -10129,9 +10176,12 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
             }
             std::fprintf(stderr, "[FISSION] live=%d%s\n", live, line.c_str());
           }
-          if (live == 0) { break; }
+          if (live <= yield_at) { break; }
         }
         fission_rounds_add(gpu_fission_rounds(), lives);
+      }
+      if (yield_at > 0) {
+        fission_yield<<<Ni, 32, 0, cs>>>(H->d_args, Ni, static_cast<unsigned long long*>(H->d_fission_fb->data()));
       }
       RAFT_CUDA_TRY(cudaPeekAtLastError());
       if (last && !early) { set_flag_kernel<<<1, 1, 0, cs>>>(H->d_completion_flag); }

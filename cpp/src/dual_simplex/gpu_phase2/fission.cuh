@@ -63,6 +63,42 @@ __device__ fission_utrace_t* g_strace;  // CUOPT_BNB_GPU_FISSION_STRACE: same, p
 __device__ unsigned long long g_strace_n;
 __device__ fission_utrace_t* g_ftrace;  // CUOPT_BNB_GPU_FISSION_FTRACE: same, per FTRAN block
 __device__ unsigned long long g_ftrace_n;
+
+// Per-pool counters of the list-capacity fallbacks (gpu_fission_inv::fb), read by the host after
+// each relaunch: calls of each solve, dense fallbacks per site, the longest list that fell back.
+enum fission_fb_t : int {
+  FB_BTRAN_CALLS = 0,  // BTRAN solves
+  FB_FTRAN_CALLS,      // FTRAN solves (two right-hand sides each)
+  FB_BTRAN_DENSE,      // BTRAN L step: w over capacity, dense row gather over Lc
+  FB_FTRAN_U0_DENSE,   // FTRAN U step of a_q: z over capacity, dense row gather over Ur
+  FB_FTRAN_U1_DENSE,   // FTRAN U step of delta_y (CUOPT_EXP_FTRAN_DY=scatter only)
+  FB_FTRAN_IN_CHUNKED, // FTRAN L step: input list over capacity, scattered in chunks
+  FB_MAX_LIST,         // longest list that took a fallback
+  // Orchestration statistics (same block, kernel_args::fstats):
+  FB_CHOOSE_CALLS,     // choose passes that read a candidate row
+  FB_SE_RESETS,        // of those, steepest-edge weight below the ratio test: reset, priced again
+  FB_GROUPS,           // groups of rounds run (graph WHILE iterations / host-loop iterations)
+  FB_SEAT_FRESH,       // seats set up per kind: fresh node
+  FB_SEAT_CHILD,       //   child continuation (host plunge or device dive)
+  FB_SEAT_RESUME,      //   host-refactor resume
+  FB_CHILD_K,          // sum over children of their starting MPF update count
+  FB_YIELDED,          // seats suspended by CUOPT_EXP_FISSION_YIELD
+  // choose passes [0..6] and resets [7..13] by seat kind (fresh, child, resume) and by the seat's
+  // iteration when choosing (<10, <50, <200, >=200)
+  FB_CHOOSE_BY,
+  FB_RESET_BY = FB_CHOOSE_BY + 7,
+  FB_COUNT    = FB_RESET_BY + 7
+};
+__device__ __forceinline__ void fission_fb_note(unsigned long long* fb, int site, int len)
+{
+  if (fb != nullptr && threadIdx.x == 0) {
+    atomicAdd(fb + site, 1ull);
+    if (site >= FB_BTRAN_DENSE && site <= FB_FTRAN_IN_CHUNKED) {
+      atomicMax(fb + FB_MAX_LIST, static_cast<unsigned long long>(len));
+    }
+  }
+}
+
 constexpr unsigned long long kUtraceCap = 1ull << 21;
 __device__ __forceinline__ unsigned long long fission_gtime()
 {
@@ -287,8 +323,17 @@ __global__ void __launch_bounds__(32) fission_setup_kernel(kernel_args* args, i_
       g_strace[atomicAdd(&g_strace_n, 1ull) & (kUtraceCap - 1)] = r;
     }
   };
+  const bool child_in = args[idx].command == static_cast<i_t>(gpu_batch_seat_command::CHILD_CONTINUE);
+  const bool live_in  = args[idx].done == 0;
   gpu_phase2_kernel_body<true, true, true>(args, idx);
   kernel_args& a = args[idx];
+  if (live_in && threadIdx.x == 0 && a.fstats != nullptr) {
+    const int kind = child_in ? FB_SEAT_CHILD : a.refactor_resume != 0 ? FB_SEAT_RESUME : FB_SEAT_FRESH;
+    atomicAdd(a.fstats + kind, 1ull);
+    if (child_in && a.slot != nullptr) {
+      atomicAdd(a.fstats + FB_CHILD_K, static_cast<unsigned long long>(a.slot->ft.num_updates_));
+    }
+  }
   if (a.done != 0) {
     emit();
     return;
@@ -319,6 +364,54 @@ __global__ void __launch_bounds__(32) fission_setup_kernel(kernel_args* args, i_
   __syncwarp(0xffffffffu);
   if (tr && threadIdx.x == 0) { r.sub[6] = static_cast<int>(clock64() - c6); }
   emit();
+}
+
+// A seat that starts with K inherited MPF updates (a child continuation) has no replay matrix R, so
+// every BTRAN / FTRAN replays them through fission_tloop_chunked. Build R from the update store, row
+// by row as the FTRAN tail would have (M[k][j] = col(2k+1).col(2j), w_j = M[k][j] / mu_j,
+// R[k][i] = w_i - sum_{i<j<k} w_j R[j][i], stored at i * kc + k), then use the closed-form replay.
+// Shared: one dense m-vector.
+constexpr int kBuildRThreads = 256;
+__global__ void __launch_bounds__(kBuildRThreads) fission_build_r(kernel_args* args, i_t n_problems)
+{
+  extern __shared__ f_t fsh[];
+  if (blockIdx.x >= n_problems) { return; }
+  kernel_args& a = args[blockIdx.x];
+  if (a.done != 0 || a.slot == nullptr || a.fm == nullptr) { return; }
+  auto& st    = *a.slot;
+  const i_t K = st.ft.num_updates_;
+  if (st.f_mrows != -1 || K <= 0 || K >= a.fm_kcap) { return; }
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = kBuildRThreads / 32;
+  const i_t* cs = st.ft.S_.col_start.data();
+  const i_t* ri = st.ft.S_.i.data();
+  const f_t* vx = st.ft.S_.x.data();
+  const f_t* mu = st.ft.mu_values_.data();
+  f_t* Rm         = a.fm;
+  const size_t kc = static_cast<size_t>(a.fm_kcap);
+  f_t* acc        = fsh;
+  __shared__ f_t w[kBuildRThreads];  // K < fm_kcap <= kBuildRThreads (checked by the host)
+  for (i_t i = threadIdx.x; i < a.m; i += kBuildRThreads) { acc[i] = 0.0; }
+  __syncthreads();
+  for (i_t k = 1; k < K; ++k) {
+    for (i_t p = cs[2 * k + 1] + threadIdx.x; p < cs[2 * k + 2]; p += kBuildRThreads) { acc[ri[p]] = vx[p]; }
+    __syncthreads();
+    for (i_t j = warp; j < k; j += nw) {
+      f_t part = 0.0;
+      for (i_t p = cs[2 * j] + lane; p < cs[2 * j + 1]; p += 32) { part += vx[p] * acc[ri[p]]; }
+      part = warp_reduce_add(part);
+      if (lane == 0) { w[j] = part / mu[j]; }
+    }
+    __syncthreads();
+    for (i_t p = cs[2 * k + 1] + threadIdx.x; p < cs[2 * k + 2]; p += kBuildRThreads) { acc[ri[p]] = 0.0; }
+    for (i_t i = warp; i < k; i += nw) {
+      f_t part = 0.0;
+      for (i_t j = i + 1 + lane; j < k; j += 32) { part += w[j] * Rm[i * kc + j]; }
+      part = warp_reduce_add(part);
+      if (lane == 0) { Rm[i * kc + k] = w[i] - part; }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) { st.f_mrows = K; }
 }
 
 // Fresh fission seat: x_B = U0^{-1} L0^{-1} (b - A_N x_N) through the explicit inverses (row-wise,
@@ -1311,26 +1404,6 @@ static_assert(kFissionStage >= kFissionCapA * (sizeof(f_t) + 2 * sizeof(i_t)), "
 // first one's seat, leaving, direction, x, lower, upper of the leaving column, ncand, nidx, nzdy.
 __device__ double g_unb0[16];
 
-// Per-pool counters of the list-capacity fallbacks (gpu_fission_inv::fb), read by the host after
-// each relaunch: calls of each solve, dense fallbacks per site, the longest list that fell back.
-enum fission_fb_t : int {
-  FB_BTRAN_CALLS = 0,  // BTRAN solves
-  FB_FTRAN_CALLS,      // FTRAN solves (two right-hand sides each)
-  FB_BTRAN_DENSE,      // BTRAN L step: w over capacity, dense row gather over Lc
-  FB_FTRAN_U0_DENSE,   // FTRAN U step of a_q: z over capacity, dense row gather over Ur
-  FB_FTRAN_U1_DENSE,   // FTRAN U step of delta_y (CUOPT_EXP_FTRAN_DY=scatter only)
-  FB_FTRAN_IN_CHUNKED, // FTRAN L step: input list over capacity, scattered in chunks
-  FB_MAX_LIST,         // longest list that took a fallback
-  FB_COUNT
-};
-__device__ __forceinline__ void fission_fb_note(unsigned long long* fb, int site, int len)
-{
-  if (fb != nullptr && threadIdx.x == 0) {
-    atomicAdd(fb + site, 1ull);
-    if (site >= FB_BTRAN_DENSE) { atomicMax(fb + FB_MAX_LIST, static_cast<unsigned long long>(len)); }
-  }
-}
-
 // Compaction of a dense shared vector into (index, value) lists by an atomic counter. Returns the
 // nonzero count. Up to cap: the lists hold them and the vector is cleared. Over cap: the lists are
 // partial and the vector is left intact for a dense fallback.
@@ -1953,6 +2026,20 @@ __device__ __forceinline__ void fission_choose_block_body(kernel_args* args, i_t
   if (tid == 0) {
     s_norm  = tot;
     s_reset = a.dy_se[leaving] < a.steepest_edge_ratio * tot ? 1 : 0;
+    if (a.fstats != nullptr) {
+      atomicAdd(a.fstats + FB_CHOOSE_CALLS, 1ull);
+      const int kind = a.command == static_cast<i_t>(gpu_batch_seat_command::CHILD_CONTINUE) ? 1
+                       : a.refactor_resume != 0                                              ? 2
+                                                                                             : 0;
+      const int it   = st.iter, bucket = it < 10 ? 3 : it < 50 ? 4 : it < 200 ? 5 : 6;
+      atomicAdd(a.fstats + FB_CHOOSE_BY + kind, 1ull);
+      atomicAdd(a.fstats + FB_CHOOSE_BY + bucket, 1ull);
+      if (s_reset) {
+        atomicAdd(a.fstats + FB_SE_RESETS, 1ull);
+        atomicAdd(a.fstats + FB_RESET_BY + kind, 1ull);
+        atomicAdd(a.fstats + FB_RESET_BY + bucket, 1ull);
+      }
+    }
     if (s_reset) {
       a.dy_se[leaving] = tot;
       st.f_state       = F_PRICE;
@@ -2756,10 +2843,28 @@ __global__ void fission_count(const kernel_args* args, i_t n_problems, int* live
   if (a.done == 0 && a.slot != nullptr && a.slot->f_state != F_DONE) { atomicAdd(live, 1); }
 }
 
-// The rounds graph's WHILE condition: repeat while any seat runs.
-__global__ void fission_set_cond(cudaGraphConditionalHandle cond, const int* live)
+// The rounds graph's WHILE condition: repeat while more than yield_at seats run.
+__global__ void fission_set_cond(cudaGraphConditionalHandle cond, const int* live, unsigned long long* fstats,
+                                 int yield_at)
 {
-  cudaGraphSetConditional(cond, *live > 0 ? 1u : 0u);
+  if (fstats != nullptr) { ++fstats[FB_GROUPS]; }
+  cudaGraphSetConditional(cond, *live > yield_at ? 1u : 0u);
+}
+
+// CUOPT_EXP_FISSION_YIELD: the seats still running when the pass stops (at a pivot boundary: the
+// last group ended with the update) exit as REFACTOR_NEEDED and resume in a later launch.
+__global__ void fission_yield(kernel_args* args, i_t n_problems, unsigned long long* fstats)
+{
+  if (blockIdx.x >= n_problems) { return; }
+  kernel_args& a = args[blockIdx.x];
+  if (a.done != 0 || a.slot == nullptr || a.slot->f_state == F_DONE) { return; }
+  auto& st = *a.slot;
+  gpu_lp lp;
+  gpu_settings settings;
+  gpu_solution sol;
+  fission_views(a, lp, settings, sol);
+  if (threadIdx.x == 0 && fstats != nullptr) { atomicAdd(fstats + FB_YIELDED, 1ull); }
+  fission_exit(a, st, lp, sol, dual::status_t::REFACTOR_NEEDED, st.iter, true, 0);
 }
 
 // ---- Explicit inverses built on the device every relaunch (see benchmarks/.../inv_bench.cu).
@@ -3086,6 +3191,26 @@ inline int gpu_fission_rounds()
   static const int k = [] {
     const char* e = std::getenv("CUOPT_BNB_GPU_FISSION_ROUNDS");
     return e != nullptr ? std::max(1, std::atoi(e)) : 8;
+  }();
+  return k;
+}
+
+// CUOPT_EXP_FISSION_YIELD=f: a pass stops once at most f * seats still run (0: run to the end).
+inline double gpu_fission_yield()
+{
+  static const double f = [] {
+    const char* e = std::getenv("CUOPT_EXP_FISSION_YIELD");
+    return e != nullptr ? std::max(0.0, std::atof(e)) : 0.0;
+  }();
+  return f;
+}
+
+// Extra price/BTRAN/choose passes per round for seats whose steepest-edge weight was reset.
+inline int gpu_fission_reset_passes()
+{
+  static const int k = [] {
+    const char* e = std::getenv("CUOPT_EXP_RESET_PASSES");
+    return e != nullptr ? std::max(0, std::atoi(e)) : 0;
   }();
   return k;
 }
