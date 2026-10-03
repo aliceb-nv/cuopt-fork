@@ -1984,6 +1984,9 @@ struct gpu_batch_run_t {
       return false;
     }
     if (w.leg_iters > 0) { w.zero_pivot_legs = 0; }
+    if (w.refactor_reason == 3) {  // fission yield: the seat's device state is intact, no host LU
+      return gds::gpu_simplified_dual_phase2_batch_stage_in_place<i_t, f_t>(handle, static_cast<size_t>(s), error);
+    }
     w.terminal_certificate_retry = (w.refactor_reason == 2);
     if (w.refactor_reason == 1) { ++rejected_refactors; }
     else if (w.refactor_reason == 2) { ++certificate_refactors; }

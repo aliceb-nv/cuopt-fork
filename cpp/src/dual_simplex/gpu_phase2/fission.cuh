@@ -83,6 +83,7 @@ enum fission_fb_t : int {
   FB_SEAT_RESUME,      //   host-refactor resume
   FB_CHILD_K,          // sum over children of their starting MPF update count
   FB_YIELDED,          // seats suspended by CUOPT_EXP_FISSION_YIELD
+  FB_SEAT_INPLACE,     // seats resumed in place (no setup)
   // choose passes [0..6] and resets [7..13] by seat kind (fresh, child, resume) and by the seat's
   // iteration when choosing (<10, <50, <200, >=200)
   FB_CHOOSE_BY,
@@ -323,6 +324,18 @@ __global__ void __launch_bounds__(32) fission_setup_kernel(kernel_args* args, i_
       g_strace[atomicAdd(&g_strace_n, 1ull) & (kUtraceCap - 1)] = r;
     }
   };
+  if (args[idx].in_place != 0 && args[idx].done == 0) {
+    // Yielded in place: continue from the saved step; nothing to set up.
+    if (threadIdx.x == 0) {
+      kernel_args& a = args[idx];
+      a.slot->f_state = a.slot->f_yield_state;
+      a.slot->f_lean  = 0;
+      a.in_place      = 0;
+      if (a.fstats != nullptr) { atomicAdd(a.fstats + FB_SEAT_INPLACE, 1ull); }
+    }
+    emit();
+    return;
+  }
   const bool child_in = args[idx].command == static_cast<i_t>(gpu_batch_seat_command::CHILD_CONTINUE);
   const bool live_in  = args[idx].done == 0;
   gpu_phase2_kernel_body<true, true, true>(args, idx);
@@ -2853,7 +2866,7 @@ __global__ void fission_set_cond(cudaGraphConditionalHandle cond, const int* liv
 
 // CUOPT_EXP_FISSION_YIELD: the seats still running when the pass stops (at a pivot boundary: the
 // last group ended with the update) exit as REFACTOR_NEEDED and resume in a later launch.
-__global__ void fission_yield(kernel_args* args, i_t n_problems, unsigned long long* fstats)
+__global__ void fission_yield(kernel_args* args, i_t n_problems, unsigned long long* fstats, int reason)
 {
   if (blockIdx.x >= n_problems) { return; }
   kernel_args& a = args[blockIdx.x];
@@ -2863,8 +2876,12 @@ __global__ void fission_yield(kernel_args* args, i_t n_problems, unsigned long l
   gpu_settings settings;
   gpu_solution sol;
   fission_views(a, lp, settings, sol);
-  if (threadIdx.x == 0 && fstats != nullptr) { atomicAdd(fstats + FB_YIELDED, 1ull); }
-  fission_exit(a, st, lp, sol, dual::status_t::REFACTOR_NEEDED, st.iter, true, 0);
+  if (threadIdx.x == 0) {
+    if (fstats != nullptr) { atomicAdd(fstats + FB_YIELDED, 1ull); }
+    st.f_yield_state = st.f_state;
+  }
+  __syncwarp(0xffffffffu);
+  fission_exit(a, st, lp, sol, dual::status_t::REFACTOR_NEEDED, st.iter, true, reason);
 }
 
 // ---- Explicit inverses built on the device every relaunch (see benchmarks/.../inv_bench.cu).

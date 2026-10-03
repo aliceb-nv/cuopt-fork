@@ -441,6 +441,12 @@ bool gpu_simplified_dual_phase2_batch_stage(
   const std::vector<gpu_bound_delta<i_t, f_t>>& bound_deltas,
   std::string& error);
 
+// Fission: resume a seat that yielded with refactor reason 3 from its device state.
+template <typename i_t, typename f_t>
+bool gpu_simplified_dual_phase2_batch_stage_in_place(gpu_batch_handle<i_t, f_t>* handle,
+                                                     std::size_t seat,
+                                                     std::string& error);
+
 template <typename i_t, typename f_t>
 bool gpu_simplified_dual_phase2_batch_relaunch(gpu_batch_handle<i_t, f_t>* handle,
                                                gpu_batch_timing& timing,

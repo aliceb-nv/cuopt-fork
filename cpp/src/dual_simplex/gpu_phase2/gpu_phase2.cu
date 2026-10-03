@@ -3694,6 +3694,7 @@ struct slot_state {
   bool used_transpose_dz{false};
   i_t f_state{0};  // fissioned pivot loop (fission.cuh): next phase
   i_t f_lean{0};   // fission fresh seat: x_B, objective and infeasibilities come from fission_xb
+  i_t f_yield_state{0};  // fission: the step a yielded seat continues from (in-place resume)
   i_t f_mrows{-1}; // rows of the fission replay matrix M held (== num_updates_ when usable)
   i_t f_mrow_k{-1}; // row of M written by the last FTRAN (from UTsol), pending the update
   f_t f_pivot{0.0};    // FTRAN: (B^-1 a_q)[basic_leaving], 0 when absent
@@ -4375,6 +4376,7 @@ struct kernel_args {
   i_t mpf_update_cap;
   f_t* fm{nullptr};  // fission replay matrix M of this seat, fm_kcap^2 (column-major)
   unsigned long long* fstats{nullptr};  // fission: the pool's fission_fb_t counters
+  i_t in_place{0};  // fission: resume a yielded seat from its device state (no setup)
   i_t fm_kcap{0};
   i_t mpf_eta_nnz_cap;
   // Per-slot PERSISTENT solve state (slot_state<FT>): host-allocated, ZEROED blob that the kernel
@@ -8474,7 +8476,8 @@ std::string gpu_fission_fallback_report()
                 c[FB_SEAT_CHILD] == 0 ? 0.0 : static_cast<double>(c[FB_CHILD_K]) / c[FB_SEAT_CHILD],
                 c[FB_SE_RESETS], c[FB_CHOOSE_CALLS], pct(c[FB_SE_RESETS], c[FB_CHOOSE_CALLS]));
   r += out;
-  std::snprintf(out, sizeof(out), "[FISSION-STATS] seats yielded to a later launch: %llu\n", c[FB_YIELDED]);
+  std::snprintf(out, sizeof(out), "[FISSION-STATS] seats yielded to a later launch: %llu, resumed in place: %llu\n",
+                c[FB_YIELDED], c[FB_SEAT_INPLACE]);
   r += out;
   const char* nm[7] = {"fresh", "child", "resume", "it<10", "it<50", "it<200", "it>=200"};
   std::string by = "[FISSION-STATS] steepest-edge resets by seat kind and iteration:";
@@ -9282,6 +9285,7 @@ bool gpu_simplified_dual_phase2_batch_stage(
   H->items[seat]         = item;
   H->items[seat].command = command;
   a.done                 = 0;
+  a.in_place             = 0;
   a.device_lu            = 0;
   a.transpose_on_device  = 0;
   a.command              = static_cast<i_t>(command);
@@ -9567,6 +9571,39 @@ static void fission_dbg_sync(cudaStream_t s, const char* step)
     std::fprintf(stderr, "[FISSION-SYNC] step '%s' failed: %s\n", step, cudaGetErrorString(e));
     throw std::runtime_error(std::string("fission debug sync: ") + step);
   }
+}
+
+// Fission yield in place: the seat's slot, factors and solution are all still on the device, so it
+// is staged without uploads and fission_setup_kernel continues it from its saved step.
+template <typename i_t, typename f_t>
+bool gpu_simplified_dual_phase2_batch_stage_in_place(gpu_phase2_detail::gpu_batch_handle_t<i_t, f_t>* H,
+                                                     std::size_t seat,
+                                                     std::string& error)
+{
+  using namespace gpu_phase2_detail;
+  if (H == nullptr || seat >= H->h_args.size() || !gpu_fission()) {
+    error = "in-place resume needs a fission seat";
+    return false;
+  }
+  init_staged(H);
+  if (H->staged[seat] != 0) {
+    error = "persistent seat was staged more than once in one generation";
+    return false;
+  }
+  kernel_args& a               = H->h_args[seat];
+  a.done                       = 0;
+  a.in_place                   = 1;
+  a.refactor_resume            = 1;
+  a.command                    = static_cast<i_t>(gpu_batch_seat_command::REFACTOR_RESUME);
+  a.device_lu                  = 0;
+  a.transpose_on_device        = 0;
+  a.bound_delta_count          = 0;
+  a.bounds_from_root           = 0;
+  a.terminal_certificate_retry = 0;
+  a.start_time                 = tic();
+  H->items[seat].command       = gpu_batch_seat_command::REFACTOR_RESUME;
+  H->staged[seat]              = 1;
+  return true;
 }
 
 template <typename i_t, typename f_t>
@@ -10181,7 +10218,10 @@ bool gpu_simplified_dual_phase2_batch_relaunch(
         fission_rounds_add(gpu_fission_rounds(), lives);
       }
       if (yield_at > 0) {
-        fission_yield<<<Ni, 32, 0, cs>>>(H->d_args, Ni, static_cast<unsigned long long*>(H->d_fission_fb->data()));
+        // CUOPT_EXP_YIELD_IN_PLACE=0: yielded seats resume through a host refactor (reason 0).
+        static const bool in_place = [] { const char* e = std::getenv("CUOPT_EXP_YIELD_IN_PLACE"); return e == nullptr || std::string(e) != "0"; }();
+        fission_yield<<<Ni, 32, 0, cs>>>(H->d_args, Ni, static_cast<unsigned long long*>(H->d_fission_fb->data()),
+                                         in_place ? 3 : 0);
       }
       RAFT_CUDA_TRY(cudaPeekAtLastError());
       if (last && !early) { set_flag_kernel<<<1, 1, 0, cs>>>(H->d_completion_flag); }
@@ -10604,6 +10644,8 @@ template bool gpu_simplified_dual_phase2_batch_stage<int, double>(
   gpu_batch_seat_command,
   const std::vector<gpu_bound_delta<int, double>>&,
   std::string&);
+template bool gpu_simplified_dual_phase2_batch_stage_in_place<int, double>(
+  gpu_phase2_detail::gpu_batch_handle_t<int, double>*, std::size_t, std::string&);
 template bool gpu_simplified_dual_phase2_batch_relaunch<int, double>(
   gpu_phase2_detail::gpu_batch_handle_t<int, double>*, gpu_batch_timing&, std::string&);
 template void gpu_simplified_dual_phase2_batch_destroy<int, double>(
